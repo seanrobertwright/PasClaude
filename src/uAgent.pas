@@ -1061,6 +1061,12 @@ begin
         still reads sensibly, and the unanswered tool_use blocks are dropped
         from the transcript so the API does not reject the next request. }
       DropUnansweredToolCalls;
+      { If the abort landed before anything was recorded - or left only tool
+        calls, which were just dropped - the transcript now ends on the user's
+        question with nothing answering it.  That gets saved like any other
+        turn, so it is trimmed here rather than in the caller: a cancel is not
+        a failure, so the caller's error path never runs. }
+      TrimUnansweredQuestion;
       if Assigned(OnNotice) then OnNotice('cancelled');
       Exit(True);
     end;

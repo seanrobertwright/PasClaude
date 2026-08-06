@@ -26,6 +26,12 @@ var
   AllowAllEdits: Boolean = False;
   AllowAllBash: Boolean = False;
 
+const
+  { pasclaude's own state directory, kept out of listings and searches.  The
+    name lives here rather than in uAgent because this unit is the one that has
+    to skip it, and two copies of the literal would drift. }
+  StateDirName = '.pasclaude';
+
 { The tool list, as the API expects it under "tools". }
 function ToolsSchema: TJson;
 
@@ -97,6 +103,20 @@ begin
     Err := Format('path escapes the session root (%s): %s', [Root, P]);
     Exit(False);
   end;
+
+  { pasclaude's own state is off limits.  The session file is the conversation
+    itself: letting the model read it wastes the context on a copy of what it
+    already has, and letting it write there would let a tool call rewrite the
+    history of the very turn that is running. }
+  if (CompareText(Copy(Cand, Length(Root) + 2, Length(StateDirName)),
+                  StateDirName) = 0) and
+     ((Length(Cand) = Length(Root) + 1 + Length(StateDirName)) or
+      (Cand[Length(Root) + 2 + Length(StateDirName)] = PathDelim)) then
+  begin
+    Err := StateDirName + ' holds pasclaude''s own session state and is not accessible';
+    Exit(False);
+  end;
+
   Full := Cand;
   Result := True;
 end;
@@ -339,7 +359,8 @@ function ListDir(const Full: string; Recurse: Boolean): string;
           { .git and build output would flood the listing with noise. }
           if (R.Attr and faDirectory) <> 0 then
           begin
-            if (R.Name = '.git') or (R.Name = 'node_modules') then Continue;
+            if (R.Name = '.git') or (R.Name = 'node_modules') or
+               (CompareText(R.Name, StateDirName) = 0) then Continue;
             Dirs.Add(R.Name);
           end
           else
@@ -396,7 +417,11 @@ var
         if (R.Name = '.') or (R.Name = '..') then Continue;
         if (R.Attr and faDirectory) <> 0 then
         begin
-          if (R.Name = '.git') or (R.Name = 'node_modules') then Continue;
+          { The session file holds the whole conversation, so a search that
+            matched it would feed the transcript back into the model - growing
+            the context every turn with a copy of itself. }
+          if (R.Name = '.git') or (R.Name = 'node_modules') or
+             (CompareText(R.Name, StateDirName) = 0) then Continue;
           Walk(IncludeTrailingPathDelimiter(Dir) + R.Name, Depth + 1);
         end
         else if Matches(R.Name) and (R.Size < MaxReadBytes) then

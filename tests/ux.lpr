@@ -856,6 +856,96 @@ begin
   end;
 end;
 
+{ ------------------------------------------------------------- self-state -- }
+
+{ The session file sits inside the directory the model is working in, and it
+  contains the conversation.  Left visible, `search` would match it and hand
+  the model a copy of its own transcript - which then goes into the next
+  request, and is saved again, growing every turn.  Worse, edit_file could
+  rewrite the history of the turn currently running.  It is therefore hidden
+  from listings and searches and refused by the path guard. }
+procedure TestStateDirIsHidden;
+var
+  Input: TJson;
+  IsErr: Boolean;
+  Out_, Marker: string;
+begin
+  WriteLn('-- self-state --');
+  uTools.AllowAllEdits := True;
+  uTools.AllowAllBash := True;
+
+  Marker := 'CONVERSATIONMARKER';
+  WriteFileText(IncludeTrailingPathDelimiter(TmpRoot) + StateDirName +
+    PathDelim + 'session.json',
+    '{"version":1,"messages":[{"role":"user","content":[{"type":"text",' +
+    '"text":"' + Marker + '"}]}]}');
+  WriteFileText(IncludeTrailingPathDelimiter(TmpRoot) + 'ordinary.txt',
+    'an ordinary project file'#10);
+
+  { A recursive listing must not mention it. }
+  Input := TJson.NewObj;
+  Input.AddStr('path', '.');
+  Input.Add('recursive', TJson.NewBool(True));
+  Out_ := RunTool('list_dir', Input, nil, IsErr);
+  Input.Free;
+  Check(Pos(StateDirName, Out_) = 0, 'list_dir does not show the state directory');
+  Check(Pos('ordinary.txt', Out_) > 0, 'but ordinary files are still listed');
+
+  { A search must not match the transcript.  This is the one that would
+    otherwise feed the conversation back into itself. }
+  Input := TJson.NewObj;
+  Input.AddStr('pattern', Marker);
+  Out_ := RunTool('search', Input, nil, IsErr);
+  Input.Free;
+  Check(Pos(Marker, Out_) = 0, 'search does not find the conversation');
+
+  { Reading and writing it are refused outright. }
+  Input := TJson.NewObj;
+  Input.AddStr('path', StateDirName + PathDelim + 'session.json');
+  Out_ := RunTool('read_file', Input, nil, IsErr);
+  Input.Free;
+  Check(IsErr, 'read_file refuses the session file');
+
+  Input := TJson.NewObj;
+  Input.AddStr('path', StateDirName + PathDelim + 'session.json');
+  Input.AddStr('content', 'rewritten history');
+  Out_ := RunTool('write_file', Input, nil, IsErr);
+  Input.Free;
+  Check(IsErr, 'write_file refuses to rewrite the session');
+  Check(Pos(Marker, ReadFileText(IncludeTrailingPathDelimiter(TmpRoot) +
+    StateDirName + PathDelim + 'session.json')) > 0,
+    'and the conversation on disk is untouched');
+
+  { Including by a roundabout path, since a guard that only matches the
+    obvious spelling is not a guard. }
+  Input := TJson.NewObj;
+  Input.AddStr('path', 'sub' + PathDelim + '..' + PathDelim + StateDirName +
+    PathDelim + 'session.json');
+  Out_ := RunTool('read_file', Input, nil, IsErr);
+  Input.Free;
+  Check(IsErr, 'an indirect path to the session is refused too');
+
+  Input := TJson.NewObj;
+  Input.AddStr('path', StateDirName);
+  Out_ := RunTool('list_dir', Input, nil, IsErr);
+  Input.Free;
+  Check(IsErr, 'the state directory cannot be listed directly');
+
+  { A file that merely starts with the same letters is a different thing and
+    must still work. }
+  WriteFileText(IncludeTrailingPathDelimiter(TmpRoot) + '.pasclaude-notes.md',
+    'these are my notes'#10);
+  Input := TJson.NewObj;
+  Input.AddStr('path', '.pasclaude-notes.md');
+  Out_ := RunTool('read_file', Input, nil, IsErr);
+  Input.Free;
+  Check(not IsErr, 'a file with a similar name is not caught by the guard');
+  Check(Pos('these are my notes', Out_) > 0, 'and reads normally');
+
+  uTools.AllowAllEdits := False;
+  uTools.AllowAllBash := False;
+end;
+
 { ----------------------------------------------------------------- editor -- }
 
 { The line editor is what the user touches on every single prompt, and its
@@ -1053,6 +1143,7 @@ begin
     TestPreview;
     TestCompact;
     TestSession;
+    TestStateDirIsHidden;
     TestEditor;
   finally
     uTools.RootDir := '';

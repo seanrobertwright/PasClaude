@@ -117,12 +117,20 @@ it would orphan that tool call.
 resume", and a conversation the user deliberately discarded would come back on
 the next run.
 
+`.pasclaude` is invisible to the tools. It sits inside the directory the model
+is working in and holds the conversation, so `search` would otherwise match it
+and hand the model a copy of its own transcript - which goes into the next
+request, gets saved again, and grows every turn. `edit_file` could rewrite the
+history of the turn currently running. It is skipped by `list_dir` and `search`
+and refused by the path guard, including by a roundabout path. A file merely
+named similarly, like `.pasclaude-notes.md`, is unaffected.
+
 ## Tools
 
 | Tool | Approval | Notes |
 | --- | --- | --- |
 | `read_file` | no | line-numbered, capped at 400 KB, hex dump if not text |
-| `list_dir` | no | skips `.git` and `node_modules`, max depth 4 |
+| `list_dir` | no | skips `.git`, `node_modules` and `.pasclaude`, max depth 4 |
 | `search` | no | case-insensitive content search, capped at 200 hits |
 | `write_file` | yes | creates intermediate directories |
 | `edit_file` | yes | exact-snippet replace; refuses an ambiguous match |
@@ -181,6 +189,9 @@ ownership here is manual, so a leak is a defect rather than noise.
   It also resumes a saved session into a fresh agent and runs a full turn from
   it, which is the only place restored history is checked against the code that
   builds requests rather than against the loader's own rules.
+  A cancellation that lands before any content arrives is checked separately,
+  because it reaches the same dangling-question state as a failed turn by a
+  path where nothing reports an error.
 * `tests\fuzz.lpr` - hostile inputs. Binary files and OEM-encoded shell output
   (the bytes that would otherwise make the API reject a whole turn), NUL bytes
   in JSON strings, path-guard escapes including a sibling directory sharing the
@@ -279,6 +290,21 @@ rather than reading it. `/clear` printed "conversation cleared" and left the
 saved copy untouched, so `--resume` brought the whole thing back. For anything
 cleared on purpose that is the wrong answer, so `/clear` now writes the cleared
 state through to disk.
+
+Two more came from asking where else the same mistake could hide. The trailing
+unanswered question was fixed for a failed turn, but a cancelled turn reaches
+the same state by another route - and a cancel is not an error, so the caller's
+failure path never ran. Pressing Esc before the model had said anything left the
+question dangling and saved it. The trim now happens inside `Send`, where every
+cancellation path passes.
+
+The last one was a question rather than a symptom: what do the tools see of
+pasclaude's own state? Everything, as it turned out. `list_dir` showed
+`.pasclaude`, `search` matched the transcript inside it, and `read_file` and
+`edit_file` would open it. A search that returns the conversation feeds it back
+into the next request, where it is saved and grows again. Disabling the path
+guard fails 5 assertions, and removing the skip from `search` or from `list_dir`
+fails 1 each.
 
 Two more tests passing for the wrong reason turned up in that suite. Removing
 the CR stripping from the line splitter changed nothing, because a stray `#13`

@@ -640,6 +640,62 @@ end;
 
 { Cancelling while the model is mid-tool-call leaves an unanswered tool_use,
   which the API rejects.  Those blocks must be stripped. }
+{ Cancelling before the model has said anything leaves the question in the
+  transcript with nothing answering it - the same shape a failed turn produces,
+  reached by a different route.  A cancel is not an error, so the caller's
+  failure path does not run, which is exactly why this needs its own check:
+  the conversation is then saved after every turn, cancelled or not. }
+procedure TestCancelBeforeAnyContent;
+var
+  A: TAgent;
+  Err, Path: string;
+  Ok: Boolean;
+  Doc: TJson;
+begin
+  ResetScript;
+  uTools.RootDir := SessionDir;
+  Path := IncludeTrailingPathDelimiter(SessionDir) + 'cancelled-session.json';
+  SetLength(Replies, 1);
+  Replies[0] := LongTextReply('chunk ', 40);
+
+  A := MakeAgent;
+  try
+    A.ShouldCancel := @WantsCancel;
+    ChunksSeen := 0;
+    { Cancel almost immediately, before any text delta has been decoded. }
+    CancelAfterChunks := 1;
+
+    Ok := A.Send('a question nobody answers', Err);
+    Check(Ok, 'an early cancellation is still not an error');
+    Check(Prose = '', 'nothing was streamed before the stop');
+
+    { This is the assertion that matters.  Whatever is left has to be a
+      conversation that can be saved, resumed and continued. }
+    Check(A.SaveSession(Path, Err), 'the cancelled turn saves: ' + Err);
+    Doc := JsonParse(A.Transcript);
+    try
+      if Doc.Count > 0 then
+        Check(Doc.Item(Doc.Count - 1).Str('role') <> 'user',
+          'a cancelled turn does not leave the transcript ending on a question')
+      else
+        Check(True, 'the cancelled turn left nothing behind, which is fine');
+    finally
+      Doc.Free;
+    end;
+  finally
+    A.Free;
+  end;
+
+  { And it must reload, because autosave already wrote it. }
+  A := MakeAgent;
+  try
+    Check(A.LoadSession(Path, Err),
+      'a session saved after a cancelled turn reloads: ' + Err);
+  finally
+    A.Free;
+  end;
+end;
+
 procedure TestCancelDuringToolCallCleansTranscript;
 var
   A: TAgent;
@@ -796,6 +852,7 @@ begin
   TestResumedSessionRunsThroughTheLoop;
   TestCancelMidStream;
   TestCancelDuringToolCallCleansTranscript;
+  TestCancelBeforeAnyContent;
   TestRetryOnOverload;
   TestNoRetryOnPermanentError;
   TestRetriesGiveUp;
