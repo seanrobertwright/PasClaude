@@ -136,12 +136,21 @@ const
   MaxRetries    = 3;
   { Bumped when the saved-session shape changes incompatibly. }
   SessionVersion = 1;
+  { A mentioned file larger than this is refused rather than attached; the
+    model can read it in slices through the tool instead. }
+  MaxMentionBytes = 100 * 1024;
   { Where a session lives, relative to the session root. }
   SessionDir  = '.pasclaude';
   SessionFile = 'session.json';
 
 { The default save location under Root. }
 function SessionPath(const Root: string): string;
+
+{ Expands @path mentions in a prompt.  Each mention of a readable text file
+  under the session root becomes an attachment appended after the prose, so
+  the model gets the file without spending a tool round reading it.  Returns
+  the expanded text; Notes lists what was attached or why something was not. }
+function ExpandMentions(const Text: string; out Notes: string): string;
 
 { Copies an existing session aside so a run that is not resuming it cannot
   destroy it on the first save.  True when there was nothing to do, or the
@@ -161,6 +170,97 @@ function SessionPath(const Root: string): string;
 begin
   Result := IncludeTrailingPathDelimiter(Root) + SessionDir +
     PathDelim + SessionFile;
+end;
+
+{ ---------------------------------------------------------------- mentions -- }
+
+{ True for the characters that can appear in a mentioned path.  The set stops
+  at whitespace and at punctuation that ends a sentence, so "see @a\b.pas,"
+  attaches a\b.pas rather than a\b.pas-comma. }
+function IsPathChar(C: Char): Boolean;
+begin
+  Result := C in ['A'..'Z', 'a'..'z', '0'..'9', '\', '/', '.', '_', '-', ':'];
+end;
+
+function ExpandMentions(const Text: string; out Notes: string): string;
+var
+  I, Start: Integer;
+  Path, Full, FileText, Attach: string;
+  F: TFileStream;
+  N: Int64;
+begin
+  Result := Text;
+  Notes := '';
+  Attach := '';
+  I := 1;
+  while I <= Length(Text) do
+  begin
+    { An @ introduces a mention only at a word boundary: "user@host" is an
+      address, not two mentions. }
+    if (Text[I] = '@') and ((I = 1) or (Text[I - 1] in [' ', #9, #10, '('])) then
+    begin
+      Start := I + 1;
+      I := Start;
+      while (I <= Length(Text)) and IsPathChar(Text[I]) do
+        Inc(I);
+      { Trailing sentence punctuation belongs to the prose. }
+      while (I > Start) and (Text[I - 1] in ['.', ',', ':']) do
+        Dec(I);
+      Path := Copy(Text, Start, I - Start);
+      if Path = '' then Continue;
+
+      { The same guard the tools use: a mention must not escape the session
+        root or reach into pasclaude's own state, and @..\..\secrets is
+        exactly as hostile typed as it is tool-called. }
+      if not uTools.ResolveInRoot(Path, Full, FileText) then
+      begin
+        Notes := Notes + Format('@%s: %s'#10, [Path, FileText]);
+        Continue;
+      end;
+      if not FileExists(Full) then
+      begin
+        Notes := Notes + Format('@%s: no such file'#10, [Path]);
+        Continue;
+      end;
+      try
+        F := TFileStream.Create(Full, fmOpenRead or fmShareDenyNone);
+        try
+          N := F.Size;
+          if N > MaxMentionBytes then
+          begin
+            Notes := Notes + Format('@%s: %d bytes, too large to attach'#10,
+              [Path, N]);
+            Continue;
+          end;
+          SetLength(FileText, N);
+          if N > 0 then F.ReadBuffer(FileText[1], N);
+        finally
+          F.Free;
+        end;
+      except
+        on E: Exception do
+        begin
+          Notes := Notes + Format('@%s: %s'#10, [Path, E.Message]);
+          Continue;
+        end;
+      end;
+      { A binary file would poison the request body; the model can still ask
+        for a hex dump through the tool if it really wants one. }
+      if not uTools.IsValidUtf8(FileText) then
+      begin
+        Notes := Notes + Format('@%s: not text, not attached'#10, [Path]);
+        Continue;
+      end;
+      Attach := Attach + Format(#10#10'--- %s ---'#10'%s', [Path, FileText]);
+      Notes := Notes + Format('@%s: attached (%d bytes)'#10,
+        [Path, Length(FileText)]);
+    end
+    else
+      Inc(I);
+  end;
+  if Attach <> '' then
+    Result := Text + #10 +
+      #10'The files mentioned above are attached below.' + Attach;
 end;
 
 { The previous session is kept under a fixed name rather than a timestamped

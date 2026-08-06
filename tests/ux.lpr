@@ -1260,6 +1260,231 @@ begin
   HistoryClear;
 end;
 
+{ --------------------------------------------------------------- mentions -- }
+
+procedure TestMentions;
+var
+  Notes, Out_: string;
+begin
+  WriteLn('-- mentions --');
+  WriteFileText(IncludeTrailingPathDelimiter(TmpRoot) + 'notes.txt',
+    'the notes contents'#10);
+
+  { The basic case: prose stays, the file is appended, the note reports it. }
+  Out_ := ExpandMentions('please look at @notes.txt for context', Notes);
+  Check(Pos('please look at @notes.txt', Out_) = 1, 'the prose is unchanged');
+  Check(Pos('the notes contents', Out_) > 0, 'the file contents are attached');
+  Check(Pos('--- notes.txt ---', Out_) > 0, 'under a header naming the file');
+  Check(Pos('attached (', Notes) > 0, 'and the user is told');
+
+  { Trailing punctuation belongs to the sentence, not the path. }
+  Out_ := ExpandMentions('see @notes.txt, then decide', Notes);
+  Check(Pos('the notes contents', Out_) > 0,
+    'a mention followed by a comma still resolves');
+
+  { A missing file is a note, not an attachment and not an error. }
+  Out_ := ExpandMentions('what about @missing.txt here', Notes);
+  Check(Out_ = 'what about @missing.txt here', 'a missing file changes nothing');
+  Check(Pos('no such file', Notes) > 0, 'but is reported');
+
+  { An email address is not a mention. }
+  Out_ := ExpandMentions('mail bob@notes.txt about it', Notes);
+  Check(Pos('--- notes.txt ---', Out_) = 0,
+    'an @ inside a word does not attach anything');
+
+  { The path guard applies to typed mentions exactly as to tool calls. }
+  Out_ := ExpandMentions('read @..\..\Windows\win.ini now', Notes);
+  Check(Pos('win.ini contents', Out_) = 0, 'an escaping mention attaches nothing');
+  Check(Pos('@..', Notes) > 0, 'and the refusal is reported');
+  Out_ := ExpandMentions('read @.pasclaude\session.json now', Notes);
+  Check(Pos('--- .pasclaude', Out_) = 0, 'the session file cannot be mentioned in');
+
+  { A binary file would poison the request body. }
+  WriteFileText(IncludeTrailingPathDelimiter(TmpRoot) + 'blob2.bin', 'A'#0#255'B');
+  Out_ := ExpandMentions('and @blob2.bin too', Notes);
+  Check(Pos(#0, Out_) = 0, 'binary bytes never reach the prompt');
+  Check(Pos('not text', Notes) > 0, 'with the reason named');
+
+  { No mention, no work: the common case must pass through untouched. }
+  Out_ := ExpandMentions('a plain question', Notes);
+  Check((Out_ = 'a plain question') and (Notes = ''), 'plain text passes through');
+end;
+
+{ ------------------------------------------------------------- multi-edit -- }
+
+procedure TestMultiEdit;
+var
+  Input, Arr, H: TJson;
+  IsErr: Boolean;
+  Path, Out_: string;
+begin
+  WriteLn('-- multi-edit --');
+  uTools.AllowAllEdits := True;
+  Path := IncludeTrailingPathDelimiter(TmpRoot) + 'multi.txt';
+  WriteFileText(Path, 'alpha'#10'beta'#10'gamma'#10'delta'#10);
+
+  { Two hunks in one call, one approval, both applied. }
+  Input := TJson.NewObj;
+  Input.AddStr('path', 'multi.txt');
+  Arr := TJson.NewArr;
+  H := TJson.NewObj;
+  H.AddStr('old_text', 'alpha');
+  H.AddStr('new_text', 'ALPHA');
+  Arr.Push(H);
+  H := TJson.NewObj;
+  H.AddStr('old_text', 'gamma');
+  H.AddStr('new_text', 'GAMMA');
+  Arr.Push(H);
+  Input.Add('edits', Arr);
+  Out_ := RunTool('edit_file', Input, nil, IsErr);
+  Input.Free;
+  Check(not IsErr, 'a two-hunk edit succeeds: ' + Out_);
+  Check(ReadFileText(Path) = 'ALPHA'#10'beta'#10'GAMMA'#10'delta'#10,
+    'both hunks landed');
+
+  { Atomicity: if the second hunk cannot match, the first is not applied. }
+  Input := TJson.NewObj;
+  Input.AddStr('path', 'multi.txt');
+  Arr := TJson.NewArr;
+  H := TJson.NewObj;
+  H.AddStr('old_text', 'beta');
+  H.AddStr('new_text', 'BETA');
+  Arr.Push(H);
+  H := TJson.NewObj;
+  H.AddStr('old_text', 'not present anywhere');
+  H.AddStr('new_text', 'x');
+  Arr.Push(H);
+  Input.Add('edits', Arr);
+  Out_ := RunTool('edit_file', Input, nil, IsErr);
+  Input.Free;
+  Check(IsErr, 'a failing hunk fails the call');
+  Check(Pos('edit 2', Out_) > 0, 'naming which hunk failed');
+  Check(ReadFileText(Path) = 'ALPHA'#10'beta'#10'GAMMA'#10'delta'#10,
+    'and no hunk was applied - all or nothing');
+
+  { The single-hunk form still works, since the model knows it. }
+  Input := TJson.NewObj;
+  Input.AddStr('path', 'multi.txt');
+  Input.AddStr('old_text', 'delta');
+  Input.AddStr('new_text', 'DELTA');
+  Out_ := RunTool('edit_file', Input, nil, IsErr);
+  Input.Free;
+  Check(not IsErr, 'the single-hunk form still works');
+  Check(Pos('DELTA', ReadFileText(Path)) > 0, 'and applies');
+
+  { No hunks at all is an error, not a silent no-op write. }
+  Input := TJson.NewObj;
+  Input.AddStr('path', 'multi.txt');
+  Out_ := RunTool('edit_file', Input, nil, IsErr);
+  Input.Free;
+  Check(IsErr, 'an edit with no hunks is refused');
+
+  uTools.AllowAllEdits := False;
+end;
+
+{ -------------------------------------------------------------- gitignore -- }
+
+procedure TestGitignore;
+var
+  Input: TJson;
+  IsErr: Boolean;
+  Out_: string;
+begin
+  WriteLn('-- gitignore --');
+  WriteFileText(IncludeTrailingPathDelimiter(TmpRoot) + '.gitignore',
+    '# build output'#10 +
+    'obj/'#10 +
+    '*.log'#10 +
+    '/topsecret.txt'#10 +
+    '!keep.log'#10);
+  WriteFileText(IncludeTrailingPathDelimiter(TmpRoot) + 'obj\junk.o', 'object code');
+  WriteFileText(IncludeTrailingPathDelimiter(TmpRoot) + 'trace.log', 'log MARKER1');
+  WriteFileText(IncludeTrailingPathDelimiter(TmpRoot) + 'keep.log', 'kept MARKER2');
+  WriteFileText(IncludeTrailingPathDelimiter(TmpRoot) + 'topsecret.txt', 'MARKER3');
+  WriteFileText(IncludeTrailingPathDelimiter(TmpRoot) + 'visible.txt', 'MARKER4');
+  LoadIgnoreRules;
+
+  Check(IsIgnored('obj', True), 'a dir-only rule hides the directory');
+  Check(IsIgnored('obj\junk.o', False), 'and everything under it');
+  Check(IsIgnored('trace.log', False), 'a *.log rule hides matching files');
+  Check(not IsIgnored('keep.log', False), 'a negated rule un-hides its match');
+  Check(IsIgnored('topsecret.txt', False), 'an anchored rule hides the root file');
+  Check(not IsIgnored('sub\topsecret.txt', False),
+    'but not the same name deeper down');
+  Check(not IsIgnored('visible.txt', False), 'unmatched files stay visible');
+  Check(not IsIgnored('trace.log.txt', False), '*.log does not match .log.txt');
+
+  { And the walkers actually consult it. }
+  Input := TJson.NewObj;
+  Input.AddStr('path', '.');
+  Input.Add('recursive', TJson.NewBool(True));
+  Out_ := RunTool('list_dir', Input, nil, IsErr);
+  Input.Free;
+  Check(Pos('junk.o', Out_) = 0, 'list_dir hides ignored output');
+  Check(Pos('visible.txt', Out_) > 0, 'and shows the rest');
+
+  Input := TJson.NewObj;
+  Input.AddStr('pattern', 'MARKER1');
+  Out_ := RunTool('search', Input, nil, IsErr);
+  Input.Free;
+  Check(Pos('MARKER1', Out_) = 0, 'search skips ignored files');
+  Input := TJson.NewObj;
+  Input.AddStr('pattern', 'MARKER2');
+  Out_ := RunTool('search', Input, nil, IsErr);
+  Input.Free;
+  Check(Pos('MARKER2', Out_) > 0, 'but not un-ignored ones');
+
+  { Search gains real globs alongside the old loose forms. }
+  Input := TJson.NewObj;
+  Input.AddStr('pattern', 'MARKER4');
+  Input.AddStr('glob', 'vis*.txt');
+  Out_ := RunTool('search', Input, nil, IsErr);
+  Input.Free;
+  Check(Pos('MARKER4', Out_) > 0, 'a star glob matches');
+  Input := TJson.NewObj;
+  Input.AddStr('pattern', 'MARKER4');
+  Input.AddStr('glob', 'nope*.txt');
+  Out_ := RunTool('search', Input, nil, IsErr);
+  Input.Free;
+  Check(Pos('MARKER4', Out_) = 0, 'and a non-matching one excludes');
+
+  { Cleanup so later tests see a rule-free root. }
+  DeleteFile(IncludeTrailingPathDelimiter(TmpRoot) + '.gitignore');
+  LoadIgnoreRules;
+  Check(not IsIgnored('trace.log', False), 'removing .gitignore clears the rules');
+end;
+
+{ --------------------------------------------------------------- markdown -- }
+
+{ The renderer's decisions are observable through Emit, so the test captures
+  raw output by swapping the console for a buffer... except uTerm writes to
+  the real console.  What is testable without that seam is the line
+  discipline: what is held, what is flushed, and the fence state.  MdMidLine
+  exposes the held-line state; the styling itself is eyeballed. }
+procedure TestMarkdown;
+begin
+  WriteLn('-- markdown --');
+  MdReset;
+  Check(not MdMidLine, 'a fresh renderer holds nothing');
+  MdFeed('a partial li');
+  Check(MdMidLine, 'an incomplete line is held back');
+  MdFeed('ne'#10);
+  Check(not MdMidLine, 'the newline releases it');
+  MdFeed('one'#10'two'#10'three no newline');
+  Check(MdMidLine, 'only the unterminated tail is held');
+  MdFinish;
+  Check(not MdMidLine, 'finish flushes the tail');
+  { A fragment split inside a fence marker must not break the fence: feed
+    the marker in two pieces and the code line after it still arrives once
+    the line completes. }
+  MdReset;
+  MdFeed('``');
+  Check(MdMidLine, 'half a fence is just a held line');
+  MdFeed('`'#10'code line'#10'```'#10);
+  Check(not MdMidLine, 'the fenced block flowed through');
+  MdFinish;
+end;
+
 { ------------------------------------------------------------------- main -- }
 
 procedure Cleanup(const Dir: string);
@@ -1296,6 +1521,10 @@ begin
     TestSession;
     TestStateDirIsHidden;
     TestEditor;
+    TestMentions;
+    TestMultiEdit;
+    TestGitignore;
+    TestMarkdown;
   finally
     uTools.RootDir := '';
     Cleanup(TmpRoot);

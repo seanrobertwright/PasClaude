@@ -56,6 +56,24 @@ function OemToUtf8(const S: string): string;
   this unit ends up in a JSON request body, where invalid UTF-8 is fatal. }
 function IsValidUtf8(const S: string): Boolean;
 
+{ Resolves P under the session root with the same rules every tool applies:
+  no escaping the root, no reaching into pasclaude's own state.  Exposed so
+  @file mentions face the same guard as tool calls. }
+function ResolveInRoot(const P: string; out Full: string; out Err: string): Boolean;
+
+{ Loads the root .gitignore, if any.  Called once at startup and after /clear
+  of the cache would make no sense - the file rarely changes mid-session. }
+procedure LoadIgnoreRules;
+
+{ True when a path relative to the root matches an ignore rule.  Exposed for
+  the tests; the walkers consult it internally. }
+function IsIgnored(const RelPath: string; IsDir: Boolean): Boolean;
+
+{ Runs a command in the session root and returns its combined output, for the
+  host's own use (git context at startup).  Same machinery as the bash tool,
+  without the permission gate - the host is not the model. }
+function RunShellQuiet(const Cmd: string; out ExitCode: Integer): string;
+
 implementation
 
 uses SysUtils, Classes, Process, Windows;
@@ -119,6 +137,171 @@ begin
 
   Full := Cand;
   Result := True;
+end;
+
+function ResolveInRoot(const P: string; out Full: string; out Err: string): Boolean;
+begin
+  Result := SafePath(P, Full, Err);
+end;
+
+{ -------------------------------------------------------------- .gitignore -- }
+
+{ A deliberately partial reading of the format: comments, blank lines,
+  dir-only rules (trailing /), anchored rules (leading /), and * within a
+  segment.  Negation (!) is honoured for whole rules.  The full spec has
+  corner cases (** spans, character classes) that build tools need and a
+  listing filter does not; anything unmatched is simply shown, which errs on
+  the side of the model seeing more rather than less. }
+type
+  TIgnoreRule = record
+    Pattern: string;      { lowercased, / separators }
+    DirOnly: Boolean;
+    Anchored: Boolean;
+    Negated: Boolean;
+  end;
+
+var
+  IgnoreRules: array of TIgnoreRule;
+
+procedure LoadIgnoreRules;
+var
+  L: TStringList;
+  I, N: Integer;
+  S: string;
+  R: TIgnoreRule;
+begin
+  SetLength(IgnoreRules, 0);
+  if not FileExists(IncludeTrailingPathDelimiter(NormalizeRoot) + '.gitignore') then
+    Exit;
+  L := TStringList.Create;
+  try
+    try
+      L.LoadFromFile(IncludeTrailingPathDelimiter(NormalizeRoot) + '.gitignore');
+    except
+      Exit;   { an unreadable .gitignore just means nothing is filtered }
+    end;
+    N := 0;
+    for I := 0 to L.Count - 1 do
+    begin
+      S := Trim(L[I]);
+      if (S = '') or (S[1] = '#') then Continue;
+      R.Negated := S[1] = '!';
+      if R.Negated then Delete(S, 1, 1);
+      R.DirOnly := (S <> '') and (S[Length(S)] = '/');
+      if R.DirOnly then SetLength(S, Length(S) - 1);
+      R.Anchored := (S <> '') and (S[1] = '/');
+      if R.Anchored then Delete(S, 1, 1);
+      if S = '' then Continue;
+      R.Pattern := LowerCase(StringReplace(S, '\', '/', [rfReplaceAll]));
+      SetLength(IgnoreRules, N + 1);
+      IgnoreRules[N] := R;
+      Inc(N);
+    end;
+  finally
+    L.Free;
+  end;
+end;
+
+{ Matches Pattern against one path segment or segment run, with * spanning
+  anything except a separator. }
+function SegMatch(const Pattern, S: string): Boolean;
+var
+  P, T: Integer;
+  StarP, StarT: Integer;
+begin
+  P := 1;
+  T := 1;
+  StarP := 0;
+  StarT := 0;
+  while T <= Length(S) do
+  begin
+    if (P <= Length(Pattern)) and
+       ((Pattern[P] = S[T]) or (Pattern[P] = '?')) then
+    begin
+      Inc(P);
+      Inc(T);
+    end
+    else if (P <= Length(Pattern)) and (Pattern[P] = '*') then
+    begin
+      StarP := P;
+      StarT := T;
+      Inc(P);
+    end
+    else if StarP > 0 then
+    begin
+      { Backtrack: the star swallows one more character, but never a
+        separator - that is what keeps *.txt from matching a\b.txt. }
+      if S[StarT] = '/' then Exit(False);
+      Inc(StarT);
+      P := StarP + 1;
+      T := StarT;
+    end
+    else
+      Exit(False);
+  end;
+  while (P <= Length(Pattern)) and (Pattern[P] = '*') do
+    Inc(P);
+  Result := P > Length(Pattern);
+end;
+
+function IsIgnored(const RelPath: string; IsDir: Boolean): Boolean;
+var
+  I, J: Integer;
+  Path, Seg: string;
+  Rule: TIgnoreRule;
+  Segs: array of string;
+  NSeg: Integer;
+  Hit: Boolean;
+begin
+  Result := False;
+  if Length(IgnoreRules) = 0 then Exit;
+  Path := LowerCase(StringReplace(RelPath, '\', '/', [rfReplaceAll]));
+
+  { Split once; a rule may match the whole path or any single segment. }
+  NSeg := 0;
+  SetLength(Segs, 0);
+  Seg := '';
+  for I := 1 to Length(Path) do
+    if Path[I] = '/' then
+    begin
+      SetLength(Segs, NSeg + 1);
+      Segs[NSeg] := Seg;
+      Inc(NSeg);
+      Seg := '';
+    end
+    else
+      Seg := Seg + Path[I];
+  SetLength(Segs, NSeg + 1);
+  Segs[NSeg] := Seg;
+  Inc(NSeg);
+
+  { Last matching rule wins, as in git. }
+  for I := 0 to High(IgnoreRules) do
+  begin
+    Rule := IgnoreRules[I];
+    { A dir-only rule can still hit a file underneath the directory: the
+      match is applied to every ancestor segment as well as the leaf. }
+    Hit := False;
+    if Rule.Anchored then
+      Hit := SegMatch(Rule.Pattern, Path) or
+             ((Pos('/', Rule.Pattern) = 0) and (NSeg > 0) and
+              SegMatch(Rule.Pattern, Segs[0]) and
+              ((NSeg > 1) or IsDir or not Rule.DirOnly))
+    else if Pos('/', Rule.Pattern) > 0 then
+      Hit := SegMatch(Rule.Pattern, Path)
+    else
+      for J := 0 to NSeg - 1 do
+        if SegMatch(Rule.Pattern, Segs[J]) then
+        begin
+          { A dir-only rule matched on the leaf requires the leaf to be a
+            directory; matched on an ancestor it always applies. }
+          if Rule.DirOnly and (J = NSeg - 1) and not IsDir then Continue;
+          Hit := True;
+          Break;
+        end;
+    if Hit then
+      Result := not Rule.Negated;
+  end;
 end;
 
 function Clip(const S: string): string;
@@ -341,12 +524,15 @@ end;
 { ------------------------------------------------------------- directories -- }
 
 function ListDir(const Full: string; Recurse: Boolean): string;
+var
+  RootPrefix: string;
 
   procedure Walk(const Dir, Prefix: string; Depth: Integer);
   var
     R: TSearchRec;
     Dirs, Files: TStringList;
     I: Integer;
+    RelName: string;
   begin
     if Depth > 4 then Exit;
     Dirs := TStringList.Create;
@@ -356,15 +542,21 @@ function ListDir(const Full: string; Recurse: Boolean): string;
       begin
         repeat
           if (R.Name = '.') or (R.Name = '..') then Continue;
+          RelName := Copy(IncludeTrailingPathDelimiter(Dir) + R.Name,
+            Length(RootPrefix) + 1, MaxInt);
           { .git and build output would flood the listing with noise. }
           if (R.Attr and faDirectory) <> 0 then
           begin
             if (R.Name = '.git') or (R.Name = 'node_modules') or
                (CompareText(R.Name, StateDirName) = 0) then Continue;
+            if IsIgnored(RelName, True) then Continue;
             Dirs.Add(R.Name);
           end
           else
+          begin
+            if IsIgnored(RelName, False) then Continue;
             Files.Add(Format('%s (%d bytes)', [R.Name, R.Size]));
+          end;
         until FindNext(R) <> 0;
         SysUtils.FindClose(R);
       end;
@@ -386,6 +578,7 @@ function ListDir(const Full: string; Recurse: Boolean): string;
 
 begin
   Result := Rel(Full) + '\'#10;
+  RootPrefix := IncludeTrailingPathDelimiter(NormalizeRoot);
   Walk(Full, '  ', 0);
 end;
 
@@ -394,10 +587,20 @@ end;
 function GrepTree(const Root, Pattern, Glob: string): string;
 var
   Hits: Integer;
+  RootPrefix: string;
 
   function Matches(const Name: string): Boolean;
   begin
-    Result := (Glob = '') or (Glob = '*') or
+    if (Glob = '') or (Glob = '*') then Exit(True);
+    { A glob containing * is exactly that and nothing else - otherwise
+      nope*.txt would still match every .txt through the extension fallback,
+      and a "did not match" filter that matches is worse than none.  The
+      historical looser forms - a bare extension like ".pas", a substring -
+      are kept only for starless patterns, because the model was told about
+      them and models repeat what worked. }
+    if Pos('*', Glob) > 0 then
+      Exit(SegMatch(LowerCase(Glob), LowerCase(Name)));
+    Result :=
       (LowerCase(ExtractFileExt(Name)) = LowerCase(ExtractFileExt(Glob))) or
       (Pos(LowerCase(Glob), LowerCase(Name)) > 0);
   end;
@@ -409,12 +612,15 @@ var
     L: TStringList;
     I: Integer;
     Err: string;
+    RelName: string;
   begin
     if (Depth > 8) or (Hits >= 200) then Exit;
     if FindFirst(IncludeTrailingPathDelimiter(Dir) + '*', faAnyFile, R) = 0 then
     begin
       repeat
         if (R.Name = '.') or (R.Name = '..') then Continue;
+        RelName := Copy(IncludeTrailingPathDelimiter(Dir) + R.Name,
+          Length(RootPrefix) + 1, MaxInt);
         if (R.Attr and faDirectory) <> 0 then
         begin
           { The session file holds the whole conversation, so a search that
@@ -422,10 +628,12 @@ var
             the context every turn with a copy of itself. }
           if (R.Name = '.git') or (R.Name = 'node_modules') or
              (CompareText(R.Name, StateDirName) = 0) then Continue;
+          if IsIgnored(RelName, True) then Continue;
           Walk(IncludeTrailingPathDelimiter(Dir) + R.Name, Depth + 1);
         end
         else if Matches(R.Name) and (R.Size < MaxReadBytes) then
         begin
+          if IsIgnored(RelName, False) then Continue;
           if not LoadFileText(IncludeTrailingPathDelimiter(Dir) + R.Name, Text, Err) then
             Continue;
           if Pos(LowerCase(Pattern), LowerCase(Text)) = 0 then Continue;
@@ -455,6 +663,7 @@ var
 begin
   Result := '';
   Hits := 0;
+  RootPrefix := IncludeTrailingPathDelimiter(NormalizeRoot);
   Walk(Root, 0);
   if Result = '' then
     Result := 'no matches';
@@ -523,6 +732,13 @@ begin
   end;
 end;
 
+function RunShellQuiet(const Cmd: string; out ExitCode: Integer): string;
+begin
+  Result := RunShell(Cmd, NormalizeRoot, ExitCode);
+  if not IsValidUtf8(Result) then
+    Result := OemToUtf8(Result);
+end;
+
 { ------------------------------------------------------------------ schema -- }
 
 function StrProp(const Desc: string): TJson;
@@ -582,10 +798,20 @@ begin
   P.Add('path', StrProp('File path, relative to the session root.'));
   P.Add('old_text', StrProp('Exact text to replace. Must occur exactly once.'));
   P.Add('new_text', StrProp('Replacement text.'));
+  P.Add('edits', TJson.NewObj);
+  with P.Find('edits') do
+  begin
+    AddStr('type', 'array');
+    AddStr('description', 'Several replacements applied together: each item ' +
+      'is {old_text, new_text}. Use this instead of separate calls when one ' +
+      'change spans several places in the file. All must match, or none are ' +
+      'applied.');
+  end;
   Result.Push(MakeTool('edit_file',
-    'Replace one exact snippet in a file. Prefer this over write_file for ' +
-    'changes to existing files. Requires user approval.',
-    P, ['path', 'old_text', 'new_text']));
+    'Replace exact snippets in a file: one via old_text/new_text, or several ' +
+    'at once via edits. Prefer this over write_file for changes to existing ' +
+    'files. Requires user approval.',
+    P, ['path']));
 
   P := TJson.NewObj;
   P.Add('path', StrProp('Directory, relative to the session root. Default ".".'));
@@ -635,6 +861,77 @@ begin
     Result := Name;
 end;
 
+{ Applies the edit(s) described by Input to Text in place.  One hunk comes as
+  old_text/new_text, several as an edits array; the two can combine.  Every
+  hunk is checked - present, unambiguous - before any is applied: an edit
+  that half-lands leaves a file that neither the user nor the model expected
+  to exist.  Later hunks match against the text as earlier ones changed it,
+  in array order. }
+function ApplyEdits(Input: TJson; var Text: string; const RelName: string;
+  out Err: string): Boolean;
+var
+  Edits: TJson;
+  I, At, Second, Count: Integer;
+  Old, New, Work: string;
+
+  function OneHunk(const O, N: string; Which: Integer): Boolean;
+  begin
+    Result := False;
+    if O = '' then
+    begin
+      Err := Format('edit %d: old_text must not be empty', [Which]);
+      Exit;
+    end;
+    At := Pos(O, Work);
+    if At = 0 then
+    begin
+      Err := Format('edit %d: old_text was not found in %s', [Which, RelName]);
+      Exit;
+    end;
+    Second := Pos(O, Work, At + 1);
+    if Second > 0 then
+    begin
+      Err := Format('edit %d: old_text occurs more than once; include more context',
+        [Which]);
+      Exit;
+    end;
+    Work := Copy(Work, 1, At - 1) + N + Copy(Work, At + Length(O), MaxInt);
+    Result := True;
+  end;
+
+begin
+  Result := False;
+  Err := '';
+  Work := Text;
+  Count := 0;
+
+  { The single-hunk form, when present, runs first. }
+  Old := Input.Str('old_text');
+  New := Input.Str('new_text');
+  if Old <> '' then
+  begin
+    if not OneHunk(Old, New, 1) then Exit;
+    Inc(Count);
+  end;
+
+  Edits := Input.Find('edits');
+  if (Edits <> nil) and (Edits.Kind = jkArr) then
+    for I := 0 to Edits.Count - 1 do
+    begin
+      if not OneHunk(Edits.Item(I).Str('old_text'),
+                     Edits.Item(I).Str('new_text'), Count + 1) then Exit;
+      Inc(Count);
+    end;
+
+  if Count = 0 then
+  begin
+    Err := 'no edits given: supply old_text/new_text or an edits array';
+    Exit;
+  end;
+  Text := Work;
+  Result := True;
+end;
+
 { Asks the user, honouring any standing "always" answer for this tool class. }
 function Permit(const Name, Detail: string; Ask: TAskProc): Boolean;
 var
@@ -664,8 +961,7 @@ end;
   believed was there. }
 function ChangePreview(const Name: string; Input: TJson): string;
 var
-  Full, Err, Text, Note, Old, New, Updated: string;
-  At, Second: Integer;
+  Full, Err, Text, Note, Updated: string;
 begin
   Result := '';
   if Input = nil then Exit;
@@ -695,16 +991,12 @@ begin
     if not FileExists(Full) then Exit;
     if not LoadFileText(Full, Text, Note) then Exit;
     if not IsValidUtf8(Text) then Exit;
-    Old := Input.Str('old_text');
-    New := Input.Str('new_text');
-    if Old = '' then Exit;
-    At := Pos(Old, Text);
-    if At = 0 then Exit;
-    { An ambiguous match is refused later anyway; previewing the first hit
-      would show an edit that is never going to happen. }
-    Second := Pos(Old, Text, At + 1);
-    if Second > 0 then Exit;
-    Updated := Copy(Text, 1, At - 1) + New + Copy(Text, At + Length(Old), MaxInt);
+    { The same application the execution path uses, so the preview is the
+      change that will actually happen - including every hunk of a multi-edit.
+      An edit that would be refused previews as nothing, and the refusal
+      carries the reason. }
+    Updated := Text;
+    if not ApplyEdits(Input, Updated, Rel(Full), Err) then Exit;
     Result := DiffSummary(Text, Updated, PreviewLines);
   end;
 end;
@@ -728,8 +1020,8 @@ end;
 function RunTool(const Name: string; Input: TJson; Ask: TAskProc;
   out IsError: Boolean): string;
 var
-  Full, Err, Text, Old, New, Cmd, Note: string;
-  Code, At, Second: Integer;
+  Full, Err, Text, Cmd, Note: string;
+  Code: Integer;
 begin
   IsError := False;
   if Input = nil then
@@ -806,33 +1098,19 @@ begin
       IsError := True;
       Exit('cannot read: ' + Note);
     end;
-    Old := Input.Str('old_text');
-    New := Input.Str('new_text');
-    if Old = '' then
+    { One hunk through old_text/new_text, several through edits.  Every hunk
+      is validated against the file before any is applied, so a failure in
+      the third leaves the first two unapplied rather than half-editing. }
+    if not ApplyEdits(Input, Text, Rel(Full), Err) then
     begin
       IsError := True;
-      Exit('old_text must not be empty');
-    end;
-    At := Pos(Old, Text);
-    if At = 0 then
-    begin
-      IsError := True;
-      Exit('old_text was not found in ' + Rel(Full));
-    end;
-    { An ambiguous match would edit the wrong place, so it is refused rather
-      than guessed at. }
-    Second := Pos(Old, Text, At + 1);
-    if Second > 0 then
-    begin
-      IsError := True;
-      Exit('old_text occurs more than once; include more context');
+      Exit(Err);
     end;
     if not PermitChange(Name, Input, Ask) then
     begin
       IsError := True;
       Exit('the user denied this edit');
     end;
-    Text := Copy(Text, 1, At - 1) + New + Copy(Text, At + Length(Old), MaxInt);
     if not SaveFileText(Full, Text, Err) then
     begin
       IsError := True;

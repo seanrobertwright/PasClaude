@@ -79,6 +79,17 @@ to their common prefix; directories complete with a trailing `\` so another Tab
 descends. Pasting a multi-line block keeps its line breaks as one prompt
 instead of firing a request per line, and `Ctrl+Enter` inserts a break by hand.
 
+`@path` in a prompt attaches that file to it: the model starts with the
+contents instead of spending a tool round reading them. Mentions face the same
+path guard as tool calls - no escaping the root, no reaching the session state
+- and a binary or oversized file is reported rather than attached. Tab
+completes paths after the `@` too.
+
+Replies render markdown as they stream: headings and **bold** brighten,
+`inline code` and fenced blocks colour cyan, fence lines are swallowed. The
+renderer holds back only the current incomplete line, so output appears line
+by line. Unclosed marks print literally rather than swallowing text.
+
 Requests carry two `cache_control` breakpoints: one on the system prompt
 (whose span also covers the tools) and one on the last message, so each turn
 reuses the cached conversation prefix instead of re-paying full price for it.
@@ -148,14 +159,22 @@ the first's conversation on its very first save.
 | Tool | Approval | Notes |
 | --- | --- | --- |
 | `read_file` | no | line-numbered, capped at 400 KB, hex dump if not text |
-| `list_dir` | no | skips `.git`, `node_modules` and `.pasclaude`, max depth 4 |
-| `search` | no | case-insensitive content search, capped at 200 hits |
+| `list_dir` | no | skips `.git`, `node_modules`, `.pasclaude` and `.gitignore`d entries, max depth 4 |
+| `search` | no | case-insensitive content search, `*` globs, respects `.gitignore`, capped at 200 hits |
 | `write_file` | yes | creates intermediate directories |
-| `edit_file` | yes | exact-snippet replace; refuses an ambiguous match |
+| `edit_file` | yes | one hunk or several at once; all must match or none apply |
 | `bash` | yes | `cmd.exe /C`, output merged, 120 s timeout |
 
 At each prompt you can answer `y` (once), `a` (always, for that class of tool)
 or `n`. Read-only tools never ask.
+
+A `.gitignore` at the root filters listings and searches - build output is
+noise the model pays tokens to look at. The reading of the format is
+deliberately partial (dir rules, `*` within a segment, anchored rules, `!`
+negation); anything unmatched is shown, which errs on the side of the model
+seeing more. When the directory is a git repository, the system prompt names
+the branch and whether the tree is dirty, saving the model its most common
+first command.
 
 A write or edit shows its diff before you answer, so the decision is about the
 change rather than about the file name:
@@ -309,6 +328,16 @@ replacing the token fails 6. The cache markers too: removing the system one
 fails 1, the conversation one fails 1. Whether the live API honours the
 markers is part of the standing no-key gap; the `/cost` counters exist so a
 real session answers that at a glance.
+
+The newest round: bypassing the path guard on @mentions fails 1 assertion
+(the session file becoming mentionable), and a first draft of the glob change
+failed its own test - `nope*.txt` still matched through the old extension
+fallback, so a non-matching filter matched anyway; starred globs now match as
+globs alone. One mutation survived and is worth recording: making each edit
+hunk commit to the output as it applies is unobservable, because the caller
+only reads the text after total success and discards it on any failure - the
+atomicity the test pins lives at the call boundary, which is the boundary
+that matters.
 
 A third defect turned up the same way as the first two - by using the program
 rather than reading it. `/clear` printed "conversation cleared" and left the

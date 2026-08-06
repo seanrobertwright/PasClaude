@@ -46,8 +46,12 @@ end;
 
 procedure OnText(const S: string);
 begin
-  Emit(S);
-  NoteWritten(S);
+  { Prose renders through the streaming markdown pass: complete lines are
+    styled as they close, the current line is held until it does.  Output
+    therefore appears line by line - the price of knowing whether a line is a
+    heading or code before printing it. }
+  MdFeed(S);
+  AtLineStart := not MdMidLine;
 end;
 
 procedure OnThinking(const S: string);
@@ -58,6 +62,10 @@ end;
 
 procedure OnToolStart(const Name, Detail: string);
 begin
+  { A tool call can interrupt mid-line; whatever prose is held back has to
+    land first or it would print after the tool line it preceded. }
+  MdFinish;
+  AtLineStart := True;
   NeedNewLine;
   EmitC(clMagenta, '  * ');
   EmitCLn(clBright, Detail);
@@ -135,6 +143,7 @@ var
   I: Integer;
   Dir, NamePart, Base: string;
   R: TSearchRec;
+  Sigil, Tok: string;
 begin
   Result := nil;
   N := 0;
@@ -147,16 +156,26 @@ begin
     Exit;
   end;
 
+  { An @ prefix is a file mention; the path completes exactly as a bare one
+    would, with the sigil carried through so the token replacement keeps it. }
+  Sigil := '';
+  Tok := Token;
+  if Copy(Tok, 1, 1) = '@' then
+  begin
+    Sigil := '@';
+    Delete(Tok, 1, 1);
+  end;
+
   { A path: everything up to the last separator names the directory, the
     rest is the prefix to match.  The session root is the base, matching how
     every tool resolves paths. }
   Dir := '';
-  NamePart := Token;
-  for I := Length(Token) downto 1 do
-    if Token[I] in ['\', '/'] then
+  NamePart := Tok;
+  for I := Length(Tok) downto 1 do
+    if Tok[I] in ['\', '/'] then
     begin
-      Dir := Copy(Token, 1, I);
-      NamePart := Copy(Token, I + 1, MaxInt);
+      Dir := Copy(Tok, 1, I);
+      NamePart := Copy(Tok, I + 1, MaxInt);
       Break;
     end;
   Base := IncludeTrailingPathDelimiter(uTools.RootDir) + Dir;
@@ -171,9 +190,9 @@ begin
          (CompareText(Copy(R.Name, 1, Length(NamePart)), NamePart) <> 0) then
         Continue;
       if (R.Attr and faDirectory) <> 0 then
-        Add(Dir + R.Name + '\')
+        Add(Sigil + Dir + R.Name + '\')
       else
-        Add(Dir + R.Name);
+        Add(Sigil + Dir + R.Name);
     until FindNext(R) <> 0;
     SysUtils.FindClose(R);
   end;
@@ -230,12 +249,59 @@ end;
 
 { ---------------------------------------------------------- system prompt -- }
 
-function SystemPrompt: string;
+{ One quiet git call at startup.  Knowing the branch and whether the tree is
+  dirty saves the model its most common first tool call, and mentioning git at
+  all tells it commits are welcome.  A directory that is not a repository
+  contributes nothing rather than an error. }
+function GitContext: string;
+var
+  Code: Integer;
+  Head, Stat: string;
+
+  function OneLine(const S: string): string;
+  var
+    P: Integer;
+  begin
+    Result := Trim(S);
+    P := Pos(#10, Result);
+    if P > 0 then SetLength(Result, P - 1);
+    Result := Trim(Result);
+  end;
+
+var
+  I, Lines: Integer;
 begin
+  Result := '';
+  Head := uTools.RunShellQuiet('git rev-parse --abbrev-ref HEAD', Code);
+  if Code <> 0 then Exit;
+  Head := OneLine(Head);
+  if Head = '' then Exit;
+
+  Stat := uTools.RunShellQuiet('git status --porcelain', Code);
+  Lines := 0;
+  if Code = 0 then
+    for I := 1 to Length(Stat) do
+      if Stat[I] = #10 then Inc(Lines);
+
+  Result := 'This is a git repository on branch "' + Head + '"';
+  if Lines = 0 then
+    Result := Result + ' with a clean tree.'
+  else
+    Result := Result + Format(' with %d changed files (git status/diff for detail).',
+      [Lines]);
+  Result := Result + #10#10;
+end;
+
+function SystemPrompt: string;
+var
+  GitInfo: string;
+begin
+  GitInfo := GitContext;
   Result :=
     'You are pasclaude, a terminal coding assistant working inside a user''s ' +
     'project directory on Windows.' + #10#10 +
     'Session root: ' + uTools.RootDir + #10#10 +
+    GitInfo +
     'Guidelines:' + #10 +
     '- Investigate before you act: read the relevant files rather than ' +
     'guessing at their contents.' + #10 +
@@ -407,6 +473,7 @@ end;
 
 var
   ApiKey, ModelName, Line, Err, Dir, SaveErr, Arg, ResumeErr: string;
+  MentionNotes: string;
   Handled: Boolean;
   Dropped: Integer;
   Resume: Boolean = False;
@@ -452,6 +519,7 @@ begin
       SetCurrentDir(Dir);
     end;
     uTools.RootDir := GetCurrentDir;
+    uTools.LoadIgnoreRules;
 
     ApiKey := GetEnvironmentVariable('ANTHROPIC_API_KEY');
     if Trim(ApiKey) = '' then
@@ -522,6 +590,19 @@ begin
         if Handled then Continue;
 
         AtLineStart := True;
+        MdReset;
+        { @path mentions become attachments before the prompt is sent, so the
+          model starts with the file instead of spending a round reading it. }
+        if Pos('@', Line) > 0 then
+        begin
+          Line := ExpandMentions(Line, MentionNotes);
+          if MentionNotes <> '' then
+          begin
+            EmitC(clGrey, '  ' + StringReplace(Trim(MentionNotes), #10,
+              #10'  ', [rfReplaceAll]));
+            EmitLn;
+          end;
+        end;
         { A session that runs long enough will eventually exceed the context
           window, and the failure mode is the whole turn being rejected.
           Trimming first costs the oldest exchanges instead. }
@@ -537,6 +618,10 @@ begin
           NeedNewLine;
           EmitCLn(clRed, '  ' + Err);
         end;
+        { The last line of the reply usually has no trailing newline and is
+          still held by the renderer. }
+        MdFinish;
+        AtLineStart := True;
         { Saved after every turn rather than at exit, because the session
           worth keeping is usually the one that ended in a crash or a closed
           window.  A failure to save is reported once and does not interrupt

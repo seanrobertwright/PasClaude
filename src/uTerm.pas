@@ -24,6 +24,25 @@ procedure EmitLn(const S: string = '');
 procedure EmitC(C: TColor; const S: string);
 procedure EmitCLn(C: TColor; const S: string = '');
 
+{ ------------------------------------------------------- markdown streaming --
+
+  The reply arrives in fragments that can split anywhere - mid-line, mid-**,
+  mid-fence.  A full parser wants the whole document; a terminal wants the
+  text as it arrives.  This renderer holds back only the current incomplete
+  line, styles complete lines as they close, and treats inline marks with a
+  simple state machine.  It covers what models actually emit - headings,
+  fenced code, inline code, bold - and passes anything else through
+  unstyled, which is always safe. }
+
+{ Resets the renderer for a fresh reply. }
+procedure MdReset;
+{ Feeds one streamed fragment; complete lines are styled and printed. }
+procedure MdFeed(const S: string);
+{ Flushes whatever is buffered, closing the reply. }
+procedure MdFinish;
+{ True when the renderer is mid-line (for the caller's cursor tracking). }
+function MdMidLine: Boolean;
+
 { Reads one line with basic editing (backspace, Ctrl+U, Ctrl+C).
   Returns False when the user asks to quit (Ctrl+C on an empty line, or EOF). }
 function ReadLineEdit(const Prompt: string; out Line: string): Boolean;
@@ -179,6 +198,127 @@ end;
 procedure EmitCLn(C: TColor; const S: string);
 begin
   EmitC(C, S + sLineBreak);
+end;
+
+{ ------------------------------------------------------- markdown streaming -- }
+
+var
+  MdBuf: string = '';          { the incomplete final line }
+  MdInFence: Boolean = False;
+
+procedure MdReset;
+begin
+  MdBuf := '';
+  MdInFence := False;
+end;
+
+function MdMidLine: Boolean;
+begin
+  Result := MdBuf <> '';
+end;
+
+{ Prints one complete line with inline styling.  `code` spans render cyan,
+  **bold** renders bright; the marks themselves are eaten.  An unclosed mark
+  prints literally, because swallowing text the model wrote is worse than
+  showing a stray asterisk. }
+procedure MdLine(const S: string);
+var
+  I, Start: Integer;
+  InCode, InBold: Boolean;
+
+  procedure Flush(Upto: Integer);
+  begin
+    if Upto >= Start then
+    begin
+      if InCode then
+        EmitC(clCyan, Copy(S, Start, Upto - Start + 1))
+      else if InBold then
+        EmitC(clBright, Copy(S, Start, Upto - Start + 1))
+      else
+        Emit(Copy(S, Start, Upto - Start + 1));
+    end;
+  end;
+
+begin
+  { Fences toggle code mode and are themselves swallowed - the colour says
+    what the block is, and the ``` line is markdown plumbing, not content. }
+  if Copy(TrimLeft(S), 1, 3) = '```' then
+  begin
+    MdInFence := not MdInFence;
+    Exit;
+  end;
+  if MdInFence then
+  begin
+    EmitCLn(clCyan, S);
+    Exit;
+  end;
+  { A heading colours the whole line and keeps its # marks: they carry the
+    level, and models refer back to "## Design" by name. }
+  if (S <> '') and (S[1] = '#') then
+  begin
+    EmitCLn(clBright, S);
+    Exit;
+  end;
+
+  I := 1;
+  Start := 1;
+  InCode := False;
+  InBold := False;
+  while I <= Length(S) do
+  begin
+    if S[I] = '`' then
+    begin
+      { The span only styles if it closes on this line. }
+      if InCode or (Pos('`', S, I + 1) > 0) then
+      begin
+        Flush(I - 1);
+        InCode := not InCode;
+        Start := I + 1;
+      end;
+      Inc(I);
+    end
+    else if (not InCode) and (I < Length(S)) and (S[I] = '*') and (S[I + 1] = '*') then
+    begin
+      if InBold or (Pos('**', S, I + 2) > 0) then
+      begin
+        Flush(I - 1);
+        InBold := not InBold;
+        Start := I + 2;
+      end;
+      Inc(I, 2);
+    end
+    else
+      Inc(I);
+  end;
+  Flush(Length(S));
+  EmitLn;
+end;
+
+procedure MdFeed(const S: string);
+var
+  I: Integer;
+  Line: string;
+begin
+  MdBuf := MdBuf + S;
+  repeat
+    I := Pos(#10, MdBuf);
+    if I = 0 then Exit;
+    Line := Copy(MdBuf, 1, I - 1);
+    Delete(MdBuf, 1, I);
+    if (Line <> '') and (Line[Length(Line)] = #13) then
+      SetLength(Line, Length(Line) - 1);
+    MdLine(Line);
+  until False;
+end;
+
+procedure MdFinish;
+begin
+  if MdBuf <> '' then
+  begin
+    MdLine(MdBuf);
+    MdBuf := '';
+  end;
+  MdInFence := False;
 end;
 
 function EscPressed: Boolean;
