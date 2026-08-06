@@ -763,6 +763,56 @@ begin
     A.Free;
   end;
 
+  { A second run in the same directory that is not resuming would overwrite the
+    session on its first save.  The old one is moved aside first, so work is
+    recoverable rather than silently gone.  Two people - or two windows - in
+    one project directory is not an exotic case. }
+  A := TAgent.Create('k', 'm', 'sys');
+  try
+    SeedTurn(A, 'valuable earlier work', 'an answer worth keeping');
+    Check(A.SaveSession(Path, Err), 'the earlier session is saved');
+  finally
+    A.Free;
+  end;
+
+  Check(BackupSession(Path, Err), 'the existing session is moved aside: ' + Err);
+  Check(not FileExists(Path), 'the live path is now free for the new run');
+  Check(FileExists(ChangeFileExt(Path, '') + '.prev.json'),
+    'and the previous conversation is kept beside it');
+  Check(Pos('valuable earlier work',
+    ReadFileText(ChangeFileExt(Path, '') + '.prev.json')) > 0,
+    'with its contents intact');
+
+  { The copy has to be a real session, not just bytes: recovering it by hand
+    means renaming it back and resuming. }
+  A := TAgent.Create('k', 'm', 'sys');
+  try
+    Check(A.LoadSession(ChangeFileExt(Path, '') + '.prev.json', Err),
+      'the kept copy is itself resumable: ' + Err);
+    Check(A.MessageCount = 2, 'carrying the earlier exchange');
+  finally
+    A.Free;
+  end;
+
+  { Backing up when there is nothing there is not an error - the common case
+    is a first run in a clean directory. }
+  DeleteFile(Path);
+  Check(BackupSession(Path, Err), 'backing up a missing session is a no-op');
+
+  { And a second backup must not fail on the copy already being there. }
+  A := TAgent.Create('k', 'm', 'sys');
+  try
+    SeedTurn(A, 'second run work', 'another answer');
+    A.SaveSession(Path, Err);
+  finally
+    A.Free;
+  end;
+  Check(BackupSession(Path, Err),
+    'a later backup replaces the previous copy: ' + Err);
+  Check(Pos('second run work',
+    ReadFileText(ChangeFileExt(Path, '') + '.prev.json')) > 0,
+    'and the copy is the most recent one');
+
   { An empty session is not corrupt, it is just a conversation nobody has had
     yet, and loading it should quietly produce an empty transcript. }
   A := TAgent.Create('k', 'm', 'sys');

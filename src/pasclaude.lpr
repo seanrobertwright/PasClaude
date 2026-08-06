@@ -423,7 +423,17 @@ begin
       end
       else if FileExists(SessionPath(uTools.RootDir)) then
       begin
-        EmitCLn(clGrey, '  a saved conversation exists here; /resume loads it');
+        { A session was left here and this run is not continuing it, so the
+          first save would overwrite it.  It is copied aside first: the user
+          who wanted it can still get it back, and the one who did not loses
+          nothing but a file. }
+        if BackupSession(SessionPath(uTools.RootDir), SaveErr) then
+          EmitCLn(clGrey,
+            '  a saved conversation exists here; /resume loads it' +
+            ' (a copy is kept as session.prev.json)')
+        else
+          EmitCLn(clYellow, '  a saved conversation exists here but could not ' +
+            'be copied aside: ' + SaveErr);
         EmitLn;
       end;
 

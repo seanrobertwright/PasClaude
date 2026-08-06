@@ -306,6 +306,8 @@ var
   Err: string;
   Ok: Boolean;
   I: Integer;
+  Path: string;
+  Doc, Msgs, Last: TJson;
 begin
   ResetScript;
   uTools.RootDir := SessionDir;
@@ -320,6 +322,71 @@ begin
     Check(CallCount = MaxToolRounds,
       Format('the loop stops after %d rounds, not more', [MaxToolRounds]));
     Check(Pos('tool rounds', Notices) > 0, 'the user is told the loop was cut off');
+
+    { The loop stops immediately after RunTools appended a tool_result that was
+      never sent, so the transcript now ends on a user message carrying tool
+      results.  Asking anything afterwards would put a second user turn right
+      behind it, and autosave writes that state to disk either way. }
+    Path := IncludeTrailingPathDelimiter(SessionDir) + 'roundlimit.json';
+    Check(A.SaveSession(Path, Err), 'the cut-off turn saves: ' + Err);
+
+    { Unwinding the unsent results leaves the user's original question with
+      nothing answering it, which is the same state a failed turn produces and
+      is handled the same way: it is dropped rather than saved, so the next
+      question does not stack behind it. }
+    Check(not A.TrimUnansweredQuestion,
+      'Send already trimmed the unanswered question at the round limit');
+    Doc := JsonParse(A.Transcript);
+    try
+      Check((Doc.Count = 0) or
+            (Doc.Item(Doc.Count - 1).Str('role') <> 'user'),
+        'so the transcript no longer ends on a question');
+    finally
+      Doc.Free;
+    end;
+
+    { The next question must not simply pile up behind the unsent results. }
+    ResetScript;
+    SetLength(Replies, 1);
+    Replies[0] := TextReply('answering the follow-up');
+    Ok := A.Send('what happened?', Err);
+    Check(Ok, 'a question after the round limit still works: ' + Err);
+
+    Doc := JsonParse(Requests[0]);
+    try
+      Msgs := Doc.Find('messages');
+      Err := '';
+      for I := 0 to Msgs.Count - 1 do
+        Err := Err + Msgs.Item(I).Str('role') + '/' +
+          Msgs.Item(I).Find('content').Item(0).Str('type') + ' ';
+      { With the cut-off turn unwound, the follow-up is a clean request: it
+        must not contain two user turns in a row anywhere, nor a tool_use with
+        nothing answering it. }
+      Ok := True;
+      for I := 1 to Msgs.Count - 1 do
+      begin
+        Last := Msgs.Item(I - 1);
+        if (Last.Str('role') = 'user') and
+           (Msgs.Item(I).Str('role') = 'user') then Ok := False;
+        if Last.Find('content').Item(0).Str('type') = 'tool_use' then
+          if Msgs.Item(I).Find('content').Item(0).Str('type') <> 'tool_result' then
+            Ok := False;
+      end;
+      Check(Ok, 'the follow-up request has no consecutive user turns and no ' +
+        'unanswered tool call: ' + Err);
+    finally
+      Doc.Free;
+    end;
+  finally
+    A.Free;
+  end;
+
+  { And what was written to disk has to be loadable, since autosave already
+    wrote it. }
+  A := MakeAgent;
+  try
+    Check(A.LoadSession(Path, Err),
+      'a session saved at the round limit reloads: ' + Err);
   finally
     A.Free;
   end;

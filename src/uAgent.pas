@@ -134,6 +134,11 @@ const
 { The default save location under Root. }
 function SessionPath(const Root: string): string;
 
+{ Copies an existing session aside so a run that is not resuming it cannot
+  destroy it on the first save.  True when there was nothing to do, or the
+  copy succeeded. }
+function BackupSession(const Path: string; out Err: string): Boolean;
+
 var
   { Base backoff in milliseconds; doubles per attempt.  Only the tests lower
     it, so a suite does not spend seconds asleep. }
@@ -147,6 +152,37 @@ function SessionPath(const Root: string): string;
 begin
   Result := IncludeTrailingPathDelimiter(Root) + SessionDir +
     PathDelim + SessionFile;
+end;
+
+{ The previous session is kept under a fixed name rather than a timestamped
+  one: a directory quietly filling with old conversations is its own problem,
+  and one level of undo is what this is for. }
+function BackupSession(const Path: string; out Err: string): Boolean;
+var
+  Prev: string;
+begin
+  Err := '';
+  Result := True;
+  if not FileExists(Path) then Exit;
+  Prev := ChangeFileExt(Path, '') + '.prev.json';
+  try
+    if FileExists(Prev) and not DeleteFile(Prev) then
+    begin
+      Err := 'cannot replace ' + Prev;
+      Exit(False);
+    end;
+    if not RenameFile(Path, Prev) then
+    begin
+      Err := 'cannot move ' + Path;
+      Exit(False);
+    end;
+  except
+    on E: Exception do
+    begin
+      Err := E.Message;
+      Result := False;
+    end;
+  end;
 end;
 
 { ------------------------------------------------------------ stream state -- }
@@ -1077,6 +1113,27 @@ begin
 
   if Assigned(OnNotice) then
     OnNotice(Format('stopped after %d tool rounds', [MaxToolRounds]));
+  { The loop exits directly after RunTools appended a tool_result message that
+    was never sent, so the transcript ends on a user turn.  The next question
+    would then sit behind it as a second user turn in a row, and the work those
+    tools did would never be seen by the model at all.  Dropping that message
+    puts the conversation back to the last assistant turn, which is a state the
+    next question can legally follow. }
+  { Unwinding the unsent results also strips the tool_use blocks they answered,
+    which can empty that assistant message and expose the results underneath
+    it, so this repeats - but it must stop while the user's original question
+    is still there, or the turn would erase itself entirely.  One message is
+    always kept for that reason. }
+  while (FMessages.Count > 1) and
+        (FMessages.Item(FMessages.Count - 1).Str('role') = 'user') do
+  begin
+    FMessages.Drop(FMessages.Count - 1);
+    DropUnansweredToolCalls;
+  end;
+  { What is left may be the user's original question with nothing answering it,
+    which is the same state a failed or cancelled turn produces and is dropped
+    for the same reason: it is about to be saved. }
+  TrimUnansweredQuestion;
   Result := True;
 end;
 

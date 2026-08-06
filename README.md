@@ -125,6 +125,11 @@ history of the turn currently running. It is skipped by `list_dir` and `search`
 and refused by the path guard, including by a roundabout path. A file merely
 named similarly, like `.pasclaude-notes.md`, is unaffected.
 
+Starting in a directory that already holds a session, without `--resume`, moves
+that session to `session.prev.json` before anything can overwrite it. Two
+windows open on one project is not exotic, and the second one used to destroy
+the first's conversation on its very first save.
+
 ## Tools
 
 | Tool | Approval | Notes |
@@ -305,6 +310,20 @@ pasclaude's own state? Everything, as it turned out. `list_dir` showed
 into the next request, where it is saved and grows again. Disabling the path
 guard fails 5 assertions, and removing the skip from `search` or from `list_dir`
 fails 1 each.
+
+Two more followed from the same habit. Hitting `MaxToolRounds` exits the loop
+directly after `RunTools` appended a `tool_result` message that was never sent,
+so the transcript ended on a user turn and the next question stacked behind it
+as a second one - with the work those last tools did never reaching the model
+at all. That tail is now unwound, repeatedly, because removing the results
+strips the `tool_use` blocks they answered, which can empty the assistant
+message and expose more results underneath. Disabling the unwind fails 2
+assertions.
+
+And running two instances in one directory showed the second destroying the
+first's conversation on its first save. The banner had always warned that a
+session existed, but warning happens before the damage and changes nothing.
+The file is now moved aside first.
 
 Two more tests passing for the wrong reason turned up in that suite. Removing
 the CR stripping from the line splitter changed nothing, because a stray `#13`
