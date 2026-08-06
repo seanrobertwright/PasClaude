@@ -444,6 +444,10 @@ begin
         begin
           NeedNewLine;
           EmitCLn(clRed, '  ' + Err);
+          { The turn failed, so the question was never answered.  Leaving it
+            in the transcript would save - and later resume - a conversation
+            ending in an unanswered user message. }
+          Agent.TrimUnansweredQuestion;
         end;
         { Saved after every turn rather than at exit, because the session
           worth keeping is usually the one that ended in a crash or a closed

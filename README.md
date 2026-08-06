@@ -100,6 +100,19 @@ user hand-edited should cost them nothing, and a transcript the API would
 reject is worse than no transcript at all, because it fails on every later
 request rather than at load time.
 
+The write goes to a temporary file and is renamed over the old one. It runs
+after every turn, so a crash or a full disk partway through a plain in-place
+write would take the previous good session with it - `fmCreate` truncates
+before it writes. The file on disk is now always one complete session or the
+other.
+
+A turn that fails - no key, no network, a rejected request - leaves the user's
+question in the transcript with nothing answering it, and autosave runs after a
+failed turn too. That question is dropped before saving, so a session never
+ends on an unanswered user message. A trailing `tool_result` is deliberately
+not treated the same way: it answers the assistant turn before it, and removing
+it would orphan that tool call.
+
 ## Tools
 
 | Tool | Approval | Notes |
@@ -191,10 +204,9 @@ ownership here is manual, so a leak is a defect rather than noise.
   key. TLS, a body that round-trips through an echo service, a response larger
   than one read buffer, aborting mid-transfer, rejection of non-https and
   unresolvable hosts, and the live Anthropic endpoint answering a generated
-  request body with `authentication_error` - which is proof the body was well
-  formed, since a malformed one is rejected as `invalid_request_error` before
-  the key is even examined. It also feeds real wire bytes into the decoder,
-  one byte at a time, to cover the seam between the two.
+  request body with a structured `authentication_error`. It also feeds real
+  wire bytes into the decoder, one byte at a time, to cover the seam between
+  the two.
 
 The suites were checked by mutation, not just by passing: reverting the
 `input_json_delta` accumulator to an assignment fails 4 assertions, flipping
@@ -233,6 +245,17 @@ inheriting whatever the shell happened to be on. It now passes identically
 under 65001, 850 and 437, and still fails if the conversion result is
 discarded.
 
+Two defects in the session work were found by running the shipped binary rather
+than the suites. Pointing it at the real endpoint with a bad key makes a turn
+fail, and reading what autosave then wrote showed a transcript ending in the
+user's unanswered question - resume it, ask again, and the conversation carries
+two user turns in a row. Deliberately blocking the write afterwards showed the
+second: an in-place `fmCreate` truncates before it writes, so a failure partway
+through destroyed the previous good session as well. Both are fixed and
+regression-tested, and removing the guard that spares a trailing `tool_result`
+fails 3 assertions - the third being the loader refusing the file, which is the
+corruption showing up where it would have hurt.
+
 Two more tests passing for the wrong reason turned up in that suite. Removing
 the CR stripping from the line splitter changed nothing, because a stray `#13`
 on both sides of a diff still compares equal: the counts stayed right while the
@@ -248,6 +271,15 @@ What remains unverified is a 200 response from the live API, which needs a key
 this machine does not have. Both sides of it are covered: the transport carries
 real traffic in `net`, and the full request-stream-tool-respond cycle runs in
 `loop`.
+
+That gap is wider than it used to look. `net` once claimed its 401 proved the
+request body was well formed, on the theory that a bad shape is rejected as
+`invalid_request_error` first. Checking that directly against the endpoint - an
+empty `messages` array, a missing `max_tokens`, an assistant-first transcript -
+returns `authentication_error` every time, because the key is examined before
+the schema. So no keyless test can say anything about whether the API accepts a
+transcript's *shape*; that is why the structural rules are enforced in
+`LoadSession` and asserted offline rather than inferred from a live response.
 
 ## Design notes
 

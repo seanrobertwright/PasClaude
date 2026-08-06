@@ -674,6 +674,69 @@ begin
     A.Free;
   end;
 
+  { A turn that failed leaves the question in the transcript with nothing
+    answering it.  Autosave runs after a failed turn too, so without trimming,
+    the saved session ends in a user message - and resuming it and asking again
+    produces two user turns in a row.  Found by running the shipped binary
+    against the real endpoint with a bad key and reading what it wrote. }
+  A := TAgent.Create('k', 'm', 'sys');
+  try
+    SeedTurn(A, 'answered question', 'an answer');
+    A.Send('question that fails', Err);   { no transport: nothing answers it }
+    Check(A.MessageCount = 3, 'the failed question is in the transcript');
+    Check(A.TrimUnansweredQuestion, 'a trailing user message is trimmed');
+    Check(A.MessageCount = 2, 'and only that one is removed');
+    T := A.Transcript;
+    Check(Pos('question that fails', T) = 0, 'the unanswered question is gone');
+    Check(Pos('answered question', T) > 0, 'the answered exchange is untouched');
+    Check(not A.TrimUnansweredQuestion,
+      'trimming again does nothing, since the last turn is the assistant');
+
+    { The saved file must not end on a user turn either. }
+    Check(A.SaveSession(Path, Err), 'the trimmed conversation saves');
+  finally
+    A.Free;
+  end;
+  A := TAgent.Create('k', 'm', 'sys');
+  try
+    Check(A.LoadSession(Path, Err), 'it reloads');
+    Check(A.MessageCount = 2, 'with the trailing question left out');
+  finally
+    A.Free;
+  end;
+
+  { A trailing tool_result is a different case and must survive: it answers
+    the assistant turn before it, so dropping it would orphan that tool call -
+    exactly the corruption the loader refuses. }
+  A := TAgent.Create('k', 'm', 'sys');
+  try
+    A.Send('use a tool', Err);
+    SetLength(Blocks, 1);
+    Blocks[0].Kind := bkToolUse;
+    Blocks[0].Id := 'call_x';
+    Blocks[0].Name := 'search';
+    Blocks[0].Text := '{"pattern":"y"}';
+    Blocks[0].Signature := '';
+    A.ApplyBlocks(Blocks, Ran);
+    Check(A.MessageCount = 3, 'question, tool call, tool result');
+    Check(not A.TrimUnansweredQuestion,
+      'a trailing tool_result is not mistaken for an unanswered question');
+    Check(A.MessageCount = 3, 'so nothing is removed');
+    Check(A.SaveSession(Path, Err) and A.LoadSession(Path, Err),
+      'and it still round-trips: ' + Err);
+  finally
+    A.Free;
+  end;
+
+  { Trimming an empty conversation must not misbehave. }
+  A := TAgent.Create('k', 'm', 'sys');
+  try
+    Check(not A.TrimUnansweredQuestion, 'trimming an empty transcript is a no-op');
+    Check(A.MessageCount = 0, 'and leaves it empty');
+  finally
+    A.Free;
+  end;
+
   { An empty session is not corrupt, it is just a conversation nobody has had
     yet, and loading it should quietly produce an empty transcript. }
   A := TAgent.Create('k', 'm', 'sys');
@@ -683,6 +746,63 @@ begin
     Check(A.MessageCount = 0, 'and leaves nothing behind');
     A.Send('starting over', Err);
     Check(A.MessageCount = 1, 'a fresh conversation starts from it');
+  finally
+    A.Free;
+  end;
+
+  { Compaction and persistence meet on every long session: the transcript is
+    trimmed before a request and saved after it, so whatever compaction leaves
+    behind is what gets written.  If compaction could produce a shape the
+    loader rejects, a long session would save a file it could never resume. }
+  A := TAgent.Create('k', 'm', 'sys');
+  try
+    for I := 1 to 10 do
+    begin
+      A.Send('long question ' + IntToStr(I), Err);
+      SetLength(Blocks, 1);
+      Blocks[0].Kind := bkToolUse;
+      Blocks[0].Id := 'tc_' + IntToStr(I);
+      Blocks[0].Name := 'search';
+      Blocks[0].Text := '{"pattern":"' + StringOfChar('p', 600) + '"}';
+      Blocks[0].Signature := '';
+      A.ApplyBlocks(Blocks, Ran);
+    end;
+    Check(A.Compact(4000) > 0, 'a long tool session compacts');
+    Check(A.SaveSession(Path, Err), 'the compacted session saves');
+  finally
+    A.Free;
+  end;
+  A := TAgent.Create('k', 'm', 'sys');
+  try
+    { This is the assertion that matters: the loader applies the same
+      structural rules the API does, so if it accepts what compaction wrote,
+      compaction did not corrupt the conversation. }
+    Check(A.LoadSession(Path, Err),
+      'what compaction left behind is still loadable: ' + Err);
+    Check(A.MessageCount > 0, 'and it is not empty');
+  finally
+    A.Free;
+  end;
+
+  { The file is rewritten after every turn, so the write must not be able to
+    destroy the previous good session partway through.  It goes to a temporary
+    file and is renamed over the old one; the observable consequences are that
+    no .tmp is left behind and that repeated saves keep the file loadable. }
+  A := TAgent.Create('k', 'm', 'sys');
+  try
+    for I := 1 to 5 do
+    begin
+      SeedTurn(A, 'turn ' + IntToStr(I), 'reply ' + IntToStr(I));
+      Check(A.SaveSession(Path, Err), 'save ' + IntToStr(I) + ' succeeds');
+    end;
+    Check(not FileExists(Path + '.tmp'), 'no temporary file is left behind');
+  finally
+    A.Free;
+  end;
+  A := TAgent.Create('k', 'm', 'sys');
+  try
+    Check(A.LoadSession(Path, Err), 'the repeatedly-saved file still loads');
+    Check(A.MessageCount = 10, 'with every exchange intact');
   finally
     A.Free;
   end;

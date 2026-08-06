@@ -192,10 +192,16 @@ begin
       if Doc = nil then Exit;
       ErrObj := Doc.Find('error');
       Check(ErrObj <> nil, 'the error object is present');
-      { A malformed body is reported as invalid_request_error even before the
-        key is checked, so this distinguishes the two. }
+      { This used to claim the body was proven well formed, on the theory that
+        a malformed one is rejected as invalid_request_error first.  That is
+        not how the endpoint behaves: an empty messages array, a missing
+        max_tokens and an assistant-first transcript all answer
+        authentication_error too, because the key is checked before the schema.
+        So this asserts only what it can - the request was transported, reached
+        the API, and came back as a structured error - and the request body's
+        shape is covered offline in stream.lpr instead. }
       Check(ErrObj.Str('type') = 'authentication_error',
-        'the body was well formed - rejected on the key, not the schema: ' +
+        'the API rejected the key, which is as far as a keyless test can get: ' +
         ErrObj.Str('type') + ' ' + ErrObj.Str('message'));
     finally
       Doc.Free;

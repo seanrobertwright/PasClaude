@@ -87,6 +87,9 @@ type
     { Bytes the transcript currently occupies as JSON. }
     function TranscriptBytes: Integer;
     function MessageCount: Integer;
+    { Drops a trailing user message that never got an answer.  Returns True if
+      one was removed. }
+    function TrimUnansweredQuestion: Boolean;
 
     { Writes the conversation to Path so a later run can pick it up.  False
       with Err set when it could not be stored. }
@@ -354,6 +357,29 @@ end;
 function TAgent.MessageCount: Integer;
 begin
   Result := FMessages.Count;
+end;
+
+{ A turn that failed - no key, no network, a rejected request - leaves the
+  user's question in the transcript with nothing answering it.  Saving that
+  and resuming it produces two user messages in a row, which is a shape the
+  conversation should never have been left in whether or not the API tolerates
+  it.  The question is dropped instead: it was never answered, and the user
+  still has it on screen to ask again. }
+function IsToolResultMessage(M: TJson): Boolean; forward;
+
+function TAgent.TrimUnansweredQuestion: Boolean;
+var
+  Last: TJson;
+begin
+  Result := False;
+  if FMessages.Count = 0 then Exit;
+  Last := FMessages.Item(FMessages.Count - 1);
+  if Last.Str('role') <> 'user' then Exit;
+  { A trailing tool_result message is a different animal: it answers the
+    assistant turn before it, and dropping it would orphan that tool call. }
+  if IsToolResultMessage(Last) then Exit;
+  FMessages.Drop(FMessages.Count - 1);
+  Result := True;
 end;
 
 { True when this message is a user turn carrying tool results rather than
@@ -712,7 +738,7 @@ function TAgent.SaveSession(const Path: string; out Err: string): Boolean;
 var
   Root, Msgs, M: TJson;
   F: TFileStream;
-  Dir, Text: string;
+  Dir, Text, Tmp: string;
   I: Integer;
 begin
   Err := '';
@@ -745,18 +771,43 @@ begin
       Err := 'cannot create ' + Dir;
       Exit;
     end;
+  { Written to a temporary file and renamed over the old one.  fmCreate
+    truncates immediately, so writing in place would mean a crash or a full
+    disk mid-write destroys the previous good session as well as the new one -
+    and this runs after every single turn, so "mid-write" is not a rare
+    moment.  A rename is atomic enough that the file on disk is always one
+    complete session or the other. }
+  Tmp := Path + '.tmp';
   try
-    F := TFileStream.Create(Path, fmCreate);
+    F := TFileStream.Create(Tmp, fmCreate);
     try
       if Text <> '' then F.WriteBuffer(Text[1], Length(Text));
     finally
       F.Free;
     end;
-    Result := True;
   except
     on E: Exception do
+    begin
       Err := E.Message;
+      DeleteFile(Tmp);
+      Exit;
+    end;
   end;
+
+  { DeleteFile then RenameFile, because Windows will not rename onto an
+    existing name.  The window between them is the one failure this cannot
+    close, so the temporary file is left in place as evidence if it happens. }
+  if FileExists(Path) and not DeleteFile(Path) then
+  begin
+    Err := 'cannot replace ' + Path;
+    Exit;
+  end;
+  if not RenameFile(Tmp, Path) then
+  begin
+    Err := 'cannot rename ' + Tmp;
+    Exit;
+  end;
+  Result := True;
 end;
 
 { A transcript is only legal if it opens with a user message and every
