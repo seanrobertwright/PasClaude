@@ -444,6 +444,96 @@ end;
 
 { A model that produces two tool calls in one message must have both run and
   both answered in a single result message. }
+{ Everything about persistence is tested offline against the loader's own
+  rules, which risks proving only that the loader agrees with itself.  This
+  drives a resumed conversation through the real Send path instead: the
+  transcript is saved, reloaded into a fresh agent, and that agent then runs a
+  full request-tool-respond cycle.  What matters is the request body it builds
+  from restored history, since that is the thing the API would accept or
+  reject. }
+procedure TestResumedSessionRunsThroughTheLoop;
+var
+  A: TAgent;
+  Err, Path: string;
+  Doc, Msgs: TJson;
+begin
+  ResetScript;
+  uTools.RootDir := SessionDir;
+  uTools.AllowAllEdits := True;
+  WriteSessionFile('resumed.txt', 'contents of the resumed file');
+  Path := IncludeTrailingPathDelimiter(SessionDir) + 'saved-session.json';
+
+  { A conversation that got as far as running a tool, then stopped. }
+  SetLength(Replies, 2);
+  Replies[0] := ToolReply('call_r1', 'read_file', '{"path":"resumed.txt"}');
+  Replies[1] := TextReply('I read it.');
+  A := MakeAgent;
+  try
+    A.Send('read that file', Err);
+    Check(A.SaveSession(Path, Err), 'the finished exchange saves');
+  finally
+    A.Free;
+  end;
+
+  { A brand new agent, as if the program had been restarted. }
+  ResetScript;
+  SetLength(Replies, 2);
+  Replies[0] := ToolReply('call_r2', 'read_file', '{"path":"resumed.txt"}');
+  Replies[1] := TextReply('Read it again.');
+  A := MakeAgent;
+  try
+    Check(A.LoadSession(Path, Err), 'it resumes into a fresh agent: ' + Err);
+    Check(A.Send('now read it again', Err),
+      'a resumed conversation completes a full turn: ' + Err);
+    Check(Pos('Read it again.', Prose) > 0, 'the answer is delivered');
+    Check(Pos('read resumed.txt', ToolLog) > 0, 'the tool ran in the resumed turn');
+
+    { The first request of the resumed turn is the one built entirely from
+      restored history plus the new question.  Its shape is what the API
+      would have judged. }
+    Doc := JsonParse(Requests[0]);
+    try
+      Msgs := Doc.Find('messages');
+      { question, tool_use, tool_result, answer, new question }
+      Check(Msgs.Count = 5, Format('restored history is sent back, got %d',
+        [Msgs.Count]));
+      Check(Msgs.Item(0).Str('role') = 'user', 'it opens with a user turn');
+      Check(Msgs.Item(0).Find('content').Item(0).Str('text') = 'read that file',
+        'the original question survived the round trip');
+      Check(Msgs.Item(1).Find('content').Item(0).Str('type') = 'tool_use',
+        'the tool call survived');
+      Check(Msgs.Item(1).Find('content').Item(0).Str('id') = 'call_r1',
+        'with its id, which is what ties it to the result');
+      Check(Msgs.Item(2).Find('content').Item(0).Str('tool_use_id') = 'call_r1',
+        'and the result still answers that exact call');
+      { The restored tool input must be an object, not the raw JSON string it
+        was accumulated from - a string here is silently accepted by the
+        loader but is not what the API expects. }
+      Check(Msgs.Item(1).Find('content').Item(0).Find('input').Kind = jkObj,
+        'the restored tool input is a JSON object, not a string');
+      Check(Msgs.Item(4).Find('content').Item(0).Str('text') = 'now read it again',
+        'the new question is appended last');
+    finally
+      Doc.Free;
+    end;
+
+    { And the whole thing must still be saveable and loadable afterwards, so a
+      resumed session can be resumed again. }
+    Check(A.SaveSession(Path, Err), 'the continued conversation saves again');
+  finally
+    A.Free;
+  end;
+
+  A := MakeAgent;
+  try
+    Check(A.LoadSession(Path, Err), 'and resumes a second time: ' + Err);
+    Check(A.MessageCount = 8, Format('carrying both exchanges, got %d',
+      [A.MessageCount]));
+  finally
+    A.Free;
+  end;
+end;
+
 procedure TestParallelToolCalls;
 var
   A: TAgent;
@@ -703,6 +793,7 @@ begin
   TestDeniedToolContinues;
   TestConversationPersists;
   TestParallelToolCalls;
+  TestResumedSessionRunsThroughTheLoop;
   TestCancelMidStream;
   TestCancelDuringToolCallCleansTranscript;
   TestRetryOnOverload;

@@ -215,7 +215,7 @@ procedure ShowHelp;
 begin
   EmitCLn(clBright, 'Commands');
   EmitCLn(clGrey,   '  /help          this list');
-  EmitCLn(clGrey,   '  /clear         forget the conversation so far');
+  EmitCLn(clGrey,   '  /clear         forget the conversation, here and on disk');
   EmitCLn(clGrey,   '  /compact       drop the oldest turns, keep the recent ones');
   EmitCLn(clGrey,   '  /resume        reload the saved conversation');
   EmitCLn(clGrey,   '  /save          write the conversation now');
@@ -270,7 +270,13 @@ begin
   else if Cmd = '/clear' then
   begin
     Agent.Reset;
-    EmitCLn(clGrey, '  conversation cleared');
+    { The saved copy has to go too.  Otherwise "cleared" means only "cleared
+      until you resume", and a user who cleared something they did not want
+      kept would find it again on the next run. }
+    if Agent.SaveSession(SessionPath(uTools.RootDir), Err) then
+      EmitCLn(clGrey, '  conversation cleared, here and on disk')
+    else
+      EmitCLn(clYellow, '  conversation cleared, but the saved copy remains: ' + Err);
   end
   else if Cmd = '/compact' then
   begin

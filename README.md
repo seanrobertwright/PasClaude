@@ -52,7 +52,7 @@ contents are appended to the system prompt as binding instructions.
 | Command | Effect |
 | --- | --- |
 | `/help` | list the commands |
-| `/clear` | forget the conversation so far |
+| `/clear` | forget the conversation, here and on disk |
 | `/compact` | drop the oldest turns, keep the recent ones |
 | `/resume` | reload the saved conversation |
 | `/save` | write the conversation now |
@@ -112,6 +112,10 @@ failed turn too. That question is dropped before saving, so a session never
 ends on an unanswered user message. A trailing `tool_result` is deliberately
 not treated the same way: it answers the assistant turn before it, and removing
 it would orphan that tool call.
+
+`/clear` clears the saved copy too. Otherwise it would mean "cleared until you
+resume", and a conversation the user deliberately discarded would come back on
+the next run.
 
 ## Tools
 
@@ -174,6 +178,9 @@ ownership here is manual, so a leak is a defect rather than noise.
   persisting across turns and clearing on reset, cancellation mid-stream and
   mid-tool-call, and the retry policy (retried on 529, not on 400, giving up
   after `MaxRetries`).
+  It also resumes a saved session into a fresh agent and runs a full turn from
+  it, which is the only place restored history is checked against the code that
+  builds requests rather than against the loader's own rules.
 * `tests\fuzz.lpr` - hostile inputs. Binary files and OEM-encoded shell output
   (the bytes that would otherwise make the API reject a whole turn), NUL bytes
   in JSON strings, path-guard escapes including a sibling directory sharing the
@@ -199,6 +206,11 @@ ownership here is manual, so a leak is a defect rather than noise.
   `tool_result` whose id does not match, an empty content array, an unknown
   role, and a block with no type. Each must be refused *and* leave the live
   conversation intact, which is asserted after all of them have been tried.
+  Finally the line editor, whose decisions are separated from the console into
+  `EditApply` so they can be driven directly: inserting mid-line, backspace
+  versus delete, both caret boundaries, an empty line under every movement key,
+  history recall including the half-typed line coming back, and a non-ASCII
+  character counted and removed as one character rather than two bytes.
 
 * `tests\net.lpr` - the transport, against real servers and needing no API
   key. TLS, a body that round-trips through an echo service, a response larger
@@ -255,6 +267,18 @@ through destroyed the previous good session as well. Both are fixed and
 regression-tested, and removing the guard that spares a trailing `tool_result`
 fails 3 assertions - the third being the loader refusing the file, which is the
 corruption showing up where it would have hurt.
+
+The line editor was checked the same way once its logic was separated from the
+console: a backspace that deletes at the caret instead of before it fails 3
+assertions, appending instead of inserting fails 1, giving `Delete` the caret
+movement that belongs to backspace fails 1, and dropping the stash that holds
+the half-typed line while history is browsed fails 2.
+
+A third defect turned up the same way as the first two - by using the program
+rather than reading it. `/clear` printed "conversation cleared" and left the
+saved copy untouched, so `--resume` brought the whole thing back. For anything
+cleared on purpose that is the wrong answer, so `/clear` now writes the cleared
+state through to disk.
 
 Two more tests passing for the wrong reason turned up in that suite. Removing
 the CR stripping from the line splitter changed nothing, because a stray `#13`

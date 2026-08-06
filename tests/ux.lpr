@@ -12,7 +12,7 @@ program ux;
 
 {$mode objfpc}{$H+}
 
-uses SysUtils, Classes, uJson, uDiff, uTools, uAgent;
+uses SysUtils, Classes, uJson, uDiff, uTools, uAgent, uTerm;
 
 var
   Fails: Integer = 0;
@@ -737,6 +737,32 @@ begin
     A.Free;
   end;
 
+  { Clearing a conversation has to clear the saved copy as well.  Otherwise
+    "cleared" means "cleared until you resume", and something the user
+    deliberately discarded comes back on the next run.  This is the sequence
+    /clear performs. }
+  A := TAgent.Create('k', 'm', 'sys');
+  try
+    SeedTurn(A, 'something private', 'a reply about it');
+    Check(A.SaveSession(Path, Err), 'the conversation is saved');
+    Check(Pos('something private', ReadFileText(Path)) > 0,
+      'and is really on disk');
+
+    A.Reset;
+    Check(A.SaveSession(Path, Err), 'clearing saves the now-empty conversation');
+    Check(Pos('something private', ReadFileText(Path)) = 0,
+      'the cleared conversation is gone from the file');
+  finally
+    A.Free;
+  end;
+  A := TAgent.Create('k', 'm', 'sys');
+  try
+    Check(A.LoadSession(Path, Err), 'the cleared session still loads');
+    Check(A.MessageCount = 0, 'and resuming it resurrects nothing');
+  finally
+    A.Free;
+  end;
+
   { An empty session is not corrupt, it is just a conversation nobody has had
     yet, and loading it should quietly produce an empty transcript. }
   A := TAgent.Create('k', 'm', 'sys');
@@ -830,6 +856,169 @@ begin
   end;
 end;
 
+{ ----------------------------------------------------------------- editor -- }
+
+{ The line editor is what the user touches on every single prompt, and its
+  failures are the kind that are obvious in use and invisible to a compiler:
+  a caret off by one, a backspace that eats the wrong character, history that
+  loses the line being typed.  EditApply is the whole decision layer, so it can
+  be driven directly. }
+procedure TestEditor;
+var
+  E: TEditState;
+
+  procedure TypeStr(const S: WideString);
+  var
+    I: Integer;
+  begin
+    for I := 1 to Length(S) do
+      EditApply(E, ekChar, S[I]);
+  end;
+
+  function Txt: string;
+  begin
+    Result := UTF8Encode(E.Text);
+  end;
+
+begin
+  WriteLn('-- editor --');
+  HistoryClear;
+
+  { Typing appends and leaves the caret at the end. }
+  EditInit(E);
+  TypeStr('hello');
+  Check(Txt = 'hello', 'typing builds the line');
+  Check(E.Caret = 5, 'the caret sits at the end');
+
+  { Backspace removes the character before the caret. }
+  EditApply(E, ekBackspace, #0);
+  Check(Txt = 'hell', 'backspace removes the last character');
+  Check(E.Caret = 4, 'and moves the caret back');
+
+  { The point of the rewrite: editing in the middle of the line. }
+  EditInit(E);
+  TypeStr('helo');
+  EditApply(E, ekLeft, #0);
+  Check(E.Caret = 3, 'left moves the caret back one');
+  EditApply(E, ekChar, 'l');
+  Check(Txt = 'hello', 'a character is inserted at the caret, not appended');
+  Check(E.Caret = 4, 'and the caret follows the insertion');
+
+  { Backspace mid-line must remove the character before the caret, not the
+    last one on the line. }
+  EditInit(E);
+  TypeStr('abXcd');
+  EditApply(E, ekLeft, #0);
+  EditApply(E, ekLeft, #0);
+  Check(E.Caret = 3, 'the caret is after the X');
+  EditApply(E, ekBackspace, #0);
+  Check(Txt = 'abcd', 'mid-line backspace removes the right character');
+  Check(E.Caret = 2, 'and the caret stays where the text closed up');
+
+  { Delete removes forwards and leaves the caret alone, which is the whole
+    difference between it and backspace. }
+  EditInit(E);
+  TypeStr('abXcd');
+  EditApply(E, ekHome, #0);
+  EditApply(E, ekRight, #0);
+  EditApply(E, ekRight, #0);
+  EditApply(E, ekDelete, #0);
+  Check(Txt = 'abcd', 'delete removes the character under the caret');
+  Check(E.Caret = 2, 'and does not move it');
+
+  { The boundaries: neither key may run off either end. }
+  EditInit(E);
+  TypeStr('ab');
+  EditApply(E, ekHome, #0);
+  EditApply(E, ekLeft, #0);
+  Check(E.Caret = 0, 'left stops at the start');
+  EditApply(E, ekBackspace, #0);
+  Check(Txt = 'ab', 'backspace at the start does nothing');
+  EditApply(E, ekEnd, #0);
+  EditApply(E, ekRight, #0);
+  Check(E.Caret = 2, 'right stops at the end');
+  EditApply(E, ekDelete, #0);
+  Check(Txt = 'ab', 'delete at the end does nothing');
+
+  { An empty line must survive every key without misbehaving. }
+  EditInit(E);
+  EditApply(E, ekBackspace, #0);
+  EditApply(E, ekDelete, #0);
+  EditApply(E, ekLeft, #0);
+  EditApply(E, ekRight, #0);
+  EditApply(E, ekHome, #0);
+  EditApply(E, ekEnd, #0);
+  Check((Txt = '') and (E.Caret = 0), 'an empty line survives every movement key');
+
+  { Home, End and clear. }
+  EditInit(E);
+  TypeStr('some text');
+  EditApply(E, ekHome, #0);
+  Check(E.Caret = 0, 'home goes to the start');
+  EditApply(E, ekEnd, #0);
+  Check(E.Caret = 9, 'end goes to the end');
+  EditApply(E, ekClear, #0);
+  Check((Txt = '') and (E.Caret = 0), 'clear empties the line');
+
+  { History. }
+  HistoryClear;
+  HistoryAdd('first command');
+  HistoryAdd('second command');
+  Check(HistoryCount = 2, 'two commands are remembered');
+  HistoryAdd('second command');
+  Check(HistoryCount = 2, 'an immediate repeat is not stored twice');
+  HistoryAdd('   ');
+  Check(HistoryCount = 2, 'blank input is not stored');
+
+  EditInit(E);
+  EditApply(E, ekHistPrev, #0);
+  Check(Txt = 'second command', 'up recalls the most recent command');
+  Check(E.Caret = Length('second command'), 'with the caret at the end');
+  EditApply(E, ekHistPrev, #0);
+  Check(Txt = 'first command', 'up again goes further back');
+  EditApply(E, ekHistPrev, #0);
+  Check(Txt = 'first command', 'and stops at the oldest');
+  EditApply(E, ekHistNext, #0);
+  Check(Txt = 'second command', 'down comes forward again');
+  EditApply(E, ekHistNext, #0);
+  Check(Txt = '', 'down past the newest returns to the empty line');
+
+  { The half-typed line must come back, which is the part people notice when
+    it is missing. }
+  EditInit(E);
+  TypeStr('half typed');
+  EditApply(E, ekHistPrev, #0);
+  Check(Txt = 'second command', 'browsing away shows history');
+  EditApply(E, ekHistNext, #0);
+  Check(Txt = 'half typed', 'and coming back restores what was being typed');
+  Check(E.Caret = Length('half typed'), 'with the caret at the end of it');
+
+  { With no history at all, the keys must leave the line alone. }
+  HistoryClear;
+  EditInit(E);
+  TypeStr('untouched');
+  EditApply(E, ekHistPrev, #0);
+  EditApply(E, ekHistNext, #0);
+  Check(Txt = 'untouched', 'history keys do nothing when there is no history');
+
+  { Non-ASCII has to survive as characters, not bytes: the editor works in
+    UTF-16 and the transcript is UTF-8, so a wrong assumption here shows up as
+    a mangled prompt. }
+  HistoryClear;
+  EditInit(E);
+  TypeStr('caf' + WideChar($00E9));
+  Check(E.Caret = 4, 'an accented character counts as one character');
+  { The bytes are checked one at a time.  A string literal with high bytes in
+    it is subject to the source file's encoding and the compiler's codepage,
+    so comparing against one tests the build as much as the editor. }
+  Check((Length(Txt) = 5) and (Byte(Txt[4]) = $C3) and (Byte(Txt[5]) = $A9),
+    'and encodes to UTF-8 on the way out');
+  EditApply(E, ekBackspace, #0);
+  Check(Txt = 'caf', 'backspace removes the whole character, not one byte');
+
+  HistoryClear;
+end;
+
 { ------------------------------------------------------------------- main -- }
 
 procedure Cleanup(const Dir: string);
@@ -864,6 +1053,7 @@ begin
     TestPreview;
     TestCompact;
     TestSession;
+    TestEditor;
   finally
     uTools.RootDir := '';
     Cleanup(TmpRoot);

@@ -31,6 +31,35 @@ function EscPressed: Boolean;
 
 function TermWidth: Integer;
 
+{ ------------------------------------------------------------ line editing --
+
+  The editor's decisions - where the caret goes, what a key removes, which
+  history entry is recalled - are separated from the console so they can be
+  tested.  ReadLineEdit is then a loop that turns real key events into these
+  calls and redraws; everything that could be wrong about the editing itself
+  lives here. }
+type
+  TEditKey = (ekChar, ekBackspace, ekDelete, ekLeft, ekRight, ekHome, ekEnd,
+              ekHistPrev, ekHistNext, ekClear);
+
+  TEditState = record
+    Text: WideString;
+    Caret: Integer;        { 0..Length(Text); characters before the cursor }
+    HistPos: Integer;      { Length(History) means "the line being typed" }
+    Pending: WideString;   { the typed line, stashed while browsing history }
+  end;
+
+{ Starts an edit with an empty line. }
+procedure EditInit(out E: TEditState);
+{ Applies one key.  Ch matters only for ekChar. }
+procedure EditApply(var E: TEditState; Key: TEditKey; Ch: WideChar);
+{ Records a finished line in the history. }
+procedure HistoryAdd(const S: string);
+{ Test seam: forget every recorded command. }
+procedure HistoryClear;
+{ Test seam: how many commands are remembered. }
+function HistoryCount: Integer;
+
 implementation
 
 uses Windows, SysUtils;
@@ -167,6 +196,79 @@ begin
   History[N] := S;
 end;
 
+procedure HistoryClear;
+begin
+  SetLength(History, 0);
+end;
+
+function HistoryCount: Integer;
+begin
+  Result := Length(History);
+end;
+
+procedure EditInit(out E: TEditState);
+begin
+  E.Text := '';
+  E.Caret := 0;
+  E.HistPos := Length(History);
+  E.Pending := '';
+end;
+
+procedure EditApply(var E: TEditState; Key: TEditKey; Ch: WideChar);
+var
+  Target: Integer;
+begin
+  case Key of
+    ekChar:
+      begin
+        Insert(Ch, E.Text, E.Caret + 1);
+        Inc(E.Caret);
+      end;
+    ekBackspace:
+      if E.Caret > 0 then
+      begin
+        Delete(E.Text, E.Caret, 1);
+        Dec(E.Caret);
+      end;
+    ekDelete:
+      { Delete removes forwards and must leave the caret where it is, which is
+        what distinguishes it from backspace. }
+      if E.Caret < Length(E.Text) then
+        Delete(E.Text, E.Caret + 1, 1);
+    ekLeft:
+      if E.Caret > 0 then Dec(E.Caret);
+    ekRight:
+      if E.Caret < Length(E.Text) then Inc(E.Caret);
+    ekHome:
+      E.Caret := 0;
+    ekEnd:
+      E.Caret := Length(E.Text);
+    ekClear:
+      begin
+        E.Text := '';
+        E.Caret := 0;
+      end;
+    ekHistPrev, ekHistNext:
+      begin
+        if Length(History) = 0 then Exit;
+        { The half-typed line is stashed on the way out so that browsing up
+          and back down returns it rather than losing it. }
+        if E.HistPos = Length(History) then E.Pending := E.Text;
+        if Key = ekHistPrev then Target := E.HistPos - 1
+                            else Target := E.HistPos + 1;
+        if Target < 0 then Target := 0;
+        if Target > Length(History) then Target := Length(History);
+        if Target = E.HistPos then Exit;
+        E.HistPos := Target;
+        if E.HistPos = Length(History) then
+          E.Text := E.Pending
+        else
+          E.Text := UTF8Decode(History[E.HistPos]);
+        E.Caret := Length(E.Text);
+      end;
+  end;
+end;
+
 { Redraws the edited line in place.  The whole line is rewritten rather than
   patched, because working out the minimal update is far more code than the
   redraw costs at terminal speeds - and it is what keeps a mid-line insert or
@@ -192,44 +294,25 @@ end;
 
 function ReadLineEdit(const Prompt: string; out Line: string): Boolean;
 var
-  W: WideString;
   Rec: INPUT_RECORD;
   NRead: DWORD = 0;
   Ch: WideChar;
   Mode: DWORD = 0;
-  Caret: Integer;
   PrevLen: Integer;
-  HistPos: Integer;
-  Pending: WideString;
+  E: TEditState;
 
-  procedure Recall(Delta: Integer);
-  var
-    Target: Integer;
+  { Applies a key and repaints.  Every editing key goes through here, so the
+    console and the state cannot drift apart. }
+  procedure Apply(Key: TEditKey; C: WideChar);
   begin
-    if Length(History) = 0 then Exit;
-    { HistPos = Length(History) means "the line being typed", which is stashed
-      in Pending so browsing away and back does not destroy it. }
-    if HistPos = Length(History) then Pending := W;
-    Target := HistPos + Delta;
-    if Target < 0 then Target := 0;
-    if Target > Length(History) then Target := Length(History);
-    if Target = HistPos then Exit;
-    HistPos := Target;
-    if HistPos = Length(History) then
-      W := Pending
-    else
-      W := UTF8Decode(History[HistPos]);
-    Caret := Length(W);
-    Redraw(Prompt, W, Caret, PrevLen);
+    EditApply(E, Key, C);
+    Redraw(Prompt, E.Text, E.Caret, PrevLen);
   end;
 
 begin
   Line := '';
-  W := '';
-  Pending := '';
-  Caret := 0;
   PrevLen := 0;
-  HistPos := Length(History);
+  EditInit(E);
   EmitC(clCyan, Prompt);
 
   { Cooked mode would swallow the per-key handling this editor needs. }
@@ -255,76 +338,19 @@ begin
         VK_RETURN:
           begin
             EmitLn;
-            Line := UTF8Encode(W);
+            Line := UTF8Encode(E.Text);
             HistoryAdd(Line);
             Exit(True);
           end;
-        VK_BACK:
-          begin
-            if Caret > 0 then
-            begin
-              Delete(W, Caret, 1);
-              Dec(Caret);
-              Redraw(Prompt, W, Caret, PrevLen);
-            end;
-            Continue;
-          end;
-        VK_DELETE:
-          begin
-            if Caret < Length(W) then
-            begin
-              Delete(W, Caret + 1, 1);
-              Redraw(Prompt, W, Caret, PrevLen);
-            end;
-            Continue;
-          end;
-        VK_LEFT:
-          begin
-            if Caret > 0 then
-            begin
-              Dec(Caret);
-              Redraw(Prompt, W, Caret, PrevLen);
-            end;
-            Continue;
-          end;
-        VK_RIGHT:
-          begin
-            if Caret < Length(W) then
-            begin
-              Inc(Caret);
-              Redraw(Prompt, W, Caret, PrevLen);
-            end;
-            Continue;
-          end;
-        VK_HOME:
-          begin
-            Caret := 0;
-            Redraw(Prompt, W, Caret, PrevLen);
-            Continue;
-          end;
-        VK_END:
-          begin
-            Caret := Length(W);
-            Redraw(Prompt, W, Caret, PrevLen);
-            Continue;
-          end;
-        VK_UP:
-          begin
-            Recall(-1);
-            Continue;
-          end;
-        VK_DOWN:
-          begin
-            Recall(1);
-            Continue;
-          end;
-        VK_ESCAPE:
-          begin
-            W := '';
-            Caret := 0;
-            Redraw(Prompt, W, Caret, PrevLen);
-            Continue;
-          end;
+        VK_BACK:   begin Apply(ekBackspace, #0); Continue; end;
+        VK_DELETE: begin Apply(ekDelete, #0);    Continue; end;
+        VK_LEFT:   begin Apply(ekLeft, #0);      Continue; end;
+        VK_RIGHT:  begin Apply(ekRight, #0);     Continue; end;
+        VK_HOME:   begin Apply(ekHome, #0);      Continue; end;
+        VK_END:    begin Apply(ekEnd, #0);       Continue; end;
+        VK_UP:     begin Apply(ekHistPrev, #0);  Continue; end;
+        VK_DOWN:   begin Apply(ekHistNext, #0);  Continue; end;
+        VK_ESCAPE: begin Apply(ekClear, #0);     Continue; end;
       end;
 
       if Ch = #3 then          { Ctrl+C }
@@ -332,38 +358,21 @@ begin
         EmitLn;
         Exit(False);
       end;
-      if Ch = #21 then         { Ctrl+U clears the line }
-      begin
-        W := '';
-        Caret := 0;
-        Redraw(Prompt, W, Caret, PrevLen);
-        Continue;
-      end;
-      if Ch = #1 then          { Ctrl+A to the start }
-      begin
-        Caret := 0;
-        Redraw(Prompt, W, Caret, PrevLen);
-        Continue;
-      end;
-      if Ch = #5 then          { Ctrl+E to the end }
-      begin
-        Caret := Length(W);
-        Redraw(Prompt, W, Caret, PrevLen);
-        Continue;
-      end;
+      if Ch = #21 then begin Apply(ekClear, #0); Continue; end;  { Ctrl+U }
+      if Ch = #1  then begin Apply(ekHome, #0);  Continue; end;  { Ctrl+A }
+      if Ch = #5  then begin Apply(ekEnd, #0);   Continue; end;  { Ctrl+E }
       if Ch >= #32 then
       begin
-        Insert(Ch, W, Caret + 1);
-        Inc(Caret);
+        EditApply(E, ekChar, Ch);
         { Appending at the end is the common case and needs no redraw, which
           keeps ordinary typing free of flicker. }
-        if Caret = Length(W) then
+        if E.Caret = Length(E.Text) then
         begin
           Emit(UTF8Encode(WideString(Ch)));
-          PrevLen := Length(W);
+          PrevLen := Length(E.Text);
         end
         else
-          Redraw(Prompt, W, Caret, PrevLen);
+          Redraw(Prompt, E.Text, E.Caret, PrevLen);
       end;
     until False;
   finally
