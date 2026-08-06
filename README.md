@@ -76,11 +76,11 @@ or `n`. Read-only tools never ask.
 ## Tests
 
 ```
-test             :: the two offline suites
+test             :: the three offline suites
 test net         :: also the suite that talks to real servers
 ```
 
-Three suites, 91 assertions, all built with `-gh` so an unfreed block fails the
+Four suites, 130 assertions, all built with `-gh` so an unfreed block fails the
 run - JSON ownership here is manual, so a leak is a defect rather than noise.
 
 * `tests\smoke.lpr` - the JSON parser (escapes, surrogate pairs, malformed
@@ -90,28 +90,37 @@ run - JSON ownership here is manual, so a leak is a defect rather than noise.
   decoder, delivered in 7- and 13-byte chunks so every line boundary and
   several JSON escapes are split across chunks. Covers text/thinking/tool
   blocks, reassembly of `input_json_delta` fragments, mid-stream error events,
-  tolerance of unknown and malformed events, the tool round-trip into the
-  transcript, denied calls still answering their `tool_use_id`, and the shape
-  of the outgoing request body.
+  tolerance of unknown and malformed events, and the shape of the outgoing
+  request body.
+* `tests\loop.lpr` - the whole agent loop, driven through `TAgent.Send`
+  against scripted responses with the transport substituted. A model asks for
+  a tool, the tool really runs, its result is fed back, and the model answers:
+  two- and three-round turns, parallel tool calls in one message, the round
+  limit cutting off a runaway model, a mid-loop transport failure aborting the
+  turn, a denied tool still letting the turn finish, and conversation state
+  persisting across turns and clearing on reset.
 * `tests\net.lpr` - the transport, against real servers and needing no API
-  key. TLS, a body that round-trips through an echo service, a response
-  larger than one read buffer, aborting mid-transfer, rejection of non-https
-  and unresolvable hosts, and the live Anthropic endpoint answering a
-  generated request body with `authentication_error` - which is proof the
-  body was well formed, since a malformed one is rejected as
-  `invalid_request_error` before the key is even examined. It also feeds real
-  wire bytes into the decoder, one byte at a time, to cover the seam between
-  the two.
+  key. TLS, a body that round-trips through an echo service, a response larger
+  than one read buffer, aborting mid-transfer, rejection of non-https and
+  unresolvable hosts, and the live Anthropic endpoint answering a generated
+  request body with `authentication_error` - which is proof the body was well
+  formed, since a malformed one is rejected as `invalid_request_error` before
+  the key is even examined. It also feeds real wire bytes into the decoder,
+  one byte at a time, to cover the seam between the two.
 
 The suites were checked by mutation, not just by passing: reverting the
 `input_json_delta` accumulator to an assignment fails 4 assertions, flipping
-the permission default from deny to allow fails 1, and disabling the
-chunk-callback abort fails 2.
+the permission default from deny to allow fails 1, disabling the chunk-callback
+abort fails 2, capping the tool loop at one round fails 2, and dropping the
+transcript copy fails 1.
 
-What remains unverified is a successful (200) turn against the live API, which
-needs a key this machine does not have. Everything either side of that is
-covered - the transport carries real traffic in `net`, and the decoding and
-tool loop run on recorded bytes in `stream`.
+`uHttp.HttpTransport` is the seam the loop suite uses. It is nil in the shipped
+program, which is asserted by the network suite reaching the real API.
+
+What remains unverified is a 200 response from the live API, which needs a key
+this machine does not have. Both sides of it are covered: the transport carries
+real traffic in `net`, and the full request-stream-tool-respond cycle runs in
+`loop`.
 
 ## Design notes
 
@@ -129,7 +138,12 @@ Details worth knowing if you touch this code:
 * **The tool loop is the whole point.** `TAgent.Send` posts the transcript,
   and if the reply contains `tool_use` blocks it runs them, appends the
   results as a user message, and posts again - up to `MaxToolRounds`. A turn
-  ends only when the model stops asking for tools.
+  ends only when the model stops asking for tools. `tests\loop.lpr` runs that
+  cycle end to end against scripted responses.
+* **Every tool_use must be answered.** The API rejects the next request if a
+  call is left without a matching `tool_result`, so even a denial produces a
+  result block carrying the refusal - which also lets the model react to it
+  rather than retrying blindly.
 * **Content blocks are assembled outside the JSON DOM.** They stream as
   start/delta/stop triplets keyed by index, and `TJson` has no setters, so
   `uAgent` accumulates plain strings in an array and builds the message once.

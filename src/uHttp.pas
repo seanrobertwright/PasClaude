@@ -33,6 +33,17 @@ function HttpPost(const Url, Headers, Body: string;
 
 function HttpAvailable: Boolean;
 
+type
+  { Stands in for the network.  See HttpTransport. }
+  TPostProc = function(const Url, Headers, Body: string;
+    OnChunk: TChunkProc; Ctx: Pointer): THttpResult;
+
+var
+  { When set, requests go here instead of to WinHTTP.  This exists so the
+    agent loop can be driven end to end against scripted responses; nothing
+    in the shipped program assigns it. }
+  HttpTransport: TPostProc = nil;
+
 implementation
 
 uses SysUtils;
@@ -160,6 +171,11 @@ begin
   Result.Status := 0;
   Result.Body := '';
   Result.Error := '';
+
+  { A substituted transport takes the whole call, so the code above it runs
+    unchanged. }
+  if Assigned(HttpTransport) then
+    Exit(HttpTransport(Url, Headers, Body, OnChunk, Ctx));
 
   if not LoadWinHttp then
   begin
