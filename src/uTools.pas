@@ -38,6 +38,14 @@ function RunTool(const Name: string; Input: TJson; Ask: TAskProc;
 { A one-line description used in the transcript and in permission prompts. }
 function DescribeTool(const Name: string; Input: TJson): string;
 
+{ Converts console output from the OEM codepage to UTF-8.  Exposed so the
+  encoding behaviour can be tested directly. }
+function OemToUtf8(const S: string): string;
+
+{ True when S is well-formed UTF-8.  Exposed because every string that leaves
+  this unit ends up in a JSON request body, where invalid UTF-8 is fatal. }
+function IsValidUtf8(const S: string): Boolean;
+
 implementation
 
 uses SysUtils, Classes, Process, Windows;
@@ -107,6 +115,124 @@ begin
 end;
 
 { ------------------------------------------------------------------ files -- }
+
+{ True when S is well-formed UTF-8.  Tool results are sent as JSON strings, and
+  a request carrying invalid UTF-8 is rejected whole - so one binary file would
+  otherwise destroy the turn rather than just the tool call. }
+function IsValidUtf8(const S: string): Boolean;
+var
+  I, Len, Need: Integer;
+  B: Byte;
+begin
+  I := 1;
+  Len := Length(S);
+  while I <= Len do
+  begin
+    B := Byte(S[I]);
+    if B < $80 then
+      Need := 0
+    else if (B and $E0) = $C0 then
+    begin
+      Need := 1;
+      if B < $C2 then Exit(False);        { overlong two-byte form }
+    end
+    else if (B and $F0) = $E0 then
+      Need := 2
+    else if (B and $F8) = $F0 then
+    begin
+      Need := 3;
+      if B > $F4 then Exit(False);        { beyond U+10FFFF }
+    end
+    else
+      Exit(False);                        { stray continuation or 0xFE/0xFF }
+
+    if I + Need > Len then Exit(False);
+    while Need > 0 do
+    begin
+      Inc(I);
+      if (Byte(S[I]) and $C0) <> $80 then Exit(False);
+      Dec(Need);
+    end;
+    Inc(I);
+  end;
+  Result := True;
+end;
+
+{ Renders bytes that are not text as a hex dump, so the model still gets
+  something useful and the request stays valid. }
+function HexDump(const S: string; MaxBytes: Integer): string;
+var
+  I, Stop: Integer;
+  Line, Ascii: string;
+  B: Byte;
+begin
+  Result := '';
+  Stop := Length(S);
+  if Stop > MaxBytes then Stop := MaxBytes;
+  I := 1;
+  while I <= Stop do
+  begin
+    Line := Format('%8.8x  ', [I - 1]);
+    Ascii := '';
+    while (I <= Stop) and (((I - 1) mod 16) <> 15) do
+    begin
+      B := Byte(S[I]);
+      Line := Line + IntToHex(B, 2) + ' ';
+      if (B >= 32) and (B < 127) then Ascii := Ascii + Chr(B) else Ascii := Ascii + '.';
+      Inc(I);
+    end;
+    if I <= Stop then
+    begin
+      B := Byte(S[I]);
+      Line := Line + IntToHex(B, 2) + ' ';
+      if (B >= 32) and (B < 127) then Ascii := Ascii + Chr(B) else Ascii := Ascii + '.';
+      Inc(I);
+    end;
+    Result := Result + Line + ' |' + Ascii + '|'#10;
+  end;
+  if Length(S) > MaxBytes then
+    Result := Result + Format('... [%d bytes total]'#10, [Length(S)]);
+end;
+
+function OemToUtf8(const S: string): string;
+var
+  W: WideString;
+  U: UTF8String;
+  N, I: Integer;
+  CP: UINT;
+begin
+  Result := '';
+  if S = '' then Exit;
+  { FPC's CP_OEMCP is the RTL's own marker value (1), not a Windows codepage
+    identifier, so passing it to MultiByteToWideChar converts nothing. }
+  CP := GetConsoleOutputCP;
+  if CP = 0 then CP := GetOEMCP;
+  N := MultiByteToWideChar(CP, 0, PAnsiChar(S), Length(S), nil, 0);
+  if N > 0 then
+  begin
+    SetLength(W, N);
+    if MultiByteToWideChar(CP, 0, PAnsiChar(S), Length(S), PWideChar(W), N) = N then
+    begin
+      U := UTF8Encode(W);
+      { The bytes are copied one at a time.  Assigning a UTF8String straight to
+        a string makes FPC convert it back to the ANSI codepage, silently
+        undoing the work. }
+      SetLength(Result, Length(U));
+      for I := 1 to Length(U) do
+        Result[I] := Char(U[I]);
+      if IsValidUtf8(Result) then Exit;
+    end;
+  end;
+  { Conversion failed, so the bytes are scrubbed to ASCII rather than left
+    invalid: a mangled character is a far smaller problem than a request the
+    API refuses outright. }
+  Result := '';
+  for I := 1 to Length(S) do
+    if Byte(S[I]) < $80 then
+      Result := Result + S[I]
+    else
+      Result := Result + '?';
+end;
 
 function LoadFileText(const Full: string; out Text: string; out Err: string): Boolean;
 var
@@ -531,6 +657,14 @@ begin
       IsError := True;
       Exit('cannot read: ' + Note);
     end;
+    { A binary file is shown as hex rather than smuggled into the request as
+      invalid UTF-8, which the API would refuse outright. }
+    if not IsValidUtf8(Text) then
+    begin
+      Result := Rel(Full) + ' is not UTF-8 text; showing a hex dump.'#10#10 +
+        HexDump(Text, 4096);
+      Exit;
+    end;
     Result := WithLineNumbers(Text);
     if Note <> '' then Result := Note + #10 + Result;
     Result := Clip(Result);
@@ -643,6 +777,10 @@ begin
       Exit('the user denied this command');
     end;
     Text := RunShell(Cmd, NormalizeRoot, Code);
+    { Console programs emit OEM-codepage bytes, not UTF-8, so anything
+      non-ASCII has to be converted or the request body becomes invalid. }
+    if not IsValidUtf8(Text) then
+      Text := OemToUtf8(Text);
     Result := Clip(Text);
     if Result = '' then Result := '(no output)';
     Result := Result + Format(#10'[exit code %d]', [Code]);
