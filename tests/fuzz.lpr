@@ -347,11 +347,16 @@ begin
   uTools.RootDir := SessionDir;
   uTools.AllowAllBash := True;
 
-  { Byte $E9 is 'e-acute' in CP850/CP1252 and is illegal on its own in UTF-8. }
+  { Byte $E9 is 'e-acute' in CP850/CP437 and is illegal on its own in UTF-8. }
   J := TJson.NewObj;
-  J.AddStr('command', 'echo caf' + Chr($E9) + ' & echo ' + Chr($FF) + Chr($FE));
+  J.AddStr('command', 'echo caf' + Chr($E9));
   Out_ := RunTool('bash', J, IsErr);
   Check(IsValidUtf8(Out_), 'shell output is valid UTF-8');
+  { Validity alone is not enough: scrubbing to '?' would also pass. The
+    character has to survive as its UTF-8 encoding. }
+  Check(Pos(#$C3#$A9, Out_) > 0,
+    'the accented character is converted, not discarded');
+  Check(Pos('caf', Out_) > 0, 'the surrounding text is intact');
 
   Doc := TJson.NewObj;
   try

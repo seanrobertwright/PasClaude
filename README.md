@@ -70,7 +70,7 @@ widening delay, and the wait is interruptible.
 
 | Tool | Approval | Notes |
 | --- | --- | --- |
-| `read_file` | no | output is line-numbered, capped at 400 KB |
+| `read_file` | no | line-numbered, capped at 400 KB, hex dump if not text |
 | `list_dir` | no | skips `.git` and `node_modules`, max depth 4 |
 | `search` | no | case-insensitive content search, capped at 200 hits |
 | `write_file` | yes | creates intermediate directories |
@@ -83,11 +83,11 @@ or `n`. Read-only tools never ask.
 ## Tests
 
 ```
-test             :: the three offline suites
+test             :: the four offline suites
 test net         :: also the suite that talks to real servers
 ```
 
-Four suites, 167 assertions, all built with `-gh` so an unfreed block fails the
+Five suites, 199 assertions, all built with `-gh` so an unfreed block fails the
 run - JSON ownership here is manual, so a leak is a defect rather than noise.
 
 * `tests\smoke.lpr` - the JSON parser (escapes, surrogate pairs, malformed
@@ -108,6 +108,11 @@ run - JSON ownership here is manual, so a leak is a defect rather than noise.
   persisting across turns and clearing on reset, cancellation mid-stream and
   mid-tool-call, and the retry policy (retried on 529, not on 400, giving up
   after `MaxRetries`).
+* `tests\fuzz.lpr` - hostile inputs. Binary files and OEM-encoded shell output
+  (the bytes that would otherwise make the API reject a whole turn), NUL bytes
+  in JSON strings, path-guard escapes including a sibling directory sharing the
+  root's name prefix, degenerate tool arguments, output caps, and a file whose
+  contents impersonate the event protocol.
 * `tests\net.lpr` - the transport, against real servers and needing no API
   key. TLS, a body that round-trips through an echo service, a response larger
   than one read buffer, aborting mid-transfer, rejection of non-https and
@@ -121,12 +126,15 @@ The suites were checked by mutation, not just by passing: reverting the
 `input_json_delta` accumulator to an assignment fails 4 assertions, flipping
 the permission default from deny to allow fails 1, disabling the chunk-callback
 abort fails 2, capping the tool loop at one round fails 2, dropping the
-transcript copy fails 1, treating every error as retryable fails 1, and
-disabling the cancelled-tool-call cleanup fails 1.
+transcript copy fails 1, treating every error as retryable fails 1, disabling
+the cancelled-tool-call cleanup fails 1, and setting the wrong console codepage
+fails 1.
 
-That last one is why mutation testing earns its keep: the cleanup test passed
-for the wrong reason at first (the cancel fired before any tool block existed,
-so there was nothing to clean up) and only the mutation exposed it.
+Two of those mutations exposed tests that passed for the wrong reason. The
+cancel-cleanup test fired before any tool block existed, so there was nothing
+to clean up. The shell-encoding test only asserted the output was valid UTF-8,
+which the ASCII-scrub fallback also satisfies - it now asserts the accented
+character survives as `C3 A9`.
 
 `uHttp.HttpTransport` is the seam the loop suite uses. It is nil in the shipped
 program, which is asserted by the network suite reaching the real API.
@@ -154,6 +162,14 @@ Details worth knowing if you touch this code:
   results as a user message, and posts again - up to `MaxToolRounds`. A turn
   ends only when the model stops asking for tools. `tests\loop.lpr` runs that
   cycle end to end against scripted responses.
+* **Everything sent to the model must be valid UTF-8.** A tool result travels
+  as a JSON string, and one invalid byte makes the API reject the entire
+  request, losing the conversation rather than just the tool call. Binary files
+  are shown as a hex dump, and shell output is converted from the console
+  codepage. Note that FPC's `CP_OEMCP` is the RTL's own marker value, not a
+  Windows codepage id, so `GetConsoleOutputCP` has to be asked instead - and
+  UTF-8 bytes must be copied into a `string` one at a time, because assigning a
+  `UTF8String` makes the compiler convert them straight back.
 * **Cancellation keeps the transcript legal.** Esc aborts the stream, but the
   API rejects a request whose assistant message contains a `tool_use` with no
   matching `tool_result`. Those blocks are stripped on cancel, so the next
