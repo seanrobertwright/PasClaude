@@ -322,8 +322,13 @@ begin
     EmitCLn(clYellow, '  every tool is now approved for this session');
   end
   else if Cmd = '/cost' then
+  begin
     EmitCLn(clGrey, Format('  %d turns, %d input tokens, %d output tokens',
-      [Agent.TurnCount, Agent.TokensIn, Agent.TokensOut]))
+      [Agent.TurnCount, Agent.TokensIn, Agent.TokensOut]));
+    if (Agent.CacheReadTokens > 0) or (Agent.CacheWriteTokens > 0) then
+      EmitCLn(clGrey, Format('  cache: %d tokens read (90%% off), %d written',
+        [Agent.CacheReadTokens, Agent.CacheWriteTokens]));
+  end
   else
     EmitCLn(clRed, '  unknown command: ' + Cmd);
 end;

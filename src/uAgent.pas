@@ -45,6 +45,7 @@ type
     FMessages: TJson;              { the "messages" array, owned here }
     FMaxTokens: Integer;
     FTotalIn, FTotalOut: Int64;
+    FCacheWrite, FCacheRead: Int64;
     FTurns: Integer;
 
     function BuildBody: string;
@@ -104,6 +105,8 @@ type
 
     function TokensIn: Int64;
     function TokensOut: Int64;
+    function CacheWriteTokens: Int64;
+    function CacheReadTokens: Int64;
     function TurnCount: Integer;
     property Model: string read FModel write FModel;
 
@@ -201,6 +204,7 @@ type
     Agent: TAgent;
     StopReason: string;
     InTok, OutTok: Int64;
+    CacheWrite, CacheRead: Int64;
     ErrText: string;
     Cancel: Boolean;
   end;
@@ -242,6 +246,11 @@ begin
       begin
         St^.InTok := Round(Usage.Num('input_tokens'));
         St^.OutTok := Round(Usage.Num('output_tokens'));
+        { Cached tokens are billed differently and are the whole point of the
+          cache_control markers, so they are tracked separately: a working
+          cache shows up here as reads growing and plain input staying small. }
+        St^.CacheWrite := Round(Usage.Num('cache_creation_input_tokens'));
+        St^.CacheRead := Round(Usage.Num('cache_read_input_tokens'));
       end;
     end;
   end
@@ -500,6 +509,16 @@ begin
   Result := FTotalOut;
 end;
 
+function TAgent.CacheWriteTokens: Int64;
+begin
+  Result := FCacheWrite;
+end;
+
+function TAgent.CacheReadTokens: Int64;
+begin
+  Result := FCacheRead;
+end;
+
 function TAgent.TurnCount: Integer;
 begin
   Result := FTurns;
@@ -509,14 +528,30 @@ function TAgent.BuildBody: string;
 var
   Root, Msgs, M, C: TJson;
   I: Integer;
+  SysBlock, SysArr, Content, LastBlock, CC: TJson;
 begin
   Root := TJson.NewObj;
   try
     Root.AddStr('model', FModel);
     Root.AddNum('max_tokens', FMaxTokens);
     Root.AddBool('stream', True);
+    { The system prompt travels as a content block so it can carry a
+      cache_control marker.  The cache covers the request prefix up to the
+      marker - tools come before system in that prefix - so this one
+      breakpoint makes the API reuse both instead of re-reading a few
+      thousand tokens of identical text on every turn. }
     if FSystem <> '' then
-      Root.AddStr('system', FSystem);
+    begin
+      SysBlock := TJson.NewObj;
+      SysBlock.AddStr('type', 'text');
+      SysBlock.AddStr('text', FSystem);
+      CC := TJson.NewObj;
+      CC.AddStr('type', 'ephemeral');
+      SysBlock.Add('cache_control', CC);
+      SysArr := TJson.NewArr;
+      SysArr.Push(SysBlock);
+      Root.Add('system', SysArr);
+    end;
     Root.Add('tools', ToolsSchema);
 
     { The transcript is copied rather than handed over, because FMessages
@@ -527,6 +562,27 @@ begin
       M := FMessages.Item(I);
       C := JsonParse(M.ToJson);
       if C <> nil then Msgs.Push(C);
+    end;
+    { A second marker on the final content block caches the conversation so
+      far.  Each turn then only pays full price for what was added since the
+      last one - the cache grows with the transcript instead of being
+      invalidated by it.  It goes on the copy, never on FMessages, so the
+      stored transcript stays free of transport concerns. }
+    if Msgs.Count > 0 then
+    begin
+      Content := Msgs.Item(Msgs.Count - 1).Find('content');
+      if (Content <> nil) and (Content.Count > 0) then
+      begin
+        LastBlock := Content.Item(Content.Count - 1);
+        if (LastBlock <> nil) and (LastBlock.Kind = jkObj) and
+           (LastBlock.Str('type') <> 'thinking') and
+           (LastBlock.Find('cache_control') = nil) then
+        begin
+          CC := TJson.NewObj;
+          CC.AddStr('type', 'ephemeral');
+          LastBlock.Add('cache_control', CC);
+        end;
+      end;
     end;
     Root.Add('messages', Msgs);
     Result := Root.ToJson;
@@ -554,6 +610,8 @@ begin
   St.StopReason := '';
   St.InTok := 0;
   St.OutTok := 0;
+  St.CacheWrite := 0;
+  St.CacheRead := 0;
   St.ErrText := '';
   St.Cancel := False;
 
@@ -573,6 +631,8 @@ begin
   begin
     Cancelled := True;
     Inc(FTotalIn, St.InTok);
+    Inc(FCacheWrite, St.CacheWrite);
+    Inc(FCacheRead, St.CacheRead);
     Inc(FTotalOut, St.OutTok);
     Blocks := St.Blocks;
     StopReason := 'cancelled';
@@ -610,6 +670,8 @@ begin
   end;
 
   Inc(FTotalIn, St.InTok);
+  Inc(FCacheWrite, St.CacheWrite);
+  Inc(FCacheRead, St.CacheRead);
   Inc(FTotalOut, St.OutTok);
   Blocks := St.Blocks;
   StopReason := St.StopReason;
@@ -743,12 +805,16 @@ begin
   St.StopReason := '';
   St.InTok := 0;
   St.OutTok := 0;
+  St.CacheWrite := 0;
+  St.CacheRead := 0;
   St.ErrText := '';
   St.Cancel := False;
   for I := Low(Chunks) to High(Chunks) do
     StreamChunk(Chunks[I], @St);
   Inc(FTotalIn, St.InTok);
   Inc(FTotalOut, St.OutTok);
+  Inc(FCacheWrite, St.CacheWrite);
+  Inc(FCacheRead, St.CacheRead);
   StopReason := St.StopReason;
   Err := St.ErrText;
   Result := St.Blocks;

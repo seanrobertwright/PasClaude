@@ -91,6 +91,50 @@ begin
     Result[I] := Copy(S, I * Size + 1, Size);
 end;
 
+{ The cache counters come back inside message_start usage, alongside the
+  ordinary token counts.  A server that omits them - or one that includes
+  them - must both decode. }
+procedure TestCacheUsage;
+var
+  A: TAgent;
+  Stop, Err: string;
+begin
+  A := TAgent.Create('k', 'my-model', 'sys');
+  try
+    A.DecodeStream([
+      Ev('{"type":"message_start","message":{"usage":{"input_tokens":9,' +
+         '"output_tokens":1,"cache_creation_input_tokens":2048,' +
+         '"cache_read_input_tokens":4096}}}'),
+      Ev('{"type":"message_delta","delta":{"stop_reason":"end_turn"},' +
+         '"usage":{"output_tokens":5}}')], Stop, Err);
+    Check(A.CacheWriteTokens = 2048, 'cache writes are decoded from usage');
+    Check(A.CacheReadTokens = 4096, 'cache reads are decoded from usage');
+    Check(A.TokensIn = 9, 'plain input tokens are unchanged by the cache fields');
+
+    { A second reply accumulates rather than overwrites. }
+    A.DecodeStream([
+      Ev('{"type":"message_start","message":{"usage":{"input_tokens":3,' +
+         '"output_tokens":1,"cache_read_input_tokens":6000}}}')], Stop, Err);
+    Check(A.CacheReadTokens = 4096 + 6000, 'cache reads accumulate across replies');
+    Check(A.CacheWriteTokens = 2048, 'absent cache fields read as zero, not garbage');
+  finally
+    A.Free;
+  end;
+
+  { The old wire shape, with no cache fields at all, must still decode - that
+    is what every reply looked like before the markers were added. }
+  A := TAgent.Create('k', 'm', 'sys');
+  try
+    A.DecodeStream([
+      Ev('{"type":"message_start","message":{"usage":{"input_tokens":7,' +
+         '"output_tokens":1}}}')], Stop, Err);
+    Check((A.CacheWriteTokens = 0) and (A.CacheReadTokens = 0),
+      'a reply without cache fields leaves the counters at zero');
+  finally
+    A.Free;
+  end;
+end;
+
 procedure TestDecode;
 var
   A: TAgent;
@@ -316,7 +360,7 @@ var
   Blocks: TPartialBlocks;
   Stop, Err: string;
   Ran: Boolean;
-  Doc, Tools, T0, Msgs, C: TJson;
+  Doc, Tools, T0, Msgs, C, Sys: TJson;
   I: Integer;
   SawRead: Boolean;
 begin
@@ -334,7 +378,15 @@ begin
       Check(Doc <> nil, 'the request body is valid JSON');
       if Doc = nil then Exit;
       Check(Doc.Str('model') = 'my-model', 'the model is set');
-      Check(Doc.Str('system') = 'be helpful', 'the system prompt is set');
+      { The system prompt travels as a block array so it can carry the cache
+        marker; the text itself must be unchanged. }
+      Sys := Doc.Find('system');
+      Check((Sys <> nil) and (Sys.Count = 1) and
+            (Sys.Item(0).Str('text') = 'be helpful'), 'the system prompt is set');
+      Check((Sys <> nil) and (Sys.Count = 1) and
+            (Sys.Item(0).Find('cache_control') <> nil) and
+            (Sys.Item(0).Find('cache_control').Str('type') = 'ephemeral'),
+        'the system prompt carries a cache breakpoint');
       Check(Doc.Num('max_tokens') > 0, 'max_tokens is present and positive');
       Check(Doc.Find('stream').AsBoolean, 'streaming is requested');
 
@@ -357,6 +409,19 @@ begin
         end;
       end;
       Check(SawRead, 'read_file is among the declared tools');
+
+      { The second breakpoint sits on the last block of the last message, so
+        each turn reuses the whole conversation prefix.  It must be on the
+        posted copy only - FMessages stays clean, which the transcript check
+        below (built before this body) relies on. }
+      Msgs := Doc.Find('messages');
+      Check(Msgs.Count > 0, 'the body carries messages');
+      C := Msgs.Item(Msgs.Count - 1).Find('content');
+      Check((C <> nil) and (C.Count > 0) and
+            (C.Item(C.Count - 1).Find('cache_control') <> nil),
+        'the last content block carries the conversation cache breakpoint');
+      Check(Pos('cache_control', A.Transcript) = 0,
+        'the stored transcript itself stays free of cache markers');
 
       Msgs := Doc.Find('messages');
       Check((Msgs <> nil) and (Msgs.Count = 2), 'the transcript is included');
@@ -414,6 +479,7 @@ end;
 
 begin
   TestDecode;
+  TestCacheUsage;
   TestErrorEvent;
   TestJunkTolerated;
   TestToolLoop;
