@@ -109,6 +109,76 @@ end;
 
 { ------------------------------------------------------------ permissions -- }
 
+{ ------------------------------------------------------------- completion -- }
+
+const
+  SlashCommands: array[0..9] of string = (
+    '/help', '/clear', '/compact', '/resume', '/save', '/cwd', '/model',
+    '/yolo', '/cost', '/exit');
+
+{ Candidates for the token being completed: slash commands when the token
+  opens the line with a slash, file and directory names under the session
+  root otherwise.  Directories come back with a trailing separator so a
+  second Tab descends into them. }
+function Complete(const Token: string; AtLineStart: Boolean): TStringArray;
+var
+  N: Integer;
+
+  procedure Add(const S: string);
+  begin
+    SetLength(Result, N + 1);
+    Result[N] := S;
+    Inc(N);
+  end;
+
+var
+  I: Integer;
+  Dir, NamePart, Base: string;
+  R: TSearchRec;
+begin
+  Result := nil;
+  N := 0;
+
+  if AtLineStart and (Copy(Token, 1, 1) = '/') then
+  begin
+    for I := 0 to High(SlashCommands) do
+      if Copy(SlashCommands[I], 1, Length(Token)) = Token then
+        Add(SlashCommands[I]);
+    Exit;
+  end;
+
+  { A path: everything up to the last separator names the directory, the
+    rest is the prefix to match.  The session root is the base, matching how
+    every tool resolves paths. }
+  Dir := '';
+  NamePart := Token;
+  for I := Length(Token) downto 1 do
+    if Token[I] in ['\', '/'] then
+    begin
+      Dir := Copy(Token, 1, I);
+      NamePart := Copy(Token, I + 1, MaxInt);
+      Break;
+    end;
+  Base := IncludeTrailingPathDelimiter(uTools.RootDir) + Dir;
+  if not DirectoryExists(ExcludeTrailingPathDelimiter(Base)) then Exit;
+
+  if FindFirst(Base + '*', faAnyFile, R) = 0 then
+  begin
+    repeat
+      if (R.Name = '.') or (R.Name = '..') then Continue;
+      if (R.Name = '.git') or (R.Name = uTools.StateDirName) then Continue;
+      if (NamePart <> '') and
+         (CompareText(Copy(R.Name, 1, Length(NamePart)), NamePart) <> 0) then
+        Continue;
+      if (R.Attr and faDirectory) <> 0 then
+        Add(Dir + R.Name + '\')
+      else
+        Add(Dir + R.Name);
+    until FindNext(R) <> 0;
+    SysUtils.FindClose(R);
+  end;
+end;
+
 { The detail of a permission prompt is the tool's one-line description, and
   for a write or edit the diff it would produce.  Additions and removals are
   coloured so the shape of a change is readable at a glance rather than
@@ -408,6 +478,7 @@ begin
       Agent.OnNotice := @OnNotice;
       Agent.Ask := @AskPermission;
       Agent.ShouldCancel := @UserWantsStop;
+      uTerm.CompleteProvider := @Complete;
 
       { Resuming happens before the banner, because a saved session can carry
         its own model and the banner should report the one actually in use. }

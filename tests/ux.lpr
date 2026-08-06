@@ -1041,6 +1041,7 @@ end;
 procedure TestEditor;
 var
   E: TEditState;
+  AtStart: Boolean;
 
   procedure TypeStr(const S: WideString);
   var
@@ -1175,6 +1176,71 @@ begin
   EditApply(E, ekHistPrev, #0);
   EditApply(E, ekHistNext, #0);
   Check(Txt = 'untouched', 'history keys do nothing when there is no history');
+
+  { Tab completion.  The whole decision - which candidates apply, what the
+    token becomes - is in CompleteToken, driven here with fixed candidate
+    lists so no file system is involved. }
+  EditInit(E);
+  TypeStr('/he');
+  Check(CompleteToken(E, ['/help']), 'a single candidate completes');
+  Check(Txt = '/help', 'to the full command');
+  Check(E.Caret = 5, 'with the caret after it');
+
+  EditInit(E);
+  TypeStr('/c');
+  { /clear, /compact, /cost and /cwd share only "/c", which is already
+    typed, so there is nothing to extend and the call must say so. }
+  Check(not CompleteToken(E, ['/clear', '/compact', '/cost', '/cwd']),
+    'candidates sharing only the typed prefix change nothing');
+  Check(Txt = '/c', 'and the line is untouched');
+  { /compact and /comp... - candidates with a longer shared prefix do
+    extend, stopping where they diverge. }
+  EditInit(E);
+  TypeStr('/c');
+  Check(CompleteToken(E, ['/compact', '/cost']),
+    'a shared prefix longer than the token extends it');
+  Check(Txt = '/co', 'up to the point of divergence');
+  Check(E.Caret = 3, 'with the caret at the new end');
+
+  EditInit(E);
+  TypeStr('read src\uA');
+  Check(CompleteToken(E, ['src\uAgent.pas']), 'a path token completes mid-line');
+  Check(Txt = 'read src\uAgent.pas', 'replacing only the token, not the line');
+  Check(E.Caret = Length('read src\uAgent.pas'), 'caret lands at the end of it');
+
+  EditInit(E);
+  TypeStr('nothing matches xyz');
+  Check(not CompleteToken(E, []), 'no candidates changes nothing');
+  Check(Txt = 'nothing matches xyz', 'and the line is untouched');
+
+  { TokenAtCaret is what the provider sees; its notion of "line start" is
+    what routes between commands and paths. }
+  EditInit(E);
+  TypeStr('/mod');
+  Check(TokenAtCaret(E, AtStart) = '/mod', 'the token is the text back to a space');
+  Check(AtStart, 'a first word is flagged as opening the line');
+  EditInit(E);
+  TypeStr('read a.txt');
+  Check(TokenAtCaret(E, AtStart) = 'a.txt', 'a later word is its own token');
+  Check(not AtStart, 'and is not at the line start');
+
+  { Multi-line input: a newline is inserted like any character and the
+    submitted text carries it. }
+  EditInit(E);
+  TypeStr('first line');
+  EditApply(E, ekNewline, #0);
+  TypeStr('second line');
+  Check(Txt = 'first line'#10'second line', 'a newline joins two lines in one buffer');
+  Check(E.Caret = Length('first line') + 1 + Length('second line'),
+    'the caret counts the newline as one character');
+  EditApply(E, ekBackspace, #0);
+  Check(Txt = 'first line'#10'second lin', 'backspace works after a newline');
+  { And crossing the boundary deletes the break itself. }
+  EditInit(E);
+  TypeStr('ab');
+  EditApply(E, ekNewline, #0);
+  EditApply(E, ekBackspace, #0);
+  Check(Txt = 'ab', 'backspace at a line start removes the break');
 
   { Non-ASCII has to survive as characters, not bytes: the editor works in
     UTF-16 and the transcript is UTF-8, so a wrong assumption here shows up as

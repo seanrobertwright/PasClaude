@@ -10,6 +10,8 @@ unit uTerm;
 
 interface
 
+uses SysUtils;
+
 type
   TColor = (clGrey, clWhite, clBright, clCyan, clGreen, clYellow, clRed,
             clMagenta, clBlue);
@@ -40,7 +42,7 @@ function TermWidth: Integer;
   lives here. }
 type
   TEditKey = (ekChar, ekBackspace, ekDelete, ekLeft, ekRight, ekHome, ekEnd,
-              ekHistPrev, ekHistNext, ekClear);
+              ekHistPrev, ekHistNext, ekClear, ekNewline);
 
   TEditState = record
     Text: WideString;
@@ -49,10 +51,27 @@ type
     Pending: WideString;   { the typed line, stashed while browsing history }
   end;
 
+  { Supplies completion candidates for the token under the caret.  The host
+    wires this to slash commands and the file system; uTerm itself stays free
+    of both. }
+  TCompleteProc = function(const Token: string; AtLineStart: Boolean): TStringArray;
+
+var
+  CompleteProvider: TCompleteProc = nil;
+
 { Starts an edit with an empty line. }
 procedure EditInit(out E: TEditState);
 { Applies one key.  Ch matters only for ekChar. }
 procedure EditApply(var E: TEditState; Key: TEditKey; Ch: WideChar);
+{ Completes the token ending at the caret using Candidates.  A single match
+  replaces the token outright; several extend it to their common prefix.
+  Returns True when the text changed.  Pure, so the whole behaviour is
+  testable without a console or a file system. }
+function CompleteToken(var E: TEditState;
+  const Candidates: array of string): Boolean;
+{ The token the completion would act on: from after the last space to the
+  caret.  Exposed for the provider and the tests. }
+function TokenAtCaret(const E: TEditState; out AtLineStart: Boolean): string;
 { Records a finished line in the history. }
 procedure HistoryAdd(const S: string);
 { Test seam: forget every recorded command. }
@@ -62,7 +81,7 @@ function HistoryCount: Integer;
 
 implementation
 
-uses Windows, SysUtils;
+uses Windows;
 
 var
   HOut: HANDLE = 0;
@@ -214,6 +233,60 @@ begin
   E.Pending := '';
 end;
 
+function TokenAtCaret(const E: TEditState; out AtLineStart: Boolean): string;
+var
+  I, Start: Integer;
+begin
+  Start := 1;
+  for I := E.Caret downto 1 do
+    if (E.Text[I] = ' ') or (E.Text[I] = #10) then
+    begin
+      Start := I + 1;
+      Break;
+    end;
+  Result := UTF8Encode(Copy(E.Text, Start, E.Caret - Start + 1));
+  AtLineStart := Start = 1;
+end;
+
+function CompleteToken(var E: TEditState;
+  const Candidates: array of string): Boolean;
+var
+  Token, Prefix, Cand: string;
+  I, J, Start: Integer;
+  AtStart: Boolean;
+  W: WideString;
+begin
+  Result := False;
+  if Length(Candidates) = 0 then Exit;
+  Token := TokenAtCaret(E, AtStart);
+
+  { The common prefix of every candidate.  With one candidate that is the
+    candidate itself, which is the single-match case. }
+  Prefix := Candidates[0];
+  for I := 1 to High(Candidates) do
+  begin
+    Cand := Candidates[I];
+    J := 1;
+    while (J <= Length(Prefix)) and (J <= Length(Cand)) and
+          (LowerCase(Prefix[J]) = LowerCase(Cand[J])) do
+      Inc(J);
+    SetLength(Prefix, J - 1);
+  end;
+
+  { Nothing longer than what is already typed means nothing to do. }
+  if Length(Prefix) <= Length(Token) then Exit;
+
+  { Replace the token with the prefix.  Both are re-measured in UTF-16, since
+    the caret counts wide characters and the strings are UTF-8. }
+  W := UTF8Decode(Token);
+  Start := E.Caret - Length(W);
+  Delete(E.Text, Start + 1, Length(W));
+  W := UTF8Decode(Prefix);
+  Insert(W, E.Text, Start + 1);
+  E.Caret := Start + Length(W);
+  Result := True;
+end;
+
 procedure EditApply(var E: TEditState; Key: TEditKey; Ch: WideChar);
 var
   Target: Integer;
@@ -248,6 +321,14 @@ begin
         E.Text := '';
         E.Caret := 0;
       end;
+    ekNewline:
+      begin
+        { A literal newline in the middle of the line, for multi-line input.
+          It goes through the same insertion path as any character so the
+          caret rules hold. }
+        Insert(WideChar(#10), E.Text, E.Caret + 1);
+        Inc(E.Caret);
+      end;
     ekHistPrev, ekHistNext:
       begin
         if Length(History) = 0 then Exit;
@@ -272,24 +353,52 @@ end;
 { Redraws the edited line in place.  The whole line is rewritten rather than
   patched, because working out the minimal update is far more code than the
   redraw costs at terminal speeds - and it is what keeps a mid-line insert or
-  a history recall from leaving debris behind. }
+  a history recall from leaving debris behind.
+
+  The buffer may hold newlines (a pasted block, or an inserted break); a
+  console cannot re-edit rows it has already scrolled past, so what is drawn
+  is the line containing the caret, with a continuation marker instead of the
+  prompt when it is not the first. }
 procedure Redraw(const Prompt: string; const W: WideString; Caret: Integer;
   var PrevLen: Integer);
 var
   I: Integer;
+  LineStart, LineEnd: Integer;
+  Seg: WideString;
+  Lead: string;
+  RelCaret: Integer;
 begin
+  { The segment between the newlines around the caret. }
+  LineStart := 1;
+  for I := Caret downto 1 do
+    if W[I] = #10 then
+    begin
+      LineStart := I + 1;
+      Break;
+    end;
+  LineEnd := Length(W);
+  for I := Caret + 1 to Length(W) do
+    if W[I] = #10 then
+    begin
+      LineEnd := I - 1;
+      Break;
+    end;
+  Seg := Copy(W, LineStart, LineEnd - LineStart + 1);
+  RelCaret := Caret - LineStart + 1;
+  if LineStart = 1 then Lead := Prompt else Lead := '... ';
+
   { Back to column zero, then over the prompt. }
   Emit(#13);
-  EmitC(clCyan, Prompt);
-  Emit(UTF8Encode(W));
+  EmitC(clCyan, Lead);
+  Emit(UTF8Encode(Seg));
   { Erase whatever the previous, longer line left on screen. }
-  for I := Length(W) to PrevLen - 1 do
+  for I := Length(Seg) to PrevLen - 1 do
     Emit(' ');
   Emit(#13);
-  EmitC(clCyan, Prompt);
-  if Caret > 0 then
-    Emit(UTF8Encode(Copy(W, 1, Caret)));
-  PrevLen := Length(W);
+  EmitC(clCyan, Lead);
+  if RelCaret > 0 then
+    Emit(UTF8Encode(Copy(Seg, 1, RelCaret)));
+  PrevLen := Length(Seg);
 end;
 
 function ReadLineEdit(const Prompt: string; out Line: string): Boolean;
@@ -300,6 +409,10 @@ var
   Mode: DWORD = 0;
   PrevLen: Integer;
   E: TEditState;
+  NPend: DWORD;
+  Token: string;
+  AtStart: Boolean;
+  Cands: TStringArray;
 
   { Applies a key and repaints.  Every editing key goes through here, so the
     console and the state cannot drift apart. }
@@ -337,10 +450,41 @@ begin
       case Rec.Event.KeyEvent.wVirtualKeyCode of
         VK_RETURN:
           begin
+            { Enter with Ctrl or Alt held inserts a line break instead of
+              submitting, which is how a multi-line prompt is written by
+              hand.  A pasted block does the same implicitly below. }
+            if (Rec.Event.KeyEvent.dwControlKeyState and
+                (LEFT_CTRL_PRESSED or RIGHT_CTRL_PRESSED or
+                 LEFT_ALT_PRESSED or RIGHT_ALT_PRESSED)) <> 0 then
+            begin
+              Apply(ekNewline, #0);
+              Continue;
+            end;
+            { A Return with more input already waiting is a paste: the
+              terminal delivered the whole clipboard as one burst of key
+              events, and treating each newline as a submit would fire off
+              one truncated request per pasted line.  The break is kept and
+              the read continues until the queue drains. }
+            if (GetNumberOfConsoleInputEvents(HIn, NPend) and (NPend > 0)) then
+            begin
+              Apply(ekNewline, #0);
+              Continue;
+            end;
             EmitLn;
             Line := UTF8Encode(E.Text);
             HistoryAdd(Line);
             Exit(True);
+          end;
+        VK_TAB:
+          begin
+            if Assigned(CompleteProvider) then
+            begin
+              Token := TokenAtCaret(E, AtStart);
+              Cands := CompleteProvider(Token, AtStart);
+              if CompleteToken(E, Cands) then
+                Redraw(Prompt, E.Text, E.Caret, PrevLen);
+            end;
+            Continue;
           end;
         VK_BACK:   begin Apply(ekBackspace, #0); Continue; end;
         VK_DELETE: begin Apply(ekDelete, #0);    Continue; end;

@@ -73,6 +73,19 @@ At the prompt, the arrow keys move the caret and walk the command history,
 `Home`/`End` (or `Ctrl+A`/`Ctrl+E`) jump to either end, and `Ctrl+U` clears
 the line.
 
+`Tab` completes: slash commands at the start of the line, file and directory
+names anywhere else, resolved against the session root. Several matches extend
+to their common prefix; directories complete with a trailing `\` so another Tab
+descends. Pasting a multi-line block keeps its line breaks as one prompt
+instead of firing a request per line, and `Ctrl+Enter` inserts a break by hand.
+
+Requests carry two `cache_control` breakpoints: one on the system prompt
+(whose span also covers the tools) and one on the last message, so each turn
+reuses the cached conversation prefix instead of re-paying full price for it.
+Cached reads are billed at a tenth of the normal input rate; `/cost` shows the
+cache counters when they are nonzero, which is also how a working cache is
+distinguished from a silently ignored marker.
+
 A long session eventually outgrows the context window, and the failure mode is
 the API rejecting the whole turn. Before each request the transcript is trimmed
 back to roughly 100 KB by dropping the oldest exchanges; `/compact` does it on
@@ -289,6 +302,13 @@ console: a backspace that deletes at the caret instead of before it fails 3
 assertions, appending instead of inserting fails 1, giving `Delete` the caret
 movement that belongs to backspace fails 1, and dropping the stash that holds
 the half-typed line while history is browsed fails 2.
+
+Completion got the same treatment: making `CompleteToken` fire when the shared
+prefix adds nothing fails 1 assertion, and making it append instead of
+replacing the token fails 6. The cache markers too: removing the system one
+fails 1, the conversation one fails 1. Whether the live API honours the
+markers is part of the standing no-key gap; the `/cost` counters exist so a
+real session answers that at a glance.
 
 A third defect turned up the same way as the first two - by using the program
 rather than reading it. `/clear` printed "conversation cleared" and left the
