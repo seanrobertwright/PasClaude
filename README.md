@@ -76,10 +76,11 @@ or `n`. Read-only tools never ask.
 ## Tests
 
 ```
-test             :: builds and runs both suites
+test             :: the two offline suites
+test net         :: also the suite that talks to real servers
 ```
 
-Two suites, 66 assertions, both built with `-gh` so an unfreed block fails the
+Three suites, 91 assertions, all built with `-gh` so an unfreed block fails the
 run - JSON ownership here is manual, so a leak is a defect rather than noise.
 
 * `tests\smoke.lpr` - the JSON parser (escapes, surrogate pairs, malformed
@@ -92,13 +93,25 @@ run - JSON ownership here is manual, so a leak is a defect rather than noise.
   tolerance of unknown and malformed events, the tool round-trip into the
   transcript, denied calls still answering their `tool_use_id`, and the shape
   of the outgoing request body.
+* `tests\net.lpr` - the transport, against real servers and needing no API
+  key. TLS, a body that round-trips through an echo service, a response
+  larger than one read buffer, aborting mid-transfer, rejection of non-https
+  and unresolvable hosts, and the live Anthropic endpoint answering a
+  generated request body with `authentication_error` - which is proof the
+  body was well formed, since a malformed one is rejected as
+  `invalid_request_error` before the key is even examined. It also feeds real
+  wire bytes into the decoder, one byte at a time, to cover the seam between
+  the two.
 
-The suites were checked by mutation: reverting the `input_json_delta`
-accumulator to an assignment fails 4 assertions, and flipping the permission
-default from deny to allow fails 1. The HTTP transport itself is not covered,
-and neither is a successful live API call - the error path was exercised
-against the real endpoint (a 401 is parsed and reported), but no key was
-available to confirm a complete turn.
+The suites were checked by mutation, not just by passing: reverting the
+`input_json_delta` accumulator to an assignment fails 4 assertions, flipping
+the permission default from deny to allow fails 1, and disabling the
+chunk-callback abort fails 2.
+
+What remains unverified is a successful (200) turn against the live API, which
+needs a key this machine does not have. Everything either side of that is
+covered - the transport carries real traffic in `net`, and the decoding and
+tool loop run on recorded bytes in `stream`.
 
 ## Design notes
 

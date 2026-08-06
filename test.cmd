@@ -1,10 +1,17 @@
 @echo off
-rem Build and run the test suites.  Usage: test
+rem Build and run the test suites.
+rem   test        offline suites only
+rem   test net    also run the suite that talks to real servers
+rem   test all    same as "test net"
 setlocal enabledelayedexpansion
 
 set ROOT=%~dp0
 set OUT=%ROOT%bin
 set UNITS=%ROOT%build\units
+
+set SUITES=smoke stream
+if /I "%~1"=="net" set SUITES=smoke stream net
+if /I "%~1"=="all" set SUITES=smoke stream net
 
 set FPC=
 for %%C in (fpc.exe) do if not "%%~$PATH:C"=="" set FPC=%%~$PATH:C
@@ -27,7 +34,7 @@ set RC=0
 
 rem -gh makes the RTL report anything the suite allocated and did not free.
 rem JSON ownership here is manual, so a leak is a real defect, not noise.
-for %%T in (smoke stream) do (
+for %%T in (%SUITES%) do (
   "%FPC%" %FLAGS% -gh -o"%OUT%\%%T.exe" "%ROOT%tests\%%T.lpr" >nul
   if errorlevel 1 (
     echo BUILD FAILED: %%T
