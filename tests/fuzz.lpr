@@ -8,7 +8,7 @@ program fuzz;
 
 {$mode objfpc}{$H+}
 
-uses SysUtils, Classes, uJson, uTools, uAgent, uHttp;
+uses SysUtils, Classes, Windows, uJson, uTools, uAgent, uHttp;
 
 var
   Fails: Integer = 0;
@@ -343,9 +343,19 @@ var
   Out_: string;
   IsErr: Boolean;
   Doc: TJson;
+  SavedCP: UINT;
 begin
   uTools.RootDir := SessionDir;
   uTools.AllowAllBash := True;
+
+  { This test is about converting OEM bytes, so it has to run with an OEM
+    codepage actually set.  Inheriting whatever the shell happened to be on
+    made it pass or fail depending on who ran it: under 65001 the console is
+    already UTF-8, `echo` emits the byte unchanged, and there is nothing to
+    convert.  The codepage is therefore pinned here and put back afterwards. }
+  SavedCP := GetConsoleOutputCP;
+  SetConsoleOutputCP(850);
+  try
 
   { Byte $E9 is 'e-acute' in CP850/CP437 and is illegal on its own in UTF-8. }
   J := TJson.NewObj;
@@ -374,6 +384,10 @@ begin
   J.AddStr('command', 'type binary.dat');
   Out_ := RunTool('bash', J, IsErr);
   Check(IsValidUtf8(Out_), 'binary command output is made valid UTF-8');
+
+  finally
+    if SavedCP <> 0 then SetConsoleOutputCP(SavedCP);
+  end;
 end;
 
 begin

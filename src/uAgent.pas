@@ -87,6 +87,15 @@ type
     { Bytes the transcript currently occupies as JSON. }
     function TranscriptBytes: Integer;
     function MessageCount: Integer;
+
+    { Writes the conversation to Path so a later run can pick it up.  False
+      with Err set when it could not be stored. }
+    function SaveSession(const Path: string; out Err: string): Boolean;
+    { Replaces the conversation with the one in Path.  A file that is missing,
+      corrupt, or not a legal transcript is refused rather than loaded, since a
+      bad transcript makes every later request fail. }
+    function LoadSession(const Path: string; out Err: string): Boolean;
+
     function TokensIn: Int64;
     function TokensOut: Int64;
     function TurnCount: Integer;
@@ -113,6 +122,14 @@ const
   MaxToolRounds = 24;
   { Transient failures are retried this many times before giving up. }
   MaxRetries    = 3;
+  { Bumped when the saved-session shape changes incompatibly. }
+  SessionVersion = 1;
+  { Where a session lives, relative to the session root. }
+  SessionDir  = '.pasclaude';
+  SessionFile = 'session.json';
+
+{ The default save location under Root. }
+function SessionPath(const Root: string): string;
 
 var
   { Base backoff in milliseconds; doubles per attempt.  Only the tests lower
@@ -121,7 +138,13 @@ var
 
 implementation
 
-uses SysUtils, uHttp;
+uses SysUtils, Classes, uHttp;
+
+function SessionPath(const Root: string): string;
+begin
+  Result := IncludeTrailingPathDelimiter(Root) + SessionDir +
+    PathDelim + SessionFile;
+end;
 
 { ------------------------------------------------------------ stream state -- }
 
@@ -677,6 +700,223 @@ procedure TAgent.ApplyBlocks(const Blocks: TPartialBlocks; out RanTools: Boolean
 begin
   RecordAssistant(Blocks);
   RanTools := RunTools(Blocks);
+end;
+
+{ ------------------------------------------------------------- persistence -- }
+
+{ A saved session is the transcript plus enough context to tell whether
+  resuming it makes sense.  The API key is deliberately not stored: it belongs
+  in the environment, and writing it into a file inside the user's project is
+  how secrets end up committed. }
+function TAgent.SaveSession(const Path: string; out Err: string): Boolean;
+var
+  Root, Msgs, M: TJson;
+  F: TFileStream;
+  Dir, Text: string;
+  I: Integer;
+begin
+  Err := '';
+  Result := False;
+  Root := TJson.NewObj;
+  try
+    Root.AddNum('version', SessionVersion);
+    Root.AddStr('model', FModel);
+    Root.AddNum('turns', FTurns);
+    Root.AddNum('tokens_in', FTotalIn);
+    Root.AddNum('tokens_out', FTotalOut);
+    Root.AddStr('saved_at', FormatDateTime('yyyy-mm-dd hh:nn:ss', Now));
+
+    Msgs := TJson.NewArr;
+    for I := 0 to FMessages.Count - 1 do
+    begin
+      M := JsonParse(FMessages.Item(I).ToJson);
+      if M <> nil then Msgs.Push(M);
+    end;
+    Root.Add('messages', Msgs);
+    Text := Root.ToJson;
+  finally
+    Root.Free;
+  end;
+
+  Dir := ExtractFilePath(Path);
+  if (Dir <> '') and not DirectoryExists(Dir) then
+    if not ForceDirectories(Dir) then
+    begin
+      Err := 'cannot create ' + Dir;
+      Exit;
+    end;
+  try
+    F := TFileStream.Create(Path, fmCreate);
+    try
+      if Text <> '' then F.WriteBuffer(Text[1], Length(Text));
+    finally
+      F.Free;
+    end;
+    Result := True;
+  except
+    on E: Exception do
+      Err := E.Message;
+  end;
+end;
+
+{ A transcript is only legal if it opens with a user message and every
+  tool_use is answered by a tool_result in the message that follows.  A file
+  that fails either test is rejected whole: loading it would poison every
+  request from then on, and a refusal the user can see beats a session that
+  mysteriously cannot talk to the API. }
+function ValidTranscript(Msgs: TJson; out Err: string): Boolean;
+var
+  I, J, K: Integer;
+  M, Content, Block, NextContent: TJson;
+  Role, BType: string;
+  Answered: Boolean;
+begin
+  Err := '';
+  Result := False;
+  if (Msgs = nil) or (Msgs.Kind <> jkArr) then
+  begin
+    Err := 'no messages array';
+    Exit;
+  end;
+  if Msgs.Count = 0 then Exit(True);   { an empty session is simply a new one }
+
+  if Msgs.Item(0).Str('role') <> 'user' then
+  begin
+    Err := 'transcript does not start with a user message';
+    Exit;
+  end;
+
+  for I := 0 to Msgs.Count - 1 do
+  begin
+    M := Msgs.Item(I);
+    Role := M.Str('role');
+    if (Role <> 'user') and (Role <> 'assistant') then
+    begin
+      Err := Format('message %d has role "%s"', [I, Role]);
+      Exit;
+    end;
+    Content := M.Find('content');
+    if (Content = nil) or (Content.Kind <> jkArr) or (Content.Count = 0) then
+    begin
+      Err := Format('message %d has no content blocks', [I]);
+      Exit;
+    end;
+
+    for J := 0 to Content.Count - 1 do
+    begin
+      Block := Content.Item(J);
+      if (Block = nil) or (Block.Kind <> jkObj) then
+      begin
+        Err := Format('message %d block %d is not an object', [I, J]);
+        Exit;
+      end;
+      BType := Block.Str('type');
+      if BType = '' then
+      begin
+        Err := Format('message %d block %d has no type', [I, J]);
+        Exit;
+      end;
+      { The one structural rule the API enforces that a saved file can
+        plausibly violate: an unanswered tool call. }
+      if BType = 'tool_use' then
+      begin
+        Answered := False;
+        if I + 1 < Msgs.Count then
+        begin
+          NextContent := Msgs.Item(I + 1).Find('content');
+          if (NextContent <> nil) and (NextContent.Kind = jkArr) then
+            for K := 0 to NextContent.Count - 1 do
+              if (NextContent.Item(K).Str('type') = 'tool_result') and
+                 (NextContent.Item(K).Str('tool_use_id') = Block.Str('id')) then
+                Answered := True;
+        end;
+        if not Answered then
+        begin
+          Err := Format('message %d has an unanswered tool call', [I]);
+          Exit;
+        end;
+      end;
+    end;
+  end;
+  Result := True;
+end;
+
+function TAgent.LoadSession(const Path: string; out Err: string): Boolean;
+var
+  F: TFileStream;
+  Text: string;
+  Root, Msgs, Copy_: TJson;
+  I: Integer;
+begin
+  Err := '';
+  Result := False;
+  if not FileExists(Path) then
+  begin
+    Err := 'no saved session at ' + Path;
+    Exit;
+  end;
+  try
+    F := TFileStream.Create(Path, fmOpenRead or fmShareDenyNone);
+    try
+      SetLength(Text, F.Size);
+      if F.Size > 0 then F.ReadBuffer(Text[1], F.Size);
+    finally
+      F.Free;
+    end;
+  except
+    on E: Exception do
+    begin
+      Err := E.Message;
+      Exit;
+    end;
+  end;
+
+  Root := JsonParse(Text);
+  if Root = nil then
+  begin
+    Err := 'the saved session is not valid JSON';
+    Exit;
+  end;
+  try
+    if Root.Kind <> jkObj then
+    begin
+      Err := 'the saved session is not an object';
+      Exit;
+    end;
+    { A file from a future version may use a shape this build cannot honour,
+      so it is refused rather than half-understood. }
+    if Round(Root.Num('version', 0)) > SessionVersion then
+    begin
+      Err := Format('the saved session is version %d; this build understands %d',
+        [Round(Root.Num('version', 0)), SessionVersion]);
+      Exit;
+    end;
+    Msgs := Root.Find('messages');
+    if not ValidTranscript(Msgs, Err) then
+    begin
+      if Err = '' then Err := 'the saved session is not a usable transcript';
+      Exit;
+    end;
+
+    { Only now is the live conversation replaced, so a rejected file leaves
+      the current session untouched. }
+    FMessages.Free;
+    FMessages := TJson.NewArr;
+    for I := 0 to Msgs.Count - 1 do
+    begin
+      Copy_ := JsonParse(Msgs.Item(I).ToJson);
+      if Copy_ <> nil then FMessages.Push(Copy_);
+    end;
+    FTurns := Round(Root.Num('turns', 0));
+    FTotalIn := Round(Root.Num('tokens_in', 0));
+    FTotalOut := Round(Root.Num('tokens_out', 0));
+    { The model is restored only when the caller did not pick one, so an
+      explicit ANTHROPIC_MODEL still wins over whatever was saved. }
+    if Root.Str('model') <> '' then FModel := Root.Str('model');
+    Result := True;
+  finally
+    Root.Free;
+  end;
 end;
 
 { True for the failures that are worth trying again: the server was busy or

@@ -217,6 +217,8 @@ begin
   EmitCLn(clGrey,   '  /help          this list');
   EmitCLn(clGrey,   '  /clear         forget the conversation so far');
   EmitCLn(clGrey,   '  /compact       drop the oldest turns, keep the recent ones');
+  EmitCLn(clGrey,   '  /resume        reload the saved conversation');
+  EmitCLn(clGrey,   '  /save          write the conversation now');
   EmitCLn(clGrey,   '  /cwd           show the session root');
   EmitCLn(clGrey,   '  /model [name]  show or change the model');
   EmitCLn(clGrey,   '  /yolo          approve every tool for this session');
@@ -242,6 +244,7 @@ var
   Cmd, Arg: string;
   Sp: Integer;
   Dropped: Integer;
+  Err: string;
 begin
   Result := True;
   Handled := False;
@@ -281,6 +284,21 @@ begin
   end
   else if Cmd = '/cwd' then
     EmitCLn(clGrey, '  ' + uTools.RootDir)
+  else if Cmd = '/save' then
+  begin
+    if Agent.SaveSession(SessionPath(uTools.RootDir), Err) then
+      EmitCLn(clGrey, Format('  saved %d messages', [Agent.MessageCount]))
+    else
+      EmitCLn(clRed, '  could not save: ' + Err);
+  end
+  else if Cmd = '/resume' then
+  begin
+    if Agent.LoadSession(SessionPath(uTools.RootDir), Err) then
+      EmitCLn(clGrey, Format('  resumed %d messages (%d turns)',
+        [Agent.MessageCount, Agent.TurnCount]))
+    else
+      EmitCLn(clRed, '  could not resume: ' + Err);
+  end
   else if Cmd = '/model' then
   begin
     if Arg <> '' then
@@ -307,20 +325,47 @@ end;
 { ------------------------------------------------------------------- main -- }
 
 var
-  ApiKey, ModelName, Line, Err, Dir: string;
+  ApiKey, ModelName, Line, Err, Dir, SaveErr, Arg, ResumeErr: string;
   Handled: Boolean;
   Dropped: Integer;
+  Resume: Boolean = False;
+  Resumed: Boolean = False;
+  SaveWarned: Boolean = False;
+  ArgI: Integer;
 
 begin
   TermInit;
   try
     Dir := '';
-    if ParamCount >= 1 then Dir := ParamStr(1);
+    for ArgI := 1 to ParamCount do
+    begin
+      Arg := ParamStr(ArgI);
+      if (Arg = '--resume') or (Arg = '-r') then
+        Resume := True
+      else if (Arg = '--help') or (Arg = '-h') or (Arg = '/?') then
+      begin
+        EmitCLn(clBright, 'pasclaude [directory] [--resume]');
+        EmitCLn(clGrey, '  --resume  continue the conversation saved in that directory');
+        { Halt skips the finally block, so the console has to be put back
+          here or the caller's codepage stays switched to UTF-8. }
+        TermDone;
+        Halt(0);
+      end
+      else if Copy(Arg, 1, 1) = '-' then
+      begin
+        EmitCLn(clRed, 'unknown option: ' + Arg);
+        TermDone;
+        Halt(2);
+      end
+      else
+        Dir := Arg;
+    end;
     if Dir <> '' then
     begin
       if not DirectoryExists(Dir) then
       begin
         EmitCLn(clRed, 'no such directory: ' + Dir);
+        TermDone;
         Halt(2);
       end;
       SetCurrentDir(Dir);
@@ -332,11 +377,13 @@ begin
     begin
       EmitCLn(clRed, 'ANTHROPIC_API_KEY is not set.');
       EmitCLn(clGrey, '  set ANTHROPIC_API_KEY=sk-ant-...');
+      TermDone;
       Halt(2);
     end;
     if not HttpAvailable then
     begin
       EmitCLn(clRed, 'winhttp.dll could not be loaded; no network available.');
+      TermDone;
       Halt(2);
     end;
 
@@ -351,7 +398,28 @@ begin
       Agent.Ask := @AskPermission;
       Agent.ShouldCancel := @UserWantsStop;
 
+      { Resuming happens before the banner, because a saved session can carry
+        its own model and the banner should report the one actually in use. }
+      ResumeErr := '';
+      if Resume then
+        Resumed := Agent.LoadSession(SessionPath(uTools.RootDir), ResumeErr);
+
       ShowBanner;
+
+      if Resume then
+      begin
+        if Resumed then
+          EmitCLn(clGreen, Format('  resumed %d messages (%d turns)',
+            [Agent.MessageCount, Agent.TurnCount]))
+        else
+          EmitCLn(clYellow, '  starting fresh: ' + ResumeErr);
+        EmitLn;
+      end
+      else if FileExists(SessionPath(uTools.RootDir)) then
+      begin
+        EmitCLn(clGrey, '  a saved conversation exists here; /resume loads it');
+        EmitLn;
+      end;
 
       repeat
         if not ReadLineEdit('> ', Line) then Break;
@@ -377,6 +445,17 @@ begin
           NeedNewLine;
           EmitCLn(clRed, '  ' + Err);
         end;
+        { Saved after every turn rather than at exit, because the session
+          worth keeping is usually the one that ended in a crash or a closed
+          window.  A failure to save is reported once and does not interrupt
+          the conversation. }
+        if not Agent.SaveSession(SessionPath(uTools.RootDir), SaveErr) then
+          if not SaveWarned then
+          begin
+            SaveWarned := True;
+            NeedNewLine;
+            EmitCLn(clYellow, '  (session not being saved: ' + SaveErr + ')');
+          end;
         NeedNewLine;
         EmitLn;
       until False;

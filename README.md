@@ -36,7 +36,7 @@ Requires Free Pascal 3.2.x for `x86_64-win64`. The script finds `fpc.exe` on
 ```
 set ANTHROPIC_API_KEY=sk-ant-...
 set ANTHROPIC_MODEL=claude-sonnet-4-20250514   :: optional
-bin\pasclaude.exe [directory]
+bin\pasclaude.exe [directory] [--resume]
 ```
 
 The directory argument (default: the current one) becomes the *session root*.
@@ -54,6 +54,8 @@ contents are appended to the system prompt as binding instructions.
 | `/help` | list the commands |
 | `/clear` | forget the conversation so far |
 | `/compact` | drop the oldest turns, keep the recent ones |
+| `/resume` | reload the saved conversation |
+| `/save` | write the conversation now |
 | `/cwd` | show the session root |
 | `/model [name]` | show or change the model |
 | `/yolo` | approve every tool for the rest of the session |
@@ -77,6 +79,26 @@ back to roughly 100 KB by dropping the oldest exchanges; `/compact` does it on
 demand. The cut is walked forward to a real user message, because a transcript
 that opens with an assistant turn - or with tool results whose call has been
 removed - is refused.
+
+## Sessions
+
+The conversation is written to `.pasclaude\session.json` after every turn, so
+the session worth keeping - the one that ended in a crash or a closed window -
+is already on disk. `--resume` picks it up at startup, `/resume` does it later,
+and `/save` forces a write.
+
+The API key is never stored. It belongs in the environment, and writing it into
+a file inside the user's project is how secrets end up committed.
+
+A saved file is validated before it replaces anything: it must be an object of
+a version this build understands, every message must have a known role and at
+least one typed content block, the transcript must open with a user message,
+and every `tool_use` must be answered by a `tool_result` carrying the matching
+id. Anything else is refused with a reason, and the conversation already in
+progress is left exactly as it was. That ordering is the point - a file the
+user hand-edited should cost them nothing, and a transcript the API would
+reject is worse than no transcript at all, because it fails on every later
+request rather than at load time.
 
 ## Tools
 
@@ -156,6 +178,14 @@ ownership here is manual, so a leak is a defect rather than noise.
   asserts an approved edit applies exactly what was previewed. Compaction is
   checked for keeping the recent turns, dropping the old ones, never emptying
   the transcript, and never leaving an orphaned `tool_result` at the front.
+  Persistence is checked by round-tripping a conversation, including a tool
+  call with its result, and then by feeding the loader a series of files it did
+  not write: missing, not JSON, not an object, no messages array, a future
+  version, a
+  transcript starting with the assistant, an unanswered tool call, a
+  `tool_result` whose id does not match, an empty content array, an unknown
+  role, and a block with no type. Each must be refused *and* leave the live
+  conversation intact, which is asserted after all of them have been tried.
 
 * `tests\net.lpr` - the transport, against real servers and needing no API
   key. TLS, a body that round-trips through an echo service, a response larger
@@ -184,6 +214,24 @@ The newer code was checked the same way: making `ChangePreview` return nothing
 fails 7 assertions, dropping the orphan check from the compaction cut point
 fails 1, and removing the guard that stops compaction emptying the transcript
 fails 2.
+
+The session loader was checked the same way: accepting an unanswered tool call
+fails 5 assertions, dropping the opening-role check fails 3, ignoring the
+version guard fails 4, and - the one worth having - replacing the live
+transcript *before* validating instead of after fails 2. That last mutation
+leaves every "is it refused?" assertion passing, since the file is still
+rejected; only the assertions about the conversation surviving a bad file
+catch it.
+
+Adding `--help` also exposed an older defect by accident. `Halt` skips the
+`finally` block that restores the console, so any early exit left the caller's
+terminal switched to UTF-8 - which then made the shell-encoding test in `fuzz`
+fail, because under codepage 65001 `echo` emits the byte unchanged and there is
+nothing for the conversion to do. Two bugs, one symptom: every early exit now
+calls `TermDone` first, and the test pins the codepage itself rather than
+inheriting whatever the shell happened to be on. It now passes identically
+under 65001, 850 and 437, and still fails if the conversion result is
+discarded.
 
 Two more tests passing for the wrong reason turned up in that suite. Removing
 the CR stripping from the line splitter changed nothing, because a stray `#13`
@@ -263,3 +311,13 @@ Details worth knowing if you touch this code:
 * **The LCS table is quadratic**, which is fine for source files and ruinous
   past a few thousand lines, so `uDiff` falls back to reporting a whole-file
   replacement rather than allocating a table nobody benefits from.
+* **A session is validated before it replaces anything.** The obvious order -
+  load, then check - leaves a rejected file having already destroyed the
+  conversation in progress. `LoadSession` parses into a scratch document,
+  validates it, and only then swaps it in, so a refusal costs the user nothing.
+  The mutation that reverses those two steps is the one a test suite is most
+  likely to miss, because every assertion about the file being *refused* still
+  passes.
+* **`Halt` skips `finally`.** The console codepage is switched at startup and
+  put back by `TermDone`, so every early exit has to call it explicitly or the
+  user's terminal is left on UTF-8 after the program is gone.

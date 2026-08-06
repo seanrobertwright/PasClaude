@@ -508,6 +508,208 @@ begin
   end;
 end;
 
+{ ---------------------------------------------------------------- session -- }
+
+{ A saved session is a file in the user's project that is read back and sent
+  straight to the API.  That makes it the one input here that is both
+  persistent and structurally load-bearing: a stale or hand-edited file must be
+  refused rather than turned into requests that fail forever after. }
+procedure TestSession;
+var
+  A: TAgent;
+  Blocks: TPartialBlocks;
+  Err, Path, T: string;
+  Ran: Boolean;
+  I: Integer;
+  Doc: TJson;
+
+  procedure SeedTurn(Ag: TAgent; const Q, R: string);
+  begin
+    Ag.Send(Q, Err);
+    SetLength(Blocks, 1);
+    Blocks[0].Kind := bkText;
+    Blocks[0].Text := R;
+    Blocks[0].Id := '';
+    Blocks[0].Name := '';
+    Blocks[0].Signature := '';
+    Ag.ApplyBlocks(Blocks, Ran);
+  end;
+
+begin
+  WriteLn('-- session --');
+  Path := IncludeTrailingPathDelimiter(TmpRoot) + 'sess' + PathDelim + 'session.json';
+
+  { The round trip has to preserve what the next request is built from: the
+    messages, and the counters the user sees in /cost. }
+  A := TAgent.Create('secret-key', 'some-model', 'sys');
+  try
+    SeedTurn(A, 'first question', 'first answer');
+    SeedTurn(A, 'second question', 'second answer');
+    Check(A.SaveSession(Path, Err), 'a session saves');
+    Check(FileExists(Path), 'the file is created, directories and all');
+  finally
+    A.Free;
+  end;
+
+  A := TAgent.Create('other-key', '', 'sys');
+  try
+    Check(A.LoadSession(Path, Err), 'a saved session loads: ' + Err);
+    Check(A.MessageCount = 4, 'every message came back');
+    T := A.Transcript;
+    Check(Pos('first question', T) > 0, 'the first question survived');
+    Check(Pos('second answer', T) > 0, 'the last answer survived');
+    Check(A.Model = 'some-model', 'the model is restored');
+    { A resumed conversation must be able to continue, which means the
+      restored transcript has to be a legal request body. }
+    A.Send('third question', Err);
+    Check(Pos('third question', A.Transcript) > 0, 'the conversation continues');
+    Doc := JsonParse(A.RequestBody);
+    Check(Doc <> nil, 'a request after resuming is valid JSON');
+    Doc.Free;
+  finally
+    A.Free;
+  end;
+
+  { The key is the one thing that must never be written down: the file lives
+    inside the user's project, next to code that gets committed. }
+  Check(Pos('secret-key', ReadFileText(Path)) = 0,
+    'the API key is not written into the session file');
+
+  { A tool call and its result have to survive together, because the API
+    rejects one without the other. }
+  A := TAgent.Create('k', 'm', 'sys');
+  try
+    A.Send('use a tool', Err);
+    SetLength(Blocks, 1);
+    Blocks[0].Kind := bkToolUse;
+    Blocks[0].Id := 'call_1';
+    Blocks[0].Name := 'search';
+    Blocks[0].Text := '{"pattern":"x"}';
+    Blocks[0].Signature := '';
+    A.ApplyBlocks(Blocks, Ran);
+    Check(Ran, 'the tool ran');
+    Check(A.SaveSession(Path, Err), 'a session with a tool call saves');
+  finally
+    A.Free;
+  end;
+  A := TAgent.Create('k', 'm', 'sys');
+  try
+    Check(A.LoadSession(Path, Err), 'a tool exchange reloads: ' + Err);
+    Check(Pos('tool_use', A.Transcript) > 0, 'the tool call survived');
+    Check(Pos('tool_result', A.Transcript) > 0, 'its result survived with it');
+  finally
+    A.Free;
+  end;
+
+  { Everything below is a file the program did not write.  Each one must be
+    refused with the current conversation left intact - a bad file on disk
+    should cost the user nothing. }
+  A := TAgent.Create('k', 'm', 'sys');
+  try
+    SeedTurn(A, 'live question', 'live answer');
+
+    Check(not A.LoadSession(IncludeTrailingPathDelimiter(TmpRoot) + 'nope.json', Err),
+      'a missing session is refused');
+    Check(Err <> '', 'and says so');
+
+    WriteFileText(Path, 'this is not json at all');
+    Check(not A.LoadSession(Path, Err), 'a corrupt session is refused');
+
+    WriteFileText(Path, '[1,2,3]');
+    Check(not A.LoadSession(Path, Err), 'a session that is not an object is refused');
+
+    WriteFileText(Path, '{"version":1}');
+    Check(not A.LoadSession(Path, Err), 'a session with no messages array is refused');
+
+    { From the future: the shape may have changed in ways this build would
+      misread, so it is refused rather than half-understood. }
+    WriteFileText(Path, '{"version":999,"messages":[]}');
+    Check(not A.LoadSession(Path, Err), 'a newer session version is refused');
+    Check(Pos('999', Err) > 0, 'the version mismatch is explained');
+
+    { The two structural rules the API enforces. }
+    WriteFileText(Path, '{"version":1,"messages":[' +
+      '{"role":"assistant","content":[{"type":"text","text":"hi"}]}]}');
+    Check(not A.LoadSession(Path, Err),
+      'a transcript starting with the assistant is refused');
+
+    WriteFileText(Path, '{"version":1,"messages":[' +
+      '{"role":"user","content":[{"type":"text","text":"q"}]},' +
+      '{"role":"assistant","content":[{"type":"tool_use","id":"c1",' +
+      '"name":"search","input":{}}]}]}');
+    Check(not A.LoadSession(Path, Err),
+      'a transcript with an unanswered tool call is refused');
+    Check(Pos('unanswered', Err) > 0, 'and names the reason');
+
+    { A tool_result whose id does not match the call is the same defect
+      wearing a disguise, and the API rejects it just as hard. }
+    WriteFileText(Path, '{"version":1,"messages":[' +
+      '{"role":"user","content":[{"type":"text","text":"q"}]},' +
+      '{"role":"assistant","content":[{"type":"tool_use","id":"c1",' +
+      '"name":"search","input":{}}]},' +
+      '{"role":"user","content":[{"type":"tool_result","tool_use_id":"WRONG",' +
+      '"content":"x"}]}]}');
+    Check(not A.LoadSession(Path, Err),
+      'a tool result with a mismatched id is refused');
+
+    WriteFileText(Path, '{"version":1,"messages":[' +
+      '{"role":"user","content":[]}]}');
+    Check(not A.LoadSession(Path, Err), 'a message with no content is refused');
+
+    WriteFileText(Path, '{"version":1,"messages":[' +
+      '{"role":"wizard","content":[{"type":"text","text":"q"}]}]}');
+    Check(not A.LoadSession(Path, Err), 'an unknown role is refused');
+
+    WriteFileText(Path, '{"version":1,"messages":[' +
+      '{"role":"user","content":[{"text":"no type here"}]}]}');
+    Check(not A.LoadSession(Path, Err), 'a block with no type is refused');
+
+    { After all of that the live conversation must be exactly as it was. }
+    Check(A.MessageCount = 2, 'the live conversation is untouched by bad files');
+    Check(Pos('live question', A.Transcript) > 0, 'its content is intact');
+    Doc := JsonParse(A.RequestBody);
+    Check(Doc <> nil, 'and it can still build a request');
+    Doc.Free;
+  finally
+    A.Free;
+  end;
+
+  { An empty session is not corrupt, it is just a conversation nobody has had
+    yet, and loading it should quietly produce an empty transcript. }
+  A := TAgent.Create('k', 'm', 'sys');
+  try
+    WriteFileText(Path, '{"version":1,"messages":[]}');
+    Check(A.LoadSession(Path, Err), 'an empty session loads without complaint');
+    Check(A.MessageCount = 0, 'and leaves nothing behind');
+    A.Send('starting over', Err);
+    Check(A.MessageCount = 1, 'a fresh conversation starts from it');
+  finally
+    A.Free;
+  end;
+
+  { Saving must be repeatable: the file is rewritten every turn, so a shorter
+    conversation must not leave the tail of a longer one behind. }
+  A := TAgent.Create('k', 'm', 'sys');
+  try
+    for I := 1 to 5 do
+      SeedTurn(A, 'q' + IntToStr(I), 'a' + IntToStr(I));
+    A.SaveSession(Path, Err);
+    A.Reset;
+    SeedTurn(A, 'only one', 'only answer');
+    A.SaveSession(Path, Err);
+  finally
+    A.Free;
+  end;
+  A := TAgent.Create('k', 'm', 'sys');
+  try
+    Check(A.LoadSession(Path, Err), 'the rewritten session loads');
+    Check(A.MessageCount = 2, 'it holds only the newer, shorter conversation');
+    Check(Pos('q5', A.Transcript) = 0, 'no debris from the longer one remains');
+  finally
+    A.Free;
+  end;
+end;
+
 { ------------------------------------------------------------------- main -- }
 
 procedure Cleanup(const Dir: string);
@@ -541,6 +743,7 @@ begin
     TestDiff;
     TestPreview;
     TestCompact;
+    TestSession;
   finally
     uTools.RootDir := '';
     Cleanup(TmpRoot);
