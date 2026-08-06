@@ -150,6 +150,46 @@ begin
   end;
 end;
 
+{ Command history.  Kept for the life of the process; a session long enough to
+  care about persistence has bigger state than this. }
+var
+  History: array of string;
+
+procedure HistoryAdd(const S: string);
+var
+  N: Integer;
+begin
+  if Trim(S) = '' then Exit;
+  N := Length(History);
+  { Repeating the last command should not fill the history with copies. }
+  if (N > 0) and (History[N - 1] = S) then Exit;
+  SetLength(History, N + 1);
+  History[N] := S;
+end;
+
+{ Redraws the edited line in place.  The whole line is rewritten rather than
+  patched, because working out the minimal update is far more code than the
+  redraw costs at terminal speeds - and it is what keeps a mid-line insert or
+  a history recall from leaving debris behind. }
+procedure Redraw(const Prompt: string; const W: WideString; Caret: Integer;
+  var PrevLen: Integer);
+var
+  I: Integer;
+begin
+  { Back to column zero, then over the prompt. }
+  Emit(#13);
+  EmitC(clCyan, Prompt);
+  Emit(UTF8Encode(W));
+  { Erase whatever the previous, longer line left on screen. }
+  for I := Length(W) to PrevLen - 1 do
+    Emit(' ');
+  Emit(#13);
+  EmitC(clCyan, Prompt);
+  if Caret > 0 then
+    Emit(UTF8Encode(Copy(W, 1, Caret)));
+  PrevLen := Length(W);
+end;
+
 function ReadLineEdit(const Prompt: string; out Line: string): Boolean;
 var
   W: WideString;
@@ -157,9 +197,39 @@ var
   NRead: DWORD = 0;
   Ch: WideChar;
   Mode: DWORD = 0;
+  Caret: Integer;
+  PrevLen: Integer;
+  HistPos: Integer;
+  Pending: WideString;
+
+  procedure Recall(Delta: Integer);
+  var
+    Target: Integer;
+  begin
+    if Length(History) = 0 then Exit;
+    { HistPos = Length(History) means "the line being typed", which is stashed
+      in Pending so browsing away and back does not destroy it. }
+    if HistPos = Length(History) then Pending := W;
+    Target := HistPos + Delta;
+    if Target < 0 then Target := 0;
+    if Target > Length(History) then Target := Length(History);
+    if Target = HistPos then Exit;
+    HistPos := Target;
+    if HistPos = Length(History) then
+      W := Pending
+    else
+      W := UTF8Decode(History[HistPos]);
+    Caret := Length(W);
+    Redraw(Prompt, W, Caret, PrevLen);
+  end;
+
 begin
   Line := '';
   W := '';
+  Pending := '';
+  Caret := 0;
+  PrevLen := 0;
+  HistPos := Length(History);
   EmitC(clCyan, Prompt);
 
   { Cooked mode would swallow the per-key handling this editor needs. }
@@ -186,24 +256,73 @@ begin
           begin
             EmitLn;
             Line := UTF8Encode(W);
+            HistoryAdd(Line);
             Exit(True);
           end;
         VK_BACK:
           begin
-            if W <> '' then
+            if Caret > 0 then
             begin
-              SetLength(W, Length(W) - 1);
-              Emit(#8' '#8);
+              Delete(W, Caret, 1);
+              Dec(Caret);
+              Redraw(Prompt, W, Caret, PrevLen);
             end;
+            Continue;
+          end;
+        VK_DELETE:
+          begin
+            if Caret < Length(W) then
+            begin
+              Delete(W, Caret + 1, 1);
+              Redraw(Prompt, W, Caret, PrevLen);
+            end;
+            Continue;
+          end;
+        VK_LEFT:
+          begin
+            if Caret > 0 then
+            begin
+              Dec(Caret);
+              Redraw(Prompt, W, Caret, PrevLen);
+            end;
+            Continue;
+          end;
+        VK_RIGHT:
+          begin
+            if Caret < Length(W) then
+            begin
+              Inc(Caret);
+              Redraw(Prompt, W, Caret, PrevLen);
+            end;
+            Continue;
+          end;
+        VK_HOME:
+          begin
+            Caret := 0;
+            Redraw(Prompt, W, Caret, PrevLen);
+            Continue;
+          end;
+        VK_END:
+          begin
+            Caret := Length(W);
+            Redraw(Prompt, W, Caret, PrevLen);
+            Continue;
+          end;
+        VK_UP:
+          begin
+            Recall(-1);
+            Continue;
+          end;
+        VK_DOWN:
+          begin
+            Recall(1);
             Continue;
           end;
         VK_ESCAPE:
           begin
-            while W <> '' do
-            begin
-              SetLength(W, Length(W) - 1);
-              Emit(#8' '#8);
-            end;
+            W := '';
+            Caret := 0;
+            Redraw(Prompt, W, Caret, PrevLen);
             Continue;
           end;
       end;
@@ -215,17 +334,36 @@ begin
       end;
       if Ch = #21 then         { Ctrl+U clears the line }
       begin
-        while W <> '' do
-        begin
-          SetLength(W, Length(W) - 1);
-          Emit(#8' '#8);
-        end;
+        W := '';
+        Caret := 0;
+        Redraw(Prompt, W, Caret, PrevLen);
+        Continue;
+      end;
+      if Ch = #1 then          { Ctrl+A to the start }
+      begin
+        Caret := 0;
+        Redraw(Prompt, W, Caret, PrevLen);
+        Continue;
+      end;
+      if Ch = #5 then          { Ctrl+E to the end }
+      begin
+        Caret := Length(W);
+        Redraw(Prompt, W, Caret, PrevLen);
         Continue;
       end;
       if Ch >= #32 then
       begin
-        W := W + Ch;
-        Emit(UTF8Encode(WideString(Ch)));
+        Insert(Ch, W, Caret + 1);
+        Inc(Caret);
+        { Appending at the end is the common case and needs no redraw, which
+          keeps ordinary typing free of flicker. }
+        if Caret = Length(W) then
+        begin
+          Emit(UTF8Encode(WideString(Ch)));
+          PrevLen := Length(W);
+        end
+        else
+          Redraw(Prompt, W, Caret, PrevLen);
       end;
     until False;
   finally

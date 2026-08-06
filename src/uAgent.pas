@@ -81,6 +81,12 @@ type
     function Send(const UserText: string; out Err: string): Boolean;
 
     procedure Reset;
+    { Drops the oldest exchanges, keeping roughly the last KeepBytes worth of
+      transcript.  Returns the number of messages removed. }
+    function Compact(KeepBytes: Integer): Integer;
+    { Bytes the transcript currently occupies as JSON. }
+    function TranscriptBytes: Integer;
+    function MessageCount: Integer;
     function TokensIn: Int64;
     function TokensOut: Int64;
     function TurnCount: Integer;
@@ -315,6 +321,87 @@ end;
 function TAgent.TokensIn: Int64;
 begin
   Result := FTotalIn;
+end;
+
+function TAgent.TranscriptBytes: Integer;
+begin
+  Result := Length(FMessages.ToJson);
+end;
+
+function TAgent.MessageCount: Integer;
+begin
+  Result := FMessages.Count;
+end;
+
+{ True when this message is a user turn carrying tool results rather than
+  something the user typed.  Such a message is only legal directly after the
+  assistant message whose tool_use ids it answers, so a compaction may never
+  leave one at the front of the transcript. }
+function IsToolResultMessage(M: TJson): Boolean;
+var
+  Content: TJson;
+  I: Integer;
+begin
+  Result := False;
+  if (M = nil) or (M.Str('role') <> 'user') then Exit;
+  Content := M.Find('content');
+  if (Content = nil) or (Content.Count = 0) then Exit;
+  for I := 0 to Content.Count - 1 do
+    if Content.Item(I).Str('type') = 'tool_result' then Exit(True);
+end;
+
+{ Keeps the tail of the conversation and throws the head away.  Old turns are
+  where the bulk of a long session's tokens sit - mostly file contents that
+  have since been edited - while the recent exchanges are what the model
+  actually needs.
+
+  The cut point is then walked forward until it lands on a real user message,
+  because starting a transcript with an assistant turn or with orphaned tool
+  results is rejected by the API. }
+function TAgent.Compact(KeepBytes: Integer): Integer;
+var
+  I, Total, Cut: Integer;
+  Sizes: array of Integer;
+  Running: Integer;
+begin
+  Result := 0;
+  if FMessages.Count <= 2 then Exit;
+
+  SetLength(Sizes, FMessages.Count);
+  Total := 0;
+  for I := 0 to FMessages.Count - 1 do
+  begin
+    Sizes[I] := Length(FMessages.Item(I).ToJson);
+    Inc(Total, Sizes[I]);
+  end;
+  if Total <= KeepBytes then Exit;
+
+  { Walk back from the end accumulating messages until the budget is spent;
+    everything before that index goes. }
+  Running := 0;
+  Cut := 0;
+  for I := FMessages.Count - 1 downto 0 do
+  begin
+    Inc(Running, Sizes[I]);
+    if Running > KeepBytes then
+    begin
+      Cut := I + 1;
+      Break;
+    end;
+  end;
+
+  while (Cut < FMessages.Count) and
+        ((FMessages.Item(Cut).Str('role') <> 'user') or
+         IsToolResultMessage(FMessages.Item(Cut))) do
+    Inc(Cut);
+
+  { Never compact away everything: a transcript with no messages cannot be
+    sent, and the last exchange is the one the user is still talking about. }
+  if Cut >= FMessages.Count then Exit;
+
+  for I := 1 to Cut do
+    FMessages.Drop(0);
+  Result := Cut;
 end;
 
 function TAgent.TokensOut: Int64;

@@ -53,6 +53,7 @@ contents are appended to the system prompt as binding instructions.
 | --- | --- |
 | `/help` | list the commands |
 | `/clear` | forget the conversation so far |
+| `/compact` | drop the oldest turns, keep the recent ones |
 | `/cwd` | show the session root |
 | `/model [name]` | show or change the model |
 | `/yolo` | approve every tool for the rest of the session |
@@ -65,6 +66,17 @@ usable for the next question.
 
 Transient failures (429, 529, 5xx) are retried up to three times with a
 widening delay, and the wait is interruptible.
+
+At the prompt, the arrow keys move the caret and walk the command history,
+`Home`/`End` (or `Ctrl+A`/`Ctrl+E`) jump to either end, and `Ctrl+U` clears
+the line.
+
+A long session eventually outgrows the context window, and the failure mode is
+the API rejecting the whole turn. Before each request the transcript is trimmed
+back to roughly 100 KB by dropping the oldest exchanges; `/compact` does it on
+demand. The cut is walked forward to a real user message, because a transcript
+that opens with an assistant turn - or with tool results whose call has been
+removed - is refused.
 
 ## Tools
 
@@ -80,15 +92,34 @@ widening delay, and the wait is interruptible.
 At each prompt you can answer `y` (once), `a` (always, for that class of tool)
 or `n`. Read-only tools never ask.
 
+A write or edit shows its diff before you answer, so the decision is about the
+change rather than about the file name:
+
+```
+  permission needed: edit_file
+    edit src\uAgent.pas
+    1 added, 1 removed
+      if not SendWithRetry(Blocks, StopReason, Err, Cancelled) then
+    - Exit(False);
+    + Exit(RecordFailure(Err));
+      RecordAssistant(Blocks);
+```
+
+The diff is built from the file as it is on disk, not from what the model
+believed was there, and it is only computed when someone is actually going to
+be asked - under `/yolo` the work is skipped entirely. A binary file is
+summarised instead of dumped, and an edit whose snippet is missing or
+ambiguous is refused before any prompt appears.
+
 ## Tests
 
 ```
-test             :: the four offline suites
+test             :: the five offline suites
 test net         :: also the suite that talks to real servers
 ```
 
-Five suites, 199 assertions, all built with `-gh` so an unfreed block fails the
-run - JSON ownership here is manual, so a leak is a defect rather than noise.
+Six suites, all built with `-gh` so an unfreed block fails the run - JSON
+ownership here is manual, so a leak is a defect rather than noise.
 
 * `tests\smoke.lpr` - the JSON parser (escapes, surrogate pairs, malformed
   input, locale-proof number formatting) and every tool, including the path
@@ -113,6 +144,19 @@ run - JSON ownership here is manual, so a leak is a defect rather than noise.
   in JSON strings, path-guard escapes including a sibling directory sharing the
   root's name prefix, degenerate tool arguments, output caps, and a file whose
   contents impersonate the event protocol.
+* `tests\ux.lpr` - the diff, the change previews, and compaction. The diff is
+  checked on the cases that make a preview useful or useless: a one-line change
+  reported as one add and one remove rather than a wholesale replacement, only
+  the changed region of a 200-line file shown, two distant edits separated by a
+  gap marker, CRLF files, the render cap, and the fallback past the LCS limit.
+  The previews are driven through the real `RunTool` with a spy standing in for
+  the user, asserting on what the prompt would have shown: the removed and
+  added lines, a new file announced as new, a binary file summarised, and no
+  prompt at all for an escaping path, a non-matching edit, or `/yolo`. It also
+  asserts an approved edit applies exactly what was previewed. Compaction is
+  checked for keeping the recent turns, dropping the old ones, never emptying
+  the transcript, and never leaving an orphaned `tool_result` at the front.
+
 * `tests\net.lpr` - the transport, against real servers and needing no API
   key. TLS, a body that round-trips through an echo service, a response larger
   than one read buffer, aborting mid-transfer, rejection of non-https and
@@ -136,6 +180,19 @@ to clean up. The shell-encoding test only asserted the output was valid UTF-8,
 which the ASCII-scrub fallback also satisfies - it now asserts the accented
 character survives as `C3 A9`.
 
+The newer code was checked the same way: making `ChangePreview` return nothing
+fails 7 assertions, dropping the orphan check from the compaction cut point
+fails 1, and removing the guard that stops compaction emptying the transcript
+fails 2.
+
+Two more tests passing for the wrong reason turned up in that suite. Removing
+the CR stripping from the line splitter changed nothing, because a stray `#13`
+on both sides of a diff still compares equal: the counts stayed right while the
+rendered diff would have carried a control character into the middle of the
+prompt. It now asserts no carriage return reaches the output. The
+empty-transcript guard was likewise uncovered until a case compacted to a
+one-byte budget, which is the only way to reach it.
+
 `uHttp.HttpTransport` is the seam the loop suite uses. It is nil in the shipped
 program, which is asserted by the network suite reaching the real API.
 
@@ -151,6 +208,7 @@ real traffic in `net`, and the full request-stream-tool-respond cycle runs in
 | `uJson` | JSON DOM: parse, build, serialise |
 | `uHttp` | WinHTTP POST with the body delivered in chunks |
 | `uTerm` | UTF-8 console output, colour, line editor |
+| `uDiff` | line diff used to preview a change before it is approved |
 | `uTools` | the tool implementations, path guard, permission gate |
 | `uAgent` | request building, SSE decoding, the tool loop |
 | `pasclaude.lpr` | REPL, slash commands, rendering |
@@ -191,3 +249,17 @@ Details worth knowing if you touch this code:
 * **Thinking blocks carry a signature** that has to be echoed back verbatim
   on the next request, so it is captured from `signature_delta` and stored
   alongside the text.
+* **Compaction has to leave a legal transcript.** Dropping the oldest messages
+  is easy; the constraint is that a request must open with a user message, and
+  a `tool_result` is only valid directly after the assistant message whose
+  `tool_use` it answers. The cut point is therefore walked forward past any
+  assistant turn and any tool-result message, and refuses to empty the
+  transcript entirely - a session with nothing left to send cannot recover.
+* **A diff is only worth building if someone will read it.** `PermitChange`
+  skips the file read and the LCS entirely when the answer is already known,
+  which is every tool call under `/yolo`. The diff is also taken against the
+  file on disk rather than against whatever the model assumed, so an approval
+  is a decision about the change that will actually be made.
+* **The LCS table is quadratic**, which is fine for source files and ruinous
+  past a few thousand lines, so `uDiff` falls back to reporting a whole-file
+  replacement rather than allocating a table nobody benefits from.

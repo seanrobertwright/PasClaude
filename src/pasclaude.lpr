@@ -14,6 +14,10 @@ uses
 
 const
   Version = '0.1';
+  { A transcript larger than this is trimmed before the next turn.  Roughly
+    100k characters, which is a fraction of the context window but well past
+    the point where old file dumps are still earning their place. }
+  CompactKeepBytes = 100 * 1024;
 
 var
   Agent: TAgent;
@@ -105,13 +109,45 @@ end;
 
 { ------------------------------------------------------------ permissions -- }
 
+{ The detail of a permission prompt is the tool's one-line description, and
+  for a write or edit the diff it would produce.  Additions and removals are
+  coloured so the shape of a change is readable at a glance rather than
+  needing to be parsed character by character. }
+procedure ShowDetail(const Detail: string);
+var
+  L: TStringList;
+  I: Integer;
+  Line: string;
+begin
+  L := TStringList.Create;
+  try
+    L.Text := Detail;
+    for I := 0 to L.Count - 1 do
+    begin
+      Line := L[I];
+      if Copy(Line, 1, 2) = '+ ' then
+        EmitCLn(clGreen, '    ' + Line)
+      else if Copy(Line, 1, 2) = '- ' then
+        EmitCLn(clRed, '    ' + Line)
+      else if Copy(Line, 1, 2) = '@@' then
+        EmitCLn(clCyan, '    ' + Line)
+      else if I = 0 then
+        EmitCLn(clBright, '    ' + Line)
+      else
+        EmitCLn(clGrey, '    ' + Line);
+    end;
+  finally
+    L.Free;
+  end;
+end;
+
 function AskPermission(const Title, Detail: string): TPermission;
 var
   Line: string;
 begin
   NeedNewLine;
   EmitCLn(clYellow, '  permission needed: ' + Title);
-  EmitCLn(clBright, '    ' + Detail);
+  ShowDetail(Detail);
   repeat
     EmitC(clYellow, '  [y] once  [a] always  [n] no > ');
     if not ReadLineEdit('', Line) then Exit(pmDeny);
@@ -180,6 +216,7 @@ begin
   EmitCLn(clBright, 'Commands');
   EmitCLn(clGrey,   '  /help          this list');
   EmitCLn(clGrey,   '  /clear         forget the conversation so far');
+  EmitCLn(clGrey,   '  /compact       drop the oldest turns, keep the recent ones');
   EmitCLn(clGrey,   '  /cwd           show the session root');
   EmitCLn(clGrey,   '  /model [name]  show or change the model');
   EmitCLn(clGrey,   '  /yolo          approve every tool for this session');
@@ -204,6 +241,7 @@ function HandleCommand(const Line: string; out Handled: Boolean): Boolean;
 var
   Cmd, Arg: string;
   Sp: Integer;
+  Dropped: Integer;
 begin
   Result := True;
   Handled := False;
@@ -230,6 +268,16 @@ begin
   begin
     Agent.Reset;
     EmitCLn(clGrey, '  conversation cleared');
+  end
+  else if Cmd = '/compact' then
+  begin
+    Dropped := Agent.Compact(CompactKeepBytes);
+    if Dropped = 0 then
+      EmitCLn(clGrey, Format('  nothing to compact (%d messages, %d bytes)',
+        [Agent.MessageCount, Agent.TranscriptBytes]))
+    else
+      EmitCLn(clGrey, Format('  dropped %d older messages, %d left (%d bytes)',
+        [Dropped, Agent.MessageCount, Agent.TranscriptBytes]));
   end
   else if Cmd = '/cwd' then
     EmitCLn(clGrey, '  ' + uTools.RootDir)
@@ -261,6 +309,7 @@ end;
 var
   ApiKey, ModelName, Line, Err, Dir: string;
   Handled: Boolean;
+  Dropped: Integer;
 
 begin
   TermInit;
@@ -313,6 +362,16 @@ begin
         if Handled then Continue;
 
         AtLineStart := True;
+        { A session that runs long enough will eventually exceed the context
+          window, and the failure mode is the whole turn being rejected.
+          Trimming first costs the oldest exchanges instead. }
+        if Agent.TranscriptBytes > CompactKeepBytes then
+        begin
+          Dropped := Agent.Compact(CompactKeepBytes);
+          if Dropped > 0 then
+            EmitCLn(clGrey, Format('  (compacted: dropped %d older messages)',
+              [Dropped]));
+        end;
         if not Agent.Send(Line, Err) then
         begin
           NeedNewLine;

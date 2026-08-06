@@ -10,7 +10,7 @@ unit uTools;
 
 interface
 
-uses uJson;
+uses uJson, uDiff;
 
 type
   { Answer to a permission prompt. }
@@ -38,6 +38,10 @@ function RunTool(const Name: string; Input: TJson; Ask: TAskProc;
 { A one-line description used in the transcript and in permission prompts. }
 function DescribeTool(const Name: string; Input: TJson): string;
 
+{ The diff a write or edit would produce, ready to show in a permission
+  prompt.  Empty for tools that change nothing on disk. }
+function ChangePreview(const Name: string; Input: TJson): string;
+
 { Converts console output from the OEM codepage to UTF-8.  Exposed so the
   encoding behaviour can be tested directly. }
 function OemToUtf8(const S: string): string;
@@ -53,6 +57,9 @@ uses SysUtils, Classes, Process, Windows;
 const
   MaxReadBytes = 400 * 1024;   { keeps a stray huge file out of the context }
   MaxOutBytes  = 30 * 1024;    { cap on any single tool result }
+  { Diff lines shown in a permission prompt.  Enough to judge a normal edit,
+    short enough that a big one does not scroll the question off screen. }
+  PreviewLines = 40;
 
 { ------------------------------------------------------------ path safety -- }
 
@@ -627,6 +634,72 @@ begin
   end;
 end;
 
+{ Builds the diff a change would produce.  Reads the file as it stands now,
+  so the preview reflects what is really on disk rather than what the model
+  believed was there. }
+function ChangePreview(const Name: string; Input: TJson): string;
+var
+  Full, Err, Text, Note, Old, New, Updated: string;
+  At, Second: Integer;
+begin
+  Result := '';
+  if Input = nil then Exit;
+
+  if Name = 'write_file' then
+  begin
+    if not SafePath(Input.Str('path'), Full, Err) then Exit;
+    if FileExists(Full) then
+    begin
+      if not LoadFileText(Full, Text, Note) then Exit;
+      { A file that is not text has no meaningful line diff, and dumping its
+        bytes into a prompt helps nobody. }
+      if not IsValidUtf8(Text) then
+        Exit(Format('replaces %d bytes of binary content', [Length(Text)]));
+    end
+    else
+    begin
+      Text := '';
+      Result := '(new file)'#10;
+    end;
+    Result := Result + DiffSummary(Text, Input.Str('content'), PreviewLines);
+  end
+
+  else if Name = 'edit_file' then
+  begin
+    if not SafePath(Input.Str('path'), Full, Err) then Exit;
+    if not FileExists(Full) then Exit;
+    if not LoadFileText(Full, Text, Note) then Exit;
+    if not IsValidUtf8(Text) then Exit;
+    Old := Input.Str('old_text');
+    New := Input.Str('new_text');
+    if Old = '' then Exit;
+    At := Pos(Old, Text);
+    if At = 0 then Exit;
+    { An ambiguous match is refused later anyway; previewing the first hit
+      would show an edit that is never going to happen. }
+    Second := Pos(Old, Text, At + 1);
+    if Second > 0 then Exit;
+    Updated := Copy(Text, 1, At - 1) + New + Copy(Text, At + Length(Old), MaxInt);
+    Result := DiffSummary(Text, Updated, PreviewLines);
+  end;
+end;
+
+function PermitChange(const Name: string; Input: TJson; Ask: TAskProc): Boolean;
+var
+  Detail, Preview: string;
+begin
+  Detail := DescribeTool(Name, Input);
+  { The diff is only built when someone is actually going to be asked, since
+    reading and diffing the file is pure waste under /yolo. }
+  if Assigned(Ask) and not (AllowAllEdits or ((Name = 'bash') and AllowAllBash)) then
+  begin
+    Preview := ChangePreview(Name, Input);
+    if Preview <> '' then
+      Detail := Detail + #10 + Preview;
+  end;
+  Result := Permit(Name, Detail, Ask);
+end;
+
 function RunTool(const Name: string; Input: TJson; Ask: TAskProc;
   out IsError: Boolean): string;
 var
@@ -677,7 +750,7 @@ begin
       IsError := True;
       Exit(Err);
     end;
-    if not Permit(Name, DescribeTool(Name, Input), Ask) then
+    if not PermitChange(Name, Input, Ask) then
     begin
       IsError := True;
       Exit('the user denied this write');
@@ -729,7 +802,7 @@ begin
       IsError := True;
       Exit('old_text occurs more than once; include more context');
     end;
-    if not Permit(Name, DescribeTool(Name, Input), Ask) then
+    if not PermitChange(Name, Input, Ask) then
     begin
       IsError := True;
       Exit('the user denied this edit');

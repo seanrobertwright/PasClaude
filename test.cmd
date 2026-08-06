@@ -9,9 +9,9 @@ set ROOT=%~dp0
 set OUT=%ROOT%bin
 set UNITS=%ROOT%build\units
 
-set SUITES=smoke stream loop fuzz
-if /I "%~1"=="net" set SUITES=smoke stream loop fuzz net
-if /I "%~1"=="all" set SUITES=smoke stream loop fuzz net
+set SUITES=smoke stream loop fuzz ux
+if /I "%~1"=="net" set SUITES=smoke stream loop fuzz ux net
+if /I "%~1"=="all" set SUITES=smoke stream loop fuzz ux net
 
 set FPC=
 for %%C in (fpc.exe) do if not "%%~$PATH:C"=="" set FPC=%%~$PATH:C
