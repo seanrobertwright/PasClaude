@@ -21,11 +21,17 @@ var
   Replies: array of string;   { response body per request, in order }
   Requests: array of string;  { what the agent actually sent }
   CallCount: Integer = 0;
-  FailAfter: Integer = -1;    { when >= 0, the transport errors at this call }
+  FailAfter: Integer = -1;    { when >= 0, the transport errors from this call }
+  FailUntil: Integer = 0;     { ... up to and including this call number }
+  FailStatus: Integer = 529;
+  FailBody: string = '';
 
   Prose: string = '';
   Notices: string = '';
   ToolLog: string = '';
+  { Set by the cancellation tests; the transport counts chunks it emitted. }
+  CancelAfterChunks: Integer = -1;
+  ChunksSeen: Integer = 0;
 
 procedure Check(Cond: Boolean; const What: string);
 begin
@@ -75,12 +81,15 @@ begin
   Requests[High(Requests)] := Body;
   Inc(CallCount);
 
-  if (FailAfter >= 0) and (CallCount > FailAfter) then
+  if (FailAfter >= 0) and (CallCount > FailAfter) and (CallCount <= FailUntil) then
   begin
-    Result.Status := 529;
-    Result.Body := '{"type":"error","error":{"type":"overloaded_error",' +
-                   '"message":"Overloaded"}}';
-    Result.Error := 'HTTP 529';
+    Result.Status := FailStatus;
+    if FailBody <> '' then
+      Result.Body := FailBody
+    else
+      Result.Body := '{"type":"error","error":{"type":"overloaded_error",' +
+                     '"message":"Overloaded"}}';
+    Result.Error := Format('HTTP %d', [FailStatus]);
     Exit;
   end;
 
@@ -98,6 +107,7 @@ begin
   I := 1;
   while I <= Length(Reply) do
   begin
+    Inc(ChunksSeen);
     if Assigned(OnChunk) then
       if not OnChunk(Copy(Reply, I, N), Ctx) then Break;
     Inc(I, N);
@@ -134,12 +144,33 @@ begin
     Ev('{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":30}}');
 end;
 
+{ A reply that streams Text as several deltas, so a cancellation can land in
+  the middle of it. }
+function LongTextReply(const Piece: string; Count: Integer): string;
+var
+  I: Integer;
+begin
+  Result :=
+    Ev('{"type":"message_start","message":{"usage":{"input_tokens":10,"output_tokens":1}}}') +
+    Ev('{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}');
+  for I := 1 to Count do
+    Result := Result +
+      Ev('{"type":"content_block_delta","index":0,"delta":' +
+         '{"type":"text_delta","text":' + JsonQuote(Piece) + '}}');
+  Result := Result +
+    Ev('{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":30}}');
+end;
+
 procedure ResetScript;
 begin
   Replies := nil;
   Requests := nil;
   CallCount := 0;
   FailAfter := -1;
+  FailUntil := 0;
+  FailStatus := 529;
+  FailBody := '';
+  ChunksSeen := 0;
   Prose := '';
   Notices := '';
   ToolLog := '';
@@ -307,6 +338,7 @@ begin
   Replies[0] := ToolReply('t1', 'list_dir', '{"path":"."}');
   Replies[1] := TextReply('never reached');
   FailAfter := 1;      { the second request fails }
+  FailUntil := 99;
 
   A := MakeAgent;
   try
@@ -314,7 +346,11 @@ begin
     Check(not Ok, 'a mid-loop transport failure fails the turn');
     Check(Pos('529', Err) > 0, 'the status is reported: ' + Err);
     Check(Pos('overloaded_error', Err) > 0, 'the API error type is reported');
-    Check(CallCount = 2, 'the loop stopped at the failure');
+    { The second request is retried before the turn gives up, so the count is
+      the first success plus every attempt at the second. }
+    Check(CallCount = 1 + MaxRetries + 1,
+      Format('the loop retried then stopped, expected %d calls, got %d',
+        [1 + MaxRetries + 1, CallCount]));
   finally
     A.Free;
   end;
@@ -455,9 +491,210 @@ begin
   end;
 end;
 
+{ Cancellation: the user presses Esc while a reply streams. }
+function WantsCancel: Boolean;
+begin
+  Result := (CancelAfterChunks >= 0) and (ChunksSeen >= CancelAfterChunks);
+end;
+
+procedure TestCancelMidStream;
+var
+  A: TAgent;
+  Err: string;
+  Ok: Boolean;
+  Doc, Msgs: TJson;
+begin
+  ResetScript;
+  uTools.RootDir := SessionDir;
+  SetLength(Replies, 2);
+  { 40 separate deltas, so the cancel can land between them. }
+  Replies[0] := LongTextReply('chunk ', 40);
+  Replies[1] := TextReply('second turn works');
+
+  A := MakeAgent;
+  try
+    A.ShouldCancel := @WantsCancel;
+    ChunksSeen := 0;
+    { The opening events take roughly 23 chunks at 9 bytes each, and each
+      delta about 12 more, so this lands a few deltas into the text. }
+    CancelAfterChunks := 60;
+
+    Ok := A.Send('say a lot', Err);
+    Check(Ok, 'a cancelled turn is not an error');
+    Check(Pos('cancelled', Notices) > 0, 'the user is told it was cancelled');
+    Check(Length(Prose) < 40 * 6, 'the reply stopped early');
+    Check(Length(Prose) > 0, 'what arrived before the stop was shown');
+
+    { The partial reply has to stay in the transcript, or the next turn would
+      look like the model never answered. }
+    Doc := JsonParse(A.Transcript);
+    try
+      Msgs := Doc;
+      Check(Msgs.Count = 2, 'the partial reply is kept in the transcript');
+      Check(Msgs.Item(1).Str('role') = 'assistant', 'it is recorded as the assistant');
+    finally
+      Doc.Free;
+    end;
+
+    { And the conversation must still work afterwards. }
+    CancelAfterChunks := -1;
+    Prose := '';
+    Ok := A.Send('carry on', Err);
+    Check(Ok and (Prose = 'second turn works'),
+      'the conversation continues after a cancellation');
+  finally
+    A.Free;
+  end;
+  CancelAfterChunks := -1;
+end;
+
+{ Cancelling while the model is mid-tool-call leaves an unanswered tool_use,
+  which the API rejects.  Those blocks must be stripped. }
+procedure TestCancelDuringToolCallCleansTranscript;
+var
+  A: TAgent;
+  Err: string;
+  Doc, Msgs, Content: TJson;
+  I, J: Integer;
+  SawToolUse: Boolean;
+begin
+  ResetScript;
+  uTools.RootDir := SessionDir;
+  SetLength(Replies, 2);
+  { The tool call completes, then a long tail of text keeps the stream open
+    so the cancel arrives with a finished tool_use already in hand - which is
+    the state that would otherwise poison the next request. }
+  Replies[0] := ToolReply('t9', 'read_file', '{"path":"note.txt"}') +
+    StringOfChar(' ', 0);
+  for I := 1 to 40 do
+    Replies[0] := Replies[0] +
+      Ev('{"type":"content_block_delta","index":1,"delta":' +
+         '{"type":"text_delta","text":"tail "}}');
+  Replies[1] := TextReply('after cancel');
+
+  A := MakeAgent;
+  try
+    A.ShouldCancel := @WantsCancel;
+    ChunksSeen := 0;
+    { Past the tool_use block, into the trailing text. }
+    CancelAfterChunks := 60;
+
+    A.Send('read something', Err);
+    Check(ToolLog = '', 'a cancelled tool call is never executed');
+
+    Doc := JsonParse(A.Transcript);
+    try
+      SawToolUse := False;
+      Msgs := Doc;
+      for I := 0 to Msgs.Count - 1 do
+      begin
+        Content := Msgs.Item(I).Find('content');
+        if Content = nil then Continue;
+        for J := 0 to Content.Count - 1 do
+          if Content.Item(J).Str('type') = 'tool_use' then SawToolUse := True;
+      end;
+      Check(not SawToolUse,
+        'no unanswered tool_use is left in the transcript');
+    finally
+      Doc.Free;
+    end;
+
+    { Proof it stayed usable: the next turn must go through. }
+    CancelAfterChunks := -1;
+    Prose := '';
+    A.Send('never mind', Err);
+    Check(Prose = 'after cancel', 'the next turn succeeds after the cleanup');
+  finally
+    A.Free;
+  end;
+  CancelAfterChunks := -1;
+end;
+
+{ Transient failures must be retried, permanent ones must not. }
+procedure TestRetryOnOverload;
+var
+  A: TAgent;
+  Err: string;
+  Ok: Boolean;
+begin
+  ResetScript;
+  uTools.RootDir := SessionDir;
+  { The transport fails the first two calls, then the script answers. }
+  SetLength(Replies, 3);
+  Replies[0] := TextReply('unused');
+  Replies[1] := TextReply('unused');
+  Replies[2] := TextReply('recovered');
+  FailAfter := 0;
+  FailUntil := 2;
+
+  A := MakeAgent;
+  try
+    Ok := A.Send('hello', Err);
+    Check(Ok, 'a turn survives transient failures: ' + Err);
+    Check(CallCount = 3, 'the request was retried twice');
+    Check(Prose = 'recovered', 'the eventual reply is delivered');
+    Check(Pos('retrying', Notices) > 0, 'the user is told a retry is happening');
+  finally
+    A.Free;
+  end;
+end;
+
+procedure TestNoRetryOnPermanentError;
+var
+  A: TAgent;
+  Err: string;
+  Ok: Boolean;
+begin
+  ResetScript;
+  uTools.RootDir := SessionDir;
+  SetLength(Replies, 1);
+  Replies[0] := TextReply('unused');
+  FailAfter := 0;
+  FailUntil := 99;
+  FailStatus := 400;
+  FailBody := '{"error":{"type":"invalid_request_error","message":"bad"}}';
+
+  A := MakeAgent;
+  try
+    Ok := A.Send('hello', Err);
+    Check(not Ok, 'a permanent error fails the turn');
+    Check(CallCount = 1, 'a 400 is not retried');
+    Check(Pos('invalid_request_error', Err) > 0, 'the reason is reported');
+  finally
+    A.Free;
+  end;
+end;
+
+procedure TestRetriesGiveUp;
+var
+  A: TAgent;
+  Err: string;
+  Ok: Boolean;
+begin
+  ResetScript;
+  uTools.RootDir := SessionDir;
+  SetLength(Replies, 1);
+  Replies[0] := TextReply('unused');
+  FailAfter := 0;
+  FailUntil := 99;
+
+  A := MakeAgent;
+  try
+    Ok := A.Send('hello', Err);
+    Check(not Ok, 'persistent failure eventually fails the turn');
+    Check(CallCount = MaxRetries + 1,
+      Format('it tried %d times then stopped, got %d',
+        [MaxRetries + 1, CallCount]));
+  finally
+    A.Free;
+  end;
+end;
+
 begin
   { Every request in this suite goes to the stand-in rather than the network. }
   uHttp.HttpTransport := @FakePost;
+  { The backoff is real time; the tests only care that it happens. }
+  uAgent.RetryBaseMs := 1;
 
   TestTwoRoundLoop;
   TestThreeRoundLoop;
@@ -466,6 +703,11 @@ begin
   TestDeniedToolContinues;
   TestConversationPersists;
   TestParallelToolCalls;
+  TestCancelMidStream;
+  TestCancelDuringToolCallCleansTranscript;
+  TestRetryOnOverload;
+  TestNoRetryOnPermanentError;
+  TestRetriesGiveUp;
 
   WriteLn;
   if Fails = 0 then

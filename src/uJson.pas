@@ -54,6 +54,8 @@ type
 
     { Detach the child at index I so the caller owns it. }
     function Take(I: Integer): TJson;
+    { Removes and frees the child at index I. }
+    procedure Drop(I: Integer);
 
     function AsString: string;                        { for jkStr/jkNum/jkBool }
     function AsNumber: Double;
@@ -228,6 +230,21 @@ begin
   Result := Item(I);
   if Result <> nil then
     FItems[I] := TJson.Create(jkNull);
+end;
+
+procedure TJson.Drop(I: Integer);
+var
+  J: Integer;
+begin
+  if (I < 0) or (I > High(FItems)) then Exit;
+  FItems[I].Free;
+  for J := I to High(FItems) - 1 do
+  begin
+    FItems[J] := FItems[J + 1];
+    FKeys[J] := FKeys[J + 1];
+  end;
+  SetLength(FItems, Length(FItems) - 1);
+  SetLength(FKeys, Length(FKeys) - 1);
 end;
 
 function TJson.AsString: string;

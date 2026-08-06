@@ -96,6 +96,13 @@ begin
   EmitCLn(clYellow, '  ' + S);
 end;
 
+{ Esc during a reply abandons it.  The key is drained here rather than left
+  in the buffer, where it would otherwise clear the next prompt line. }
+function UserWantsStop: Boolean;
+begin
+  Result := EscPressed;
+end;
+
 { ------------------------------------------------------------ permissions -- }
 
 function AskPermission(const Title, Detail: string): TPermission;
@@ -178,6 +185,8 @@ begin
   EmitCLn(clGrey,   '  /yolo          approve every tool for this session');
   EmitCLn(clGrey,   '  /cost          tokens used so far');
   EmitCLn(clGrey,   '  /exit          quit (Ctrl+C also works)');
+  EmitLn;
+  EmitCLn(clGrey,   '  Esc during a reply stops it.');
 end;
 
 procedure ShowBanner;
@@ -186,6 +195,7 @@ begin
   EmitCLn(clGrey, '  ' + uTools.RootDir);
   EmitCLn(clGrey, '  ' + Agent.Model);
   EmitCLn(clGrey, '  /help for commands, /exit to quit');
+  EmitCLn(clGrey, '  Esc stops a reply in progress');
   EmitLn;
 end;
 
@@ -290,6 +300,7 @@ begin
       Agent.OnToolResult := @OnToolResult;
       Agent.OnNotice := @OnNotice;
       Agent.Ask := @AskPermission;
+      Agent.ShouldCancel := @UserWantsStop;
 
       ShowBanner;
 

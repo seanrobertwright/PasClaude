@@ -23,6 +23,8 @@ type
   { Rendering hooks, so this unit stays free of console code. }
   TTextProc = procedure(const S: string);
   TToolProc = procedure(const Name, Detail: string);
+  { Polled while a response streams; True abandons the request. }
+  TCancelProc = function: Boolean;
 
   TBlockKind = (bkText, bkThinking, bkToolUse);
 
@@ -48,12 +50,19 @@ type
     function BuildBody: string;
     { One request/response exchange.  Returns the blocks the model produced. }
     function SendOnce(out Blocks: TPartialBlocks; out StopReason: string;
-      out Err: string): Boolean;
+      out Err: string; out Cancelled: Boolean): Boolean;
     { Appends an assistant message rebuilt from Blocks. }
     procedure RecordAssistant(const Blocks: TPartialBlocks);
     { Runs every tool_use block and appends the tool_result user message.
       Returns False when no tool was requested. }
     function RunTools(const Blocks: TPartialBlocks): Boolean;
+    { SendOnce with retries for transient failures. }
+    function SendWithRetry(out Blocks: TPartialBlocks;
+      out StopReason, Err: string; out Cancelled: Boolean): Boolean;
+    { A wait that the user can break out of.  False when cancelled. }
+    function SleepCancellable(Ms: Integer): Boolean;
+    { Strips tool_use blocks that will never get a result. }
+    procedure DropUnansweredToolCalls;
   public
     OnText: TTextProc;             { streamed assistant prose }
     OnThinking: TTextProc;         { streamed reasoning, when the model emits it }
@@ -61,6 +70,8 @@ type
     OnToolResult: TToolProc;
     OnNotice: TTextProc;           { status and error lines }
     Ask: TAskProc;
+    { Polled between chunks so the user can abandon a long reply. }
+    ShouldCancel: TCancelProc;
 
     constructor Create(const ApiKey, AModel, SystemPrompt: string);
     destructor Destroy; override;
@@ -94,6 +105,13 @@ const
   ApiUrl        = 'https://api.anthropic.com/v1/messages';
   ApiVersion    = '2023-06-01';
   MaxToolRounds = 24;
+  { Transient failures are retried this many times before giving up. }
+  MaxRetries    = 3;
+
+var
+  { Base backoff in milliseconds; doubles per attempt.  Only the tests lower
+    it, so a suite does not spend seconds asleep. }
+  RetryBaseMs: Integer = 1000;
 
 implementation
 
@@ -261,6 +279,10 @@ begin
   St := PStream(Ctx);
   St^.Buf := St^.Buf + Data;
   ConsumeLines(St);
+  { Checked per chunk rather than per event: it is the cheapest place that
+    still reacts within a few hundred bytes of the user pressing Esc. }
+  if Assigned(St^.Agent.ShouldCancel) and St^.Agent.ShouldCancel() then
+    St^.Cancel := True;
   Result := not St^.Cancel;
 end;
 
@@ -336,7 +358,7 @@ begin
 end;
 
 function TAgent.SendOnce(out Blocks: TPartialBlocks; out StopReason: string;
-  out Err: string): Boolean;
+  out Err: string; out Cancelled: Boolean): Boolean;
 var
   St: TStreamState;
   Headers, Body: string;
@@ -346,6 +368,7 @@ begin
   Blocks := nil;
   StopReason := '';
   Err := '';
+  Cancelled := False;
 
   St.Buf := '';
   St.Blocks := nil;
@@ -364,6 +387,19 @@ begin
 
   Body := BuildBody;
   Res := HttpPost(ApiUrl, Headers, Body, @StreamChunk, @St);
+
+  { A user-cancelled transfer is not a failure: whatever was decoded before
+    the abort is kept, so the partial reply stays in the transcript and the
+    conversation remains coherent. }
+  if St.Cancel then
+  begin
+    Cancelled := True;
+    Inc(FTotalIn, St.InTok);
+    Inc(FTotalOut, St.OutTok);
+    Blocks := St.Blocks;
+    StopReason := 'cancelled';
+    Exit(True);
+  end;
 
   if not Res.Ok then
   begin
@@ -556,12 +592,69 @@ begin
   RanTools := RunTools(Blocks);
 end;
 
+{ True for the failures that are worth trying again: the server was busy or
+  the connection dropped.  A 4xx other than 429 means the request itself is
+  wrong, so retrying it would just fail identically. }
+function Transient(const Err: string): Boolean;
+begin
+  Result := (Pos('429', Err) > 0) or (Pos('529', Err) > 0) or
+            (Pos('overloaded', Err) > 0) or (Pos('rate_limit', Err) > 0) or
+            (Pos('HTTP 500', Err) > 0) or (Pos('HTTP 502', Err) > 0) or
+            (Pos('HTTP 503', Err) > 0) or (Pos('HTTP 504', Err) > 0);
+end;
+
+{ Sends one request, retrying transient failures with a widening delay. }
+function TAgent.SendWithRetry(out Blocks: TPartialBlocks;
+  out StopReason, Err: string; out Cancelled: Boolean): Boolean;
+var
+  Attempt, Wait: Integer;
+begin
+  for Attempt := 0 to MaxRetries do
+  begin
+    Result := SendOnce(Blocks, StopReason, Err, Cancelled);
+    if Result or Cancelled then Exit;
+    if not Transient(Err) then Exit;
+    if Attempt = MaxRetries then Exit;
+
+    { 1s, 2s, 4s by default.  Long enough to clear a burst, short enough that
+      the user does not think the program has hung. }
+    Wait := RetryBaseMs shl Attempt;
+    if Assigned(OnNotice) then
+      OnNotice(Format('%s - retrying in %dms (%d of %d)',
+        [Err, Wait, Attempt + 1, MaxRetries]));
+    if not SleepCancellable(Wait) then
+    begin
+      Cancelled := True;
+      Exit(True);
+    end;
+  end;
+end;
+
+{ Waits, but breaks early when the user cancels.  Returns False if cancelled. }
+function TAgent.SleepCancellable(Ms: Integer): Boolean;
+var
+  Waited, Step: Integer;
+begin
+  Step := 50;
+  if Ms < Step then Step := Ms;
+  if Step <= 0 then Exit(not (Assigned(ShouldCancel) and ShouldCancel()));
+  Waited := 0;
+  while Waited < Ms do
+  begin
+    if Assigned(ShouldCancel) and ShouldCancel() then Exit(False);
+    Sleep(Step);
+    Inc(Waited, Step);
+  end;
+  Result := True;
+end;
+
 function TAgent.Send(const UserText: string; out Err: string): Boolean;
 var
   Msg, Arr, B: TJson;
   Blocks: TPartialBlocks;
   StopReason: string;
   Round: Integer;
+  Cancelled: Boolean;
 begin
   Err := '';
   if Trim(UserText) <> '' then
@@ -580,9 +673,19 @@ begin
   Inc(FTurns);
   for Round := 1 to MaxToolRounds do
   begin
-    if not SendOnce(Blocks, StopReason, Err) then
+    if not SendWithRetry(Blocks, StopReason, Err, Cancelled) then
       Exit(False);
     RecordAssistant(Blocks);
+    if Cancelled then
+    begin
+      { Any tool the model asked for before the abort is deliberately not
+        run: the user said stop.  The partial reply is kept so the next turn
+        still reads sensibly, and the unanswered tool_use blocks are dropped
+        from the transcript so the API does not reject the next request. }
+      DropUnansweredToolCalls;
+      if Assigned(OnNotice) then OnNotice('cancelled');
+      Exit(True);
+    end;
     if not RunTools(Blocks) then
       Exit(True);
     { A tool ran, so the model gets another go with the results in hand. }
@@ -591,6 +694,46 @@ begin
   if Assigned(OnNotice) then
     OnNotice(Format('stopped after %d tool rounds', [MaxToolRounds]));
   Result := True;
+end;
+
+{ The API rejects a request whose last assistant message contains a tool_use
+  with no matching tool_result.  After a cancellation that is exactly the
+  state, so those blocks are stripped; if nothing else remains, the message
+  goes too. }
+procedure TAgent.DropUnansweredToolCalls;
+var
+  Last, Content, Keep: TJson;
+  I: Integer;
+begin
+  if FMessages.Count = 0 then Exit;
+  Last := FMessages.Item(FMessages.Count - 1);
+  if Last.Str('role') <> 'assistant' then Exit;
+  Content := Last.Find('content');
+  if Content = nil then Exit;
+
+  Keep := TJson.NewArr;
+  for I := 0 to Content.Count - 1 do
+    if Content.Item(I).Str('type') <> 'tool_use' then
+      Keep.Push(JsonParse(Content.Item(I).ToJson));
+
+  if Keep.Count = Content.Count then
+  begin
+    Keep.Free;
+    Exit;
+  end;
+
+  { Rebuilding the message is simpler than editing it in place, and TJson has
+    no removal operation by design. }
+  FMessages.Drop(FMessages.Count - 1);
+  if Keep.Count > 0 then
+  begin
+    Last := TJson.NewObj;
+    Last.AddStr('role', 'assistant');
+    Last.Add('content', Keep);
+    FMessages.Push(Last);
+  end
+  else
+    Keep.Free;
 end;
 
 end.

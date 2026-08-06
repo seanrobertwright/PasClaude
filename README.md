@@ -59,6 +59,13 @@ contents are appended to the system prompt as binding instructions.
 | `/cost` | turns and tokens used |
 | `/exit` | quit (Ctrl+C also works) |
 
+Pressing `Esc` while a reply is streaming stops it. Whatever arrived is kept,
+any tool the model was about to call is not run, and the conversation stays
+usable for the next question.
+
+Transient failures (429, 529, 5xx) are retried up to three times with a
+widening delay, and the wait is interruptible.
+
 ## Tools
 
 | Tool | Approval | Notes |
@@ -80,7 +87,7 @@ test             :: the three offline suites
 test net         :: also the suite that talks to real servers
 ```
 
-Four suites, 130 assertions, all built with `-gh` so an unfreed block fails the
+Four suites, 167 assertions, all built with `-gh` so an unfreed block fails the
 run - JSON ownership here is manual, so a leak is a defect rather than noise.
 
 * `tests\smoke.lpr` - the JSON parser (escapes, surrogate pairs, malformed
@@ -97,8 +104,10 @@ run - JSON ownership here is manual, so a leak is a defect rather than noise.
   a tool, the tool really runs, its result is fed back, and the model answers:
   two- and three-round turns, parallel tool calls in one message, the round
   limit cutting off a runaway model, a mid-loop transport failure aborting the
-  turn, a denied tool still letting the turn finish, and conversation state
-  persisting across turns and clearing on reset.
+  turn, a denied tool still letting the turn finish, conversation state
+  persisting across turns and clearing on reset, cancellation mid-stream and
+  mid-tool-call, and the retry policy (retried on 529, not on 400, giving up
+  after `MaxRetries`).
 * `tests\net.lpr` - the transport, against real servers and needing no API
   key. TLS, a body that round-trips through an echo service, a response larger
   than one read buffer, aborting mid-transfer, rejection of non-https and
@@ -111,8 +120,13 @@ run - JSON ownership here is manual, so a leak is a defect rather than noise.
 The suites were checked by mutation, not just by passing: reverting the
 `input_json_delta` accumulator to an assignment fails 4 assertions, flipping
 the permission default from deny to allow fails 1, disabling the chunk-callback
-abort fails 2, capping the tool loop at one round fails 2, and dropping the
-transcript copy fails 1.
+abort fails 2, capping the tool loop at one round fails 2, dropping the
+transcript copy fails 1, treating every error as retryable fails 1, and
+disabling the cancelled-tool-call cleanup fails 1.
+
+That last one is why mutation testing earns its keep: the cleanup test passed
+for the wrong reason at first (the cancel fired before any tool block existed,
+so there was nothing to clean up) and only the mutation exposed it.
 
 `uHttp.HttpTransport` is the seam the loop suite uses. It is nil in the shipped
 program, which is asserted by the network suite reaching the real API.
@@ -140,10 +154,10 @@ Details worth knowing if you touch this code:
   results as a user message, and posts again - up to `MaxToolRounds`. A turn
   ends only when the model stops asking for tools. `tests\loop.lpr` runs that
   cycle end to end against scripted responses.
-* **Every tool_use must be answered.** The API rejects the next request if a
-  call is left without a matching `tool_result`, so even a denial produces a
-  result block carrying the refusal - which also lets the model react to it
-  rather than retrying blindly.
+* **Cancellation keeps the transcript legal.** Esc aborts the stream, but the
+  API rejects a request whose assistant message contains a `tool_use` with no
+  matching `tool_result`. Those blocks are stripped on cancel, so the next
+  question still works.
 * **Content blocks are assembled outside the JSON DOM.** They stream as
   start/delta/stop triplets keyed by index, and `TJson` has no setters, so
   `uAgent` accumulates plain strings in an array and builds the message once.
@@ -155,7 +169,9 @@ Details worth knowing if you touch this code:
 * **`WriteConsoleW` fails on a redirected handle,** so `RawWrite` falls back
   to the plain stream. That is what makes `echo /help | pasclaude` work.
 * **Permission defaults to deny.** `RunTool` takes a nil `Ask` in tests and in
-  any non-interactive context, and a nil ask means no.
+  any non-interactive context, and a nil ask means no. Even a denial produces
+  a `tool_result` carrying the refusal, both because the API demands one and
+  because it lets the model react rather than retry blindly.
 * **Thinking blocks carry a signature** that has to be echoed back verbatim
   on the next request, so it is captured from `signature_delta` and stored
   alongside the text.
