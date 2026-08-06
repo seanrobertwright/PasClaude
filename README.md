@@ -76,13 +76,29 @@ or `n`. Read-only tools never ask.
 ## Tests
 
 ```
-fpc -MObjFPC -Scghi -Fusrc -FUbuild\units -obin\smoke.exe tests\smoke.lpr
-bin\smoke.exe
+test             :: builds and runs both suites
 ```
 
-Covers the JSON parser (escapes, surrogate pairs, malformed input, locale-proof
-number formatting) and every tool including the path guard and the deny-by-
-default permission path. The network layer is not covered.
+Two suites, 66 assertions, both built with `-gh` so an unfreed block fails the
+run - JSON ownership here is manual, so a leak is a defect rather than noise.
+
+* `tests\smoke.lpr` - the JSON parser (escapes, surrogate pairs, malformed
+  input, locale-proof number formatting) and every tool, including the path
+  guard and the deny-by-default permission path.
+* `tests\stream.lpr` - recorded server-sent events replayed through the real
+  decoder, delivered in 7- and 13-byte chunks so every line boundary and
+  several JSON escapes are split across chunks. Covers text/thinking/tool
+  blocks, reassembly of `input_json_delta` fragments, mid-stream error events,
+  tolerance of unknown and malformed events, the tool round-trip into the
+  transcript, denied calls still answering their `tool_use_id`, and the shape
+  of the outgoing request body.
+
+The suites were checked by mutation: reverting the `input_json_delta`
+accumulator to an assignment fails 4 assertions, and flipping the permission
+default from deny to allow fails 1. The HTTP transport itself is not covered,
+and neither is a successful live API call - the error path was exercised
+against the real endpoint (a 401 is parsed and reported), but no key was
+available to confirm a complete turn.
 
 ## Design notes
 

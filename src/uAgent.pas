@@ -74,6 +74,19 @@ type
     function TokensOut: Int64;
     function TurnCount: Integer;
     property Model: string read FModel write FModel;
+
+    { Test seam.  Feeds raw response bytes through the same decoder the live
+      stream uses, so the SSE handling can be exercised without a network.
+      Chunks are concatenated as received, which is how a split mid-line or
+      mid-escape gets covered. }
+    function DecodeStream(const Chunks: array of string;
+      out StopReason, Err: string): TPartialBlocks;
+    { Test seam: the transcript as it would be sent. }
+    function Transcript: string;
+    { Test seam: the exact request body that would go on the wire. }
+    function RequestBody: string;
+    { Test seam: run the recorded blocks through the assistant/tool path. }
+    procedure ApplyBlocks(const Blocks: TPartialBlocks; out RanTools: Boolean);
   end;
 
 const
@@ -500,6 +513,47 @@ begin
     Results.Free;
     raise;
   end;
+end;
+
+{ ------------------------------------------------------------ test seams -- }
+
+function TAgent.DecodeStream(const Chunks: array of string;
+  out StopReason, Err: string): TPartialBlocks;
+var
+  St: TStreamState;
+  I: Integer;
+begin
+  St.Buf := '';
+  St.Blocks := nil;
+  St.Agent := Self;
+  St.StopReason := '';
+  St.InTok := 0;
+  St.OutTok := 0;
+  St.ErrText := '';
+  St.Cancel := False;
+  for I := Low(Chunks) to High(Chunks) do
+    StreamChunk(Chunks[I], @St);
+  Inc(FTotalIn, St.InTok);
+  Inc(FTotalOut, St.OutTok);
+  StopReason := St.StopReason;
+  Err := St.ErrText;
+  Result := St.Blocks;
+end;
+
+function TAgent.Transcript: string;
+begin
+  Result := FMessages.ToJson;
+end;
+
+function TAgent.RequestBody: string;
+begin
+  Result := BuildBody;
+end;
+
+procedure TAgent.ApplyBlocks(const Blocks: TPartialBlocks; out RanTools: Boolean);
+begin
+  RecordAssistant(Blocks);
+  RanTools := RunTools(Blocks);
 end;
 
 function TAgent.Send(const UserText: string; out Err: string): Boolean;

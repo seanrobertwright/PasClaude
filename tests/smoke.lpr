@@ -70,7 +70,7 @@ procedure TestTools;
 var
   Dir, Out_: string;
   IsErr: Boolean;
-  J: TJson;
+  J, Sch: TJson;
 begin
   Dir := IncludeTrailingPathDelimiter(GetTempDir) + 'pasclaude-test';
   ForceDirectories(Dir);
@@ -158,7 +158,13 @@ begin
   Out_ := Run('no_such_tool', J, IsErr);
   Check(IsErr, 'an unknown tool is an error');
 
-  Check(ToolsSchema.Count = 6, 'the schema exposes six tools');
+  { The caller owns the schema, so it is freed here rather than leaked. }
+  Sch := ToolsSchema;
+  try
+    Check(Sch.Count = 6, 'the schema exposes six tools');
+  finally
+    Sch.Free;
+  end;
 end;
 
 var
@@ -177,5 +183,7 @@ begin
     WriteLn('all tests passed')
   else
     WriteLn(Fails, ' test(s) failed');
-  Halt(Ord(Fails <> 0));
+  { ExitCode rather than Halt: Halt skips the cleanup of temporaries, which
+    shows up as a phantom leak under -gh. }
+  ExitCode := Ord(Fails <> 0);
 end.
