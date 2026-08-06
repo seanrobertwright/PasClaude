@@ -325,6 +325,21 @@ first's conversation on its first save. The banner had always warned that a
 session existed, but warning happens before the damage and changes nothing.
 The file is now moved aside first.
 
+Asking the same question of the *failure* path found the eighth: a transport
+error mid-loop aborts the turn at a point where tool results have been appended
+and never sent, exactly as the round limit did. The unwind is now one method
+used by both, and `Send` performs it on every exit that can reach that state -
+failure, cancellation and the round limit - rather than relying on the caller.
+Removing it from either call site fails assertions that name the shape
+directly.
+
+Not every hypothesis paid out, which is worth recording too. The saved session
+looked like it might grow without bound, since compaction trims the transcript
+in memory. It does not: compaction runs before the request and the save runs
+after, so the file is written from the trimmed transcript. That is now asserted
+rather than assumed - the file shrinks from 11288 to 2909 bytes across a
+compaction, and resuming does not restore what was discarded.
+
 Two more tests passing for the wrong reason turned up in that suite. Removing
 the CR stripping from the line splitter changed nothing, because a stray `#13`
 on both sides of a diff still compares equal: the counts stayed right while the
@@ -422,3 +437,8 @@ Details worth knowing if you touch this code:
 * **`Halt` skips `finally`.** The console codepage is switched at startup and
   put back by `TermDone`, so every early exit has to call it explicitly or the
   user's terminal is left on UTF-8 after the program is gone.
+* **`Send` owns the transcript's shape.** Three different exits - a transport
+  failure, a cancellation, and the round limit - can each leave tool results
+  the model never saw, or a question nothing answered. Putting the cleanup in
+  the caller only fixed the one path the caller could see; it lives inside
+  `Send` so every exit passes through it.

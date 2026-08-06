@@ -398,6 +398,11 @@ var
   A: TAgent;
   Err: string;
   Ok: Boolean;
+  Path: string;
+  Doc, Msgs: TJson;
+  Shape: string;
+  I: Integer;
+  Good: Boolean;
 begin
   ResetScript;
   uTools.RootDir := SessionDir;
@@ -418,6 +423,49 @@ begin
     Check(CallCount = 1 + MaxRetries + 1,
       Format('the loop retried then stopped, expected %d calls, got %d',
         [1 + MaxRetries + 1, CallCount]));
+
+    { The turn aborted right after RunTools appended a tool_result that was
+      never sent - the same state the round limit produced.  autosave runs
+      after a failed turn too, so whatever is left has to be storable and
+      resumable rather than a transcript the API would refuse. }
+    Path := IncludeTrailingPathDelimiter(SessionDir) + 'midfail.json';
+    Check(A.SaveSession(Path, Err), 'the aborted turn saves: ' + Err);
+
+    { The turn aborted after a tool_result was appended but before it was ever
+      sent, so the transcript ends on a user turn.  Asking again would put a
+      second user turn straight behind it - the same defect the round limit
+      had, reached by the failure path. }
+    ResetScript;
+    FailAfter := -1;
+    FailUntil := 0;
+    SetLength(Replies, 1);
+    Replies[0] := TextReply('answering after the failure');
+    Ok := A.Send('try again', Err);
+    Check(Ok, 'a question after a mid-loop failure works: ' + Err);
+
+    Doc := JsonParse(Requests[0]);
+    try
+      Msgs := Doc.Find('messages');
+      Shape := '';
+      for I := 0 to Msgs.Count - 1 do
+        Shape := Shape + Msgs.Item(I).Str('role') + '/' +
+          Msgs.Item(I).Find('content').Item(0).Str('type') + ' ';
+      Good := True;
+      for I := 1 to Msgs.Count - 1 do
+        if (Msgs.Item(I - 1).Str('role') = 'user') and
+           (Msgs.Item(I).Str('role') = 'user') then Good := False;
+      Check(Good, 'no two user turns in a row after a failed turn: ' + Shape);
+    finally
+      Doc.Free;
+    end;
+  finally
+    A.Free;
+  end;
+
+  A := MakeAgent;
+  try
+    Check(A.LoadSession(Path, Err),
+      'a session saved after a mid-loop failure reloads: ' + Err);
   finally
     A.Free;
   end;

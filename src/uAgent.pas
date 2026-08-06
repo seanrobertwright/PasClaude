@@ -90,6 +90,9 @@ type
     { Drops a trailing user message that never got an answer.  Returns True if
       one was removed. }
     function TrimUnansweredQuestion: Boolean;
+    { Unwinds a turn that stopped with tool results the model never saw, back
+      to a state the next question can legally follow. }
+    procedure UnwindUnsentTail;
 
     { Writes the conversation to Path so a later run can pick it up.  False
       with Err set when it could not be stored. }
@@ -112,6 +115,9 @@ type
       out StopReason, Err: string): TPartialBlocks;
     { Test seam: the transcript as it would be sent. }
     function Transcript: string;
+    { Test seam: append a user turn without sending, so a suite can build a
+      conversation without a transport. }
+    procedure AppendUserText(const S: string);
     { Test seam: the exact request body that would go on the wire. }
     function RequestBody: string;
     { Test seam: run the recorded blocks through the assistant/tool path. }
@@ -1062,33 +1068,43 @@ begin
   Result := True;
 end;
 
-function TAgent.Send(const UserText: string; out Err: string): Boolean;
+procedure TAgent.AppendUserText(const S: string);
 var
   Msg, Arr, B: TJson;
+begin
+  if Trim(S) = '' then Exit;
+  B := TJson.NewObj;
+  B.AddStr('type', 'text');
+  B.AddStr('text', S);
+  Arr := TJson.NewArr;
+  Arr.Push(B);
+  Msg := TJson.NewObj;
+  Msg.AddStr('role', 'user');
+  Msg.Add('content', Arr);
+  FMessages.Push(Msg);
+end;
+
+function TAgent.Send(const UserText: string; out Err: string): Boolean;
+var
   Blocks: TPartialBlocks;
   StopReason: string;
   Round: Integer;
   Cancelled: Boolean;
 begin
   Err := '';
-  if Trim(UserText) <> '' then
-  begin
-    B := TJson.NewObj;
-    B.AddStr('type', 'text');
-    B.AddStr('text', UserText);
-    Arr := TJson.NewArr;
-    Arr.Push(B);
-    Msg := TJson.NewObj;
-    Msg.AddStr('role', 'user');
-    Msg.Add('content', Arr);
-    FMessages.Push(Msg);
-  end;
+  AppendUserText(UserText);
 
   Inc(FTurns);
   for Round := 1 to MaxToolRounds do
   begin
     if not SendWithRetry(Blocks, StopReason, Err, Cancelled) then
+    begin
+      { The turn dies here, possibly with tool results already appended that
+        the model never saw.  Leaving them would make the next question a
+        second user turn in a row, so the tail is unwound before giving up. }
+      UnwindUnsentTail;
       Exit(False);
+    end;
     RecordAssistant(Blocks);
     if Cancelled then
     begin
@@ -1119,22 +1135,29 @@ begin
     tools did would never be seen by the model at all.  Dropping that message
     puts the conversation back to the last assistant turn, which is a state the
     next question can legally follow. }
-  { Unwinding the unsent results also strips the tool_use blocks they answered,
-    which can empty that assistant message and expose the results underneath
-    it, so this repeats - but it must stop while the user's original question
-    is still there, or the turn would erase itself entirely.  One message is
-    always kept for that reason. }
+  UnwindUnsentTail;
+  Result := True;
+end;
+
+{ A turn can stop with tool results already appended that the model never saw:
+  the round limit cuts the loop, and a transport failure aborts it.  Either way
+  the transcript ends on a user turn, so the next question would sit behind it
+  as a second one - and the work those tools did is never seen at all.
+
+  Unwinding the results also strips the tool_use blocks they answered, which
+  can empty that assistant message and expose more results underneath, so this
+  repeats.  It stops while the user's original question is still there, or the
+  turn would erase itself entirely; that question is then trimmed too, being
+  the same unanswered state a failed turn leaves. }
+procedure TAgent.UnwindUnsentTail;
+begin
   while (FMessages.Count > 1) and
         (FMessages.Item(FMessages.Count - 1).Str('role') = 'user') do
   begin
     FMessages.Drop(FMessages.Count - 1);
     DropUnansweredToolCalls;
   end;
-  { What is left may be the user's original question with nothing answering it,
-    which is the same state a failed or cancelled turn produces and is dropped
-    for the same reason: it is about to be saved. }
   TrimUnansweredQuestion;
-  Result := True;
 end;
 
 { The API rejects a request whose last assistant message contains a tool_use

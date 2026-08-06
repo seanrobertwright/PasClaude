@@ -352,7 +352,7 @@ begin
   A := TAgent.Create('k', 'm', 'sys');
   try
     Check(A.Compact(1000) = 0, 'an empty transcript compacts to nothing');
-    A.Send('hello', Err);
+    A.AppendUserText('hello');
     Check(A.Compact(10) = 0, 'a single exchange is never dropped');
     Check(A.MessageCount = 1, 'the only message survives');
   finally
@@ -364,7 +364,7 @@ begin
   try
     for I := 1 to 12 do
     begin
-      A.Send('question ' + IntToStr(I), Err);
+      A.AppendUserText('question ' + IntToStr(I));
       SetLength(Blocks, 1);
       Blocks[0].Kind := bkText;
       Blocks[0].Text := StringOfChar('x', 1000) + ' answer ' + IntToStr(I);
@@ -414,7 +414,7 @@ begin
   try
     for I := 1 to 6 do
     begin
-      A.Send('q' + IntToStr(I), Err);
+      A.AppendUserText('q' + IntToStr(I));
       SetLength(Blocks, 1);
       Blocks[0].Kind := bkText;
       Blocks[0].Text := StringOfChar('z', 500);
@@ -443,7 +443,7 @@ begin
   try
     for I := 1 to 10 do
     begin
-      A.Send('ask ' + IntToStr(I), Err);
+      A.AppendUserText('ask ' + IntToStr(I));
       SetLength(Blocks, 1);
       Blocks[0].Kind := bkToolUse;
       Blocks[0].Id := 'call_' + IntToStr(I);
@@ -480,7 +480,7 @@ begin
   try
     for I := 1 to 8 do
     begin
-      A.Send('q' + IntToStr(I), Err);
+      A.AppendUserText('q' + IntToStr(I));
       SetLength(Blocks, 1);
       Blocks[0].Kind := bkText;
       Blocks[0].Text := StringOfChar('y', 900);
@@ -490,7 +490,7 @@ begin
       A.ApplyBlocks(Blocks, Ran);
     end;
     A.Compact(3000);
-    A.Send('after compaction', Err);
+    A.AppendUserText('after compaction');
     T := A.Transcript;
     Check(Pos('after compaction', T) > 0, 'the next question appends normally');
     Doc := JsonParse(A.RequestBody);
@@ -522,10 +522,14 @@ var
   Ran: Boolean;
   I: Integer;
   Doc: TJson;
+  Before, After_: Integer;
 
   procedure SeedTurn(Ag: TAgent; const Q, R: string);
   begin
-    Ag.Send(Q, Err);
+    { Send is not used here: with no transport it fails, and a failed turn now
+      correctly unwinds the question it could not answer.  The user turn is
+      appended directly so the seeded conversation is the one being tested. }
+    Ag.AppendUserText(Q);
     SetLength(Blocks, 1);
     Blocks[0].Kind := bkText;
     Blocks[0].Text := R;
@@ -561,7 +565,7 @@ begin
     Check(A.Model = 'some-model', 'the model is restored');
     { A resumed conversation must be able to continue, which means the
       restored transcript has to be a legal request body. }
-    A.Send('third question', Err);
+    A.AppendUserText('third question');
     Check(Pos('third question', A.Transcript) > 0, 'the conversation continues');
     Doc := JsonParse(A.RequestBody);
     Check(Doc <> nil, 'a request after resuming is valid JSON');
@@ -579,7 +583,7 @@ begin
     rejects one without the other. }
   A := TAgent.Create('k', 'm', 'sys');
   try
-    A.Send('use a tool', Err);
+    A.AppendUserText('use a tool');
     SetLength(Blocks, 1);
     Blocks[0].Kind := bkToolUse;
     Blocks[0].Id := 'call_1';
@@ -682,10 +686,11 @@ begin
   A := TAgent.Create('k', 'm', 'sys');
   try
     SeedTurn(A, 'answered question', 'an answer');
-    A.Send('question that fails', Err);   { no transport: nothing answers it }
-    Check(A.MessageCount = 3, 'the failed question is in the transcript');
-    Check(A.TrimUnansweredQuestion, 'a trailing user message is trimmed');
-    Check(A.MessageCount = 2, 'and only that one is removed');
+    { No transport, so this turn fails - and Send now unwinds the question it
+      could not answer rather than leaving it for autosave to store. }
+    A.Send('question that fails', Err);
+    Check(A.MessageCount = 2, 'the failed question is not left in the transcript');
+    Check(not A.TrimUnansweredQuestion, 'there is nothing left to trim');
     T := A.Transcript;
     Check(Pos('question that fails', T) = 0, 'the unanswered question is gone');
     Check(Pos('answered question', T) > 0, 'the answered exchange is untouched');
@@ -710,7 +715,7 @@ begin
     exactly the corruption the loader refuses. }
   A := TAgent.Create('k', 'm', 'sys');
   try
-    A.Send('use a tool', Err);
+    A.AppendUserText('use a tool');
     SetLength(Blocks, 1);
     Blocks[0].Kind := bkToolUse;
     Blocks[0].Id := 'call_x';
@@ -820,7 +825,7 @@ begin
     WriteFileText(Path, '{"version":1,"messages":[]}');
     Check(A.LoadSession(Path, Err), 'an empty session loads without complaint');
     Check(A.MessageCount = 0, 'and leaves nothing behind');
-    A.Send('starting over', Err);
+    A.AppendUserText('starting over');
     Check(A.MessageCount = 1, 'a fresh conversation starts from it');
   finally
     A.Free;
@@ -834,7 +839,7 @@ begin
   try
     for I := 1 to 10 do
     begin
-      A.Send('long question ' + IntToStr(I), Err);
+      A.AppendUserText('long question ' + IntToStr(I));
       SetLength(Blocks, 1);
       Blocks[0].Kind := bkToolUse;
       Blocks[0].Id := 'tc_' + IntToStr(I);
@@ -879,6 +884,36 @@ begin
   try
     Check(A.LoadSession(Path, Err), 'the repeatedly-saved file still loads');
     Check(A.MessageCount = 10, 'with every exchange intact');
+  finally
+    A.Free;
+  end;
+
+  { A session file that only ever grows would eventually be a problem of its
+    own: compaction bounds the transcript in memory, so the file written from
+    it has to shrink too, or resuming would restore everything compaction just
+    discarded. }
+  A := TAgent.Create('k', 'm', 'sys');
+  try
+    for I := 1 to 12 do
+      SeedTurn(A, 'question ' + IntToStr(I) + StringOfChar('q', 400),
+                  'answer ' + IntToStr(I) + StringOfChar('a', 400));
+    A.SaveSession(Path, Err);
+    Before := Length(ReadFileText(Path));
+
+    Check(A.Compact(3000) > 0, 'the long conversation compacts');
+    Check(A.SaveSession(Path, Err), 'and saves again');
+    After_ := Length(ReadFileText(Path));
+    Check(After_ < Before,
+      Format('the saved file shrinks with the transcript, %d -> %d',
+        [Before, After_]));
+  finally
+    A.Free;
+  end;
+  A := TAgent.Create('k', 'm', 'sys');
+  try
+    Check(A.LoadSession(Path, Err), 'the compacted file reloads');
+    Check(Pos('question 1' + StringOfChar('q', 400), A.Transcript) = 0,
+      'and resuming does not restore what compaction discarded');
   finally
     A.Free;
   end;
