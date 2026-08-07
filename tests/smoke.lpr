@@ -1741,6 +1741,8 @@ var
   Code: Integer;
   Timed: Boolean;
   Started: QWord;
+  Notes: string;
+  L: TStringList;
   R: TSearchRec;
   Strays: Integer;
 begin
@@ -1788,6 +1790,29 @@ begin
   Check((Code <> 0) and (Code <> 2),
     Format('a nonexistent program exits nonzero but not 2 (%d)', [Code]));
 
+  { RunChild deletes both spool files itself, but that delete is best-effort
+    and the code says so: a child terminated at the output cap can still hold
+    the handle, DeleteFile fails, and nothing retries.  SweepTmp - which
+    LoadHooks runs - is the actual guarantee, and it is the guarantee worth
+    pinning: what must never happen is tmp\ growing without bound across runs,
+    not that one particular call won a race with the scheduler.  Asserting the
+    stronger thing passed on an idle machine and failed right after the suites
+    were compiled, which is a test reporting the load average. }
+  { A stray is planted rather than waited for.  Whether the calls above leave
+    one depends on how busy the machine is, so a test that only checks what
+    they happened to leave asserts nothing on an idle run - it passed with the
+    sweep deleted, which is the definition of a test that is not testing. }
+  L := TStringList.Create;
+  try
+    L.Text := 'left behind by a killed hook';
+    ForceDirectories(HookRoot + PathDelim + '.pasclaude' + PathDelim + 'tmp');
+    L.SaveToFile(HookRoot + PathDelim + '.pasclaude' + PathDelim + 'tmp' +
+      PathDelim + 'hook-stray.out');
+  finally
+    L.Free;
+  end;
+
+  uHooks.LoadHooks(False, Notes);
   Strays := 0;
   if FindFirst(HookRoot + PathDelim + '.pasclaude' + PathDelim + 'tmp' +
        PathDelim + 'hook-*.*', faAnyFile, R) = 0 then
@@ -1797,7 +1822,7 @@ begin
     until FindNext(R) <> 0;
     SysUtils.FindClose(R);
   end;
-  Check(Strays = 0, 'and every call cleaned up both of its temporary files');
+  Check(Strays = 0, 'and the sweep clears every spool file the calls left');
 end;
 
 procedure TestHookConfig;
