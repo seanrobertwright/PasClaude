@@ -5,7 +5,7 @@ program smoke;
 
 {$mode objfpc}{$H+}
 
-uses SysUtils, Classes, uJson, uHttp, uTools, uAgent;
+uses SysUtils, Classes, uJson, uHttp, uTools, uAgent, uRegex;
 
 var
   Fails: Integer = 0;
@@ -64,6 +64,137 @@ function Run(const Name: string; Input: TJson; out IsErr: Boolean): string;
 begin
   Result := uTools.RunTool(Name, Input, nil, IsErr);
   Input.Free;
+end;
+
+{ ------------------------------------------------------------ regex engine -- }
+
+{ uRegex is public API precisely so its behaviour can be pinned without a
+  file, a console or a network anywhere in the picture. }
+
+procedure ReCheck(const Pat, Subj: string; Want: Boolean;
+  CaseSensitive: Boolean = False);
+var
+  R: TRegex;
+  E: string;
+  Verdict: string;
+begin
+  if not TRegex.Compile(Pat, CaseSensitive, R, E) then
+  begin
+    Check(False, Format('/%s/ compiles (got "%s")', [Pat, E]));
+    Exit;
+  end;
+  try
+    if Want then Verdict := 'matches' else Verdict := 'rejects';
+    Check((R.Match(Subj) = rrMatch) = Want,
+      Format('/%s/ %s "%s"', [Pat, Verdict, Subj]));
+  finally
+    R.Free;
+  end;
+end;
+
+procedure ReBad(const Pat, What: string);
+var
+  R: TRegex;
+  E: string;
+  Ok: Boolean;
+begin
+  Ok := not TRegex.Compile(Pat, False, R, E);
+  if not Ok then R.Free;
+  { R must be nil on failure: a half-built object handed back would be both a
+    wrong answer and, under -gh, a leak. }
+  Check(Ok and (E <> '') and (R = nil), What + ' is refused: ' + E);
+end;
+
+procedure TestRegexEngine;
+var
+  R: TRegex;
+  E, Long: string;
+  I: Integer;
+begin
+  { Literals, any-byte, classes and the shorthands. }
+  ReCheck('abc', 'xxabcyy', True);
+  ReCheck('abc', 'ab', False);
+  ReCheck('a.c', 'abc', True);
+  ReCheck('[a-z]+', 'ABC', True);
+  ReCheck('[a-z]+', 'ABC', False, True);
+  ReCheck('[^0-9]', '123', False);
+  ReCheck('[^0-9]', '12a3', True);
+  ReCheck('\d\d', 'a12b', True);
+  ReCheck('\d\d', 'a1b2', False);
+  ReCheck('\D', '123', False);
+  ReCheck('\w+', '   ', False);
+  ReCheck('\W', 'abc_1', False);
+  ReCheck('\s', 'a b', True);
+  ReCheck('\S', '   ', False);
+
+  { Anchors and word boundaries. }
+  ReCheck('^abc', 'abc', True);
+  ReCheck('^abc', 'xabc', False);
+  ReCheck('abc$', 'xabc', True);
+  ReCheck('abc$', 'abcx', False);
+  ReCheck('\bfoo\b', 'a foo b', True);
+  ReCheck('\bfoo\b', 'afoo b', False);
+  ReCheck('\Boo', 'foo', True);
+
+  { Alternation and groups. }
+  ReCheck('cat|dog', 'hotdog', True);
+  ReCheck('cat|dog', 'bird', False);
+  ReCheck('a|b|c', 'zzc', True);
+  ReCheck('(?:ab)+', 'abab', True);
+  ReCheck('(ab)c', 'abc', True);
+
+  { Case folding is compile-time, so it must apply to bare letters and to
+    class ranges alike, and must switch off when asked. }
+  ReCheck('AbC', 'xabcx', True);
+  ReCheck('AbC', 'xabcx', False, True);
+
+  { Counted repeats: the tail-duplication code, and the likeliest place for
+    an off-by-one that nothing else here would catch. }
+  ReCheck('^a{2,4}$', 'a', False);
+  ReCheck('^a{2,4}$', 'aa', True);
+  ReCheck('^a{2,4}$', 'aaaa', True);
+  ReCheck('^a{2,4}$', 'aaaaa', False);
+  ReCheck('^a{2,}$', 'aaaaa', True);
+  ReCheck('^a{2,}$', 'a', False);
+  ReCheck('^(ab){2}$', 'abab', True);
+  ReCheck('^(ab){2}$', 'aba', False);
+  ReCheck('^(a|bb){2,3}$', 'bbabb', True);
+  ReCheck('^(a|bb){2,3}$', 'bbabbb', False);
+  ReCheck('^x{0,3}y$', 'y', True);
+  ReCheck('^x{0,3}y$', 'xxxy', True);
+  ReCheck('^x{0,3}y$', 'xxxxy', False);
+
+  { Bad patterns are reported, not raised and not silently reinterpreted. }
+  ReBad('[a-', 'an unterminated class');
+  ReBad('(a', 'an unterminated group');
+  ReBad('a)', 'a stray close paren');
+  ReBad('a{3,1}', 'a reversed repeat range');
+  ReBad('a{999}', 'a repeat count over the cap');
+  ReBad('\q', 'an unknown escape');
+  ReBad('a\', 'a trailing backslash');
+  ReBad('a|', 'an empty branch');
+  ReBad('(\w{100}){100}', 'a pattern that would compile too large');
+  Long := '';
+  for I := 1 to 5000 do Long := Long + 'a';
+  ReBad(Long, 'a 5000-byte pattern');
+
+  { The budget is the one guard that keeps a hostile pattern from running
+    unbounded inside a tool call nothing can interrupt.  Exhausting it must
+    report rrBudget - "unknown" - and never rrNoMatch. }
+  if TRegex.Compile('z+q', False, R, E) then
+  try
+    R.Budget := 40;
+    Check(R.Match(StringOfChar('z', 200)) = rrBudget,
+      'a spent budget reports exhaustion rather than a clean miss');
+    R.Budget := DefaultRegexBudget;
+    Check(R.Match(StringOfChar('z', 200)) = rrNoMatch,
+      'and the same call with the real budget gives a definite answer');
+    Check(R.ProgramSize > 0, 'the compiled program has instructions');
+  finally
+    R.Free;
+  end
+  else
+    Check(False, 'the budget pattern compiles: ' + E);
 end;
 
 procedure TestTools;
@@ -133,6 +264,48 @@ begin
   J.AddStr('pattern', 'nothing-matches-this-xyzzy');
   Out_ := Run('search', J, IsErr);
   Check(Pos('no matches', Out_) > 0, 'search reports an empty result');
+
+  { Regex is opt-in.  Without the flag a metacharacter is just a character -
+    which is the whole backward-compatibility argument, since "D.P" is the
+    shape of half the identifiers a code search goes looking for. }
+  J := TJson.NewObj;
+  J.AddStr('pattern', 'd.p');
+  Out_ := Run('search', J, IsErr);
+  Check(Pos('b.txt', Out_) = 0, 'a metacharacter stays literal without regex');
+
+  J := TJson.NewObj;
+  J.AddStr('pattern', 'd.p');
+  J.AddBool('regex', True);
+  Out_ := Run('search', J, IsErr);
+  Check((not IsErr) and (Pos('b.txt', Out_) > 0),
+    'and is a pattern with it: ' + Out_);
+
+  J := TJson.NewObj;
+  J.AddStr('pattern', '^zzz\d+$');
+  J.AddBool('regex', True);
+  Out_ := Run('search', J, IsErr);
+  Check((not IsErr) and (Pos('no matches', Out_) > 0),
+    'a regex that matches nothing says so');
+
+  { A bad pattern is a clean tool error, not a crash and not a search for the
+    literal text. }
+  J := TJson.NewObj;
+  J.AddStr('pattern', '[a-');
+  J.AddBool('regex', True);
+  Out_ := Run('search', J, IsErr);
+  Check(IsErr and (Pos('invalid regex', Out_) > 0),
+    'an invalid pattern is a tool error: ' + Out_);
+
+  J := TJson.NewObj;
+  J.AddStr('pattern', 'DUP');
+  J.AddBool('case_sensitive', True);
+  Out_ := Run('search', J, IsErr);
+  Check(Pos('b.txt', Out_) = 0, 'case_sensitive excludes a different case');
+
+  J := TJson.NewObj;
+  J.AddStr('pattern', 'DUP');
+  Out_ := Run('search', J, IsErr);
+  Check(Pos('b.txt', Out_) > 0, 'and the default still folds case');
 
   uTools.AllowAllBash := True;
   J := TJson.NewObj;
@@ -553,6 +726,7 @@ var
   Schema: TJson;
 begin
   TestJson;
+  TestRegexEngine;
   TestTools;
   TestFetch;
   TestBashPrefixes;
@@ -563,6 +737,10 @@ begin
   Schema := ToolsSchema;
   try
     Check(Pos('"input_schema"', Schema.ToJson) > 0, 'the schema serialises');
+    Check(Pos('"integer"', Schema.ToJson) > 0,
+      'and carries the new depth properties');
+    Check(Pos('"case_sensitive"', Schema.ToJson) > 0,
+      'and the search flags');
   finally
     Schema.Free;
   end;

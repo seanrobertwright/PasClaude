@@ -127,10 +127,15 @@ procedure SavePermissions(const Path: string);
 
 implementation
 
-uses Classes, Process, Windows, uHttp;
+uses Classes, Process, Windows, uHttp, uRegex;
 
 const
   MaxReadBytes = 400 * 1024;   { keeps a stray huge file out of the context }
+  { The ceiling on the depth argument of list_dir and search.  The complaint
+    the argument answers is a *fixed* cap, not the existence of one: with no
+    ceiling at all a single list_dir on a node_modules-shaped tree would do
+    unbounded work only for Clip to throw most of the answer away. }
+  MaxWalkDepth = 12;
   MaxOutBytes  = 30 * 1024;    { cap on any single tool result }
   { A fetched page larger than this is cut; the model gets the front, which
     is where documents put what they are about. }
@@ -577,7 +582,10 @@ end;
 
 { ------------------------------------------------------------- directories -- }
 
-function ListDir(const Full: string; Recurse: Boolean): string;
+{ MaxDepth 0 is the old non-recursive listing and 4 the old recursive one:
+  both are now expressed as a depth rather than as a Boolean plus a constant,
+  which is what lets the caller ask for more. }
+function ListDir(const Full: string; MaxDepth: Integer): string;
 var
   RootPrefix: string;
 
@@ -588,7 +596,7 @@ var
     I: Integer;
     RelName: string;
   begin
-    if Depth > 4 then Exit;
+    if Depth > MaxDepth then Exit;
     Dirs := TStringList.Create;
     Files := TStringList.Create;
     try
@@ -619,7 +627,7 @@ var
       for I := 0 to Dirs.Count - 1 do
       begin
         Result := Result + Prefix + Dirs[I] + '\'#10;
-        if Recurse then
+        if Depth < MaxDepth then
           Walk(IncludeTrailingPathDelimiter(Dir) + Dirs[I], Prefix + '  ', Depth + 1);
       end;
       for I := 0 to Files.Count - 1 do
@@ -638,10 +646,43 @@ end;
 
 { ------------------------------------------------------------------ search -- }
 
-function GrepTree(const Root, Pattern, Glob: string): string;
+{ Two engines behind one walker.  UseRegex is opt-in rather than sniffed from
+  the pattern text, because real code searches are full of metacharacters used
+  literally - "Result :=", "array[0]", "foo.bar" - and a "looks like a regex"
+  heuristic would silently reinterpret them with no error anyone could see.
+  Err is non-empty only when the pattern would not compile; the caller turns
+  that into a tool error. }
+function GrepTree(const Root, Pattern, Glob: string;
+  UseRegex, CaseSensitive: Boolean; MaxDepth: Integer;
+  out Err: string): string;
 var
   Hits: Integer;
-  RootPrefix: string;
+  RootPrefix, Needle: string;
+  Rx: TRegex;
+  Truncated: Boolean;
+
+  { The match decision for one line.  A budget exhaustion is not a miss: it
+    means the answer is unknown, so it stops the walk and is reported. }
+  function LineHit(const L: string): Boolean;
+  begin
+    if UseRegex then
+    begin
+      case Rx.Match(L) of
+        rrMatch: Result := True;
+        rrBudget:
+          begin
+            Truncated := True;
+            Result := False;
+          end;
+      else
+        Result := False;
+      end;
+    end
+    else if CaseSensitive then
+      Result := Pos(Needle, L) > 0
+    else
+      Result := Pos(Needle, LowerCase(L)) > 0;
+  end;
 
   function Matches(const Name: string): Boolean;
   begin
@@ -662,13 +703,14 @@ var
   procedure Walk(const Dir: string; Depth: Integer);
   var
     R: TSearchRec;
-    Text, Line: string;
+    { Named apart from the enclosing function's out parameter: Err there is
+      the compile error, and shadowing it here would be a trap. }
+    LText, LErr, Line: string;
     L: TStringList;
     I: Integer;
-    Err: string;
     RelName: string;
   begin
-    if (Depth > 8) or (Hits >= 200) then Exit;
+    if (Depth > MaxDepth) or (Hits >= 200) or Truncated then Exit;
     if FindFirst(IncludeTrailingPathDelimiter(Dir) + '*', faAnyFile, R) = 0 then
     begin
       repeat
@@ -688,38 +730,72 @@ var
         else if Matches(R.Name) and (R.Size < MaxReadBytes) then
         begin
           if IsIgnored(RelName, False) then Continue;
-          if not LoadFileText(IncludeTrailingPathDelimiter(Dir) + R.Name, Text, Err) then
+          if not LoadFileText(IncludeTrailingPathDelimiter(Dir) + R.Name, LText, LErr) then
             Continue;
-          if Pos(LowerCase(Pattern), LowerCase(Text)) = 0 then Continue;
+          { A hit goes straight into a JSON request body, where one bad byte
+            makes the API reject the whole turn.  read_file has hex-dumped
+            binary for exactly this reason since the beginning; search never
+            checked, so a binary file whose name happened to pass the glob
+            could take down the conversation. }
+          if not IsValidUtf8(LText) then Continue;
+          { The whole-file prefilter is what makes a substring search over a
+            big tree cheap.  A regex has no cheap literal to prefilter on, so
+            that path pays per line - bounded by the step budget instead. }
+          if not UseRegex then
+          begin
+            if CaseSensitive then
+            begin
+              if Pos(Needle, LText) = 0 then Continue;
+            end
+            else if Pos(Needle, LowerCase(LText)) = 0 then Continue;
+          end;
           L := TStringList.Create;
           try
-            L.Text := Text;
+            L.Text := LText;
             for I := 0 to L.Count - 1 do
             begin
               Line := L[I];
-              if Pos(LowerCase(Pattern), LowerCase(Line)) > 0 then
+              if LineHit(Line) then
               begin
                 Result := Result + Format('%s:%d: %s'#10,
                   [Rel(IncludeTrailingPathDelimiter(Dir) + R.Name), I + 1, Trim(Line)]);
                 Inc(Hits);
                 if Hits >= 200 then Break;
               end;
+              if Truncated then Break;
             end;
           finally
             L.Free;
           end;
         end;
-      until (FindNext(R) <> 0) or (Hits >= 200);
+      until (FindNext(R) <> 0) or (Hits >= 200) or Truncated;
       SysUtils.FindClose(R);
     end;
   end;
 
 begin
   Result := '';
+  Err := '';
   Hits := 0;
-  RootPrefix := IncludeTrailingPathDelimiter(NormalizeRoot);
-  Walk(Root, 0);
-  if Result = '' then
+  Truncated := False;
+  Rx := nil;
+  if CaseSensitive then Needle := Pattern else Needle := LowerCase(Pattern);
+  if UseRegex and not TRegex.Compile(Pattern, CaseSensitive, Rx, Err) then
+    Exit('');
+  try
+    { One budget for the whole call rather than one per line, so a hostile
+      pattern cannot spend its allowance again on every file in the tree. }
+    if Rx <> nil then Rx.Budget := DefaultRegexBudget;
+    RootPrefix := IncludeTrailingPathDelimiter(NormalizeRoot);
+    Walk(Root, 0);
+  finally
+    Rx.Free;
+  end;
+  { Partial hits are still worth having, so this is a note rather than an
+    error - but the model has to be told the answer is incomplete. }
+  if Truncated then
+    Result := Result + '[search stopped: pattern too expensive]'#10;
+  if Trim(Result) = '' then
     Result := 'no matches';
 end;
 
@@ -1184,14 +1260,37 @@ begin
 
   P := TJson.NewObj;
   P.Add('path', StrProp('Directory, relative to the session root. Default ".".'));
-  P.Add('recursive', BoolProp('Descend into subdirectories (max depth 4).'));
+  P.Add('recursive', BoolProp('Descend into subdirectories (depth 4 unless ' +
+    'depth is given).'));
+  { Hand-built, like the edits and todos arrays: there is no IntProp helper,
+    and one more of those for two call sites earns less than it costs. }
+  P.Add('depth', TJson.NewObj);
+  with P.Find('depth') do
+  begin
+    AddStr('type', 'integer');
+    AddStr('description', 'How many levels to descend, 1-12. Overrides ' +
+      'recursive. Default 4 when recursive, 0 otherwise.');
+  end;
   Result.Push(MakeTool('list_dir', 'List a directory.', P, []));
 
   P := TJson.NewObj;
-  P.Add('pattern', StrProp('Case-insensitive substring to search for.'));
+  P.Add('pattern', StrProp('Text to find. A case-insensitive substring ' +
+    'unless regex is true.'));
   P.Add('glob', StrProp('Optional filename filter, e.g. ".pas" or "test".'));
+  P.Add('regex', BoolProp('Treat pattern as a regular expression: . * + ? ' +
+    'repeat counts, [a-z], \d \w \s \b ^ $ | and (groups). ASCII byte ' +
+    'semantics; no backreferences or lookaround.'));
+  P.Add('case_sensitive', BoolProp('Match case exactly. Default false.'));
+  P.Add('depth', TJson.NewObj);
+  with P.Find('depth') do
+  begin
+    AddStr('type', 'integer');
+    AddStr('description', 'How many directory levels to search, 1-12. ' +
+      'Default 8.');
+  end;
   Result.Push(MakeTool('search',
-    'Search file contents under the session root. Returns path:line: text.',
+    'Search file contents under the session root. Returns path:line: text. ' +
+    'Set regex for pattern syntax.',
     P, ['pattern']));
 
   P := TJson.NewObj;
@@ -1228,6 +1327,22 @@ end;
 
 { --------------------------------------------------------------- execution -- }
 
+{ The effective walk depth for a tool call.  The value arrives as a Double, so
+  it is range-checked before it is rounded: Round(1e300) raises, and a model
+  can send anything.  A silly depth clamps rather than failing the call - a
+  clamp is a more useful answer than a refused tool. }
+function WalkDepth(Input: TJson; DefaultDepth: Integer): Integer;
+var
+  D: Double;
+begin
+  if (Input = nil) or (Input.Find('depth') = nil) then Exit(DefaultDepth);
+  D := Input.Num('depth', DefaultDepth);
+  if D >= MaxWalkDepth then Exit(MaxWalkDepth);
+  { Written as a positive test so a NaN lands here rather than in Round. }
+  if not (D > 1) then Exit(1);
+  Result := Round(D);
+end;
+
 function DescribeTool(const Name: string; Input: TJson): string;
 var
   S: string;
@@ -1241,9 +1356,21 @@ begin
   else if Name = 'edit_file' then
     Result := 'edit ' + Input.Str('path')
   else if Name = 'list_dir' then
-    Result := 'list ' + Input.Str('path', '.')
+  begin
+    Result := 'list ' + Input.Str('path', '.');
+    if Input.Find('depth') <> nil then
+      Result := Result + Format(' (depth %d)', [WalkDepth(Input, 0)]);
+  end
+  { Which engine ran is worth a character in the transcript: /pat/ and "pat"
+    mean different searches, and a user reading the log should not have to
+    guess which one the model asked for. }
   else if Name = 'search' then
-    Result := Format('search "%s"', [Input.Str('pattern')])
+  begin
+    if Input.Bool('regex') then
+      Result := Format('search /%s/', [Input.Str('pattern')])
+    else
+      Result := Format('search "%s"', [Input.Str('pattern')]);
+  end
   else if Name = 'bash' then
   begin
     S := Input.Str('command');
@@ -1572,12 +1699,24 @@ begin
       IsError := True;
       Exit('no such directory: ' + Rel(Full));
     end;
-    Result := Clip(ListDir(Full, Input.Bool('recursive')));
+    { An explicit depth wins; otherwise recursive still means the old 4. }
+    if Input.Bool('recursive') then Code := 4 else Code := 0;
+    Result := Clip(ListDir(Full, WalkDepth(Input, Code)));
   end
 
   else if Name = 'search' then
   begin
-    Result := Clip(GrepTree(NormalizeRoot, Input.Str('pattern'), Input.Str('glob')));
+    { No permission call: search reads and reports, so it stays ungated and
+      nothing new joins the edits class. }
+    Text := GrepTree(NormalizeRoot, Input.Str('pattern'), Input.Str('glob'),
+      Input.Bool('regex'), Input.Bool('case_sensitive'),
+      WalkDepth(Input, 8), Err);
+    if Err <> '' then
+    begin
+      IsError := True;
+      Exit('invalid regex: ' + Err);
+    end;
+    Result := Clip(Text);
   end
 
   else if Name = 'bash' then

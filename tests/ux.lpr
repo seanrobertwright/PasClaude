@@ -1454,6 +1454,74 @@ begin
   Check(not IsIgnored('trace.log', False), 'removing .gitignore clears the rules');
 end;
 
+{ ------------------------------------------------------------- walk depth -- }
+
+{ Defined with the rest of the main-block housekeeping at the foot of the
+  file; this test builds a ten-level tree and has to take it down again. }
+procedure Cleanup(const Dir: string); forward;
+
+{ Both walkers used to stop at a constant - 4 for list_dir, 8 for search - and
+  a tree deeper than that was simply invisible.  The cap is now an argument
+  with a ceiling: the defaults must not have moved, the argument must actually
+  be honoured, and a preposterous value must clamp rather than run away. }
+procedure TestWalkDepth;
+var
+  Input: TJson;
+  Out_, Deep, Deeper, At99: string;
+  IsErr: Boolean;
+begin
+  Deep := IncludeTrailingPathDelimiter(TmpRoot) + 'dp\a\b\c\d\e\';
+  Deeper := Deep + 'f\g\h\i\';
+  WriteFileText(Deep + 'deep.txt', 'six levels down');
+  WriteFileText(Deeper + 'deepest.txt', 'DEPTHMARKER ten levels down');
+
+  Input := TJson.NewObj;
+  Input.AddStr('path', '.');
+  Input.AddBool('recursive', True);
+  Out_ := RunTool('list_dir', Input, nil, IsErr);
+  Input.Free;
+  Check(Pos('deep.txt', Out_) = 0,
+    'the default recursive listing still stops at depth 4');
+
+  Input := TJson.NewObj;
+  Input.AddStr('path', '.');
+  Input.AddNum('depth', 8);
+  Out_ := RunTool('list_dir', Input, nil, IsErr);
+  Input.Free;
+  Check(Pos('deep.txt', Out_) > 0, 'and a depth argument reaches further');
+
+  Input := TJson.NewObj;
+  Input.AddStr('path', '.');
+  Input.AddNum('depth', 99);
+  At99 := RunTool('list_dir', Input, nil, IsErr);
+  Input.Free;
+  Check((not IsErr) and (At99 <> ''), 'an absurd depth still returns');
+
+  Input := TJson.NewObj;
+  Input.AddStr('path', '.');
+  Input.AddNum('depth', 12);
+  Out_ := RunTool('list_dir', Input, nil, IsErr);
+  Input.Free;
+  Check(At99 = Out_, 'and clamps to the ceiling rather than running away');
+
+  Input := TJson.NewObj;
+  Input.AddStr('pattern', 'DEPTHMARKER');
+  Out_ := RunTool('search', Input, nil, IsErr);
+  Input.Free;
+  Check(Pos('deepest.txt', Out_) = 0,
+    'search at its default depth misses a file ten levels down');
+
+  Input := TJson.NewObj;
+  Input.AddStr('pattern', 'DEPTHMARKER');
+  Input.AddNum('depth', 12);
+  Out_ := RunTool('search', Input, nil, IsErr);
+  Input.Free;
+  Check(Pos('deepest.txt', Out_) > 0, 'and finds it when told how deep to go');
+
+  { The later tests list and search this root, so the tree does not stay. }
+  Cleanup(IncludeTrailingPathDelimiter(TmpRoot) + 'dp');
+end;
+
 { --------------------------------------------------------------- markdown -- }
 
 { The renderer's decisions are observable through Emit, so the test captures
@@ -1747,6 +1815,7 @@ begin
     TestMentions;
     TestMultiEdit;
     TestGitignore;
+    TestWalkDepth;
     TestMarkdown;
     TestCtrlC;
     TestHistoryPersistence;

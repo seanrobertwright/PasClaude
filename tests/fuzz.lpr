@@ -390,6 +390,80 @@ begin
   end;
 end;
 
+{ The regex engine is reachable from the model, so every hostile pattern it
+  can be handed has to come back as a message rather than as a hang, a crash,
+  or an exception escaping RunTool. }
+procedure TestHostileRegex;
+var
+  J: TJson;
+  Out_, Pat: string;
+  IsErr: Boolean;
+  I: Integer;
+  Elapsed: QWord;
+
+  procedure BadPattern(const P, What: string);
+  var
+    K: TJson;
+    S: string;
+    E: Boolean;
+  begin
+    K := TJson.NewObj;
+    K.AddStr('pattern', P);
+    K.AddBool('regex', True);
+    S := RunTool('search', K, E);
+    Check(E and (Pos('invalid regex', S) > 0), What + ': ' + Copy(S, 1, 60));
+  end;
+
+begin
+  uTools.RootDir := SessionDir;
+  uTools.AllowAllEdits := True;
+
+  { The pattern every backtracking engine dies on.  Measured on TRegExpr
+    0.987, 27 characters took 17.7 seconds and each further character doubled
+    it, so 60 never returns.  A lockstep simulation cannot behave that way,
+    and this assertion is what says so. }
+  J := TJson.NewObj;
+  J.AddStr('path', 'evil-regex.txt');
+  J.AddStr('content', StringOfChar('a', 60) + 'b'#10);
+  RunTool('write_file', J, IsErr);
+
+  J := TJson.NewObj;
+  J.AddStr('pattern', '(a+)+$');
+  J.AddBool('regex', True);
+  J.AddStr('glob', 'evil-regex');
+  Elapsed := GetTickCount64;
+  Out_ := RunTool('search', J, IsErr);
+  Elapsed := GetTickCount64 - Elapsed;
+  Check(Out_ <> '', 'a nested-quantifier pattern returns at all');
+  Check(Int64(Elapsed) < 2000,
+    Format('and returns promptly, in %d ms', [Int64(Elapsed)]));
+
+  BadPattern('(a', 'an unbalanced group');
+  BadPattern('[a-z', 'an unbalanced class');
+  BadPattern('a\', 'a lone backslash');
+  BadPattern('a|', 'a trailing alternation');
+  BadPattern('\xZZ', '\x without hex digits');
+  BadPattern('a{300}', 'a repeat above the cap');
+  Pat := '';
+  for I := 1 to 200 do Pat := Pat + '(';
+  BadPattern(Pat, '200 nested groups');
+  Pat := '';
+  for I := 1 to 5000 do Pat := Pat + 'a';
+  BadPattern(Pat, 'a 5000-byte pattern');
+
+  { A binary file whose name passes the glob must not put raw bytes into the
+    result: they would go straight into the request body and the API would
+    reject the whole turn. }
+  WriteRaw('binmark.dat', [$FF, $FE, Ord('B'), Ord('I'), Ord('N'), Ord('M'),
+    Ord('A'), Ord('R'), Ord('K'), $FF, $C3, $28]);
+  J := TJson.NewObj;
+  J.AddStr('pattern', 'BINMARK');
+  Out_ := RunTool('search', J, IsErr);
+  Check(IsValidUtf8(Out_), 'search output over a binary tree is valid UTF-8');
+  Check(Pos('binmark.dat', LowerCase(Out_)) = 0,
+    'and the binary file is skipped rather than quoted');
+end;
+
 begin
   TestBinaryFileDoesNotCorruptBody;
   TestNulByteIsEscaped;
@@ -398,6 +472,7 @@ begin
   TestOutputIsBounded;
   TestToolOutputCannotForgeProtocol;
   TestShellOutputIsUtf8;
+  TestHostileRegex;
 
   WriteLn;
   if Fails = 0 then
