@@ -9,10 +9,13 @@ No dependencies beyond the FPC RTL: HTTPS is WinHTTP bound at runtime, JSON is
 a small DOM in `uJson`, and the console is driven through the Win32 API.
 
 ```
-pasclaude 0.1
-  E:\Projects\pascal\pasclaude
+    /    /  \
+   <    /    >     pasclaude v0.1
+    \  /    /      a coding agent in Free Pascal
+
   claude-sonnet-4-5
-  /help for commands, /exit to quit
+  E:\Projects\pascal\pasclaude
+  /help for commands, /exit to quit, Esc stops a reply
 
 > what does uHttp do, and is the timeout long enough for streaming?
   * read src\uHttp.pas
@@ -67,11 +70,13 @@ contents are appended to the system prompt as binding instructions.
 | `/compact` | drop the oldest turns, keep the recent ones |
 | `/compact full` | replace the transcript with a model-written summary |
 | `/diff` | list the files this session has changed |
+| `/jobs` | background commands still running |
 | `/memory` | show the project memory (CLAUDE.md) |
 | `/init` | have the model write a CLAUDE.md for this project |
 | `/rewind` | undo turns: conversation and edited files |
 | `/sessions` | list saved sessions and resume one |
 | `/think [n]` | extended thinking: on, off, or a token budget |
+| `/web [on\|off]` | let the model search the web (off by default) |
 | `/resume` | reload the saved conversation |
 | `/save [name]` | write the conversation now; a name makes a keepable copy |
 | `/cwd` | show the session root |
@@ -277,13 +282,22 @@ the first's conversation on its very first save.
 
 | Tool | Approval | Notes |
 | --- | --- | --- |
-| `read_file` | no | line-numbered, capped at 400 KB, hex dump if not text |
-| `list_dir` | no | skips `.git`, `node_modules`, `.pasclaude` and `.gitignore`d entries, max depth 4 |
-| `search` | no | case-insensitive content search, `*` globs, respects `.gitignore`, capped at 200 hits |
+| `read_file` | no | line-numbered, capped at 400 KB, hex dump if not text; a `.ipynb` comes back as numbered notebook cells instead |
+| `list_dir` | no | skips `.git`, `node_modules`, `.pasclaude` and `.gitignore`d entries; depth 4 when recursive, or a `depth` argument up to 12 |
+| `search` | no | case-insensitive substring or, with `regex`, a bounded regular expression; `*` globs, `case_sensitive` and `depth` arguments, respects `.gitignore`, capped at 200 hits |
 | `write_file` | yes | creates intermediate directories |
 | `edit_file` | yes | one hunk or several at once; all must match or none apply |
-| `bash` | yes | `cmd.exe /C`, output merged, 120 s timeout |
+| `notebook_edit` | yes | replace, insert or delete one cell of a Jupyter notebook; same diff preview and approval as `edit_file` |
+| `bash` | yes | `cmd.exe /C`, output merged, 120 s timeout; `run_in_background` returns a job id instead of waiting |
+| `bash_output` | no | what a background job has printed since the last read, or the list of jobs |
+| `kill_bash` | no | stops a background job and the whole process tree under it |
 | `fetch` | yes | HTTPS GET, capped at 200 KB, own "always" class |
+| `todo_write` | no | the visible task list; display state, touches nothing |
+| `task` | no | hands a self-contained question to a read-only subagent |
+
+A thirteenth, `web_search`, is declared to the API rather than implemented
+here: the search runs on Anthropic's servers, `/web on` is what turns the
+declaration on, and there is no local code for it to call.
 
 At each prompt you can answer `y` (once), `a` (always) or `n`. Read-only
 tools never ask. For the edit tools and fetch, "always" covers the tool
@@ -320,6 +334,146 @@ after it, and a body that is not valid UTF-8 is scrubbed rather than
 hex-dumped: a page in another encoding is still mostly readable text,
 unlike a binary file.
 
+`search` takes a regular expression when asked for one, and the engine is
+hand-written (`src\uRegex.pas`) rather than `uses RegExpr`. The reason is
+worth recording, because the obvious choice is the wrong one. FPC does ship
+TRegExpr and it compiles and links here - that was checked before anything
+was written. It was rejected on one property: TRegExpr 0.987 is a
+backtracker with no step limit, no deadline and no abort hook anywhere in
+its source. Measured on this machine, `(a+)+$` against a run of `a`s took
+109 ms at 20 characters, 1.7 s at 24 and 17.7 s at 27 - a clean doubling per
+character. A tool call runs synchronously with nothing above it holding a
+clock (the 120 s deadline belongs to the shell runner, not the tool layer),
+so one pathological pattern against one ordinary line of code would freeze
+the session with no way out short of killing the process. Nothing bolted on
+from outside fixes that: an input-length cap cannot beat an exponent, a
+watchdog thread cannot interrupt a compute loop, and screening patterns for
+nested quantifiers is a heuristic that misses `(a|a)+` and `a?a?a?...`.
+
+So `uRegex` is a Thompson NFA simulation instead. All live threads advance
+over the line in lockstep, one byte at a time, with a per-position visited
+set that collapses duplicate program counters; the cost is bounded by line
+length times program size, and catastrophic backtracking is not screened
+for - it cannot be expressed. It is small (about 900 lines) only because
+`search` reports whole matched lines and never a slice of one, so it needs
+no capture groups, no leftmost-longest rule and no greedy/lazy distinction.
+On top sits a step budget spent once per search rather than per line; when
+it runs out the tool reports the hits it found plus a note that the search
+was stopped, because "incomplete" is a different answer from "no matches".
+`bin\fuzz.exe` asserts that `(a+)+$` over 60 characters returns in under two
+seconds - the assertion that encodes the whole decision.
+
+Regex is opt-in through `regex: true` rather than detected from the pattern:
+`Result :=`, `array[0]` and `foo.bar` are exactly what code searches look
+like, and auto-switching would silently change what an existing prompt
+means. The syntax is byte-oriented ASCII (`\w` and `\b` are `[A-Za-z0-9_]`,
+bytes at or above $80 match only as literals, no backreferences, no
+lookaround), which is safe because the output is always a whole line, so no
+match can cut a UTF-8 sequence in half. Both tree walkers take a `depth`
+argument now, 1 to 12, clamped rather than refused; their defaults are
+unchanged.
+
+pasclaude reads a `.ipynb` as cells, not as JSON. `read_file` on a notebook
+prints `== cell 0 (code, execution_count 3) ==` headers followed by the
+source verbatim and one summary line per output: `image/png (148.2 KB)`
+rather than the 148 KB itself. That is the whole point - a single
+`display_data` output is routinely megabytes of base64, and dumping it would
+spend the context on data the model cannot use. text/plain reprs are shown
+(truncated), streams and tracebacks are shown with ANSI escapes stripped,
+and everything past 15 lines or 2000 characters per output, or 8 outputs per
+cell, is counted rather than printed.
+
+Editing goes through `notebook_edit(path, cell, edit_mode, source?,
+cell_type?)`, not `edit_file`. Damage from the wrong read default is
+unrecoverable - the base64 is already in the context - so reading had to
+change; editing had to be a separate tool because `edit_file`'s contract is
+substring replacement on file text, and a notebook's text is JSON. Overload
+it and `old_text` means something different depending on the extension,
+while insert and delete have no expression in its schema at all.
+`notebook_edit` asks for approval exactly as `edit_file` does, and its diff
+preview is a diff of the cell view - so what the user approves is what the
+model proposed, in the same words, and base64 cannot reach the prompt.
+
+The file is written back in Jupyter's own layout (one space of indent,
+sorted keys, trailing newline), byte-identical to what nbformat produces:
+round-trip fidelity here means "the user's git diff shows one changed line",
+not "Jupyter still opens it". A notebook someone formatted differently is
+reformatted once on the first edit, which the permission prompt announces.
+One deliberate deviation: nbformat escapes non-ASCII as `\uXXXX` and we emit
+raw UTF-8, so a notebook containing non-ASCII text shows those lines as
+changed after the first edit. Both forms are legal JSON. A source replace
+keeps the cell's outputs and execution count - the user approved "change
+this cell's code", not "throw away the plot it produced" - and the cell view
+labels them, so a later read shows the model they are now stale. Only
+nbformat 4 is supported; a v3 notebook is refused by name rather than
+half-understood, because rewriting one as v4 would silently discard its
+worksheet structure.
+
+Shell commands can outlive the tool call that started them. `bash` takes
+`run_in_background`; setting it returns a job id straight away instead of
+waiting. `bash_output` reads whatever the job has produced since the last
+read, along with whether it is still running and its exit code once it is
+not; called with no job id it lists every job instead. `kill_bash` stops a
+job and everything it started, and hands back the output it had not yet
+given up. `/jobs` shows the same list to the user, because a process started
+on their behalf by a model has to be visible without asking the model about
+it. Foreground commands still time out after 120 seconds; background ones do
+not.
+
+Output goes to a spool file under `.pasclaude\jobs`, not a pipe. An
+anonymous pipe that nobody drains fills and then blocks the writer forever,
+and for a background command "nobody is draining it" is not a risk but the
+definition, so the deadlock would be the normal case rather than the corner.
+The alternatives were a reader thread per job - in a codebase with no
+threading anywhere to model one on - or an overlapped I/O state machine. A
+file cannot fill. The child's stdin is an inherited handle onto `NUL`, so a
+command that reads stdin gets an instant EOF instead of waiting forever for
+a keyboard nobody is at.
+
+Each job also owns a Win32 job object with kill-on-close, so the whole
+process tree dies with pasclaude, including the case where pasclaude dies
+badly: Windows reclaims the handle even when no `finally` block runs. That
+is the only mechanism on Windows that answers "must not be orphaned"
+honestly - `TerminateProcess` on `cmd.exe` leaves the grandchildren, which
+is precisely the shape of `npm run dev`, and `taskkill /T` does nothing at
+all if pasclaude itself is killed. FPC 3.2.2 does not declare the job API,
+so four `kernel32` prototypes are declared in `uTools`.
+
+Polling reads the spool from a per-job byte offset that advances by exactly
+what was returned: no byte twice, no byte skipped. While the job is running
+the chunk is trimmed back to the last newline, so the model never sees half
+a line - and never a multi-byte character split across two reads, which
+would leave both halves invalid with no way to rejoin them. A single line
+longer than the read cap is the exception, handed over cut at the last
+complete character rather than held back forever. A poll is bounded by that
+read cap rather than by `Clip`, because `Clip` would drop bytes the model
+can never ask for again. OEM console output is converted to UTF-8 exactly as
+it is for foreground bash.
+
+A background command faces the same permission gate as a foreground one, and
+the same remembered per-program approval covers both. Backgrounding is a
+question about who waits, not about what runs: a detached `del /s` deletes
+exactly as much as an attached one. The prompt says `[background]` so the
+user can see they are approving a run that outlives the answer.
+`bash_output` and `kill_bash` ask nothing - they can only observe or stop a
+process this session already got permission to start, and refusing a kill is
+a gate that can only ever do harm. Jobs stop at `/clear` (the transcript
+holding their ids is being thrown away, and a job nobody can name is a
+process the user cannot get rid of) and at exit. They deliberately survive
+cancellation: Esc cancels the model's reply, not the user's build. At most
+eight run at once, and a job that writes more than 16 MB is stopped and says
+so.
+
+Three limits are worth stating rather than hiding. A grandchild spawned in
+the microseconds between `CreateProcess` and the job assignment escapes the
+job and would survive `kill_bash`. The 16 MB cap is only enforced when
+something sweeps the table - a launch, a poll, a list - so an unpolled job
+can overrun it until the next tool call, the same shape of limitation the
+foreground 120-second deadline already has. And a job still running at exit
+is stopped by design, so a user who wanted a truly detached server will find
+it gone; that is the deliberate trade against orphaning, which the launch
+message and `/jobs` make visible.
+
 A tool call shows up the moment its block opens in the stream - the name
 first, then the argument JSON echoed as it arrives (capped at 160
 characters) - so a long argument stream, a big `write_file` say, reads as
@@ -352,6 +506,160 @@ believed was there, and it is only computed when someone is actually going to
 be asked - under `/yolo` the work is skipped entirely. A binary file is
 summarised instead of dumped, and an edit whose snippet is missing or
 ambiguous is refused before any prompt appears.
+
+## Web search
+
+Anthropic's web search is a server-side tool: pasclaude declares it and the
+API does the searching. There is no `RunTool` branch, nothing to execute
+locally, and - the part that decides the design - no per-call hook to hang a
+permission prompt on. Since the user can never be asked "may I search for
+this?", the only honest place to put the consent is the declaration itself,
+so the declaration is what the user controls. `/web on` turns it on for the
+session, `/web off` turns it back off, and `--web` does the same for print
+mode, where `Ask` is nil and nothing could be approved interactively anyway.
+It is off by default: with it off the tool is absent from the request body
+entirely, so the model has no way to reach the network and the session pays
+no tokens for a declaration it may not use. It is deliberately not
+persisted, for the same reason `/yolo` is not - a standing file meaning "and
+every future session may reach the internet" is a wider grant than the word
+implied. `fetch` is unchanged and is still the way to read a known URL.
+
+The decoder repair is the interesting half. It assumed every content block
+is text, thinking or `tool_use`; anything else fell into an else branch that
+turned it into an empty text block, which `RecordAssistant` then dropped for
+being blank. A server-side block would therefore have vanished from the
+transcript - breaking the echo the API requires on the next request - while
+the `input_json_delta` carrying its search query accumulated into that text
+block and would have been sent back as assistant prose. Two new block kinds
+fix it: `bkServerToolUse`, which is the local `tool_use` shape under a
+different type string, and `bkResult`, a raw passthrough that captures the
+block's own JSON whole from `content_block_start` and replays it verbatim. A
+block this client never understood is one it cannot correctly rebuild, so it
+is not rebuilt. Making `bkResult` the fallback for every unrecognised type
+fixes `redacted_thinking` and whatever ships next for free.
+
+Whether a subscription OAuth token may declare this tool, and whether the
+dated type string `web_search_20260209` is still current, are things only a
+live server can answer - and a rejected declaration would 400 every turn for
+the rest of the session. So a failure whose message names `web_search` turns
+the tool off, prints a notice, and retries the same round without it. The
+worst case is one wasted request. That converts an unverifiable assumption
+into a bounded, testable degradation, which is also the only form of it a
+suite with no network can cover. A long server-side run ends the turn with
+`pause_turn` rather than `end_turn`, which `Send` treats as "keep going"
+instead of as a finished answer.
+
+Two costs come with it. Search results enter the transcript verbatim and are
+echoed to the model on every later turn, which is a prompt-injection surface
+this codebase did not previously have; default-off limits the exposure but
+does not remove it. And results are not `Clip`ped - they are not `RunTool`
+output - so a verbose result set inflates the transcript and every cached
+turn after it.
+
+## Subagents
+
+The `task` tool hands a self-contained investigation to a nested agent with
+its own conversation and returns its final message as the tool result:
+`task(prompt, agent_type?)`, one at a time, synchronously, inside the
+parent's tool call. The model uses it for the questions that would otherwise
+fill the main transcript with intermediate reading - "which unit owns X",
+"where is Y configured" - and works from the answer instead of from six file
+dumps.
+
+`uTools` sits below `uAgent`, so the tool that spawns an agent cannot know
+what an agent is. That is resolved exactly as the network already is:
+`uTools` declares `TSubagentProc` and `var SubagentRunner: TSubagentProc =
+nil`, and `uAgent`'s `initialization` assigns it. A nil runner means the tool
+is not advertised and, if named anyway, returns a plain error - deny by
+default extended from files to a capability. It is the same shape as
+`uHttp.HttpTransport`, so it introduces no new concept.
+
+A subagent gets `read_file`, `list_dir` and `search`. Nothing else. It runs
+inside a tool call, where the user is being asked nothing and is not even
+looking at a prompt; threading `Ask` down would raise a permission dialog on
+behalf of a conversation the user cannot see, whose question they never
+wrote, with a detail line that is a plausible-looking write request and no
+context. And it would be theatre, because `Permit` short-circuits on
+`AllowAllEdits` and `PermitBash` on a persisted "always" - so under `/yolo`,
+or after a single `a` pressed in some earlier session, a writable subagent
+would write and shell with no prompt at all. Deny-by-default would be
+honoured in letter and defeated in spirit, in exactly the sessions where the
+user had already relaxed their guard. It is enforced twice: `ToolsSchema`
+stops after those three tools when the depth is raised, and `RunTool`
+refuses everything else at the top. The second is the real one, because the
+schema is advice to the model and `RunTool` is the boundary - and it runs
+before any `Permit` call, so a standing grant cannot reach past it.
+
+Read-only is also what answers the shared-state question. `uTools` has six
+module-level blobs two live agents would share, and the honest answer to
+"which must be saved and restored around a subagent" is: none of them. The
+todo list, the changed-file list, the bash prefix table and the rewind
+snapshots are written only by tools a subagent cannot call, and `BeginTurn`
+is host-only, so `/rewind` checkpoints stay keyed to the parent's turn
+numbers. `RootDir` is legitimately shared - same session root, same guard.
+That is a property a reviewer can verify by reading one three-name
+allowlist, where the alternative was trusting six save-and-restore pairs,
+one missed restore being a silently corrupted rewind.
+
+Depth caps at one (`MaxSubagentDepth`), in a counter whose Enter/Leave is
+balanced in a `finally` so an exception cannot leave the parent permanently
+unable to delegate. Two guards, not one: `EnterSubagent` refuses at the cap,
+and `task` is absent from the schema a subagent is sent. Rounds cap at
+twelve (`SubagentMaxRounds`) rather than the parent's twenty-four - it is
+doing one self-contained job and nobody is watching it spend.
+`MaxToolRounds` became the default value of a new per-agent `MaxRounds`
+property rather than a literal in the loop. The subagent's four token
+counters are folded into the parent's whether or not its turn succeeded: a
+failed subagent still spent tokens, and a `/cost` that quietly omits them
+lies in the one direction the user would mind, discovered only on the
+invoice.
+
+Its `OnText`, `OnThinking`, `OnToolArg` and `OnToolUseBegin` stay nil - two
+agents streaming prose to one terminal interleaved is unreadable, and the
+user did not ask the second one anything. `OnToolStart` and `OnNotice`
+forward to the parent's with `-> ` and `subagent: ` prefixes, so there is
+one line per step and the wait is visibly alive. The answer arrives through
+the ordinary tool-result summary; `pasclaude.lpr` needed no per-tool arm.
+
+Cancellation turned up two real defects rather than polish. `CtrlCPressed`
+consumes its flag as it answers, so a subagent polling `ShouldCancel` would
+swallow the user's Esc and leave the parent running; a `ForceCancel` latch
+in `uAgent`, tested first inside a new `WantsCancel` that replaced all three
+poll sites, fixes it, and only a top-level turn clears it, so a subagent's
+own `Send` cannot erase the abort it just caused. Second, a cancel landing
+inside a tool call lets `RunTools` finish and push its results, so the
+transcript ends on a `tool_result` user message the model will never answer
+- and `TrimUnansweredQuestion` rightly refuses to drop a `tool_result`, so
+the next question would be a second user turn in a row and the API would
+reject it. `UnwindCancelledTail` picks the right repair: the full unwind when
+the last message is a user turn, `TrimUnansweredQuestion` otherwise, since
+with a trailing assistant message the unwind loop never runs and a dangling
+`tool_use` would survive. `Send` also checks `WantsCancel` after `RunTools`,
+so a latched abort does not send one more request just to abort it
+mid-stream.
+
+Named types live in `.pasclaude\agents\<name>.md`, the whole file being the
+briefing, mirroring custom slash commands exactly rather than inventing a
+second pattern. The parent's system prompt is deliberately not inherited: it
+carries the project memory and the "writes need approval" guidance, neither
+of which applies to a helper that cannot write and has no user to ask. The
+name is filtered for `\ / : .` and control characters, the same rule
+`ExpandCustomCommand` uses. That filter carries more weight here - agent
+definitions live inside the state directory `SafePath` exists to refuse, so
+this is the one place in `uTools` that opens a file without `SafePath`, the
+path around the name is constructed, and the filter is the whole of the
+guard. It must stay that way deliberately. The contents are UTF-8-validated
+and clipped, because they become a system prompt on a nested request where
+one bad byte loses the call and surfaces only as a mysterious tool failure.
+
+There is no parallelism, and that is a decision rather than a gap. There is
+no threading anywhere in this codebase; `TProcess`, the console hooks,
+`HttpTransport` and every `uTools` blob are process-global, and the depth
+counter is a plain `Integer`. Concurrency would be a rewrite of the
+ownership model for a tool that already returns in seconds. Multiplicity is
+free and already works: the model can emit several `task` blocks in one
+assistant turn and `RunTools` runs them one after another, each Enter/Leave
+balanced.
 
 ## Tests
 
@@ -574,6 +882,71 @@ prompt. It now asserts no carriage return reaches the output. The
 empty-transcript guard was likewise uncovered until a case compacted to a
 one-byte budget, which is the only way to reach it.
 
+This round's five features were tested the same way, each in the suite that
+can see it. `smoke` gained the regex engine driven directly - 47 match
+assertions over literals, classes, anchors, `\b`, alternation, groups, case
+folding and the counted repeats `^a{2,4}$`, `^(ab){2}$`, `^(a|bb){2,3}$`,
+which are the highest-risk code in it - plus 10 malformed patterns that must
+return an error rather than a match, two budget assertions, the job API
+end to end (start, poll, poll again for nothing, kill, clear), and the
+subagent gate: inside a raised depth the schema is exactly three tools and
+`write_file` returns "not available to a subagent" *and* leaves no file on
+disk. `ux` covers the walk depths (a ten-level tree found at `depth: 12`, a
+`depth: 99` clamped to output byte-identical to `depth: 12`), the notebook
+round trip against a fixture written in nbformat's exact layout, and the
+`/jobs` listing. `fuzz` covers the hostile half: `(a+)+$` over 60 characters
+asserted to return in under two seconds, eight malformed patterns, a
+truncated and a 1 MB-output notebook, nine job launches against a limit of
+eight, an OEM-emitting job polled back as UTF-8, and agent-type names that
+walk paths. `loop` covers the subagent's own request body (three tools,
+`task` not among them, the parent's system prompt not inherited), its cost
+folding, its round cap, cancellation across both agents, the `web_search`
+declaration appearing only when asked for, `pause_turn` resuming, and a
+rejected declaration disabling itself after one wasted request. `stream`
+replays a `server_tool_use` block whose JSON is split mid-escape and asserts
+the result block is echoed back byte for byte.
+
+Mutation-checked in the usual form. For search: dropping both budget guards
+in `uRegex` fails 1 assertion, dropping the UTF-8 check in the search walker
+fails 2, emitting one repeat copy too many fails 2, defaulting `regex` to
+true fails 1, and hard-coding either walker's depth back to its old constant
+fails 1 each. Worth knowing before anyone simplifies one away: dropping only
+*one* of the two budget guards fails nothing, because they mask each other.
+For notebooks: dropping the space after `:` in `ToJsonPretty` fails 2,
+removing the `PermitChange` call from the `notebook_edit` branch fails 2,
+rendering output data by value instead of by size fails 4, and an off-by-one
+in `InsertAt`'s shift loop fails 1 and leaks besides - 13 blocks in `smoke`,
+52 in `ux` - because the overwritten child is never freed. For background
+bash: making `bash` ignore `run_in_background` fails 4, moving the
+permission gate below the background fork fails 3, dropping the OEM
+conversion from the spool reader fails 2,
+leaving `ClearJobs` to forget the array without stopping the jobs fails 1,
+and never advancing the poll offset fails 3. For web search: reverting the
+`content_block_start` dispatch to the old `bkText` fallback fails 5,
+removing the delta guard that blanks a truncated raw block fails 2, removing
+`Send`'s `pause_turn` resume fails 2, removing the self-heal call fails 5,
+and keeping `DropUnansweredToolCalls`' test as `type <> 'tool_use'` fails 1.
+For subagents: disabling `RunTool`'s gate fails 3 - and the file the
+subagent was refused actually lands on disk, which is the one that catches
+the real hole - dropping `AbsorbUsage` fails 3, removing the `ForceCancel`
+latch fails 1, leaving `Send`'s bound at the `MaxToolRounds` literal fails 2,
+deleting `if SubDepth > 0 then Exit` from `ToolsSchema` fails 6, and
+removing the agent-type character filter fails 6.
+
+Reviewing that round found one bug in three places: a byte cap applied with
+`Copy`, which cuts a multi-byte character in half. `uNotebook.Shorten` did it
+to an output summary that goes straight to the model, `BackgroundJobList` did
+it to the 57-character command column that `bash_output` returns, and `Clip`
+- the 30 KB cap on every tool result - had always done it. The rule now lives
+once, in `uJson.Utf8Cut`, because `uNotebook` sits below `uTools` and cannot
+reach `IsValidUtf8`, so the bottom unit that already owns UTF-8
+representation is the only legal common home. The same review found
+`ReadJobChunk` returning nothing without advancing its offset when a running
+job's chunk held no newline, so a job printing one line longer than the read
+cap would repeat that nothing forever; a full buffer with no newline is now
+handed over, cut at the last complete character. All four are regression-
+tested and all four tests fail without the fix.
+
 `uHttp.HttpTransport` is the seam the loop suite uses. It is nil in the shipped
 program, which is asserted by the network suite reaching the real API.
 
@@ -603,6 +976,8 @@ transcript's *shape*; that is why the structural rules are enforced in
 | `uHttp` | WinHTTP POST with the body delivered in chunks |
 | `uTerm` | UTF-8 console output, colour, line editor |
 | `uDiff` | line diff used to preview a change before it is approved |
+| `uRegex` | NFA regex: compile a pattern, match a line, spend a budget |
+| `uNotebook` | `.ipynb` cell view, cell edits, nbformat's exact layout |
 | `uTools` | the tool implementations, path guard, permission gate |
 | `uAgent` | request building, SSE decoding, the tool loop |
 | `pasclaude.lpr` | REPL, slash commands, rendering |
@@ -674,6 +1049,43 @@ Details worth knowing if you touch this code:
 * **`Halt` skips `finally`.** The console codepage is switched at startup and
   put back by `TermDone`, so every early exit has to call it explicitly or the
   user's terminal is left on UTF-8 after the program is gone.
+* **A byte cap is not a character cap.** Every place that truncates text
+  bound for the model - `Clip`, the notebook output summary, the job
+  listing's command column - goes through `uJson.Utf8Cut`, which backs up to
+  a character boundary. A plain `Copy` can leave a lead byte with no
+  continuation, and one such byte makes the API reject the whole request.
+* **The regex engine may not backtrack.** `uRegex` is an NFA simulation
+  because a tool call has no clock above it: nothing in `uTools` can
+  interrupt a compute loop, so a pattern's cost has to be bounded by
+  construction rather than watched. Any change that introduces
+  backreferences or lookaround reintroduces the exponent that the whole unit
+  exists to avoid.
+* **`uJson` values are mutable now, by convention only.** `SetAt` and
+  `InsertAt` were added so `notebook_edit` can change one cell without
+  cloning a document whose megabytes are exactly what it is trying to
+  preserve. The DOM was already structurally mutable through `Take`/`Drop`;
+  this is the missing third operation. Ownership rules are unchanged - the
+  parent owns its children, and `SetAt` frees the value it replaces.
+* **A background job's output goes to a file, never a pipe.** An undrained
+  anonymous pipe blocks its writer forever, and for a detached command
+  undrained is the definition rather than the risk. The per-job read offset
+  must advance by exactly what was handed back: repeat it and the model sees
+  the same output twice, skip it and those bytes are gone for good.
+* **A subagent's toolset is enforced in `RunTool`, not in the schema.** The
+  schema is advice to a model; `RunTool` is the boundary, and the check sits
+  above every `Permit` call so a `/yolo` session or a persisted "always"
+  cannot reach past it. The read-only rule is also what makes it safe for
+  two agents to share `uTools`' module-level state, so widening it is not a
+  local change.
+* **`ForceCancel` is a latch, not a poll.** `CtrlCPressed` consumes its flag
+  as it answers, so whichever agent asks first eats the user's Esc. Every
+  cancellation check goes through `WantsCancel`, which tests the latch
+  first, and only a top-level turn clears it.
+* **A server-side content block is echoed verbatim.** `bkResult` stores the
+  block's own JSON from `content_block_start` and replays it unchanged,
+  because a block this client does not understand is one it cannot correctly
+  rebuild - and it is the fallback for every unrecognised type, so the next
+  one the API ships costs nothing.
 * **`Send` owns the transcript's shape.** Three different exits - a transport
   failure, a cancellation, and the round limit - can each leave tool results
   the model never saw, or a question nothing answered. Putting the cleanup in

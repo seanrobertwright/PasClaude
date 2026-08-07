@@ -1,15 +1,17 @@
 # Claude Code features not yet in pasclaude
 
 pasclaude already covers a lot of the core experience: streaming chat with
-markdown rendering, eight tools (read_file, write_file, edit_file, list_dir,
-search, bash, fetch, todo_write) behind a diff-previewing permission gate,
-per-program bash approval, CLAUDE.md / AGENTS.md / .pasclaude.md project
-instructions, `@path` file mentions, tab completion, persistent history,
-session save/resume with validation, automatic context trimming plus
-token-triggered summarizing compaction, prompt caching with cost counters,
-retry with Retry-After, extended thinking, `.gitignore`-aware
-listing/search, git status in the system prompt, and reuse of Claude Code's
-or Jcode's OAuth credentials.
+markdown rendering, twelve tools (read_file, write_file, edit_file,
+notebook_edit, list_dir, search, bash, bash_output, kill_bash, fetch,
+todo_write, task) behind a diff-previewing permission gate, per-program bash
+approval, an opt-in server-side web_search, regex search and notebook-aware
+read/edit, background shell jobs, read-only subagents, CLAUDE.md /
+AGENTS.md / .pasclaude.md project instructions, `@path` file mentions, tab
+completion, persistent history, session save/resume with validation,
+automatic context trimming plus token-triggered summarizing compaction,
+prompt caching with cost counters, retry with Retry-After, extended
+thinking, `.gitignore`-aware listing/search, git status in the system
+prompt, and reuse of Claude Code's or Jcode's OAuth credentials.
 
 Checked items have been built since this list was compiled; the strikethrough
 text preserves what was missing at the time. Unchecked items remain open.
@@ -22,18 +24,53 @@ text preserves what was missing at the time. Unchecked items remain open.
   transcript and hands back its final message; named types live in
   `.pasclaude\agents\<name>.md`. One level deep, twelve tool rounds, no
   parallelism.*
-- [ ] **Web search** — `fetch` does an HTTPS GET of a known URL; there is no
-  WebSearch tool.
+- [x] ~~**Web search** — `fetch` does an HTTPS GET of a known URL; there is
+  no WebSearch tool.~~
+  *Built: the server-side `web_search` tool, declared to the API only when
+  `/web on` or `--web` says so. The API runs the search; the decoder
+  round-trips `server_tool_use` and `web_search_tool_result` blocks and
+  resumes on `pause_turn`, and a declaration the server rejects disables
+  itself after one wasted request. Off by default and never persisted.
+  Still missing: no per-query prompt is possible (there is no local call to
+  gate), and results are not clipped, so a verbose result set stays in the
+  transcript and is echoed on every later turn.*
 - [x] ~~**Todo tracking** — no TodoWrite/task-list tool for plan visibility
   on multi-step work.~~
   *Built: the `todo_write` tool maintains a task list rendered live in the
   terminal (`[x]` green, `[~]` yellow, `[ ]` grey).*
-- [ ] **Background bash** — shell commands are synchronous with a 120 s
-  timeout; no run-in-background, output polling, or kill.
-- [ ] **Notebook editing** — no Jupyter (`.ipynb`) aware read/edit.
-- [ ] **Regex search** — `search` does case-insensitive substrings and `*`
+- [x] ~~**Background bash** — shell commands are synchronous with a 120 s
+  timeout; no run-in-background, output polling, or kill.~~
+  *Built: `run_in_background` on the bash tool, `bash_output` to poll,
+  `kill_bash` to stop; output spooled to a file under `.pasclaude\jobs`
+  rather than a pipe; a Win32 job object per job so the tree dies with
+  pasclaude; the same per-program approval as foreground bash; `/jobs` to
+  see what is running. At most eight at once, 16 MB of output each. Still
+  missing: a job left running at exit is stopped by design, so there is no
+  truly detached server; the 16 MB cap is only enforced when something
+  sweeps the table, so an unpolled job can overrun it until the next tool
+  call; and a grandchild spawned in the moment between `CreateProcess` and
+  the job assignment escapes `kill_bash`.*
+- [x] ~~**Notebook editing** — no Jupyter (`.ipynb`) aware read/edit.~~
+  *Built: `read_file` renders a `.ipynb` as numbered cells with outputs
+  summarised by mime type and size rather than dumped; `notebook_edit`
+  replaces, inserts or deletes a cell through `edit_file`'s permission gate
+  and diff preview. Writes back in nbformat's exact layout, so ids,
+  execution counts and outputs survive a round trip untouched. Still
+  missing: nbformat 4 only — a v3 notebook is refused rather than upgraded —
+  and non-ASCII text is written as raw UTF-8 where nbformat escapes it, so
+  such lines show as changed once on the first edit.*
+- [x] ~~**Regex search** — `search` does case-insensitive substrings and `*`
   globs, not the full regex Grep of Claude Code; `list_dir` is capped at
-  depth 4.
+  depth 4.~~
+  *Built: `search` takes `regex`, `case_sensitive` and `depth`; `list_dir`
+  takes `depth` (1-12, defaults unchanged). The engine is an NFA simulation
+  in `uRegex`, not FPC's TRegExpr, so a pattern like `(a+)+` cannot hang the
+  session. Still missing, and deliberately: no capture groups reported, no
+  backreferences, no lookaround — `search` returns whole matching lines, not
+  slices, which is what lets the engine stay bounded. Quantifiers count
+  bytes rather than characters, so `.{3}` matches three bytes of a UTF-8
+  sequence. And the regex path has no literal to prefilter on, so it drops
+  the substring prefilter and is measurably slower over a large tree.*
 
 ## Extensibility
 
@@ -158,6 +195,28 @@ text preserves what was missing at the time. Unchecked items remain open.
   and Esc aborts both agents. Named types are markdown files under
   `.pasclaude\agents\`, exactly as slash commands are under
   `.pasclaude\commands\`.
+- **Regex search and walk depth** — `search` takes `regex`,
+  `case_sensitive` and `depth`; `list_dir` takes `depth` (1-12, defaults
+  unchanged). The engine is an NFA simulation in `uRegex`, not FPC's
+  TRegExpr, so a pattern like `(a+)+` cannot hang the session. Whole
+  matching lines only, ASCII byte semantics, no backreferences or
+  lookaround.
+- **Notebook editing** — `read_file` renders a `.ipynb` as numbered cells
+  with each output summarised by mime type and size; `notebook_edit`
+  replaces, inserts or deletes one cell through `edit_file`'s permission
+  gate and diff preview, writing the file back in nbformat's exact layout.
+  (nbformat 4 only.)
+- **Background bash** — `run_in_background` on the bash tool, `bash_output`
+  to poll, `kill_bash` to stop; output spooled to a file under
+  `.pasclaude\jobs` rather than a pipe; a Win32 job object per job so the
+  process tree dies with pasclaude; the same per-program approval as
+  foreground bash; `/jobs` to see what is running. (Jobs are stopped at
+  exit, so nothing is truly detached.)
+- **Web search** — the server-side `web_search` tool, declared only when
+  `/web on` or `--web` says so; the API runs the search, the decoder
+  round-trips `server_tool_use` and `web_search_tool_result` blocks, and a
+  rejected declaration disables itself after one wasted request. `fetch` is
+  unchanged and still the way to read a known URL.
 
 *Compiled from `README.md` and the `src/` units at
 `E:\Projects\pascal\pasclaude`, compared against the public Claude Code
