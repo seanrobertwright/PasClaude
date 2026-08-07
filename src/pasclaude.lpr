@@ -33,6 +33,10 @@ var
   { What the banner says about how the session authenticates; '' for a
     plain API key, which is the unremarkable case. }
   BannerAuth: string = '';
+  { True once /yolo ran.  The permissions save skips these sessions
+    wholesale, because yolo's blanket flags and real per-answer approvals
+    are the same variables, and only the latter deserve to persist. }
+  YoloSession: Boolean = False;
   { Bytes of tool-argument JSON already echoed for the current tool call;
     the display caps what it shows, the model still gets everything. }
   ToolArgShown: Integer = 0;
@@ -127,7 +131,26 @@ var
   I, Show: Integer;
   Line: string;
   W: Integer;
+  Todos: TStringArray;
 begin
+  { The todo list renders as the list itself, states coloured, not as a
+    tool-output summary: the list is the display. }
+  if Name = 'todo_write' then
+  begin
+    Todos := uTools.CurrentTodos;
+    for I := 0 to High(Todos) do
+    begin
+      Line := Todos[I];
+      if Copy(Line, 1, 3) = '[x]' then
+        EmitCLn(clGreen, '    ' + Line)
+      else if Copy(Line, 1, 3) = '[~]' then
+        EmitCLn(clYellow, '    ' + Line)
+      else
+        EmitCLn(clGrey, '    ' + Line);
+    end;
+    AtLineStart := True;
+    Exit;
+  end;
   W := TermWidth - 8;
   if W < 20 then W := 20;
   L := TStringList.Create;
@@ -170,9 +193,9 @@ end;
 { ------------------------------------------------------------- completion -- }
 
 const
-  SlashCommands: array[0..11] of string = (
-    '/help', '/clear', '/compact', '/diff', '/think', '/resume', '/save',
-    '/cwd', '/model', '/yolo', '/cost', '/exit');
+  SlashCommands: array[0..13] of string = (
+    '/help', '/clear', '/compact', '/diff', '/memory', '/init', '/think',
+    '/resume', '/save', '/cwd', '/model', '/yolo', '/cost', '/exit');
 
 { Candidates for the token being completed: slash commands when the token
   opens the line with a slash, file and directory names under the session
@@ -405,6 +428,8 @@ begin
   EmitCLn(clGrey,   '  /compact       drop the oldest turns, keep the recent ones');
   EmitCLn(clGrey,   '  /compact full  replace the transcript with a model-written summary');
   EmitCLn(clGrey,   '  /diff          list the files this session has changed');
+  EmitCLn(clGrey,   '  /memory        show the project memory (CLAUDE.md)');
+  EmitCLn(clGrey,   '  /init          have the model write a CLAUDE.md for this project');
   EmitCLn(clGrey,   '  /think [n]     extended thinking: on, off, or a token budget');
   EmitCLn(clGrey,   '  /resume        reload the saved conversation');
   EmitCLn(clGrey,   '  /save          write the conversation now');
@@ -424,27 +449,128 @@ begin
     PathDelim + 'history.txt';
 end;
 
-{ A Claude subscription can stand in for an API key: Claude Code stores its
-  OAuth token in ~\.claude\.credentials.json, and the messages API accepts
-  it as a Bearer.  Read-only - refreshing the token is Claude Code's job,
-  and this program must never write into another program's state.  Returns
-  '' when there is no usable token, with Why saying what was found. }
-function SubscriptionToken(out Why: string): string;
+{ Standing approvals, beside the session and the history. }
+function PermissionsPath: string;
+begin
+  Result := IncludeTrailingPathDelimiter(uTools.RootDir) + SessionDir +
+    PathDelim + 'permissions.json';
+end;
+
+{ The project memory file.  CLAUDE.md is preferred when it exists because
+  that is where users of Claude Code already keep this; otherwise whichever
+  instruction file the project has; otherwise CLAUDE.md gets created. }
+function MemoryPath: string;
+var
+  Names: array[0..2] of string = ('CLAUDE.md', 'AGENTS.md', '.pasclaude.md');
+  I: Integer;
+begin
+  for I := 0 to High(Names) do
+  begin
+    Result := IncludeTrailingPathDelimiter(uTools.RootDir) + Names[I];
+    if FileExists(Result) then Exit;
+  end;
+  Result := IncludeTrailingPathDelimiter(uTools.RootDir) + 'CLAUDE.md';
+end;
+
+{ Appends one remembered line to the project memory.  The note lands under
+  a Notes heading so hand-written instructions above it stay untouched.
+  This is the # shortcut: fact in, file grows, next session knows it. }
+procedure RememberNote(const Note: string);
 var
   Path, Text: string;
-  F: TFileStream;
-  Root, OAuth: TJson;
-  ExpiresMs, NowMs: Int64;
+  L: TStringList;
 begin
-  Result := '';
-  Why := '';
-  Path := IncludeTrailingPathDelimiter(GetEnvironmentVariable('USERPROFILE')) +
-    '.claude' + PathDelim + '.credentials.json';
+  Path := MemoryPath;
+  L := TStringList.Create;
+  try
+    if FileExists(Path) then
+    try
+      L.LoadFromFile(Path);
+    except
+      on E: Exception do
+      begin
+        EmitCLn(clRed, '  could not read ' + ExtractFileName(Path) + ': ' + E.Message);
+        Exit;
+      end;
+    end;
+    Text := L.Text;
+    if Pos('## Notes', Text) = 0 then
+    begin
+      if (Text <> '') and (Copy(Text, Length(Text), 1) <> #10) then
+        L.Add('');
+      if Text = '' then
+        L.Add('# Project notes')
+      else
+        L.Add('');
+      L.Add('## Notes');
+    end;
+    L.Add('- ' + Note);
+    try
+      L.SaveToFile(Path);
+      EmitCLn(clGrey, '  remembered in ' + ExtractFileName(Path));
+      EmitCLn(clGrey, '  (takes effect next session; project instructions load at startup)');
+    except
+      on E: Exception do
+        EmitCLn(clRed, '  could not write ' + ExtractFileName(Path) + ': ' + E.Message);
+    end;
+  finally
+    L.Free;
+  end;
+end;
+
+{ Shows the memory file, numbered, so /memory answers "what does this
+  project tell the agent?" without opening an editor. }
+procedure ShowMemory;
+var
+  Path: string;
+  L: TStringList;
+  I: Integer;
+begin
+  Path := MemoryPath;
   if not FileExists(Path) then
   begin
-    Why := 'no Claude Code credentials found';
+    EmitCLn(clGrey, '  no project memory yet (# a note, or /init, creates ' +
+      ExtractFileName(Path) + ')');
     Exit;
   end;
+  EmitCLn(clBright, '  ' + ExtractFileName(Path) + ':');
+  L := TStringList.Create;
+  try
+    try
+      L.LoadFromFile(Path);
+    except
+      on E: Exception do
+      begin
+        EmitCLn(clRed, '  could not read it: ' + E.Message);
+        Exit;
+      end;
+    end;
+    for I := 0 to L.Count - 1 do
+      EmitCLn(clGrey, Format('  %3d  %s', [I + 1, L[I]]));
+  finally
+    L.Free;
+  end;
+end;
+
+{ A Claude subscription can stand in for an API key.  Two programs on this
+  machine may hold its OAuth token: Claude Code (~\.claude\.credentials.json)
+  and Jcode (~\.jcode\auth.json).  Whichever has a live token wins; both
+  files are read-only here - refreshing is their owner's job, and this
+  program must never write into another program's state.  Returns '' when
+  no usable token exists anywhere, with Why saying what was found. }
+
+function NowUnixMs: Int64;
+begin
+  Result := Round((LocalTimeToUniversal(Now) - EncodeDate(1970, 1, 1)) * MSecsPerDay);
+end;
+
+function ReadFileText(const Path: string; out Text: string): Boolean;
+var
+  F: TFileStream;
+begin
+  Result := False;
+  Text := '';
+  if not FileExists(Path) then Exit;
   try
     F := TFileStream.Create(Path, fmOpenRead or fmShareDenyNone);
     try
@@ -453,43 +579,111 @@ begin
     finally
       F.Free;
     end;
+    Result := True;
   except
-    on E: Exception do
-    begin
-      Why := 'credentials unreadable: ' + E.Message;
-      Exit;
-    end;
+    Result := False;
   end;
+end;
+
+{ Claude Code's file: {"claudeAiOauth":{"accessToken","expiresAt",...}}. }
+function TokenFromClaudeCode(out Why: string): string;
+var
+  Text: string;
+  Root, OAuth: TJson;
+  ExpiresMs: Int64;
+begin
+  Result := '';
+  Why := 'no Claude Code credentials';
+  if not ReadFileText(IncludeTrailingPathDelimiter(
+    GetEnvironmentVariable('USERPROFILE')) + '.claude' + PathDelim +
+    '.credentials.json', Text) then Exit;
   Root := JsonParse(Text);
   if Root = nil then
   begin
-    Why := 'credentials are not valid JSON';
+    Why := 'Claude Code credentials are not valid JSON';
     Exit;
   end;
   try
     OAuth := Root.Find('claudeAiOauth');
     if OAuth = nil then
     begin
-      Why := 'no OAuth entry in the credentials';
+      Why := 'no OAuth entry in the Claude Code credentials';
       Exit;
     end;
-    { An expired token would fail every request with a 401; saying so up
-      front beats a session that mysteriously cannot talk.  Refreshing it is
-      one "claude" run away. }
     ExpiresMs := Round(OAuth.Num('expiresAt', 0));
-    NowMs := Round((LocalTimeToUniversal(Now) - EncodeDate(1970, 1, 1)) * MSecsPerDay);
-    if (ExpiresMs > 0) and (NowMs > ExpiresMs) then
+    if (ExpiresMs > 0) and (NowUnixMs > ExpiresMs) then
     begin
-      Why := 'the subscription token has expired; run claude once to refresh it';
+      Why := 'the Claude Code token has expired';
       Exit;
     end;
     Result := OAuth.Str('accessToken');
-    if Result = '' then
-      Why := 'the credentials carry no access token';
+    if Result = '' then Why := 'the Claude Code credentials hold no token';
   finally
     Root.Free;
   end;
 end;
+
+{ Jcode's file: {"anthropic_accounts":[{"access","expires",...}]}. }
+function TokenFromJcode(out Why: string): string;
+var
+  Text: string;
+  Root, Accts, A: TJson;
+  I: Integer;
+  ExpiresMs: Int64;
+begin
+  Result := '';
+  Why := 'no Jcode credentials';
+  if not ReadFileText(IncludeTrailingPathDelimiter(
+    GetEnvironmentVariable('USERPROFILE')) + '.jcode' + PathDelim +
+    'auth.json', Text) then Exit;
+  Root := JsonParse(Text);
+  if Root = nil then
+  begin
+    Why := 'Jcode credentials are not valid JSON';
+    Exit;
+  end;
+  try
+    Accts := Root.Find('anthropic_accounts');
+    if (Accts = nil) or (Accts.Kind <> jkArr) or (Accts.Count = 0) then
+    begin
+      Why := 'no accounts in the Jcode credentials';
+      Exit;
+    end;
+    { The first account with a live token; expired ones are skipped rather
+      than reported, since a later account may still work. }
+    for I := 0 to Accts.Count - 1 do
+    begin
+      A := Accts.Item(I);
+      if A.Str('access') = '' then Continue;
+      ExpiresMs := Round(A.Num('expires', 0));
+      if (ExpiresMs > 0) and (NowUnixMs > ExpiresMs) then Continue;
+      Exit(A.Str('access'));
+    end;
+    Why := 'every Jcode token has expired';
+  finally
+    Root.Free;
+  end;
+end;
+
+function SubscriptionToken(out Why: string): string;
+var
+  WhyCc, WhyJc: string;
+begin
+  Result := TokenFromClaudeCode(WhyCc);
+  if Result <> '' then
+  begin
+    Why := '';
+    Exit;
+  end;
+  Result := TokenFromJcode(WhyJc);
+  if Result <> '' then
+  begin
+    Why := '';
+    Exit;
+  end;
+  Why := WhyCc + '; ' + WhyJc;
+end;
+
 
 { What this session changed.  git diff --stat is the richer answer when
   there is a repository - it also sees compiler output and hand edits - so
@@ -621,6 +815,7 @@ begin
   begin
     Agent.Reset;
     uTools.ClearChangedFiles;
+    uTools.ClearTodos;
     { The saved copy has to go too.  Otherwise "cleared" means only "cleared
       until you resume", and a user who cleared something they did not want
       kept would find it again on the next run. }
@@ -677,6 +872,36 @@ begin
       session's own list is the fallback. }
     ShowDiff;
   end
+  else if Cmd = '/memory' then
+    ShowMemory
+  else if Cmd = '/init' then
+  begin
+    if FileExists(MemoryPath) then
+      EmitCLn(clYellow, '  ' + ExtractFileName(MemoryPath) +
+        ' already exists; /memory shows it, # adds to it')
+    else
+    begin
+      { The model writes it: it can read the project first, which is the
+        whole point - a template would know nothing this directory did not
+        already say.  An ordinary turn, so the write shows its diff and
+        asks like any other. }
+      AtLineStart := True;
+      MdReset;
+      if not Agent.Send(
+        'Explore this project briefly (list_dir, key files) and then use ' +
+        'write_file to create CLAUDE.md in the project root: a concise ' +
+        'instruction file for AI coding agents working here. Include: what ' +
+        'the project is, how to build and test it, the layout, and any ' +
+        'conventions you can see in the code. Keep it under 60 lines. ' +
+        'Do not invent rules the code does not show.', Err) then
+      begin
+        NeedNewLine;
+        EmitCLn(clRed, '  ' + Err);
+      end;
+      MdFinish;
+      AtLineStart := True;
+    end;
+  end
   else if Cmd = '/think' then
   begin
     if (Arg = '') or (Arg = 'on') then
@@ -732,6 +957,12 @@ begin
   begin
     uTools.AllowAllEdits := True;
     uTools.AllowAllBash := True;
+    uTools.AllowAllFetch := True;
+    YoloSession := True;
+    { Deliberately not persisted: /yolo is "I trust this session", and a
+      standing file that quietly means "and every future one" is a wider
+      grant than the word implied.  The per-answer approvals do persist,
+      because each named the thing it covered. }
     EmitCLn(clYellow, '  every tool is now approved for this session');
   end
   else if Cmd = '/cost' then
@@ -746,10 +977,60 @@ begin
         [Agent.ContextTokens]));
   end
   else
-    EmitCLn(clRed, '  unknown command: ' + Cmd);
+    { Not one of ours.  Left unhandled so the caller can try the custom
+      commands in .pasclaude\commands before declaring it unknown. }
+    Handled := False;
 end;
 
 { ------------------------------------------------------------------- main -- }
+
+{ A user-defined command: /name args reads .pasclaude\commands\name.md and
+  returns its contents as the prompt, with every $ARGUMENTS replaced by the
+  rest of the line.  The file is the prompt, nothing more - no frontmatter,
+  no scripting - because a prompt in a file already covers the real use:
+  the same request typed often, made one word. }
+function ExpandCustomCommand(const Line: string; out Ok: Boolean): string;
+var
+  Name, Args, Path: string;
+  Sp, I: Integer;
+  L: TStringList;
+begin
+  Result := '';
+  Ok := False;
+  Sp := Pos(' ', Line);
+  if Sp = 0 then
+  begin
+    Name := Copy(Line, 2, MaxInt);
+    Args := '';
+  end
+  else
+  begin
+    Name := Copy(Line, 2, Sp - 2);
+    Args := Trim(Copy(Line, Sp + 1, MaxInt));
+  end;
+  if Name = '' then Exit;
+  { The name is a filename; anything that could redirect the lookup out of
+    the commands directory is refused rather than resolved. }
+  for I := 1 to Length(Name) do
+    if Name[I] in ['\', '/', ':', '.'] then Exit;
+
+  Path := IncludeTrailingPathDelimiter(uTools.RootDir) + SessionDir +
+    PathDelim + 'commands' + PathDelim + Name + '.md';
+  if not FileExists(Path) then Exit;
+
+  L := TStringList.Create;
+  try
+    try
+      L.LoadFromFile(Path);
+    except
+      Exit;
+    end;
+    Result := StringReplace(L.Text, '$ARGUMENTS', Args, [rfReplaceAll]);
+    Ok := Trim(Result) <> '';
+  finally
+    L.Free;
+  end;
+end;
 
 var
   ApiKey, ModelName, Line, Err, Dir, SaveErr, Arg, ResumeErr: string;
@@ -761,6 +1042,9 @@ var
   SaveWarned: Boolean = False;
   UsingSubscription: Boolean = False;
   ArgI: Integer;
+  PrintPrompt: string = '';
+  PrintMode: Boolean = False;
+  Piped: string;
 
 begin
   TermInit;
@@ -769,12 +1053,21 @@ begin
     for ArgI := 1 to ParamCount do
     begin
       Arg := ParamStr(ArgI);
+      { -p consumed the next argument as its prompt on the pass before. }
+      if (ArgI > 1) and ((ParamStr(ArgI - 1) = '-p') or
+         (ParamStr(ArgI - 1) = '--print')) then Continue;
       if (Arg = '--resume') or (Arg = '-r') then
         Resume := True
+      else if (Arg = '-p') or (Arg = '--print') then
+      begin
+        PrintMode := True;
+        if ArgI < ParamCount then PrintPrompt := ParamStr(ArgI + 1);
+      end
       else if (Arg = '--help') or (Arg = '-h') or (Arg = '/?') then
       begin
-        EmitCLn(clBright, 'pasclaude [directory] [--resume]');
+        EmitCLn(clBright, 'pasclaude [directory] [--resume] [-p "prompt"]');
         EmitCLn(clGrey, '  --resume  continue the conversation saved in that directory');
+        EmitCLn(clGrey, '  -p        answer one prompt and exit (reads stdin when piped)');
         { Halt skips the finally block, so the console has to be put back
           here or the caller's codepage stays switched to UTF-8. }
         TermDone;
@@ -843,6 +1136,59 @@ begin
       Agent.ShouldCancel := @UserWantsStop;
       uTerm.CompleteProvider := @Complete;
 
+      { Print mode: one prompt in, one answer out, exit code says how it
+        went.  This is what makes  pasclaude -p "..."  usable from scripts
+        and pipes.  No banner, no session save - a script's throwaway
+        question should not disturb the directory's saved conversation -
+        and no permission prompts: stdin may be a pipe, so asking would
+        hang.  Ask stays nil, which is the deny-by-default path; read-only
+        tools still work, and a print run that needs an edit approved says
+        so in its output rather than stalling. }
+      if PrintMode then
+      begin
+        Agent.Ask := nil;
+        { A piped stdin becomes context under the prompt, which is how
+          type build.log | pasclaude -p "why did this fail?"  works. }
+        Piped := '';
+        if not StdinIsConsole then
+          while not EOF(Input) do
+          begin
+            ReadLn(Line);
+            Piped := Piped + Line + #10;
+          end;
+        if Trim(PrintPrompt) = '' then
+        begin
+          { No -p argument: the piped text itself is the prompt. }
+          PrintPrompt := Piped;
+          Piped := '';
+        end;
+        if Trim(PrintPrompt) = '' then
+        begin
+          EmitCLn(clRed, 'print mode needs a prompt: -p "question" or piped stdin');
+          TermDone;
+          Halt(2);
+        end;
+        if Piped <> '' then
+          PrintPrompt := PrintPrompt + #10#10 +
+            'Input follows.'#10'---'#10 + Piped;
+
+        MdReset;
+        if Agent.Send(PrintPrompt, Err) then
+        begin
+          MdFinish;
+          TermDone;
+          Halt(0);
+        end
+        else
+        begin
+          MdFinish;
+          NeedNewLine;
+          EmitCLn(clRed, Err);
+          TermDone;
+          Halt(1);
+        end;
+      end;
+
       { Resuming happens before the banner, because a saved session can carry
         its own model and the banner should report the one actually in use. }
       ResumeErr := '';
@@ -852,6 +1198,9 @@ begin
       { Up-arrow reaching last week's build command is the whole point of
         history; in-memory only, it died with the window. }
       HistoryLoad(HistoryPath);
+      { Standing approvals survive restarts.  Print mode skips this: a
+        scripted run must not inherit interactive grants, nor write any. }
+      LoadPermissions(PermissionsPath);
 
       ShowBanner;
 
@@ -893,6 +1242,28 @@ begin
 
         if not HandleCommand(Line, Handled) then Break;
         if Handled then Continue;
+
+        { A leading # is a note for the project memory, Claude Code's
+          shortcut: "# prefer edit_file" lands in CLAUDE.md, not in the
+          conversation. }
+        if (Length(Line) > 1) and (Line[1] = '#') and (Line[2] = ' ') then
+        begin
+          RememberNote(Trim(Copy(Line, 2, MaxInt)));
+          Continue;
+        end;
+
+        { A slash word nobody built in may be a custom command: the contents
+          of .pasclaude\commands\<name>.md become the prompt, with $ARGUMENTS
+          substituted.  Checked after the built-ins so none can be shadowed. }
+        if Line[1] = '/' then
+        begin
+          Line := ExpandCustomCommand(Line, Handled);
+          if not Handled then
+          begin
+            EmitCLn(clRed, '  unknown command (no .pasclaude\commands match either)');
+            Continue;
+          end;
+        end;
 
         AtLineStart := True;
         MdReset;
@@ -971,6 +1342,10 @@ begin
             NeedNewLine;
             EmitCLn(clYellow, '  (session not being saved: ' + SaveErr + ')');
           end;
+        { Approvals persist too, but never from a /yolo session: the blanket
+          flags it sets are indistinguishable from real per-answer grants. }
+        if not YoloSession then
+          SavePermissions(PermissionsPath);
         NeedNewLine;
         EmitLn;
       until False;

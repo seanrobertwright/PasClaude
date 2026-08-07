@@ -67,6 +67,8 @@ contents are appended to the system prompt as binding instructions.
 | `/compact` | drop the oldest turns, keep the recent ones |
 | `/compact full` | replace the transcript with a model-written summary |
 | `/diff` | list the files this session has changed |
+| `/memory` | show the project memory (CLAUDE.md) |
+| `/init` | have the model write a CLAUDE.md for this project |
 | `/think [n]` | extended thinking: on, off, or a token budget |
 | `/resume` | reload the saved conversation |
 | `/save` | write the conversation now |
@@ -75,6 +77,29 @@ contents are appended to the system prompt as binding instructions.
 | `/yolo` | approve every tool for the rest of the session |
 | `/cost` | turns and tokens used |
 | `/exit` | quit (Ctrl+C also works) |
+
+A prompt starting with `# ` is a note for the project memory rather than a
+question: `# prefer edit_file here` appends to CLAUDE.md (or AGENTS.md /
+.pasclaude.md, whichever the project already has) under a Notes heading,
+and the next session starts knowing it. `/memory` shows the file; `/init`
+has the model explore the project and write a starter CLAUDE.md, through
+the ordinary write approval.
+
+A slash command nobody built in is looked up in `.pasclaude\commands\`:
+`/shout loud words` reads `commands\shout.md` and sends its contents as the
+prompt with every `$ARGUMENTS` replaced by `loud words`. The file is the
+prompt, nothing more - no frontmatter, no scripting - because a prompt in a
+file already covers the real use: the same request typed often, made one
+word. Built-ins cannot be shadowed; the lookup runs only after they decline.
+
+`pasclaude -p "question"` is print mode: one prompt in, one answer out,
+exit code 0 on success. Piped stdin becomes context under the prompt
+(`type build.log | pasclaude -p "why did this fail?"`), or is the prompt
+itself when `-p` has no argument. No banner, no session save - a script's
+throwaway question should not disturb the directory's saved conversation -
+and no permission prompts: stdin may be a pipe, so asking would hang.
+Read-only tools work; a run that needed an edit approved says so in its
+output instead of stalling.
 
 Pressing `Esc` while a reply is streaming stops it, and so does `Ctrl+C`:
 outside the prompt the default Ctrl+C handler would kill the process
@@ -246,6 +271,21 @@ first token, lowercased, stripped of path and `.exe`, so `git` and
 runs everything after the separator regardless of what the first program
 was. "Always" for one degrades to this-once. `/yolo` still approves
 everything.
+
+"Always" answers persist in `.pasclaude\permissions.json` - the tool-class
+grants and the approved bash programs - so a restart does not re-ask what
+was already answered. The file only ever widens what is approved, never
+narrows a live grant, and it is deliberately tiny and hand-editable:
+deleting a line must do the predictable thing. `/yolo` is the exception:
+its blanket flags are "I trust this session", not "and every future one",
+so a yolo session never writes the file. Print mode neither reads nor
+writes it - a scripted run must not inherit interactive grants.
+
+The model also has a `todo_write` tool for multi-step work: it maintains a
+task list that renders in the terminal as it changes - `[x]` done (green),
+`[~]` in progress (yellow), `[ ]` pending - so a long task shows its plan
+rather than a wall of tool calls. No approval needed; the list is display
+state and touches nothing.
 
 `fetch` reaches the outside world, so it asks - and its "always" answer is
 its own class, separate from the edit tools, because approving edits forever

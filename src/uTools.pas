@@ -94,6 +94,21 @@ procedure NoteChangedFile(const RelPath: string);
 { Test seam and /clear: forget the list. }
 procedure ClearChangedFiles;
 
+{ The task list the model maintains through the todo_write tool, rendered
+  by the host after each update.  One string per item, prefixed with its
+  state: '[ ] ', '[~] ' (in progress), '[x] '. }
+function CurrentTodos: TStringArray;
+{ Test seam and /clear. }
+procedure ClearTodos;
+
+{ Loads standing approvals from Path: the tool-class "always" answers and
+  the approved bash programs, so an "a" gives once survives restarts.  A
+  missing or unreadable file simply approves nothing. }
+procedure LoadPermissions(const Path: string);
+{ Writes the standing approvals to Path.  Failures are swallowed: the
+  session works identically, approvals just will not persist. }
+procedure SavePermissions(const Path: string);
+
 implementation
 
 uses Classes, Process, Windows, uHttp;
@@ -865,6 +880,99 @@ begin
   SetLength(ChangedList, 0);
 end;
 
+{ ------------------------------------------------------------------ todos -- }
+
+var
+  TodoList: array of string;
+
+function CurrentTodos: TStringArray;
+var
+  I: Integer;
+begin
+  SetLength(Result, Length(TodoList));
+  for I := 0 to High(TodoList) do
+    Result[I] := TodoList[I];
+end;
+
+procedure ClearTodos;
+begin
+  SetLength(TodoList, 0);
+end;
+
+{ ------------------------------------------------- permission persistence -- }
+
+{ The file is JSON: {"allow_edits":bool,"allow_bash":bool,"allow_fetch":bool,
+  "bash_programs":["git","build",...]}.  Deliberately not the transcript
+  format and deliberately tiny - it is user-editable state, and someone
+  deleting a line from it must be able to predict what that does. }
+procedure LoadPermissions(const Path: string);
+var
+  F: TFileStream;
+  Text: string;
+  Root, Progs: TJson;
+  I: Integer;
+begin
+  if not FileExists(Path) then Exit;
+  try
+    F := TFileStream.Create(Path, fmOpenRead or fmShareDenyNone);
+    try
+      SetLength(Text, F.Size);
+      if F.Size > 0 then F.ReadBuffer(Text[1], F.Size);
+    finally
+      F.Free;
+    end;
+  except
+    Exit;
+  end;
+  Root := JsonParse(Text);
+  if Root = nil then Exit;
+  try
+    { Approvals only widen from the file, never narrow: a session that
+      already granted something keeps it regardless of what is on disk. }
+    if Root.Bool('allow_edits') then AllowAllEdits := True;
+    if Root.Bool('allow_bash') then AllowAllBash := True;
+    if Root.Bool('allow_fetch') then AllowAllFetch := True;
+    Progs := Root.Find('bash_programs');
+    if (Progs <> nil) and (Progs.Kind = jkArr) then
+      for I := 0 to Progs.Count - 1 do
+        AllowBashPrefix(Progs.Item(I).AsString);
+  finally
+    Root.Free;
+  end;
+end;
+
+procedure SavePermissions(const Path: string);
+var
+  Root, Progs: TJson;
+  Text: string;
+  F: TFileStream;
+  I: Integer;
+begin
+  Root := TJson.NewObj;
+  try
+    Root.AddBool('allow_edits', AllowAllEdits);
+    Root.AddBool('allow_bash', AllowAllBash);
+    Root.AddBool('allow_fetch', AllowAllFetch);
+    Progs := TJson.NewArr;
+    for I := 0 to High(BashPrefixes) do
+      Progs.Push(TJson.NewStr(BashPrefixes[I]));
+    Root.Add('bash_programs', Progs);
+    Text := Root.ToJson;
+  finally
+    Root.Free;
+  end;
+  try
+    F := TFileStream.Create(Path, fmCreate);
+    try
+      if Text <> '' then F.WriteBuffer(Text[1], Length(Text));
+    finally
+      F.Free;
+    end;
+  except
+    { Nothing: persistence is a convenience. }
+  end;
+end;
+
 { ------------------------------------------------------------------ schema -- }
 
 function StrProp(const Desc: string): TJson;
@@ -965,6 +1073,22 @@ begin
     'Use it to read documentation, APIs, or reference pages. ' +
     'Requires user approval.',
     P, ['url']));
+
+  P := TJson.NewObj;
+  P.Add('todos', TJson.NewObj);
+  with P.Find('todos') do
+  begin
+    AddStr('type', 'array');
+    AddStr('description', 'The full task list, replacing the previous one. ' +
+      'Each item: {"content": string, "status": "pending"|"in_progress"|' +
+      '"completed"}. Keep at most one item in_progress.');
+  end;
+  Result.Push(MakeTool('todo_write',
+    'Maintain a visible task list for multi-step work. Call it when ' +
+    'starting a task with several steps, and again as each step starts and ' +
+    'finishes, so the user can follow the plan. Send the whole list each ' +
+    'time.',
+    P, ['todos']));
 end;
 
 { --------------------------------------------------------------- execution -- }
@@ -993,6 +1117,13 @@ begin
   end
   else if Name = 'fetch' then
     Result := 'fetch ' + Input.Str('url')
+  else if Name = 'todo_write' then
+  begin
+    if (Input.Find('todos') <> nil) then
+      Result := Format('update todos (%d items)', [Input.Find('todos').Count])
+    else
+      Result := 'update todos';
+  end
   else
     Result := Name;
 end;
@@ -1369,6 +1500,35 @@ begin
       Text := OemToUtf8(Text);
     if Text = '' then Text := '(empty response)';
     Result := Clip(Text);
+  end
+
+  else if Name = 'todo_write' then
+  begin
+    { No permission gate: the list is display state, it touches nothing.
+      The whole list replaces the previous one, which spares the model a
+      diff protocol and the code a merge. }
+    with Input do
+    begin
+      if (Find('todos') = nil) or (Find('todos').Kind <> jkArr) then
+      begin
+        IsError := True;
+        Exit('todos must be an array');
+      end;
+      SetLength(TodoList, Find('todos').Count);
+      for Code := 0 to Find('todos').Count - 1 do
+      begin
+        Text := Find('todos').Item(Code).Str('status');
+        if Text = 'completed' then
+          TodoList[Code] := '[x] '
+        else if Text = 'in_progress' then
+          TodoList[Code] := '[~] '
+        else
+          TodoList[Code] := '[ ] ';
+        TodoList[Code] := TodoList[Code] +
+          Find('todos').Item(Code).Str('content');
+      end;
+    end;
+    Result := Format('todo list updated (%d items)', [Length(TodoList)]);
   end
 
   else

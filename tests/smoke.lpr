@@ -5,7 +5,7 @@ program smoke;
 
 {$mode objfpc}{$H+}
 
-uses SysUtils, uJson, uHttp, uTools, uAgent;
+uses SysUtils, Classes, uJson, uHttp, uTools, uAgent;
 
 var
   Fails: Integer = 0;
@@ -161,7 +161,7 @@ begin
   { The caller owns the schema, so it is freed here rather than leaked. }
   Sch := ToolsSchema;
   try
-    Check(Sch.Count = 7, 'the schema exposes seven tools');
+    Check(Sch.Count = 8, 'the schema exposes eight tools');
   finally
     Sch.Free;
   end;
@@ -431,6 +431,124 @@ begin
   end;
 end;
 
+{ The todo tool: display state, no gate, whole-list replacement. }
+procedure TestTodos;
+var
+  J, Arr, T: TJson;
+  Out_: string;
+  IsErr: Boolean;
+  Todos: TStringArray;
+begin
+  ClearTodos;
+  Check(Length(CurrentTodos) = 0, 'the todo list starts empty');
+
+  J := TJson.NewObj;
+  Arr := TJson.NewArr;
+  T := TJson.NewObj;
+  T.AddStr('content', 'first step');
+  T.AddStr('status', 'completed');
+  Arr.Push(T);
+  T := TJson.NewObj;
+  T.AddStr('content', 'second step');
+  T.AddStr('status', 'in_progress');
+  Arr.Push(T);
+  T := TJson.NewObj;
+  T.AddStr('content', 'third step');
+  T.AddStr('status', 'pending');
+  Arr.Push(T);
+  J.Add('todos', Arr);
+  { Ask is nil here, which proves no permission gate blocks the tool. }
+  Out_ := Run('todo_write', J, IsErr);
+  Check(not IsErr, 'todo_write needs no approval: ' + Out_);
+
+  Todos := CurrentTodos;
+  Check(Length(Todos) = 3, 'three items are held');
+  Check((Length(Todos) = 3) and (Todos[0] = '[x] first step'),
+    'completed renders as [x]');
+  Check((Length(Todos) = 3) and (Todos[1] = '[~] second step'),
+    'in_progress renders as [~]');
+  Check((Length(Todos) = 3) and (Todos[2] = '[ ] third step'),
+    'pending renders as [ ]');
+
+  { The next call replaces, not appends. }
+  J := TJson.NewObj;
+  Arr := TJson.NewArr;
+  T := TJson.NewObj;
+  T.AddStr('content', 'only step');
+  T.AddStr('status', 'pending');
+  Arr.Push(T);
+  J.Add('todos', Arr);
+  Run('todo_write', J, IsErr);
+  Check(Length(CurrentTodos) = 1, 'a new list replaces the old one');
+
+  J := TJson.NewObj;
+  J.AddStr('todos', 'not an array');
+  Out_ := Run('todo_write', J, IsErr);
+  Check(IsErr, 'a non-array is refused');
+  Check(Length(CurrentTodos) = 1, 'and the list is untouched');
+
+  ClearTodos;
+end;
+
+{ Standing approvals surviving a "restart" (a save, a wipe, a load). }
+procedure TestPermissionPersistence;
+var
+  P: string;
+begin
+  P := IncludeTrailingPathDelimiter(GetTempDir) + 'pasclaude-perms.json';
+  DeleteFile(P);
+
+  ClearBashPrefixes;
+  uTools.AllowAllEdits := False;
+  uTools.AllowAllBash := False;
+  uTools.AllowAllFetch := False;
+
+  uTools.AllowAllEdits := True;
+  AllowBashPrefix('git status');
+  AllowBashPrefix('build');
+  SavePermissions(P);
+
+  { The wipe stands in for a process exit. }
+  ClearBashPrefixes;
+  uTools.AllowAllEdits := False;
+  Check(not BashPrefixAllowed('git log'), 'the wipe took the approvals');
+
+  LoadPermissions(P);
+  Check(uTools.AllowAllEdits, 'the edit-class always came back');
+  Check(not uTools.AllowAllBash, 'bash-all was never granted and stays off');
+  Check(not uTools.AllowAllFetch, 'fetch stays off too');
+  Check(BashPrefixAllowed('git log'), 'the git approval survived the restart');
+  Check(BashPrefixAllowed('build debug'), 'and the build approval');
+  Check(not BashPrefixAllowed('del x'), 'del was never approved and still is not');
+
+  { A file that grants nothing narrows nothing: approvals only widen.  The
+    file must genuinely not grant, so it is written while everything is
+    off, and only then is the live grant made. }
+  ClearBashPrefixes;
+  uTools.AllowAllEdits := False;
+  SavePermissions(P);   { the file now says allow_edits: false }
+  uTools.AllowAllEdits := True;
+  LoadPermissions(P);
+  Check(uTools.AllowAllEdits, 'loading never revokes a live grant');
+
+  { Garbage is ignored, not fatal. }
+  ClearBashPrefixes;
+  uTools.AllowAllEdits := False;
+  with TStringList.Create do
+  try
+    Text := 'not json at all';
+    SaveToFile(P);
+  finally
+    Free;
+  end;
+  LoadPermissions(P);
+  Check(not uTools.AllowAllEdits, 'a garbled file approves nothing');
+
+  DeleteFile(P);
+  ClearBashPrefixes;
+  uTools.AllowAllEdits := False;
+end;
+
 var
   Schema: TJson;
 begin
@@ -440,6 +558,8 @@ begin
   TestBashPrefixes;
   TestChangedFiles;
   TestListModels;
+  TestTodos;
+  TestPermissionPersistence;
   Schema := ToolsSchema;
   try
     Check(Pos('"input_schema"', Schema.ToJson) > 0, 'the schema serialises');

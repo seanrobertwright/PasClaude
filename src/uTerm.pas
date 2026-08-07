@@ -60,6 +60,10 @@ function ReadLineEdit(const Prompt: string; out Line: string): Boolean;
 { True when a key is waiting; used to let the user interrupt a stream. }
 function EscPressed: Boolean;
 
+{ True when stdin is a real console rather than a pipe or a file, which is
+  how print mode decides whether there is piped input to read. }
+function StdinIsConsole: Boolean;
+
 { True once per Ctrl+C received while no prompt is being read (that is,
   while a reply streams).  Reading it consumes it.  The prompt itself sees
   Ctrl+C as a key and quits; this flag exists for the stretches where nothing
@@ -435,6 +439,15 @@ begin
     MdBuf := '';
   end;
   MdInFence := False;
+end;
+
+{ GetConsoleMode succeeds only on a real console handle; a pipe or a file
+  refuses it, which is exactly the distinction wanted. }
+function StdinIsConsole: Boolean;
+var
+  M: DWORD;
+begin
+  Result := (HIn <> 0) and GetConsoleMode(HIn, M);
 end;
 
 function EscPressed: Boolean;
