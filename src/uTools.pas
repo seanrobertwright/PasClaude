@@ -180,11 +180,14 @@ function DescribeTool(const Name: string; Input: TJson): string;
 function ChangePreview(const Name: string; Input: TJson): string;
 
 { Converts console output from the OEM codepage to UTF-8.  Exposed so the
-  encoding behaviour can be tested directly. }
+  encoding behaviour can be tested directly.  The implementation now lives in
+  uJson, with the rest of the UTF-8 family, because uHooks needs it too and
+  sits below this unit; this stays as the name every caller already uses. }
 function OemToUtf8(const S: string): string;
 
 { True when S is well-formed UTF-8.  Exposed because every string that leaves
-  this unit ends up in a JSON request body, where invalid UTF-8 is fatal. }
+  this unit ends up in a JSON request body, where invalid UTF-8 is fatal.
+  Implemented in uJson; see the note on OemToUtf8. }
 function IsValidUtf8(const S: string): Boolean;
 
 { Resolves P under the session root with the same rules every tool applies:
@@ -332,11 +335,28 @@ procedure SavePermissions(const Path: string);
   project's config is trusted" forever; a fingerprint says "these bytes are",
   and the moment they change the question is asked again.  Same idea as an
   "always" for bash recording the program rather than the command line.
-  Keys in use: 'mcp:<server>' for permission to run the program at all, and
-  'mcp-call:<server>' for a standing yes to its tool calls. }
+  Keys in use: 'mcp:<server>' for permission to run the program at all,
+  'mcp-call:<server>' for a standing yes to its tool calls, and 'hooks.json'
+  for the bytes of the hook config the user approved. }
 function TrustedFingerprint(const Key: string): string;   { '' when absent }
 procedure RecordTrust(const Key, Fingerprint: string);
 procedure ClearTrust;                                     { test seam }
+
+{ Reads one trusted fingerprint straight off Path without touching any of the
+  in-memory approvals.  It exists because the hook trust question has to be
+  answered before the agent is constructed, while LoadPermissions deliberately
+  runs after the print-mode Halt so a scripted run neither inherits nor writes
+  approvals.  Duplicating one field read is cheaper than reordering startup
+  and changing what -p inherits. }
+function LoadTrustedEntry(const Path, Key: string): string;
+
+{ ---- hooks ----
+  Read-once: the flag is set from a PreToolUse hook's allow decision and
+  consumed by the first gate that asks for it, and RunTool clears it again at
+  the top of every call.  An allow that outlived its tool call would be an
+  allow the user never gave, and the task tool makes that reentrancy real
+  rather than theoretical. }
+function TakeHookAllow: Boolean;
 
 { ---- MCP servers ----
   A project's .mcp.json names programs to run.  That is the one genuinely new
@@ -431,7 +451,7 @@ procedure AllowMcpServer(const ToolName: string);
 
 implementation
 
-uses Classes, Process, Windows, uHttp, uRegex, uNotebook, uMcp;
+uses Classes, Process, Windows, uHttp, uRegex, uNotebook, uMcp, uHooks;
 
 const
   MaxReadBytes = 400 * 1024;   { keeps a stray huge file out of the context }
@@ -702,44 +722,15 @@ end;
 
 { True when S is well-formed UTF-8.  Tool results are sent as JSON strings, and
   a request carrying invalid UTF-8 is rejected whole - so one binary file would
-  otherwise destroy the turn rather than just the tool call. }
-function IsValidUtf8(const S: string): Boolean;
-var
-  I, Len, Need: Integer;
-  B: Byte;
-begin
-  I := 1;
-  Len := Length(S);
-  while I <= Len do
-  begin
-    B := Byte(S[I]);
-    if B < $80 then
-      Need := 0
-    else if (B and $E0) = $C0 then
-    begin
-      Need := 1;
-      if B < $C2 then Exit(False);        { overlong two-byte form }
-    end
-    else if (B and $F0) = $E0 then
-      Need := 2
-    else if (B and $F8) = $F0 then
-    begin
-      Need := 3;
-      if B > $F4 then Exit(False);        { beyond U+10FFFF }
-    end
-    else
-      Exit(False);                        { stray continuation or 0xFE/0xFF }
+  otherwise destroy the turn rather than just the tool call.
 
-    if I + Need > Len then Exit(False);
-    while Need > 0 do
-    begin
-      Inc(I);
-      if (Byte(S[I]) and $C0) <> $80 then Exit(False);
-      Dec(Need);
-    end;
-    Inc(I);
-  end;
-  Result := True;
+  The body moved to uJson when uHooks arrived: a unit below this one spawns
+  child processes and has to repair their output, and the ladder forbids it
+  from reaching up here.  This forward keeps every existing caller, in src and
+  in the suites, compiling against the name it already used. }
+function IsValidUtf8(const S: string): Boolean;
+begin
+  Result := uJson.IsValidUtf8(S);
 end;
 
 { Renders bytes that are not text as a hex dump, so the model still gets
@@ -778,44 +769,12 @@ begin
     Result := Result + Format('... [%d bytes total]'#10, [Length(S)]);
 end;
 
+{ Moved to uJson beside IsValidUtf8, for the same reason and with the same
+  forward: uHooks reads a console program's output too, and it sits below this
+  unit. }
 function OemToUtf8(const S: string): string;
-var
-  W: WideString;
-  U: UTF8String;
-  N, I: Integer;
-  CP: UINT;
 begin
-  Result := '';
-  if S = '' then Exit;
-  { FPC's CP_OEMCP is the RTL's own marker value (1), not a Windows codepage
-    identifier, so passing it to MultiByteToWideChar converts nothing. }
-  CP := GetConsoleOutputCP;
-  if CP = 0 then CP := GetOEMCP;
-  N := MultiByteToWideChar(CP, 0, PAnsiChar(S), Length(S), nil, 0);
-  if N > 0 then
-  begin
-    SetLength(W, N);
-    if MultiByteToWideChar(CP, 0, PAnsiChar(S), Length(S), PWideChar(W), N) = N then
-    begin
-      U := UTF8Encode(W);
-      { The bytes are copied one at a time.  Assigning a UTF8String straight to
-        a string makes FPC convert it back to the ANSI codepage, silently
-        undoing the work. }
-      SetLength(Result, Length(U));
-      for I := 1 to Length(U) do
-        Result[I] := Char(U[I]);
-      if IsValidUtf8(Result) then Exit;
-    end;
-  end;
-  { Conversion failed, so the bytes are scrubbed to ASCII rather than left
-    invalid: a mangled character is a far smaller problem than a request the
-    API refuses outright. }
-  Result := '';
-  for I := 1 to Length(S) do
-    if Byte(S[I]) < $80 then
-      Result := Result + S[I]
-    else
-      Result := Result + '?';
+  Result := uJson.OemToUtf8(S);
 end;
 
 { The reading half of every file tool.  Limit is a parameter rather than a
@@ -1963,6 +1922,63 @@ begin
   SetLength(Trusted, 0);
 end;
 
+function LoadTrustedEntry(const Path, Key: string): string;
+var
+  F: TFileStream;
+  Text: string;
+  Root, Obj: TJson;
+begin
+  Result := '';
+  if not FileExists(Path) then Exit;
+  try
+    F := TFileStream.Create(Path, fmOpenRead or fmShareDenyNone);
+    try
+      SetLength(Text, F.Size);
+      if F.Size > 0 then F.ReadBuffer(Text[1], F.Size);
+    finally
+      F.Free;
+    end;
+  except
+    Exit;
+  end;
+  Root := JsonParse(Text);
+  if Root = nil then Exit;
+  try
+    Obj := Root.Find('trusted');
+    { Nothing is recorded in memory here.  This reads the file and leaves,
+      because the standing approvals are loaded later by LoadPermissions and
+      doing half the job early would change what a print-mode run inherits. }
+    if (Obj <> nil) and (Obj.Kind = jkObj) then Result := Obj.Str(Key);
+  finally
+    Root.Free;
+  end;
+end;
+
+{ ---------------------------------------------------------------- hooks -- }
+
+var
+  { Set from a PreToolUse hook's allow, cleared by whoever reads it first and
+    again at the top of every RunTool.  Deliberately module state rather than
+    a parameter: the gates that consult it are three calls deep inside tool
+    arms that have no business knowing a hook exists. }
+  HookAllowPending: Boolean = False;
+
+function TakeHookAllow: Boolean;
+begin
+  Result := HookAllowPending;
+  HookAllowPending := False;
+end;
+
+{ Hands uHooks the session root.  The ladder runs the other way - uHooks may
+  not know this unit exists - so it asks through a procedure variable, the
+  same shape uAgent uses to fill SubagentRunner.  Doing it this way rather
+  than mirroring RootDir into a second variable means a test that moves the
+  root moves the hooks with it and cannot forget. }
+function HookRoot: string;
+begin
+  Result := NormalizeRoot;
+end;
+
 { ---------------------------------------------------------- changed files -- }
 
 var
@@ -2855,7 +2871,18 @@ begin
   { A standing yes recorded against the server's actual command line. }
   if IsMcp and McpCallApproved(Name) then Exit(True);
 
+  { Nobody to ask means no. }
   if Ask = nil then Exit(False);
+
+  { A PreToolUse hook may turn a question into a yes.  The POSITION of this
+    line is the whole safety argument and is not stylistic.  Below the nil
+    check, a hook cannot widen print mode or a subagent, because both arrive
+    here with Ask nil - that property costs no guard anybody has to remember.
+    Below the AllowAll short-circuits, it is only ever reached when a human
+    was about to be asked anyway, so it converts a question into a yes and can
+    never convert a refusal into one.  Anyone adding a fifth approval class
+    puts it above here, with the other class tests. }
+  if TakeHookAllow then Exit(True);
 
   A := Ask(Name, Detail);
   case A of
@@ -2887,6 +2914,8 @@ begin
   if AllowAllBash then Exit(True);
   if BashPrefixAllowed(Cmd) then Exit(True);
   if Ask = nil then Exit(False);
+  { Same line, same position, same argument as in Permit above. }
+  if TakeHookAllow then Exit(True);
 
   P := BashPrefix(Cmd);
   A := Ask('bash', Detail);
@@ -4021,7 +4050,12 @@ begin
   McpSaveCache;
 end;
 
-function RunTool(const Name: string; Input: TJson; Ask: TAskProc;
+{ The dispatch ladder itself.  It is deliberately still one function with
+  forty Exit points: RunTool below wraps it to fire the two tool hook events,
+  which is a two-line diff, where threading a try/finally through every one of
+  those exits to do the same thing would be a forty-site diff with forty
+  chances to get one wrong. }
+function RunToolInner(const Name: string; Input: TJson; Ask: TAskProc;
   out IsError: Boolean): string;
 var
   Full, Err, Text, Cmd, Note, Updated: string;
@@ -4029,22 +4063,6 @@ var
   Ok: Boolean;
 begin
   IsError := False;
-  if Input = nil then
-  begin
-    IsError := True;
-    Exit('missing tool input');
-  end;
-
-  { This, not the schema, is where read-only is true.  The schema is advice
-    to the model and nothing stops it naming a tool it was never offered; and
-    the permission gate is no backstop here, because Permit short-circuits on
-    AllowAllEdits and PermitBash on a persisted "always", so under /yolo a
-    subagent's write would land with a nil Ask and no prompt at all. }
-  if (SubDepth > 0) and not IsSubagentTool(Name) then
-  begin
-    IsError := True;
-    Exit('not available to a subagent: ' + Name);
-  end;
 
   if Name = 'read_file' then
   begin
@@ -4471,10 +4489,85 @@ begin
   end;
 end;
 
+function RunTool(const Name: string; Input: TJson; Ask: TAskProc;
+  out IsError: Boolean): string;
+var
+  Call: THookCall;
+  HO: THookOutcome;
+begin
+  IsError := False;
+
+  { Cleared before anything can set it.  A hook's allow belongs to the call it
+    was answered for; one surviving into the next call is an approval nobody
+    gave, and task makes nested calls real. }
+  HookAllowPending := False;
+
+  if Input = nil then
+  begin
+    IsError := True;
+    Exit('missing tool input');
+  end;
+
+  { This, not the schema, is where read-only is true.  The schema is advice
+    to the model and nothing stops it naming a tool it was never offered; and
+    the permission gate is no backstop here, because Permit short-circuits on
+    AllowAllEdits and PermitBash on a persisted "always", so under /yolo a
+    subagent's write would land with a nil Ask and no prompt at all.
+
+    It runs BEFORE the PreToolUse fire deliberately: a hook must never be
+    offered the chance to allow a call the read-only boundary already refused,
+    and a subagent's hooks would be running with a nil Ask besides. }
+  if (SubDepth > 0) and not IsSubagentTool(Name) then
+  begin
+    IsError := True;
+    Exit('not available to a subagent: ' + Name);
+  end;
+
+  if HooksEnabled then
+  begin
+    Call := uHooks.HookCall(hePreTool);
+    Call.ToolName := Name;
+    Call.ToolInput := Input;
+    HO := FireHooks(Call);
+    if HO.Blocked then
+    begin
+      { Byte for byte the shape a permission denial already takes, which is
+        why uAgent needs no change at all: its one-tool_result-per-tool_use
+        invariant is satisfied by construction rather than by care. }
+      IsError := True;
+      if Trim(HO.Text) = '' then Exit('blocked by a PreToolUse hook');
+      Exit(Clip(HO.Text));
+    end;
+    HookAllowPending := HO.Allowed;
+  end;
+
+  Result := RunToolInner(Name, Input, Ask, IsError);
+
+  if HooksEnabled then
+  begin
+    { Whether or not a gate consumed it, the allow dies with its tool call. }
+    HookAllowPending := False;
+    Call := uHooks.HookCall(hePostTool);
+    Call.ToolName := Name;
+    Call.ToolInput := Input;
+    Call.ResultText := Result;
+    Call.ResultIsError := IsError;
+    HO := FireHooks(Call);
+    { The tool already ran, so a block here cannot un-run it: the honest
+      rendering is the real result with the hook's objection appended and the
+      whole thing marked as an error. }
+    if Trim(HO.Text) <> '' then Result := Clip(Result + #10 + HO.Text);
+    if HO.Blocked then IsError := True;
+  end;
+end;
+
 initialization
   { The same ladder-crossing shape uAgent uses to fill SubagentRunner, except
     that both halves live in this unit, so there is nothing to wait for. }
   RegisterMcpToolSource;
+  { And the same shape pointing the other way down the ladder: uHooks needs
+    the session root and may not reach up here for it. }
+  uHooks.HookRootDir := @HookRoot;
 
 finalization
   { A background job outliving the process that started it is the one failure

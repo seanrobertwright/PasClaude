@@ -10,7 +10,8 @@ program pasclaude;
 {$mode objfpc}{$H+}
 
 uses
-  SysUtils, Classes, DateUtils, uTerm, uJson, uHttp, uMcp, uTools, uAgent;
+  SysUtils, Classes, DateUtils, uTerm, uJson, uHttp, uMcp, uHooks, uTools,
+  uAgent;
 
 const
   Version = '0.1';
@@ -199,9 +200,9 @@ end;
 { ------------------------------------------------------------- completion -- }
 
 const
-  SlashCommands: array[0..18] of string = (
-    '/help', '/clear', '/compact', '/diff', '/jobs', '/mcp', '/memory', '/init',
-    '/rewind', '/sessions', '/think', '/web',
+  SlashCommands: array[0..19] of string = (
+    '/help', '/clear', '/compact', '/diff', '/hooks', '/jobs', '/mcp',
+    '/memory', '/init', '/rewind', '/sessions', '/think', '/web',
     '/resume', '/save', '/cwd', '/model', '/yolo', '/cost', '/exit');
 
 { Candidates for the token being completed: slash commands when the token
@@ -524,6 +525,7 @@ begin
   EmitCLn(clGrey,   '  /compact       drop the oldest turns, keep the recent ones');
   EmitCLn(clGrey,   '  /compact full  replace the transcript with a model-written summary');
   EmitCLn(clGrey,   '  /diff          list the files this session has changed');
+  EmitCLn(clGrey,   '  /hooks         hooks this project defines; /hooks off disables them');
   EmitCLn(clGrey,   '  /jobs          background commands still running');
   EmitCLn(clGrey,   '  /mcp           MCP servers: status, restart, refresh');
   EmitCLn(clGrey,   '  /memory        show the project memory (CLAUDE.md)');
@@ -544,6 +546,15 @@ begin
   EmitCLn(clGrey,   '  .pasclaude\agents\ is a subagent type the task tool can ask for.');
 end;
 
+{ Hook failures, matcher budgets and load-time notes.  Yellow, because none of
+  them stops the session and all of them mean something in a file is not doing
+  what its author expected. }
+procedure HookNotice(const Msg: string);
+begin
+  NeedNewLine;
+  EmitCLn(clYellow, '  ' + Msg);
+end;
+
 { Where the prompt history lives, beside the session. }
 function HistoryPath: string;
 begin
@@ -556,6 +567,44 @@ function PermissionsPath: string;
 begin
   Result := IncludeTrailingPathDelimiter(uTools.RootDir) + SessionDir +
     PathDelim + 'permissions.json';
+end;
+
+{ The first-contact question for .pasclaude\hooks.json.  Nothing on disk is
+  trusted initially: the file is executable configuration a git clone can
+  carry, and running it before the user has read it is remote code execution.
+  Today the only path to arbitrary code is bash's per-program prompt, and this
+  must not become a second path that skips it.
+
+  The fingerprint is over the bytes, so editing the file re-asks - an "always"
+  that survived the text changing under it would be an approval of something
+  never read.  Same y/a/n vocabulary, same file, same narrow-always rule as the
+  bash prefixes.  /yolo deliberately does not answer this question. }
+function TrustHooks: Boolean;
+var
+  FP: string;
+begin
+  Result := False;
+  if not uHooks.HooksConfigured then Exit;
+  FP := uHooks.HookFingerprint;
+  if (FP <> '') and (FP = uTools.LoadTrustedEntry(PermissionsPath,
+                            uHooks.HookTrustKey)) then Exit(True);
+
+  case AskPermission('hooks',
+         'this project defines hooks: ' + SessionDir + PathDelim +
+         uHooks.HooksFileName + #10 +
+         'these commands run automatically, before you approve anything else'#10 +
+         uHooks.HookSummaryOf(uHooks.HooksFilePath)) of
+    pmAllowOnce: Result := True;
+    pmAllowAlways:
+      begin
+        { Recorded in the same "trusted" object MCP uses, so one mechanism
+          answers "which of this project's programs did I say yes to". }
+        uTools.RecordTrust(uHooks.HookTrustKey, FP);
+        Result := True;
+      end;
+  else
+    EmitCLn(clGrey, '  hooks are off for this session (/hooks shows them)');
+  end;
 end;
 
 { The project memory file.  CLAUDE.md is preferred when it exists because
@@ -867,6 +916,36 @@ begin
   finally
     L.Free;
   end;
+end;
+
+{ /hooks, /hooks off.  Reports the file, whether it is running, and what the
+  user actually approved, because "hooks are configured" and "hooks are on"
+  are different states and only this can tell them apart. }
+procedure ShowHooks(const Arg: string);
+var
+  Sum: string;
+begin
+  if LowerCase(Trim(Arg)) = 'off' then
+  begin
+    uHooks.ClearHooks;
+    EmitCLn(clGrey, '  hooks are off for this session');
+    Exit;
+  end;
+  if not uHooks.HooksConfigured then
+  begin
+    EmitCLn(clGrey, '  no hooks (put them in ' + SessionDir + PathDelim +
+      uHooks.HooksFileName + ')');
+    Exit;
+  end;
+  EmitCLn(clGrey, '  ' + uHooks.HooksFilePath);
+  if uHooks.HooksEnabled then
+  begin
+    EmitCLn(clGreen, '  enabled, fingerprint ' + uHooks.HookFingerprint);
+    Sum := uHooks.HookSummary;
+    if Sum <> '' then EmitC(clGrey, Sum);
+  end
+  else
+    EmitCLn(clYellow, '  not running (not trusted this session, or /hooks off)');
 end;
 
 { /mcp, /mcp restart <name>, /mcp refresh.  Every configured server is shown,
@@ -1398,6 +1477,8 @@ begin
     else
       PickModel;
   end
+  else if Cmd = '/hooks' then
+    ShowHooks(Arg)
   else if Cmd = '/mcp' then
     ShowMcp(Arg)
   else if Cmd = '/yolo' then
@@ -1409,7 +1490,9 @@ begin
       permission to be spawned: that question was answered before this session
       knew what .mcp.json contained, and "stop asking me about these tools" is
       not the same sentence as "run whatever programs a cloned repository
-      names". }
+      names".  For the same reason it does not trust hooks.json: that question
+      is about running a repository's commands, not about the tools the model
+      was declared. }
     uTools.AllowAllMcp := True;
     YoloSession := True;
     { Deliberately not persisted: /yolo is "I trust this session", and a
@@ -1500,6 +1583,13 @@ var
   WebFlag: Boolean = False;
   Piped: string;
   McpErr: string = '';
+  HookExtra: string = '';
+  HookNotes: string = '';
+  HookOut: THookOutcome;
+  HookCallRec: THookCall;
+  StopActive: Boolean = False;
+  Again: Boolean = False;
+  TurnOk: Boolean = False;
 
 begin
   TermInit;
@@ -1528,6 +1618,7 @@ begin
         EmitCLn(clGrey, '  --resume  continue the conversation saved in that directory');
         EmitCLn(clGrey, '  --web     let the model search the web (off by default)');
         EmitCLn(clGrey, '  -p        answer one prompt and exit (reads stdin when piped)');
+        EmitCLn(clGrey, '            (-p never loads hooks: nobody is there to approve them)');
         { Halt skips the finally block, so the console has to be put back
           here or the caller's codepage stays switched to UTF-8. }
         TermDone;
@@ -1583,7 +1674,48 @@ begin
 
     ModelName := GetEnvironmentVariable('ANTHROPIC_MODEL');
     if UsingSubscription then BannerAuth := 'subscription';
-    Agent := TAgent.Create(ApiKey, ModelName, SystemPrompt + ProjectContext);
+
+    { Hooks, before the agent exists, because SessionStart's output can only
+      reach the model through the string Create is handed - TAgent has no
+      setter for its system prompt, deliberately, since changing it mid-session
+      would throw away the prompt cache on every turn afterwards.
+
+      Print mode is excluded outright rather than by a flag it could be talked
+      out of: a scripted run has nobody to answer the trust question, and
+      deny-by-default means a config that cannot be asked about does not run.
+      There is no override in v1 - that is a decision to make with a user in
+      the room, not a default. }
+    HookExtra := '';
+    if not PrintMode then
+    begin
+      uHooks.OnHookNotice := @HookNotice;
+      if TrustHooks then
+      begin
+        uHooks.LoadHooks(True, HookNotes);
+        if Trim(HookNotes) <> '' then
+          EmitC(clYellow, '  ' + StringReplace(Trim(HookNotes), #10, #10'  ',
+            [rfReplaceAll]) + #10);
+        if uHooks.HooksEnabled then
+        begin
+          HookOut := uHooks.FireHooks(uHooks.HookCall(heSessionStart));
+          if HookOut.Blocked then
+          begin
+            { A SessionStart hook is the one place a block means "do not
+              start": there is no turn to refuse and no transcript to keep
+              legal, so the honest answer is to say why and stop. }
+            NeedNewLine;
+            EmitCLn(clRed, '  ' + Trim(HookOut.Text));
+            TermDone;
+            Halt(2);
+          end;
+          if Trim(HookOut.Text) <> '' then
+            HookExtra := #10#10'Session context follows.'#10 + HookOut.Text;
+        end;
+      end;
+    end;
+
+    Agent := TAgent.Create(ApiKey, ModelName,
+      SystemPrompt + ProjectContext + HookExtra);
     try
       Agent.OnText := @OnText;
       Agent.OnThinking := @OnThinking;
@@ -1752,6 +1884,28 @@ begin
             EmitLn;
           end;
         end;
+        { UserPromptSubmit fires here, after the mentions are expanded and
+          before anything touches the transcript.  Blocking costs nothing to
+          undo: Send has not run, so FMessages is untouched and the transcript
+          is trivially still legal. }
+        if uHooks.HooksEnabled then
+        begin
+          HookCallRec := uHooks.HookCall(heUserPrompt);
+          HookCallRec.Prompt := Line;
+          HookOut := uHooks.FireHooks(HookCallRec);
+          if HookOut.Blocked then
+          begin
+            NeedNewLine;
+            if Trim(HookOut.Text) = '' then
+              EmitCLn(clYellow, '  blocked by a UserPromptSubmit hook')
+            else
+              EmitCLn(clYellow, '  ' + Trim(HookOut.Text));
+            EmitLn;
+            Continue;
+          end;
+          if Trim(HookOut.Text) <> '' then
+            Line := Line + #10#10 + HookOut.Text;
+        end;
         { A session that runs long enough will eventually exceed the context
           window, and the failure mode is the whole turn being rejected.
           Trimming first costs the oldest exchanges instead.  Two triggers:
@@ -1802,17 +1956,44 @@ begin
               [Dropped]));
           end;
         end;
-        { The moment before the turn runs is what /rewind returns to. }
-        RecordCheckpoint(Line);
-        if not Agent.Send(Line, Err) then
-        begin
-          NeedNewLine;
-          EmitCLn(clRed, '  ' + Err);
-        end;
-        { The last line of the reply usually has no trailing newline and is
-          still held by the renderer. }
-        MdFinish;
-        AtLineStart := True;
+        { The Stop hook can say the turn is not finished, and its output then
+          becomes the next prompt.  Exactly one continuation per user turn:
+          StopActive caps it, and the same flag is in the hook's payload so a
+          hook can tell it is on its second look and stop asking.  A turn that
+          FAILED is never re-driven - a hook must not be able to turn a
+          transport error into a loop. }
+        StopActive := False;
+        repeat
+          Again := False;
+          { The moment before the turn runs is what /rewind returns to. }
+          RecordCheckpoint(Line);
+          TurnOk := Agent.Send(Line, Err);
+          if not TurnOk then
+          begin
+            NeedNewLine;
+            EmitCLn(clRed, '  ' + Err);
+          end;
+          { The last line of the reply usually has no trailing newline and is
+            still held by the renderer. }
+          MdFinish;
+          AtLineStart := True;
+
+          if TurnOk and uHooks.HooksEnabled and not StopActive then
+          begin
+            HookCallRec := uHooks.HookCall(heStop);
+            HookCallRec.StopActive := StopActive;
+            HookOut := uHooks.FireHooks(HookCallRec);
+            if HookOut.Blocked and (Trim(HookOut.Text) <> '') then
+            begin
+              StopActive := True;
+              Line := HookOut.Text;
+              Again := True;
+              NeedNewLine;
+              EmitCLn(clGrey, '  (a Stop hook asked for one more turn)');
+              MdReset;
+            end;
+          end;
+        until not Again;
         { Saved after every turn rather than at exit, because the session
           worth keeping is usually the one that ended in a crash or a closed
           window.  A failure to save is reported once and does not interrupt

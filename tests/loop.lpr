@@ -12,7 +12,7 @@ program loop;
 
 {$mode objfpc}{$H+}
 
-uses SysUtils, Classes, uJson, uHttp, uTools, uAgent;
+uses SysUtils, Classes, uJson, uHttp, uHooks, uTools, uAgent;
 
 var
   Fails: Integer = 0;
@@ -2067,6 +2067,142 @@ begin
   end;
 end;
 
+{ ------------------------------------------------------------------ hooks -- }
+
+procedure WriteHooksFile(const Body: string);
+begin
+  ForceDirectories(IncludeTrailingPathDelimiter(SessionDir) + StateDirName);
+  WriteSessionFile(StateDirName + PathDelim + uHooks.HooksFileName, Body);
+end;
+
+{ A blocked tool call still has to produce a tool_result, or the next request
+  carries a tool_use nobody answered and the API rejects the whole turn.  This
+  is the assertion the feature's safety rests on, and it is only visible from
+  above the tool layer. }
+procedure TestHookBlocksToolCall;
+var
+  A: TAgent;
+  Err, Notes, Target: string;
+  Ok: Boolean;
+  Doc, Msgs, Content, C: TJson;
+begin
+  ResetScript;
+  uTools.RootDir := SessionDir;
+  uTools.AllowAllEdits := True;
+  Target := IncludeTrailingPathDelimiter(SessionDir) + 'hooked-loop.txt';
+  SysUtils.DeleteFile(Target);
+
+  WriteHooksFile('{"hooks":{"PreToolUse":[{"matcher":"^write_file$",' +
+    '"command":"echo the hook said no & exit /b 2"}]}}');
+  uHooks.LoadHooks(True, Notes);
+  Check(uHooks.HooksEnabled, 'the blocking hook loaded: ' + Trim(Notes));
+
+  SetLength(Replies, 2);
+  Replies[0] := ToolReply('toolu_h1', 'write_file',
+    '{"path":"hooked-loop.txt","content":"x"}');
+  Replies[1] := TextReply('Understood.');
+
+  A := MakeAgent;
+  try
+    Ok := A.Send('write the file', Err);
+    Check(Ok, 'the turn completes despite the block: ' + Err);
+    Check(CallCount = 2, Format('and takes exactly two requests (%d)',
+      [CallCount]));
+    Check(not FileExists(Target), 'the tool never ran');
+
+    Doc := JsonParse(Requests[1]);
+    try
+      Msgs := Doc.Find('messages');
+      Content := Msgs.Item(Msgs.Count - 1).Find('content');
+      Check(Msgs.Item(Msgs.Count - 1).Str('role') = 'user',
+        'the block comes back as a user turn');
+      Check(Content.Count = 1, 'with exactly one content block');
+      C := Content.Item(0);
+      Check(C.Str('type') = 'tool_result',
+        'and that block is a tool_result: ' + C.Str('type'));
+      Check(C.Str('tool_use_id') = 'toolu_h1',
+        'tied to the call that was blocked: ' + C.Str('tool_use_id'));
+      Check(C.Bool('is_error'), 'marked as an error, the way a denial is');
+      Check(Pos('the hook said no', C.Str('content')) > 0,
+        'carrying the hook''s reason: ' + C.Str('content'));
+    finally
+      Doc.Free;
+    end;
+  finally
+    A.Free;
+    uHooks.ClearHooks;
+    SysUtils.DeleteFile(Target);
+  end;
+end;
+
+{ The Stop hook drives one more turn, and only one.  The REPL owns the loop,
+  so its shape is replicated here rather than reached into - what is being
+  pinned is the contract the REPL implements: at most one continuation per
+  user turn, the hook's text becomes the next prompt, and StopActive tells the
+  hook it is on its second look. }
+procedure TestStopHookContinuation;
+var
+  A: TAgent;
+  Err, Notes, Line: string;
+  HookOut: THookOutcome;
+  Call: THookCall;
+  StopActive, Again, TurnOk: Boolean;
+  Doc, Msgs: TJson;
+begin
+  ResetScript;
+  uTools.RootDir := SessionDir;
+
+  { Exit 2 every time it is asked, so the cap is the only thing that can stop
+    the loop.  If StopActive went missing this would never return. }
+  WriteHooksFile('{"hooks":{"Stop":[{"command":' +
+    '"echo run the tests & exit /b 2"}]}}');
+  uHooks.LoadHooks(True, Notes);
+  Check(uHooks.HooksEnabled, 'the Stop hook loaded: ' + Trim(Notes));
+
+  SetLength(Replies, 3);
+  Replies[0] := TextReply('Done.');
+  Replies[1] := TextReply('Tests pass.');
+  Replies[2] := TextReply('This third reply must never be requested.');
+
+  A := MakeAgent;
+  try
+    Line := 'do the thing';
+    StopActive := False;
+    repeat
+      Again := False;
+      TurnOk := A.Send(Line, Err);
+      if TurnOk and uHooks.HooksEnabled and not StopActive then
+      begin
+        Call := uHooks.HookCall(heStop);
+        Call.StopActive := StopActive;
+        HookOut := uHooks.FireHooks(Call);
+        if HookOut.Blocked and (Trim(HookOut.Text) <> '') then
+        begin
+          StopActive := True;
+          Line := HookOut.Text;
+          Again := True;
+        end;
+      end;
+    until not Again;
+
+    Check(CallCount = 2,
+      Format('a Stop block drives exactly one more turn (%d requests)',
+        [CallCount]));
+    Doc := JsonParse(Requests[1]);
+    try
+      Msgs := Doc.Find('messages');
+      Check(Pos('run the tests',
+        Msgs.Item(Msgs.Count - 1).Find('content').Item(0).Str('text')) > 0,
+        'and the hook''s own words became the next prompt');
+    finally
+      Doc.Free;
+    end;
+  finally
+    A.Free;
+    uHooks.ClearHooks;
+  end;
+end;
+
 begin
   { Every request in this suite goes to the stand-in rather than the network. }
   uHttp.HttpTransport := @FakePost;
@@ -2106,6 +2242,8 @@ begin
   TestSubagentCancel;
   TestSubagentRoundCap;
   TestMcpTurn;
+  TestHookBlocksToolCall;
+  TestStopHookContinuation;
 
   WriteLn;
   if Fails = 0 then

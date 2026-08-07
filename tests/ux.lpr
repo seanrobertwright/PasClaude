@@ -12,7 +12,7 @@ program ux;
 
 {$mode objfpc}{$H+}
 
-uses SysUtils, Classes, uJson, uDiff, uTools, uAgent, uTerm, uNotebook;
+uses SysUtils, Classes, uJson, uDiff, uHooks, uTools, uAgent, uTerm, uNotebook;
 
 var
   Fails: Integer = 0;
@@ -2178,6 +2178,97 @@ begin
   DeleteFile(Path);
 end;
 
+{ What the user reads before approving a hook file, and what survives in
+  permissions.json afterwards.  Both are the parts of this feature a person
+  actually meets: the summary is the entire basis for the yes, and the
+  fingerprint is what stops the yes outliving the text it was given for. }
+procedure TestHooksPanel;
+var
+  Notes, Sum, P, FP: string;
+  SavedEdits, SavedBash, SavedFetch: Boolean;
+begin
+  ForceDirectories(IncludeTrailingPathDelimiter(TmpRoot) + StateDirName);
+  WriteFileText(uHooks.HooksFilePath, '{"hooks":{' +
+    '"PreToolUse":[{"matcher":"^(write_file|edit_file)$",' +
+    '"command":"python .pasclaude\\hooks\\fmt.py"}],' +
+    '"Stop":[{"command":"build.cmd"}]}}');
+
+  { The prompt has to describe the file before the file is trusted, so this
+    is read straight off disk with nothing loaded. }
+  uHooks.ClearHooks;
+  Sum := uHooks.HookSummaryOf(uHooks.HooksFilePath);
+  Check(Length(Sum) - Length(StringReplace(Sum, #10, '', [rfReplaceAll])) = 2,
+    'the approval prompt shows one line per hook');
+  Check((Pos('PreToolUse', Sum) > 0) and (Pos('Stop', Sum) > 0),
+    'naming each event: ' + StringReplace(Trim(Sum), #10, ' | ', [rfReplaceAll]));
+  Check(Pos('write_file|edit_file', Sum) > 0, 'and each matcher');
+  Check((Pos('fmt.py', Sum) > 0) and (Pos('build.cmd', Sum) > 0),
+    'and each command verbatim, which is the whole basis for the answer');
+
+  uHooks.LoadHooks(True, Notes);
+  Sum := uHooks.HookSummary;
+  Check(Length(Sum) - Length(StringReplace(Sum, #10, '', [rfReplaceAll])) = 2,
+    'and the loaded table renders the same two lines');
+
+  { The trust field shares permissions.json with the standing approvals, so
+    the thing to pin is that it cannot displace one of them. }
+  SavedEdits := uTools.AllowAllEdits;
+  SavedBash := uTools.AllowAllBash;
+  SavedFetch := uTools.AllowAllFetch;
+  P := IncludeTrailingPathDelimiter(TmpRoot) + 'ux-perms.json';
+  DeleteFile(P);
+  try
+    Check(uTools.LoadTrustedEntry(P, uHooks.HookTrustKey) = '',
+      'a permissions file that does not exist trusts nothing');
+
+    uTools.ClearTrust;
+    ClearBashPrefixes;
+    uTools.AllowAllEdits := True;
+    uTools.AllowAllBash := False;
+    uTools.AllowAllFetch := True;
+    AllowBashPrefix('git status');
+    FP := uHooks.HookFingerprint;
+    Check(FP <> '', 'the file has a fingerprint');
+    uTools.RecordTrust(uHooks.HookTrustKey, FP);
+    uTools.SavePermissions(P);
+
+    Check(uTools.LoadTrustedEntry(P, uHooks.HookTrustKey) = FP,
+      'the hook fingerprint round-trips through the file');
+    Check(uTools.LoadTrustedEntry(P, 'nothing-like-this') = '',
+      'and nothing else comes back with it');
+
+    { The narrow read must not be a full load in disguise: it runs before the
+      print-mode Halt, where loading approvals is exactly what must not
+      happen. }
+    uTools.AllowAllEdits := False;
+    uTools.LoadTrustedEntry(P, uHooks.HookTrustKey);
+    Check(not uTools.AllowAllEdits,
+      'reading the fingerprint grants no approvals of its own');
+
+    uTools.AllowAllFetch := False;
+    ClearBashPrefixes;
+    uTools.LoadPermissions(P);
+    Check(uTools.AllowAllEdits, 'the edits approval still round-trips');
+    Check(uTools.AllowAllFetch, 'and the fetch approval');
+    Check(not uTools.AllowAllBash, 'and bash is still off, as it was written');
+    Check(BashPrefixAllowed('git log'),
+      'and the bash program approvals were not displaced by the trust field');
+
+    { A changed file is a new question, which is the entire point. }
+    WriteFileText(uHooks.HooksFilePath, '{"hooks":{"Stop":[{"command":"x"}]}}');
+    Check(uHooks.HookFingerprint <> FP,
+      'editing hooks.json invalidates the recorded approval');
+  finally
+    DeleteFile(P);
+    uHooks.ClearHooks;
+    uTools.ClearTrust;
+    ClearBashPrefixes;
+    uTools.AllowAllEdits := SavedEdits;
+    uTools.AllowAllBash := SavedBash;
+    uTools.AllowAllFetch := SavedFetch;
+  end;
+end;
+
 procedure Cleanup(const Dir: string);
 var
   R: TSearchRec;
@@ -2224,6 +2315,7 @@ begin
     TestRewind;
     TestJobList;
     TestMcpPanel;
+    TestHooksPanel;
   finally
     { Before the cleanup, not after: a live child holding a spool handle under
       TmpRoot would make the recursive delete fail. }

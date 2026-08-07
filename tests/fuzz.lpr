@@ -8,7 +8,7 @@ program fuzz;
 
 {$mode objfpc}{$H+}
 
-uses SysUtils, Classes, Windows, uJson, uMcp, uTools, uAgent, uHttp;
+uses SysUtils, Classes, Windows, uJson, uMcp, uHooks, uTools, uAgent, uHttp;
 
 var
   Fails: Integer = 0;
@@ -953,6 +953,196 @@ begin
   Check(SubagentDepth = 0, 'and no failed call left the depth raised');
 end;
 
+{ ------------------------------------------------------------------ hooks -- }
+
+procedure WriteHooks(const Body: string);
+begin
+  ForceDirectories(IncludeTrailingPathDelimiter(SessionDir) + StateDirName);
+  WriteFileText(uHooks.HooksFilePath, Body);
+end;
+
+{ A hooks.json arrives from a repository, so every shape below is reachable by
+  somebody else's mistake or somebody else's intent.  None of them may load
+  something unbounded, and none may leave the feature in a state where
+  HooksEnabled lies. }
+procedure TestHooksHostileConfig;
+var
+  Notes, Big, Out_: string;
+  I: Integer;
+  J: TJson;
+  IsErr: Boolean;
+  Started: QWord;
+
+  procedure Survives(const Body, What: string);
+  var
+    N: string;
+  begin
+    WriteHooks(Body);
+    uHooks.LoadHooks(True, N);
+    Check(uHooks.HookCount(hePreTool) + uHooks.HookCount(hePostTool) +
+          uHooks.HookCount(heStop) + uHooks.HookCount(heUserPrompt) +
+          uHooks.HookCount(heSessionStart) <= uHooks.MaxHookEntries, What);
+  end;
+
+begin
+  uTools.RootDir := SessionDir;
+
+  Survives('[1,2,3]', 'a root array loads nothing and does not raise');
+  Check(not uHooks.HooksEnabled, 'and leaves the feature off');
+  Survives('"just a string"', 'a root string is survived');
+  Survives('{"hooks":[1,2]}', 'a "hooks" array is survived');
+  Survives('{"hooks":{"PreToolUse":{"command":"x"}}}',
+    'an event whose value is an object is survived');
+  Survives('{"hooks":{"PreToolUse":[42]}}',
+    'an entry that is a number is survived');
+  Survives('{"hooks":{"PreToolUse":[{"command":{"a":1}}]}}',
+    'an object command is survived');
+  Check(uHooks.HookCount(hePreTool) = 0, 'and registers nothing');
+
+  { timeout_ms is a double off a file: +Inf overflows a bare Round, NaN
+    compares false against every bound, and a negative is a deadline already
+    in the past.  All four have to land inside [500, 60000]. }
+  WriteHooks('{"hooks":{"PreToolUse":[' +
+    '{"command":"echo a","timeout_ms":1e309},' +
+    '{"command":"echo b","timeout_ms":-5},' +
+    '{"command":"echo c","timeout_ms":0},' +
+    '{"command":"echo d","timeout_ms":"soon"},' +
+    '{"command":"echo e","timeout_ms":900000}]}}');
+  uHooks.LoadHooks(True, Notes);
+  Check(uHooks.HookCount(hePreTool) = 5, 'five hostile timeouts all load');
+  Check(uHooks.HooksEnabled, 'and the table is usable');
+
+  { Eight entries on each of the five events: forty asked for, and the total
+    cap has to bite before the per-event one runs out of chances to. }
+  Big := '';
+  for I := 1 to 5 do
+  begin
+    if Big <> '' then Big := Big + ',';
+    case I of
+      1: Big := Big + '"PreToolUse"';
+      2: Big := Big + '"PostToolUse"';
+      3: Big := Big + '"Stop"';
+      4: Big := Big + '"UserPromptSubmit"';
+    else Big := Big + '"SessionStart"';
+    end;
+    Big := Big + ':[{"command":"echo 1"},{"command":"echo 2"},' +
+      '{"command":"echo 3"},{"command":"echo 4"},{"command":"echo 5"},' +
+      '{"command":"echo 6"},{"command":"echo 7"},{"command":"echo 8"}]';
+  end;
+  WriteHooks('{"hooks":{' + Big + '}}');
+  uHooks.LoadHooks(True, Notes);
+  Check(uHooks.HookCount(hePreTool) +
+        uHooks.HookCount(hePostTool) +
+        uHooks.HookCount(heStop) +
+        uHooks.HookCount(heUserPrompt) +
+        uHooks.HookCount(heSessionStart) <= uHooks.MaxHookEntries,
+    'forty entries across five events stop at the total cap');
+
+  { The pattern that hangs a backtracker.  uRegex cannot express it as a hang,
+    and the budget is the second line of defence rather than the first. }
+  WriteHooks('{"hooks":{"PreToolUse":[{"matcher":"(a+)+$",' +
+    '"command":"echo never runs & exit /b 2"}]}}');
+  uHooks.LoadHooks(True, Notes);
+  Check(uHooks.HookCount(hePreTool) = 1, 'the pathological matcher compiles');
+  Started := GetTickCount64;
+  J := TJson.NewObj;
+  Out_ := RunTool(StringOfChar('a', 60), J, IsErr);
+  { The pattern is legal and does match a run of a's; the assertion is that
+    deciding so took milliseconds.  Against a backtracker this is 17 seconds
+    at 27 characters and unbounded at 60. }
+  Check(GetTickCount64 - Started < 5000,
+    'and deciding it against sixty a''s takes no measurable time');
+  Check(IsErr, 'the matcher reached a definite answer: ' + Copy(Out_, 1, 40));
+
+  uHooks.ClearHooks;
+  Check(not uHooks.HooksEnabled, 'and everything is put back');
+end;
+
+{ What a hook does, rather than what its config says.  The tool result is what
+  reaches the model, so every one of these is a way to lose a conversation. }
+procedure TestHooksHostileBehaviour;
+var
+  Notes, Out_, Payload: string;
+  J: TJson;
+  IsErr, Saved: Boolean;
+  Started: QWord;
+begin
+  uTools.RootDir := SessionDir;
+  Saved := uTools.AllowAllEdits;
+  uTools.AllowAllEdits := True;
+  try
+    { Five megabytes from a hook, appended to a tool result.  The cap has to
+      hold on the read, and the cut has to leave valid UTF-8. }
+    WriteHooks('{"hooks":{"PostToolUse":[{"command":' +
+      '"for /L %i in (1,1,120000) do @echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",' +
+      '"timeout_ms":30000}]}}');
+    uHooks.LoadHooks(True, Notes);
+    J := TJson.NewObj;
+    J.AddStr('path', '.');
+    Out_ := RunTool('list_dir', J, IsErr);
+    Check(Length(Out_) < 80 * 1024,
+      Format('a hook printing megabytes is bounded (%d bytes)', [Length(Out_)]));
+    Check(IsValidUtf8(Out_), 'and what reaches the model is valid UTF-8');
+
+    { Raw high bytes with no BOM: unrepaired, one of these loses the whole
+      conversation, not just the tool call. }
+    WriteHooks('{"hooks":{"PostToolUse":[{"command":' +
+      '"echo caféÿþ raw"}]}}');
+    uHooks.LoadHooks(True, Notes);
+    J := TJson.NewObj;
+    J.AddStr('path', '.');
+    Out_ := RunTool('list_dir', J, IsErr);
+    Check(IsValidUtf8(Out_), 'high bytes from a hook are repaired, not passed on');
+
+    { Exit 0 with stdout that starts like JSON and is not.  A block would be
+      the wrong reading: the hook did not refuse anything. }
+    WriteHooks('{"hooks":{"PreToolUse":[{"command":' +
+      '"echo {not really json at all"}]}}');
+    uHooks.LoadHooks(True, Notes);
+    J := TJson.NewObj;
+    J.AddStr('path', '.');
+    Out_ := RunTool('list_dir', J, IsErr);
+    Check(not IsErr,
+      'unparseable stdout at exit 0 is context, never a block: ' + Out_);
+
+    { A hook that starts a long-lived grandchild and returns.  The job object
+      kills the tree at the deadline; if it did not, the spool would still be
+      open and undeletable. }
+    WriteHooks('{"hooks":{"PreToolUse":[{"command":' +
+      '"start /b ping -n 30 127.0.0.1 >nul & ping -n 30 127.0.0.1 >nul",' +
+      '"timeout_ms":1500}]}}');
+    uHooks.LoadHooks(True, Notes);
+    Started := GetTickCount64;
+    J := TJson.NewObj;
+    J.AddStr('path', '.');
+    Out_ := RunTool('list_dir', J, IsErr);
+    Check(GetTickCount64 - Started < 10000,
+      'a hook that outlives its deadline does not hold the turn');
+    Check(not IsErr, 'and a timeout is a failure, not a block: ' + Out_);
+
+    { A tool_input too big for the payload is omitted wholesale.  Truncating
+      it would hand the hook stdin that is not JSON at all. }
+    WriteHooks('{"hooks":{"PreToolUse":[{"matcher":"^write_file$",' +
+      '"command":"findstr /R . & exit /b 2","timeout_ms":20000}]}}');
+    uHooks.LoadHooks(True, Notes);
+    J := TJson.NewObj;
+    J.AddStr('path', 'big.txt');
+    J.AddStr('content', StringOfChar('q', 300 * 1024));
+    Out_ := RunTool('write_file', J, IsErr);
+    Check(IsErr, 'the oversized call was blocked, so its payload came back');
+    Payload := Out_;
+    Check(Pos('_omitted', Payload) > 0,
+      'and the hook saw the input omitted rather than cut');
+    Check(Pos('bytes', Payload) > 0, 'with the byte count in the omission');
+    Check(Length(Payload) < uHooks.MaxHookInBytes,
+      Format('and the payload itself stayed under the cap (%d)',
+        [Length(Payload)]));
+  finally
+    uHooks.ClearHooks;
+    uTools.AllowAllEdits := Saved;
+  end;
+end;
+
 { Every way a real MCP server can misbehave, driven against bin\srvmock.exe -
   a real child with real pipes, because the scripted wire in smoke.lpr cannot
   produce a process that is genuinely there and genuinely silent, and that is
@@ -1309,6 +1499,8 @@ begin
   TestBackgroundJobsHostile;
   TestHostileSearchResult;
   TestAgentDefinitions;
+  TestHooksHostileConfig;
+  TestHooksHostileBehaviour;
   TestMcpConfig;
   TestMcpSchemaTrust;
   TestMcpHostileServer;

@@ -5,7 +5,7 @@ program smoke;
 
 {$mode objfpc}{$H+}
 
-uses SysUtils, Classes, uJson, uHttp, uMcp, uTools, uAgent, uRegex;
+uses SysUtils, Classes, uJson, uHttp, uMcp, uHooks, uTools, uAgent, uRegex;
 
 var
   Fails: Integer = 0;
@@ -1685,6 +1685,324 @@ begin
   SysUtils.DeleteFile(ErrLog);
 end;
 
+{ ------------------------------------------------------------------ hooks -- }
+
+var
+  { A scripted TAskProc for the permission-interaction test: it counts and
+    always refuses, so "the write happened" and "Ask was never called" are two
+    independent assertions rather than one. }
+  AskCalls: Integer = 0;
+
+function AlwaysDeny(const Title, Detail: string): TPermission;
+begin
+  Inc(AskCalls);
+  Result := pmDeny;
+end;
+
+function HookRoot: string;
+begin
+  Result := IncludeTrailingPathDelimiter(GetTempDir) + 'pasclaude-hooks';
+end;
+
+procedure WriteHooksFile(const Body: string);
+var
+  L: TStringList;
+begin
+  ForceDirectories(HookRoot + PathDelim + '.pasclaude');
+  L := TStringList.Create;
+  try
+    L.Text := Body;
+    L.SaveToFile(uHooks.HooksFilePath);
+  finally
+    L.Free;
+  end;
+end;
+
+{ The primitive on its own, which is where the transport decisions are either
+  true or not.  Everything above it is policy; this is the part that either
+  deadlocks or does not. }
+procedure TestRunChild;
+var
+  Out_, Payload, Big: string;
+  Code: Integer;
+  Timed: Boolean;
+  Started: QWord;
+  R: TSearchRec;
+  Strays: Integer;
+begin
+  ForceDirectories(HookRoot);
+  uTools.RootDir := HookRoot;
+
+  Payload := '{"hook_event_name":"PreToolUse","tool_name":"write_file"}';
+  Code := uHooks.RunChild('findstr /R .', Payload, '', 5000,
+    uHooks.MaxHookOutBytes, Out_, Timed);
+  Check((Code = 0) and not Timed, 'a hook that reads stdin exits 0');
+  Check(Pos('hook_event_name', Out_) > 0,
+    'and the payload really arrived on its stdin: ' + Copy(Out_, 1, 40));
+
+  Code := uHooks.RunChild('echo blocked 1>&2 & exit /b 2', '', '', 5000,
+    uHooks.MaxHookOutBytes, Out_, Timed);
+  Check(Code = 2, 'exit 2 propagates through cmd.exe intact');
+  Check(Pos('blocked', Out_) > 0, 'and stderr is merged into the spool');
+
+  Started := GetTickCount64;
+  Code := uHooks.RunChild('ping -n 30 127.0.0.1 >nul', '', '', 1500,
+    uHooks.MaxHookOutBytes, Out_, Timed);
+  Check(Timed, 'a hook past its deadline is killed');
+  Check(GetTickCount64 - Started < 6000,
+    'and the deadline is honoured, not merely noticed');
+
+  { The deadlock case.  With a pipe for stdin this blocks forever at the
+    buffer size, because there is no second thread to drain it. }
+  Big := StringOfChar('x', 200 * 1024);
+  Started := GetTickCount64;
+  Code := uHooks.RunChild('echo ignored', Big, '', 5000,
+    uHooks.MaxHookOutBytes, Out_, Timed);
+  Check((Code = 0) and not Timed,
+    'a child that never reads 200 KB of stdin still completes');
+  Check(GetTickCount64 - Started < 5000, 'and does not stall waiting for it');
+
+  Code := uHooks.RunChild('for /L %i in (1,1,20000) do @echo a line of output',
+    '', '', 30000, uHooks.MaxHookOutBytes, Out_, Timed);
+  Check(Length(Out_) = uHooks.MaxHookOutBytes,
+    Format('a torrent of output is cut at the cap (%d)', [Length(Out_)]));
+  Check(IsValidUtf8(Out_), 'and the cut leaves valid UTF-8');
+
+  { The measured fact the whole exit-code rule rests on. }
+  Code := uHooks.RunChild('no_such_program_xyz', '', '', 5000,
+    uHooks.MaxHookOutBytes, Out_, Timed);
+  Check((Code <> 0) and (Code <> 2),
+    Format('a nonexistent program exits nonzero but not 2 (%d)', [Code]));
+
+  Strays := 0;
+  if FindFirst(HookRoot + PathDelim + '.pasclaude' + PathDelim + 'tmp' +
+       PathDelim + 'hook-*.*', faAnyFile, R) = 0 then
+  begin
+    repeat
+      Inc(Strays);
+    until FindNext(R) <> 0;
+    SysUtils.FindClose(R);
+  end;
+  Check(Strays = 0, 'and every call cleaned up both of its temporary files');
+end;
+
+procedure TestHookConfig;
+var
+  Notes, F1, F2: string;
+  L: TStringList;
+  I: Integer;
+begin
+  uTools.RootDir := HookRoot;
+
+  WriteHooksFile('{"hooks":{' +
+    '"PreToolUse":[{"matcher":"^(write_file|edit_file)$","command":"echo pre"}],' +
+    '"Stop":[{"command":"echo stop","timeout_ms":2000}]}}');
+  uHooks.LoadHooks(True, Notes);
+  Check(uHooks.HooksEnabled, 'a valid file loads');
+  Check(uHooks.HookCount(hePreTool) = 1, 'one PreToolUse hook');
+  Check(uHooks.HookCount(heStop) = 1, 'one Stop hook');
+  Check(uHooks.HookCount(hePostTool) = 0, 'and nothing for the others');
+  Check(Trim(Notes) = '', 'and nothing to complain about: ' + Notes);
+
+  { Trust is the gate, and it gates the parse itself. }
+  uHooks.LoadHooks(False, Notes);
+  Check(not uHooks.HooksEnabled, 'an untrusted file loads nothing at all');
+  Check(uHooks.HookCount(hePreTool) = 0, 'not even one entry');
+
+  F1 := uHooks.HookFingerprint;
+  F2 := uHooks.HookFingerprint;
+  Check((F1 <> '') and (F1 = F2), 'the fingerprint is stable: ' + F1);
+  L := TStringList.Create;
+  try
+    L.LoadFromFile(uHooks.HooksFilePath);
+    L.Add('');
+    L.SaveToFile(uHooks.HooksFilePath);
+  finally
+    L.Free;
+  end;
+  Check(uHooks.HookFingerprint <> F1, 'and changes when the bytes change');
+
+  { An event pasclaude does not fire is named, not swallowed: a config pasted
+    in from elsewhere says which half of itself will do nothing. }
+  WriteHooksFile('{"hooks":{"SessionEnd":[{"command":"echo bye"}]}}');
+  uHooks.LoadHooks(True, Notes);
+  Check(uHooks.HookCount(heStop) = 0, 'SessionEnd registers nothing');
+  Check(Pos('SessionEnd', Notes) > 0,
+    'and the note names it: ' + Trim(Notes));
+
+  WriteHooksFile('{"hooks":{"PreToolUse":[{"matcher":"^x$"}]}}');
+  uHooks.LoadHooks(True, Notes);
+  Check(uHooks.HookCount(hePreTool) = 0, 'an entry with no command is skipped');
+  Check(Pos('command', Notes) > 0, 'and noted: ' + Trim(Notes));
+
+  WriteHooksFile('{"hooks":{"PreToolUse":[{"matcher":"(","command":"echo x"}]}}');
+  uHooks.LoadHooks(True, Notes);
+  Check(uHooks.HookCount(hePreTool) = 0,
+    'a matcher that will not compile disables its hook');
+  Check(Pos('will not compile', Notes) > 0,
+    'at load time, not mid-tool-call: ' + Trim(Notes));
+
+  { Claude Code's nested shape is reported rather than half-supported. }
+  WriteHooksFile('{"hooks":{"PreToolUse":[{"matcher":"^x$","hooks":' +
+    '[{"type":"command","command":"echo x"}]}]}}');
+  uHooks.LoadHooks(True, Notes);
+  Check(uHooks.HookCount(hePreTool) = 0, 'the nested shape registers nothing');
+  Check(Pos('flat', Notes) > 0, 'and says what pasclaude wants: ' + Trim(Notes));
+
+  F1 := '{"hooks":{"PreToolUse":[';
+  for I := 1 to 12 do
+  begin
+    if I > 1 then F1 := F1 + ',';
+    F1 := F1 + '{"command":"echo ' + IntToStr(I) + '"}';
+  end;
+  WriteHooksFile(F1 + ']}}');
+  uHooks.LoadHooks(True, Notes);
+  Check(uHooks.HookCount(hePreTool) = uHooks.MaxHooksPerEvent,
+    Format('twelve entries for one event load %d', [uHooks.HookCount(hePreTool)]));
+  Check(Pos('only the first', Notes) > 0, 'and the cap is visible: ' + Trim(Notes));
+
+  uHooks.ClearHooks;
+  Check(not uHooks.HooksEnabled, 'ClearHooks turns the feature off');
+  Check(uHooks.HookCount(hePreTool) = 0, 'and empties the table');
+end;
+
+{ End to end through RunTool, which is the only path that proves the wrapper
+  fires around the ladder rather than beside it. }
+procedure TestHookDispatch;
+var
+  Notes, Out_, Target: string;
+  J: TJson;
+  IsErr: Boolean;
+  Saved: Boolean;
+begin
+  uTools.RootDir := HookRoot;
+  Saved := uTools.AllowAllEdits;
+  uTools.AllowAllEdits := True;
+  Target := HookRoot + PathDelim + 'hooked.txt';
+  DeleteFile(Target);
+  try
+    WriteHooksFile('{"hooks":{"PreToolUse":[{"matcher":"^write_file$",' +
+      '"command":"echo not on my watch & exit /b 2"}]}}');
+    uHooks.LoadHooks(True, Notes);
+
+    J := TJson.NewObj;
+    J.AddStr('path', 'hooked.txt');
+    J.AddStr('content', 'x');
+    Out_ := Run('write_file', J, IsErr);
+    Check(IsErr, 'a PreToolUse block is an error result');
+    Check(Pos('not on my watch', Out_) > 0,
+      'carrying the hook''s own words: ' + Out_);
+    Check(not FileExists(Target),
+      'and the tool never ran, so the file does not exist');
+
+    { The matcher is real: the same hook must not fire for another tool. }
+    WriteHooksFile('{"hooks":{"PreToolUse":[{"matcher":"^bash$",' +
+      '"command":"echo not on my watch & exit /b 2"}]}}');
+    uHooks.LoadHooks(True, Notes);
+    J := TJson.NewObj;
+    J.AddStr('path', 'hooked.txt');
+    J.AddStr('content', 'canary');
+    Out_ := Run('write_file', J, IsErr);
+    Check(not IsErr, 'a hook whose matcher misses does not fire: ' + Out_);
+    Check(FileExists(Target), 'and the write happened');
+
+    { PostToolUse appends rather than replaces, so the model still gets the
+      tool's answer along with the objection. }
+    WriteHooksFile('{"hooks":{"PostToolUse":[{"command":"echo reviewed"}]}}');
+    uHooks.LoadHooks(True, Notes);
+    J := TJson.NewObj;
+    J.AddStr('path', 'hooked.txt');
+    Out_ := Run('read_file', J, IsErr);
+    Check(not IsErr, 'a PostToolUse hook exiting 0 is not an error');
+    Check(Pos('reviewed', Out_) > 0, 'its text is appended: ' + Out_);
+    Check(Pos('canary', Out_) > 0, 'and the tool result is still there');
+
+    WriteHooksFile('{"hooks":{"PostToolUse":[{"command":"echo rejected & ' +
+      'exit /b 2"}]}}');
+    uHooks.LoadHooks(True, Notes);
+    J := TJson.NewObj;
+    J.AddStr('path', 'hooked.txt');
+    Out_ := Run('read_file', J, IsErr);
+    Check(IsErr, 'a PostToolUse block marks the result as an error');
+    Check((Pos('rejected', Out_) > 0) and (Pos('canary', Out_) > 0),
+      'without throwing away what the tool actually returned');
+
+    { Hooks fire around a registered source''s tools too, by name and with no
+      coordination between the two features - the wrapper is outside the
+      ladder, and the dispatcher lives inside its terminal else. }
+    ClearToolSources;
+    Check(RegisterToolSource('stub__', @StubDeclare, @StubRun, Notes),
+      'a source registers for the hook-reach test');
+    WriteHooksFile('{"hooks":{"PreToolUse":[{"matcher":"^stub__",' +
+      '"command":"echo no sources here & exit /b 2"}]}}');
+    uHooks.LoadHooks(True, Notes);
+    Out_ := Run('stub__one', TJson.NewObj, IsErr);
+    Check(IsErr and (Pos('no sources here', Out_) > 0),
+      'a PreToolUse hook blocks an MCP-shaped tool as well: ' + Out_);
+    ClearToolSources;
+    RegisterMcpToolSource;
+
+    uHooks.ClearHooks;
+  finally
+    uTools.AllowAllEdits := Saved;
+    DeleteFile(Target);
+  end;
+end;
+
+{ The single most important test here: where the hook allow sits relative to
+  the nil-Ask check. }
+procedure TestHookPermission;
+var
+  Notes, Out_, Target: string;
+  J: TJson;
+  IsErr: Boolean;
+  SavedEdits: Boolean;
+begin
+  uTools.RootDir := HookRoot;
+  SavedEdits := uTools.AllowAllEdits;
+  uTools.AllowAllEdits := False;
+  Target := HookRoot + PathDelim + 'allowed.txt';
+  try
+    WriteHooksFile('{"hooks":{"PreToolUse":[{"matcher":"^write_file$",' +
+      '"command":"echo {\"decision\":\"allow\"}"}]}}');
+    uHooks.LoadHooks(True, Notes);
+    Check(uHooks.HooksEnabled, 'the allow hook loaded: ' + Trim(Notes));
+
+    { Nil Ask is print mode and a subagent both.  A hook must not be able to
+      widen either, and the property comes from the line's position rather
+      than from a rule anybody has to remember. }
+    DeleteFile(Target);
+    J := TJson.NewObj;
+    J.AddStr('path', 'allowed.txt');
+    J.AddStr('content', 'x');
+    Out_ := uTools.RunTool('write_file', J, nil, IsErr);
+    J.Free;
+    Check(IsErr, 'with no way to ask, a hook allow still denies: ' + Out_);
+    Check(not FileExists(Target), 'and nothing was written');
+
+    { With somebody to ask, the allow answers for them - and the somebody is
+      never consulted, which is what makes it an allow rather than a default. }
+    AskCalls := 0;
+    DeleteFile(Target);
+    J := TJson.NewObj;
+    J.AddStr('path', 'allowed.txt');
+    J.AddStr('content', 'x');
+    Out_ := uTools.RunTool('write_file', J, @AlwaysDeny, IsErr);
+    J.Free;
+    Check(not IsErr, 'a hook allow satisfies the gate: ' + Out_);
+    Check(FileExists(Target), 'and the write happened');
+    Check(AskCalls = 0, Format('without asking the user at all (%d calls)',
+      [AskCalls]));
+
+    Check(not uTools.TakeHookAllow,
+      'and the allow does not outlive its tool call');
+  finally
+    uHooks.ClearHooks;
+    uTools.AllowAllEdits := SavedEdits;
+    DeleteFile(Target);
+  end;
+end;
+
 procedure TestPermissionPersistence;
 var
   P: string;
@@ -1762,6 +2080,10 @@ begin
   TestMcpPermissionClass;
   TestMcpScripted;
   TestMcpServerProcess;
+  TestRunChild;
+  TestHookConfig;
+  TestHookDispatch;
+  TestHookPermission;
   Schema := ToolsSchema;
   try
     Check(Pos('"input_schema"', Schema.ToJson) > 0, 'the schema serialises');

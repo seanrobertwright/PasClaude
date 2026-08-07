@@ -108,9 +108,23 @@ function JsonQuote(const S: string): string;
   caller that knows whether they are OEM output or a binary file. }
 function Utf8Cut(const S: string; MaxBytes: Integer): string;
 
+{ True when S is well-formed UTF-8.  Everything this program sends is a JSON
+  string, and a request carrying one bad byte is rejected whole - so a single
+  binary file would destroy the turn rather than just the tool call.  It lives
+  here beside Utf8Cut rather than in uTools because it is now needed by two
+  units the ladder forbids from reaching up: the UTF-8 family belongs in one
+  place, and the bottom of the ladder is the only place everyone can see. }
+function IsValidUtf8(const S: string): Boolean;
+
+{ Converts console output from the OEM codepage to UTF-8, scrubbing to ASCII
+  when the conversion itself fails - a mangled character is a far smaller
+  problem than a request the API refuses outright.  Same reason for living
+  here as IsValidUtf8: every unit that spawns a child process needs it. }
+function OemToUtf8(const S: string): string;
+
 implementation
 
-uses SysUtils;
+uses SysUtils, Windows;
 
 constructor TJson.Create(AKind: TJsonKind);
 begin
@@ -406,6 +420,85 @@ begin
     if K + Need - 1 > N then N := K - 1;
   end;
   Result := Copy(S, 1, N);
+end;
+
+function IsValidUtf8(const S: string): Boolean;
+var
+  I, Len, Need: Integer;
+  B: Byte;
+begin
+  I := 1;
+  Len := Length(S);
+  while I <= Len do
+  begin
+    B := Byte(S[I]);
+    if B < $80 then
+      Need := 0
+    else if (B and $E0) = $C0 then
+    begin
+      Need := 1;
+      if B < $C2 then Exit(False);        { overlong two-byte form }
+    end
+    else if (B and $F0) = $E0 then
+      Need := 2
+    else if (B and $F8) = $F0 then
+    begin
+      Need := 3;
+      if B > $F4 then Exit(False);        { beyond U+10FFFF }
+    end
+    else
+      Exit(False);                        { stray continuation or 0xFE/0xFF }
+
+    if I + Need > Len then Exit(False);
+    while Need > 0 do
+    begin
+      Inc(I);
+      if (Byte(S[I]) and $C0) <> $80 then Exit(False);
+      Dec(Need);
+    end;
+    Inc(I);
+  end;
+  Result := True;
+end;
+
+function OemToUtf8(const S: string): string;
+var
+  W: WideString;
+  U: UTF8String;
+  N, I: Integer;
+  CP: UINT;
+begin
+  Result := '';
+  if S = '' then Exit;
+  { FPC's CP_OEMCP is the RTL's own marker value (1), not a Windows codepage
+    identifier, so passing it to MultiByteToWideChar converts nothing. }
+  CP := GetConsoleOutputCP;
+  if CP = 0 then CP := GetOEMCP;
+  N := MultiByteToWideChar(CP, 0, PAnsiChar(S), Length(S), nil, 0);
+  if N > 0 then
+  begin
+    SetLength(W, N);
+    if MultiByteToWideChar(CP, 0, PAnsiChar(S), Length(S), PWideChar(W), N) = N then
+    begin
+      U := UTF8Encode(W);
+      { The bytes are copied one at a time.  Assigning a UTF8String straight to
+        a string makes FPC convert it back to the ANSI codepage, silently
+        undoing the work. }
+      SetLength(Result, Length(U));
+      for I := 1 to Length(U) do
+        Result[I] := Char(U[I]);
+      if IsValidUtf8(Result) then Exit;
+    end;
+  end;
+  { Conversion failed, so the bytes are scrubbed to ASCII rather than left
+    invalid: a mangled character is a far smaller problem than a request the
+    API refuses outright. }
+  Result := '';
+  for I := 1 to Length(S) do
+    if Byte(S[I]) < $80 then
+      Result := Result + S[I]
+    else
+      Result := Result + '?';
 end;
 
 { FloatToStr would honour the locale's decimal separator, which JSON does not
