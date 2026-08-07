@@ -39,7 +39,8 @@ Requires Free Pascal 3.2.x for `x86_64-win64`. The script finds `fpc.exe` on
 ```
 set ANTHROPIC_API_KEY=sk-ant-...
 set ANTHROPIC_MODEL=claude-sonnet-4-5          :: optional
-bin\pasclaude.exe [directory] [--resume]
+bin\pasclaude.exe [directory] [--resume] [--web] [-p "prompt"]
+                  [--output-format text|json|stream-json] [--input-format text|stream-json]
 ```
 
 Without a key, a Claude subscription works instead: if Claude Code has been
@@ -70,11 +71,15 @@ contents are appended to the system prompt as binding instructions.
 | `/compact` | drop the oldest turns, keep the recent ones |
 | `/compact full` | replace the transcript with a model-written summary |
 | `/diff` | list the files this session has changed |
+| `/hooks` | the commands this project runs automatically; `/hooks off` stops them |
 | `/jobs` | background commands still running |
+| `/mcp` | MCP servers: status, `/mcp restart <name>`, `/mcp refresh` |
 | `/memory` | show the project memory (CLAUDE.md) |
 | `/init` | have the model write a CLAUDE.md for this project |
 | `/rewind` | undo turns: conversation and edited files |
 | `/sessions` | list saved sessions and resume one |
+| `/skills` | the skills this project offers; also rescans for new ones |
+| `/plugins` | installed plugins; `/plugins enable\|disable <name>` |
 | `/think [n]` | extended thinking: on, off, or a token budget |
 | `/web [on\|off]` | let the model search the web (off by default) |
 | `/resume` | reload the saved conversation |
@@ -129,7 +134,9 @@ itself when `-p` has no argument. No banner, no session save - a script's
 throwaway question should not disturb the directory's saved conversation -
 and no permission prompts: stdin may be a pipe, so asking would hang.
 Read-only tools work; a run that needed an edit approved says so in its
-output instead of stalling.
+output instead of stalling. It also loads no hooks and spawns no MCP server,
+not by a new rule but by where it halts: a scripted run cannot be the thing
+that first executes a project's code.
 
 Pressing `Esc` while a reply is streaming stops it, and so does `Ctrl+C`:
 outside the prompt the default Ctrl+C handler would kill the process
@@ -294,10 +301,13 @@ the first's conversation on its very first save.
 | `fetch` | yes | HTTPS GET, capped at 200 KB, own "always" class |
 | `todo_write` | no | the visible task list; display state, touches nothing |
 | `task` | no | hands a self-contained question to a read-only subagent |
+| `skill` | no | reads a named `SKILL.md` out of the project; declared only when the project has skills |
 
-A thirteenth, `web_search`, is declared to the API rather than implemented
-here: the search runs on Anthropic's servers, `/web on` is what turns the
-declaration on, and there is no local code for it to call.
+`web_search` is declared to the API rather than implemented here: the search
+runs on Anthropic's servers, `/web on` is what turns the declaration on, and
+there is no local code for it to call. An MCP server's tools appear beside
+these as `mcp__<server>__<tool>`, contributed at runtime rather than written
+down here.
 
 At each prompt you can answer `y` (once), `a` (always) or `n`. Read-only
 tools never ask. For the edit tools and fetch, "always" covers the tool
@@ -667,6 +677,406 @@ free and already works: the model can emit several `task` blocks in one
 assistant turn and `RunTools` runs them one after another, each Enter/Leave
 balanced.
 
+## Trust
+
+Until this round, nothing in a project directory could make pasclaude run a
+program. `CLAUDE.md` was prose, `.pasclaude\commands\` was prose, an agent
+definition was prose; the only route to `CreateProcess` was the `bash` tool,
+and that route ends at a prompt showing the command. Two of the four features
+below change that - `.mcp.json` names programs to spawn, `hooks.json` names
+commands to run at fixed points in a turn - so the line those files cross is
+worth drawing explicitly rather than leaving a reader to infer it.
+
+The organizing distinction is declarative versus executable. Declarative text
+becomes prompt and nothing else: skill bodies, plugin commands, plugin agent
+types, `CLAUDE.md`. That is trusted without a prompt, because it grants a
+repository author no capability they did not already have through the
+instruction files this program has always read unprompted and labelled
+binding. A skill that says to run `del /s` produces a `bash` call that lands
+on the same prompt it always would. Executable configuration - anything that
+reaches `CreateProcess` - is asked about, every time the bytes change.
+
+Both questions go through the same `[y] once [a] always [n] no` prompt the
+bash gate uses, and both are shown in full before they are answered: every
+hook command verbatim, every server's expanded command line. "Always" records
+a fingerprint of exactly what was approved, not a name: the FNV-1a 64 of
+`hooks.json`'s bytes, and for a server the hash of its command, its arguments
+in order and its `NAME=VALUE` environment overrides sorted. Editing the hooks
+file asks again. Repointing an approved server name at a different program
+asks again, by name, showing the new program - because the name is a label
+the same file controls, so approving the name would approve whatever it is
+later made to mean. Environment values are hashed as well as names, since
+`NODE_OPTIONS` chooses the program as surely as an argument does.
+
+Those fingerprints live in the approvals file, which is why that file moved
+out of the project this round. `%LOCALAPPDATA%\pasclaude\approvals\` is
+keyed by the session root's full path; a repository that could ship its own
+`permissions.json` would have been answering its own question, pre-approving
+its own hooks and its own servers before a prompt appeared. When neither
+`%LOCALAPPDATA%` nor `%USERPROFILE%` is set there is no store, and that means
+approve-nothing and persist-nothing rather than a fall back into the project,
+which would restore the hole.
+
+Three things deliberately do *not* answer these questions. `/yolo` grants the
+per-call classes and not the right to spawn: yolo has always meant "stop
+asking me about these tools", it is answered before the repository's config is
+known to exist, and extending it to launching third-party binaries a cloned
+repository chose is a different sentence. Print mode is structurally unable to
+reach either prompt - it halts before the config is read, and would arrive
+with a nil `Ask` and deny everything if it did - so a scripted run can never
+be the thing that first executes a project's code. And enabling a plugin
+activates its commands, agents and skills and nothing else; a plugin manifest
+naming a hook or a server is reported by `/plugins` and never acted on.
+
+What this does not protect against, stated plainly:
+
+* Habituation. A user who answers `a` by reflex is one keystroke from running
+  a repository's commands. Showing every command verbatim and re-asking on
+  every edit is a mitigation, not a fix, and it is the price of the feature
+  existing at all.
+* Prompt injection. A server can put instructions in a tool description and a
+  skill can put them in its body, and both reach the model. Skill results are
+  wrapped in a header naming the skill and its source and a trailer saying the
+  text is project-supplied and not an instruction from the user; those lines
+  are the only signal separating repository text from the user's own voice,
+  and they are load-bearing rather than decorative. For MCP the gate is the
+  user having approved the program.
+* FNV-1a is a change detector, not a cryptographic digest. It is not
+  preimage-resistant, and widening it to 64 bits doubles the work without
+  changing that. FPC ships SHA-256 in fcl-hash rather than the RTL, which is
+  outside this program's dependency rule. The residual attack needs someone
+  who can already get a first server approved and then engineer a second
+  config colliding with it.
+* `.mcp.json` sits at the project root, so the tools can read *and write* it.
+  That is accepted rather than worked around: convention puts it there, it is
+  meant to be committed, and config is read once at startup, so a model that
+  rewrites it changes nothing that session and the new command line has no
+  matching fingerprint at the next launch. `hooks.json` lives under
+  `.pasclaude` and is therefore unreachable by the tools. The asymmetry is
+  deliberate - hooks have no convention pushing them to the root, so they take
+  the stricter placement for free - and should not be "fixed" for symmetry.
+
+## MCP servers
+
+A project can name programs for pasclaude to run: an `.mcp.json` in the
+session root, in the shape the rest of the ecosystem uses.
+
+```json
+{"mcpServers": {
+  "github": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-github"],
+             "env": {"GITHUB_TOKEN": "${GH_TOKEN}"}}
+}}
+```
+
+Their tools become ordinary tools, named `mcp__<server>__<tool>`. stdio
+transport only; an entry carrying a `url`, or a `type` other than stdio, is
+listed in `/mcp` as unsupported rather than silently dropped, because a user
+who wrote it and saw nothing would conclude the feature is broken. `${VAR}`
+and `${VAR:-default}` are expanded before the command line is hashed, so what
+the fingerprint covers is what will actually run.
+
+Startup cost is paid once. The first run after approval connects, discovers
+and writes `.pasclaude\mcp-cache.json`; every later run declares from the
+cache and spawns nothing until the first actual call. That buys a real
+divergence - we can advertise a tool the server no longer has - and it is the
+right trade, because the failure is one clean tool error that `/mcp refresh`
+fixes, where the alternative adds every server's boot time to every prompt.
+The tool list is frozen for the session even when a live server says it
+changed: the tools array renders ahead of the system prompt under one
+`cache_control` breakpoint, so swapping it mid-session throws the whole prompt
+cache away on every turn afterwards. `/mcp` says `tools changed` and leaves it.
+
+Everything a server says is treated as data. Tool names are sanitized to the
+API's `[A-Za-z0-9_-]` and composed against its 64-character ceiling; when they
+will not fit the server segment is truncated, and if even that is not enough
+the tool is skipped. Skipping beats mangling - a name we invented cannot be
+referenced by the user in an approval and reads to the model as a broken
+machine. Schemas are checked for type, depth (16) and size (8 KB) and
+*rejected* rather than truncated, because a cut schema does not parse and one
+that did would be a lie the model acts on every turn. Descriptions are cut on
+a UTF-8 boundary. `annotations`, `title` and `outputSchema` are dropped, per
+the spec's own instruction that a client must not trust them: "the user
+approved running this program" is not the same statement as "believe what it
+says about its own side effects". Every skip is counted and shown in `/mcp`,
+because a server contributing three of forty tools while looking correct is
+worse than one that looks broken. The declarations share a 32 KB budget across
+*all* servers, consumed in configuration order, because that text lands in the
+cached prefix and a per-server cap is unbounded in aggregate.
+
+`/mcp` lists every configured server with its status, tool and skip counts,
+expanded command line and stderr path. `/mcp restart <name>` drops a
+connection so the next call reconnects; `/mcp refresh` reconnects everything
+and rewrites the cache for the next run. Servers do not appear in `/jobs`, are
+not killable by `kill_bash`, and survive `/clear`: a running server is a
+capability this session has, not something the conversation said.
+
+`src\uMcp.pas` is the transport and knows nothing about approval, naming or
+dispatch. The decision worth recording is the one about blocking. A
+synchronous read on an empty pipe waits until somebody writes, and an MCP
+server is a third-party program that can hang, crash on a bad request, or take
+its time. Background bash met the same hazard from the other side and answered
+it with a spool file, which works there precisely because nobody is waiting;
+here somebody always is, since a tool call cannot return until the server
+answers. So every wire wait goes through one function, `McpAwait`, whose loop
+is: drain the complete lines already buffered, check the buffer cap, ask the
+pipe how many bytes are ready without consuming them, read only that many,
+check the deadline. There is no path that reads without first peeking and none
+that waits without a deadline, which makes "a hung server can never hang
+pasclaude" one function's postcondition rather than a discipline spread over
+four call sites. A deadline that expires kills the connection rather than
+abandoning it: a server that ignored one request has no credibility for the
+next, and one left running still owns its stderr file.
+
+Polling on the caller's thread, rather than a reader thread or overlapped I/O,
+is a correctness argument and not a style one. Every mutable thing above this
+unit is an unguarded module global, and the subagent design reasons explicitly
+from "the tools a subagent may call touch no module state"; a reader thread
+would invalidate that argument for the whole program to save a five-millisecond
+sleep. The write side has the same shape for the same reason - a `WriteFile`
+to a server that has stopped draining its stdin is the one wait a read deadline
+cannot cover, so the stdin handle is set `PIPE_NOWAIT` at spawn and the send
+loop carries its own deadline and liveness check.
+
+Three bounds keep a misbehaving server from doing damage. A request over
+256 KB is refused locally without touching the pipe. A line over 1 MB with no
+newline kills the connection, because a server streaming an unterminated line
+is indistinguishable from one that has hung. A tool result is capped at 64 KB
+with `uJson.Utf8Cut` and a note saying it was cut. Junk on stdout is discarded
+rather than fatal - the spec forbids it, but a client that dies on a stray line
+hands a broken server the power to end the session - and an unsolicited request
+from the server gets a `-32601` reply so it is not left waiting. No shell is
+interposed on the command line: a shell would change the quoting the caller
+decided on, swallow the exit code, and sit between us and the pipes so that
+closing stdin no longer reaches the server.
+
+## Extending the tool list
+
+The twelve built-in tools are still twelve straight-line literals. Anything
+else that wants to contribute tools registers a *source*: a name prefix
+matching `^[a-z][a-z0-9_]*__$` and two procedures, one that declares and one
+that runs. MCP registers `mcp__`. The double underscore is the whole trick -
+no built-in name contains one and none ever may, so a source cannot shadow
+`read_file`, and the rule does not need revisiting when a thirteenth built-in
+lands. Overlapping prefixes are refused at registration, so at most one source
+matches a name and dispatch does not depend on the order things registered in.
+
+Sources are declared last, below the cut that ends a subagent's tool list.
+That cut is an `Exit`, so a subagent is never told about a source's tools no
+matter who adds the next one - and `RunTool`'s read-only boundary refuses the
+call anyway, since nothing a source contributes is on the three-name
+allowlist. The dispatcher catches exceptions from a source's handler. That is
+not defensive habit: the tool loop above does not catch, so an exception
+escaping there would skip the `tool_result` the API requires and leave a
+transcript that cannot be sent.
+
+## Hooks
+
+`.pasclaude\hooks.json` runs commands of your choosing at five points in a
+turn: before a tool runs, after it runs, when you submit a prompt, when the
+model finishes, and once when the session starts. A hook is a command line
+and, for the two tool events, an optional regular expression matched against
+the tool name.
+
+```json
+{"hooks":{
+  "PreToolUse":[{"matcher":"^(write_file|edit_file)$",
+                 "command":"python .pasclaude\\hooks\\fmt.py","timeout_ms":5000}],
+  "Stop":[{"command":"build.cmd"}]}}
+```
+
+A hook is handed one UTF-8 JSON object on stdin - always `hook_event_name` and
+`session_root`, plus `tool_name`/`tool_input`, `tool_result`/`is_error`,
+`prompt` or `stop_hook_active` depending on the event. It answers with its exit
+code: 0 proceeds, 2 blocks, and anything else means the hook *failed*, which is
+never a block. On exit 0 a JSON object on stdout is honoured -
+`{"decision":"allow"|"deny","reason":...,"context":...}` - and anything else is
+treated as plain context appended to the result, the prompt or the system
+prompt.
+
+That "anything else is a failure" rule is the one worth explaining, because the
+obvious rule is wrong. A nonexistent program exits 1 through cmd.exe; under
+"any nonzero blocks", one mistyped hook command would silently deny every tool
+call in the project with no way to find out why. A timeout is treated
+identically, for the same reason.
+
+What blocking means, per event: `PreToolUse` - the tool does not run and the
+hook's text comes back as the tool's error result; `PostToolUse` - the tool
+already ran, so its output is kept, the hook's objection appended and the whole
+thing marked as an error; `UserPromptSubmit` - the turn is abandoned before
+anything reaches the transcript; `Stop` - one more turn runs with the hook's
+text as the prompt, exactly once per user turn; `SessionStart` - pasclaude
+prints the reason and exits.
+
+Stdin is a file, not a pipe. `uTools` already records why anonymous pipes were
+rejected for detached children; a hook makes pasclaude the writer, and with one
+thread there is nobody to drain. Measured: 200 KB to a child that never reads
+it completes at once through a file handle and deadlocks at the buffer size
+through a pipe. The deadlock is made impossible rather than unlikely. A
+`tool_input` over 64 KB is replaced wholesale with `{"_omitted":"N bytes"}`
+rather than truncated, because half a JSON value is not JSON and a hook that
+cannot parse its own stdin is worse off than one told plainly.
+
+A block returns the same `(text, is_error)` pair a permission denial already
+returns, which is why the conversation loop needed no change at all: "blocking
+leaves a legal transcript" is true by construction. A hook's `allow` decision
+is read once and is checked *after* the nil-`Ask` test in `Permit`, so it can
+turn a question into a yes and can never turn a refusal into one - print mode
+and subagents both arrive there with a nil `Ask` and are unaffected. Matchers
+are the same bounded NFA the `search` tool uses, so a pattern from an untrusted
+file cannot hang the session; one that will not compile disables its hook with
+a note at startup rather than a surprise mid-tool-call. Unknown event names are
+named in the notes rather than ignored, so a Claude Code config pasted in tells
+you which half of itself pasclaude will not fire - including that product's
+nested `{"matcher":...,"hooks":[...]}` entry shape, which is detected and
+reported rather than supported, because two accepted shapes is two parsers and
+twice the surface to fuzz.
+
+`/hooks` shows the file, whether hooks are running, the fingerprint and one
+line per hook. `/hooks off` turns them off for the session.
+
+## Skills and plugins
+
+A skill is a directory under `.pasclaude\skills\` holding a `SKILL.md`: a small
+frontmatter block naming it and describing when it applies, then a body of
+instructions. Only the name and the description are ever advertised; the body
+arrives when the model calls the `skill` tool by name. That is the whole idea -
+a project can write down a dozen procedures and pay one line per procedure per
+turn instead of a dozen documents. The catalogue is discovered from disk on
+each refresh: this project's own skills, then each enabled plugin's
+alphabetically, then the user's own in `%USERPROFILE%\.pasclaude\skills\`.
+Nearer wins, the rule the instruction files already use.
+
+The catalogue lives in the `skill` tool's own description rather than in the
+system prompt. The system prompt is fixed when the agent is constructed and has
+no setter, so a catalogue there could never change during a session; the tool
+schema is rebuilt fresh on every request, and both sit inside the same single
+`cache_control` breakpoint, so the token cost is byte-identical and a skill
+dropped in after `/skills` is live on the next turn. `/skills` prints the
+catalogue and doubles as the rescan, because re-reading up to thirty-two files
+per request would cost more than a stale list does.
+
+The frontmatter reader takes a stated subset and refuses everything else with a
+line number: a `---` fence, flat `key: value` lines, optionally quoted scalars
+with no escape interpretation, `#` comments, blank lines. Block scalars,
+sequences, indentation, flow collections, anchors and aliases are errors naming
+the construct and the line. Unknown flat keys parse and are ignored, so a file
+carrying `allowed-tools` or `license` still loads. This is small on purpose: a
+half-implemented YAML parser mis-reads a description silently, and a
+description read wrong is a skill that never triggers with nothing anywhere
+saying why. A skill whose file fails to parse is listed by `/skills` with its
+error rather than vanishing, for the same reason.
+
+The `skill` tool is not gated. It reads a file the user put in their own
+project, which is `read_file`'s trust class, and what comes back is text of the
+same class as `CLAUDE.md`. It grants no capability. The header and trailer
+described under Trust replace the gate that would have been theatre.
+
+A plugin is a directory under `.pasclaude\plugins\` carrying a `plugin.json`
+and any of `commands\`, `agents\`, `skills\`. It contributes into those three
+namespaces through the same loaders an ordinary custom command or agent type
+uses; it creates no parallel universe. A plugin dropped in is inert until
+`/plugins enable <name>`. That consent is a typed name rather than a y/a/n
+prompt deliberately: a launch-time prompt is answered by muscle memory before
+anything has been read, while typing a plugin's name means the user went and
+looked. Enablement lives in `.pasclaude\plugins.json`, which - unlike the
+approvals file - is authoritative in *both* directions, because a disable that
+did not survive a restart would be a consent bug the user could never diagnose.
+Both files say so in comment. Collisions resolve nearest-first and the source
+is always shown, so a cloned repository's plugin shadowing something the user
+wrote is visible rather than silent. Built-in slash commands can never be
+shadowed; the built-in dispatch runs first, unchanged.
+
+Caps, all of them visible when they bite: 32 skills catalogued (past that the
+listing ends `(N more skills are installed but not listed)`), 320 bytes of
+description each, 128 KB per `SKILL.md`, 16 plugins. A supporting file that is
+not valid UTF-8 is refused rather than hex-dumped - that is a mistake in the
+skill, not a binary the model asked to see.
+
+## Driving pasclaude from another program
+
+`-p` answers a single prompt, and two flags change what that answer looks like
+on the wire. `--output-format json` prints one JSON object and nothing else:
+the finished result of the turn. `--output-format stream-json` prints one JSON
+object per line as the turn happens - the tools it called, the text as it
+streamed, and finally the result. `--input-format stream-json` turns stdin into
+the other half of the conversation, so a driver can ask a second question
+without starting a second process, and can answer the permission questions the
+user would otherwise have answered.
+
+Both flags need `-p`, and `--input-format stream-json` needs
+`--output-format stream-json`, because a driver that can speak has to be able
+to listen. `-p` takes the next argument as its prompt only when that argument
+does not begin with `-`, so the flags may go on either side of it.
+
+The message types: `system` (subtype `init`, emitted once, carrying the session
+id, cwd, model, permission mode and the full inventory of tools, agents,
+commands, MCP servers and skills), `user` (the prompt echoed back),
+`assistant_delta` (`delta.type` is `text` or `thinking`), `tool_use` (id, name,
+and the input as a parsed object), `tool_result` (tool_use_id, name, content,
+is_error), `notice`, `hook`, `permission_request`, `error`, and `result`.
+Exactly one `result` per turn is the contract and the process never exits
+without one, so a driver knows the run is over when it sees the result line and
+then stdout closes.
+
+The permission exchange is the part worth an example. pasclaude emits
+
+```json
+{"type":"permission_request","id":"perm_1","tool_name":"write_file",
+ "title":"write_file","detail":"...diff..."}
+```
+
+and blocks on exactly one line of stdin. The driver replies
+
+```json
+{"type":"permission_response","id":"perm_1","behavior":"allow"}
+```
+
+where behavior is `allow`, `allow_always` or `deny`. Everything else denies: an
+unknown verb, a mismatched id, a line that is not JSON, a message that is not a
+`permission_response`, and end of stream. That is the same rule the console
+prompt follows when its own read fails, and there is no default-allow branch
+anywhere in the parser.
+
+A run *without* `--input-format stream-json` can read files, list directories
+and search, and nothing else. Every write, edit and shell command is refused in
+band, as an ordinary `tool_result` with `is_error` true naming the refusal -
+print mode's existing deny-by-default rule, not a new one. An SDK run never
+reads or writes the approvals file and never writes `session.json` or
+`history.txt`, so a driver's throwaway question neither inherits a human's
+standing approvals nor manufactures new ones. It never loads hooks and never
+spawns an MCP server, for the same structural reason: it halts before that
+startup work runs.
+
+Exit codes: 0 success, 1 the turn failed, 2 a startup or usage error. A startup
+failure in `json` or `stream-json` mode is emitted as a single
+`{"type":"error","error":"..."}` line rather than a sentence, so a driver's
+parser is never handed prose.
+
+```python
+p = subprocess.Popen([exe, "-p", "", "--output-format", "stream-json",
+                      "--input-format", "stream-json"],
+                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+p.stdin.write(json.dumps({"type": "user",
+                          "message": {"role": "user", "content": "hello"}}) + "\n")
+p.stdin.flush()
+for line in p.stdout:
+    msg = json.loads(line)
+    if msg["type"] == "result":
+        break
+```
+
+The same code is reachable from Pascal. `src\uSdk.pas` is console-free and
+`examples\embed.lpr` is about sixty lines using only SysUtils and uSdk - set
+the root, construct, ask, free - and `build.cmd` builds it, so it cannot rot
+into needing `uTerm`. One session per process, because `RootDir`, the AllowAll
+flags, the job table, the bash prefixes, the snapshots and the ignore rules are
+all module-global in `uTools`; a subprocess is the isolation boundary.
+
+That unit is also where the system prompt now lives. It was lifted out of
+`pasclaude.lpr` verbatim, which is what makes it testable for the first time -
+specifically that user memory loads *before* the project's own instruction
+files, so nearer still wins.
+
 ## Tests
 
 ```
@@ -953,6 +1363,90 @@ cap would repeat that nothing forever; a full buffer with no newline is now
 handed over, cut at the last complete character. All four are regression-
 tested and all four tests fail without the fix.
 
+The extensibility round is tested the same way, in the suite that can see
+each part. Two new seams carry most of it. `uMcp.McpWire` is a record of four
+nil-by-default procedure pointers in the spirit of `uHttp.HttpTransport`; with
+one installed, the framing, the handshake, pagination, both error channels,
+junk, an unterminated line, an oversized request and the deadline all run
+against scripted bytes with no child process at all, delivered in nine-byte
+chunks so every frame arrives split across reads. Nothing shipped assigns it,
+and a test says so out loud. The half a script cannot reach - real pipes, real
+handle inheritance, real EOF, a real exit code, and a process that is genuinely
+there and genuinely silent - runs against `bin\srvmock.exe`, a stand-in server
+built by `test.cmd` whose misbehaviour is chosen by argument (`--hang`,
+`--die`, `--junk`, `--crlf`, `--pages`, `--chatty`, `--big`, `--deaf`). It is
+written against nothing but SysUtils and builds its JSON by hand, because a
+fixture sharing our parser and our writer could not fail the ways a foreign
+server fails; and it is built without `-gh`, because heaptrc's report on exit
+would go down the same stdout the protocol is framed on. `uSdk.SdkSink` and
+`SdkSource` are the other: the whole line protocol is driven with no process,
+no pipe and no console.
+
+`smoke` covers the primitives where the decisions are either true or not: the
+child-process runner (stderr really merges, exit 2 survives cmd.exe, a
+nonexistent program returns 1 and not 2, 200 KB of stdin to a child that never
+reads it completes, nothing is left in `.pasclaude\tmp`); the hook loader; the
+tool registry's six registration refusals and its dispatch; the MCP protocol
+end to end through the scripted wire and once against a real `srvmock`; the
+skill frontmatter reader and catalogue; plugin precedence through four
+independent gates; and the SDK `init` line's inventory compared name-by-name
+against a live walk of `ToolsSchema` rather than against a literal count, so a
+feature adding a tool breaks nothing there. `fuzz` covers the hostile half:
+hostile `.mcp.json` (traversing server names, a 5 MB config, `url` entries),
+schema trust driven through `McpValidateTool` directly, real spawned children
+with each misbehaviour flag, hostile `hooks.json`, hook behaviour under
+megabytes of output and a blown deadline, skill names that walk paths with a
+decoy planted at every traversal target, and the approvals store asserted to
+live under `%LOCALAPPDATA%` and never inside the root - including that a
+committed `.pasclaude\permissions.json` grants nothing through either loader.
+`loop` covers the turn: a hook blocking a tool call and the transcript that
+results, the Stop-hook continuation making exactly two requests, an MCP tool
+appearing in the request body after the built-ins and round-tripping a call,
+the same call denied still producing exactly one `tool_result`, and five SDK
+tests over the protocol, per-turn usage, multi-turn driver input, permission
+delegation and hostile driver lines. `ux` covers what a person meets: the
+`/mcp` panel's six tab-separated columns, the hooks panel, and plugin state
+round-tripping in *both* directions.
+
+Mutation-checked in the usual form. For the transport: pretty-printing the
+request instead of using the compact writer fails 11 assertions; abandoning a
+timed-out connection instead of killing it fails 1; dropping the
+peek-before-read guard fails no assertion at all - the suite simply never
+returns, which is exactly the failure the design exists to prevent and is worth
+recording as caught by a hang rather than by a red line. For the registry:
+moving the source loop above the `SubDepth` cut in `ToolsSchema` fails 6,
+dropping `(not IsMcp)` from the edits catch-all in `Permit` - the `/yolo` hole -
+fails 3, and dropping the `try/except` from the dispatcher takes `smoke` down
+with an unhandled exception, which is exactly what `RunTools` would do in
+production. For hooks: moving `TakeHookAllow` above the nil-`Ask` check fails 2
+(the single most important line in that feature, and it is pinned), dropping
+the `PostToolUse` error marking fails 1, and removing the total entry cap fails
+1. For skills: dropping the guard that stops a skill-free project advertising
+the tool fails 9 in `smoke` and 4 in `loop`, `Copy` instead of `Utf8Cut` on the
+description fails 1, treating EOF as the end of frontmatter fails 2, scanning
+enabled plugins before the project fails 1, and copying the approvals file's
+only-widen rule into the plugin state fails 3. For the SDK: replacing the
+per-turn usage delta with the post-send snapshot fails 1, and making the
+permission parser fall through to allow on an unrecognised verb and on EOF
+fails 3.
+
+Two bugs were found by the tests rather than by review. `TJson.Take(I)`
+detaches by substituting a fresh null, so `Count` never falls and the obvious
+move loop - `while Decl.Count > 0 do Push(Decl.Take(0))` - never terminates; it
+allocated 5.3 GB before it was killed. Every append loop indexes over the fixed
+length instead. And a mutation check exposed a fuzz assertion passing for the
+wrong reason: it used `not McpAlive(C)`, which answers from the recorded state
+and survived the mutant, and now asserts `McpConnectionCount = 0`, which only
+falls when the connection was actually torn down.
+
+The one place with no regression test says so. The argument loop that parses
+`-p` and the format flags is inline in `pasclaude.lpr`'s main block,
+interleaved with `FailStart`, `Halt` and `SetCurrentDir`, and no suite spawns
+the executable; pinning it honestly means extracting the whole loop into a
+seam, which is a larger refactor than a one-line predicate warrants, and
+extracting only the predicate would test a tautology. It was verified by hand
+against the built binary instead.
+
 `uHttp.HttpTransport` is the seam the loop suite uses. It is nil in the shipped
 program, which is asserted by the network suite reaching the real API.
 
@@ -984,9 +1478,19 @@ transcript's *shape*; that is why the structural rules are enforced in
 | `uDiff` | line diff used to preview a change before it is approved |
 | `uRegex` | NFA regex: compile a pattern, match a line, spend a budget |
 | `uNotebook` | `.ipynb` cell view, cell edits, nbformat's exact layout |
+| `uMcp` | MCP stdio client: two pipes, JSON-RPC, a deadline on every wait |
+| `uHooks` | a child process with a deadline, the hook table, hook dispatch |
 | `uTools` | the tool implementations, path guard, permission gate |
 | `uAgent` | request building, SSE decoding, the tool loop |
+| `uSdk` | system prompt assembly, the NDJSON line protocol, the facade |
 | `pasclaude.lpr` | REPL, slash commands, rendering |
+
+The ladder is strict: `uJson` -> `uHttp`/`uDiff`/`uRegex`/`uNotebook`/`uMcp`/
+`uHooks` -> `uTools` -> `uAgent` -> `uSdk` -> `pasclaude.lpr`. Nothing at or
+below `uAgent` knows the console exists. `uHooks` sits below `uTools` and so
+cannot call it, which is why the UTF-8 family - `IsValidUtf8` and `OemToUtf8`
+- moved down into `uJson` beside `Utf8Cut`, with one-line forwards left in
+`uTools` so every existing reference still compiles.
 
 Details worth knowing if you touch this code:
 
@@ -1097,6 +1601,50 @@ Details worth knowing if you touch this code:
   the model never saw, or a question nothing answered. Putting the cleanup in
   the caller only fixed the one path the caller could see; it lives inside
   `Send` so every exit passes through it.
+* **No built-in tool name may contain `__`.** That is what makes a registered
+  source's prefix rule (`^[a-z][a-z0-9_]*__$`) a structural guarantee rather
+  than a check against a list that grows: a source cannot shadow a built-in,
+  and adding a thirteenth built-in does not require revisiting the rule.
+* **The tools array must not change between turns except at an explicit user
+  command.** `tools` renders before `system` under one `cache_control`
+  breakpoint, so any change to the tool list invalidates the entire prompt
+  cache - system prompt included - on every turn afterwards. MCP freezes its
+  list for the session and reports a `list_changed` rather than applying it;
+  the skill catalogue is cached and invalidated only by `RefreshSkills`, which
+  the host calls at startup, `/clear`, `/skills` and after a plugin is enabled
+  or disabled.
+* **Registered sources are declared below the subagent cut, and the cut is an
+  `Exit`.** That is why a subagent is never told about a source's tools no
+  matter who adds the next append site, and why the "only one append site"
+  rule was not needed. `RunTool`'s three-name allowlist refuses the call
+  independently.
+* **A tool source's handler is wrapped in `try/except`.** `uAgent.RunTools`
+  does not catch, so an exception escaping a source would skip the
+  `tool_result` the API requires and leave a transcript that cannot be sent.
+  A source is third-party code; the dispatcher is the boundary.
+* **The hook allow-flag is read once and sits below the nil-`Ask` check.** Its
+  position in `Permit` is load-bearing, not stylistic: three properties fall
+  out of it with no separate guard - print mode cannot be widened, a subagent
+  cannot be widened, and the flag is reachable only where a human was about to
+  be asked anyway. Anyone adding a fifth approval class adds it *above* those
+  lines, with the other class tests, and must also exclude itself from the
+  edits catch-all or it silently inherits `AllowAllEdits`.
+* **No MCP wire wait exists outside `McpAwait`, and no write outside the send
+  loop.** Both peek before they touch the pipe and both carry a deadline. A
+  server is a third-party program; "it cannot hang us" has to be one
+  function's postcondition rather than a discipline spread across call sites.
+* **The approvals file lives outside the project.** It records what the user
+  let *this project* do, so a project that could ship its own copy would be
+  answering its own question. When no home directory is set there is no store,
+  which means approve-nothing - never a fall back into the project.
+* **`.pasclaude\plugins.json` is authoritative in both directions**, unlike
+  the approvals file, which only ever widens. A disable that did not survive a
+  restart would be a consent bug nobody could diagnose. Both files carry a
+  comment saying they have opposite semantics and why.
+* **Every new path under `.pasclaude` bypasses `SafePath` and must say so.**
+  `SafePath` refuses that directory by design, so the substitute guard is the
+  established one and no feature may invent a second: filter the bare name for
+  `\ / : .` and control characters, then construct the directory part.
 
 ## License
 
