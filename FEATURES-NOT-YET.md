@@ -1,17 +1,17 @@
 # Claude Code features not yet in pasclaude
 
 pasclaude already covers a lot of the core experience: streaming chat with
-markdown rendering, twelve tools (read_file, write_file, edit_file,
+markdown rendering, thirteen tools (read_file, write_file, edit_file,
 notebook_edit, list_dir, search, bash, bash_output, kill_bash, fetch,
-todo_write, task) behind a diff-previewing permission gate, per-program bash
-approval, an opt-in server-side web_search, regex search and notebook-aware
-read/edit, background shell jobs, read-only subagents, CLAUDE.md /
-AGENTS.md / .pasclaude.md project instructions, `@path` file mentions, tab
-completion, persistent history, session save/resume with validation,
-automatic context trimming plus token-triggered summarizing compaction,
-prompt caching with cost counters, retry with Retry-After, extended
-thinking, `.gitignore`-aware listing/search, git status in the system
-prompt, and reuse of Claude Code's or Jcode's OAuth credentials.
+todo_write, skill, task) behind a diff-previewing permission gate,
+per-program bash approval, an opt-in server-side web_search, regex search
+and notebook-aware read/edit, background shell jobs, read-only subagents,
+CLAUDE.md / AGENTS.md / .pasclaude.md project instructions, `@path` file
+mentions, tab completion, persistent history, session save/resume with
+validation, automatic context trimming plus token-triggered summarizing
+compaction, prompt caching with cost counters, retry with Retry-After,
+extended thinking, `.gitignore`-aware listing/search, git status in the
+system prompt, and reuse of Claude Code's or Jcode's OAuth credentials.
 
 It now also covers the extensibility surface: MCP servers over stdio behind a
 per-command-line spawn prompt, lifecycle hooks at five points in a turn behind
