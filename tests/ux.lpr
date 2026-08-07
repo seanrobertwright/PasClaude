@@ -1485,6 +1485,26 @@ begin
   MdFinish;
 end;
 
+{ The console control handler, driven directly: a Ctrl+C event must be
+  consumed (or the default handler kills the process mid-turn, skipping every
+  finally block) and must surface exactly once through CtrlCPressed.  Other
+  events pass through untouched, because Ctrl+Break and a closing window mean
+  "kill it", not "stop the reply". }
+procedure TestCtrlC;
+const
+  CTRL_C_EVENT = 0;
+  CTRL_BREAK_EVENT = 1;
+begin
+  WriteLn('-- ctrl+c --');
+  Check(not CtrlCPressed, 'no Ctrl+C means no cancel');
+  Check(HandleConsoleBreak(CTRL_C_EVENT), 'Ctrl+C is consumed, not fatal');
+  Check(CtrlCPressed, 'the cancel flag is raised');
+  Check(not CtrlCPressed, 'reading the flag consumes it');
+  Check(not HandleConsoleBreak(CTRL_BREAK_EVENT),
+    'Ctrl+Break keeps its default meaning');
+  Check(not CtrlCPressed, 'Ctrl+Break does not raise the cancel flag');
+end;
+
 { ------------------------------------------------------------------- main -- }
 
 procedure Cleanup(const Dir: string);
@@ -1525,6 +1545,7 @@ begin
     TestMultiEdit;
     TestGitignore;
     TestMarkdown;
+    TestCtrlC;
   finally
     uTools.RootDir := '';
     Cleanup(TmpRoot);

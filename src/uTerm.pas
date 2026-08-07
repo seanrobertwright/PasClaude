@@ -50,6 +50,17 @@ function ReadLineEdit(const Prompt: string; out Line: string): Boolean;
 { True when a key is waiting; used to let the user interrupt a stream. }
 function EscPressed: Boolean;
 
+{ True once per Ctrl+C received while no prompt is being read (that is,
+  while a reply streams).  Reading it consumes it.  The prompt itself sees
+  Ctrl+C as a key and quits; this flag exists for the stretches where nothing
+  is reading the keyboard and the default handler would kill the process -
+  skipping every finally block, console restoration included. }
+function CtrlCPressed: Boolean;
+
+{ The console control handler, exposed so a test can deliver a synthetic
+  event without a keyboard.  Returns True when the event was consumed. }
+function HandleConsoleBreak(CtrlType: LongWord): LongBool; stdcall;
+
 function TermWidth: Integer;
 
 { ------------------------------------------------------------ line editing --
@@ -108,6 +119,29 @@ var
   SavedAttr: Word = 7;
   SavedCP: UINT = 0;
   SavedInCP: UINT = 0;
+  { Written from the console control thread, read from the main one; a
+    Boolean write is atomic on every target this builds for. }
+  CtrlCFlag: Boolean = False;
+
+function HandleConsoleBreak(CtrlType: LongWord): LongBool; stdcall;
+begin
+  { Only Ctrl+C is turned into a cancel; Ctrl+Break and a closing window
+    keep their default meaning, because a user reaching for those wants the
+    process gone, not the reply stopped. }
+  if CtrlType = CTRL_C_EVENT then
+  begin
+    CtrlCFlag := True;
+    Result := True;
+  end
+  else
+    Result := False;
+end;
+
+function CtrlCPressed: Boolean;
+begin
+  Result := CtrlCFlag;
+  CtrlCFlag := False;
+end;
 
 function Attr(C: TColor): Word;
 begin
@@ -138,10 +172,12 @@ begin
   SavedInCP := GetConsoleCP;
   SetConsoleOutputCP(CP_UTF8);
   SetConsoleCP(CP_UTF8);
+  SetConsoleCtrlHandler(@HandleConsoleBreak, True);
 end;
 
 procedure TermDone;
 begin
+  SetConsoleCtrlHandler(@HandleConsoleBreak, False);
   if HOut <> 0 then
     SetConsoleTextAttribute(HOut, SavedAttr);
   if SavedCP <> 0 then SetConsoleOutputCP(SavedCP);
@@ -568,11 +604,15 @@ begin
   EditInit(E);
   EmitC(clCyan, Prompt);
 
-  { Cooked mode would swallow the per-key handling this editor needs. }
+  { Raw mode: cooked mode would swallow the per-key handling this editor
+    needs, and ENABLE_PROCESSED_INPUT would route Ctrl+C to the control
+    handler instead of the input buffer - the editor wants it as a key, so
+    that Ctrl+C at the prompt quits rather than merely setting the cancel
+    flag nobody is polling. }
   if HIn <> 0 then
   begin
     GetConsoleMode(HIn, Mode);
-    SetConsoleMode(HIn, ENABLE_PROCESSED_INPUT);
+    SetConsoleMode(HIn, 0);
   end;
   try
     repeat

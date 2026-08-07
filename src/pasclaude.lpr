@@ -18,10 +18,18 @@ const
     100k characters, which is a fraction of the context window but well past
     the point where old file dumps are still earning their place. }
   CompactKeepBytes = 100 * 1024;
+  { When the API reports the prompt at more than this many tokens, the
+    transcript is trimmed even if its byte count looks fine.  Bytes are a
+    proxy; this is the measured thing the context window actually fills
+    with, and 150k leaves headroom under a 200k window for the reply. }
+  CompactTokens = 150000;
 
 var
   Agent: TAgent;
   AtLineStart: Boolean = True;
+  { Bytes of tool-argument JSON already echoed for the current tool call;
+    the display caps what it shows, the model still gets everything. }
+  ToolArgShown: Integer = 0;
 
 { ------------------------------------------------------------- rendering -- }
 
@@ -71,6 +79,39 @@ begin
   EmitCLn(clBright, Detail);
 end;
 
+{ The moment a tool_use block opens in the stream - its arguments are still
+  arriving.  The name goes up immediately so a long argument stream (a big
+  write_file, say) reads as progress rather than as a hang. }
+procedure OnToolUseBegin(const Name, Id: string);
+begin
+  MdFinish;
+  AtLineStart := True;
+  NeedNewLine;
+  EmitC(clMagenta, '  ~ ');
+  EmitC(clGrey, Name + ' ');
+  ToolArgShown := 0;
+  AtLineStart := False;
+end;
+
+{ Argument JSON, echoed as it streams.  Capped: the point is to show life
+  and the gist of the call, not to dump a whole file onto one line.  JSON
+  string fragments carry no raw newlines, so the line stays a line. }
+procedure OnToolArg(const S: string);
+const
+  MaxShow = 160;
+var
+  Room: Integer;
+begin
+  if ToolArgShown >= MaxShow then Exit;
+  Room := MaxShow - ToolArgShown;
+  if Length(S) <= Room then
+    EmitC(clGrey, S)
+  else
+    EmitC(clGrey, Copy(S, 1, Room) + '...');
+  Inc(ToolArgShown, Length(S));
+  AtLineStart := False;
+end;
+
 { Tool output is summarised rather than dumped: the model gets the whole
   thing, the user only needs to see that it happened and roughly what came
   back. }
@@ -108,11 +149,14 @@ begin
   EmitCLn(clYellow, '  ' + S);
 end;
 
-{ Esc during a reply abandons it.  The key is drained here rather than left
-  in the buffer, where it would otherwise clear the next prompt line. }
+{ Esc during a reply abandons it, and so does Ctrl+C: outside the prompt the
+  default Ctrl+C handler would kill the process mid-turn, skipping every
+  finally block - console restoration included - so it is caught and treated
+  as the cancel the user meant.  The key is drained here rather than left in
+  the buffer, where it would otherwise clear the next prompt line. }
 function UserWantsStop: Boolean;
 begin
-  Result := EscPressed;
+  Result := EscPressed or CtrlCPressed;
 end;
 
 { ------------------------------------------------------------ permissions -- }
@@ -353,6 +397,7 @@ begin
   EmitCLn(clGrey,   '  /help          this list');
   EmitCLn(clGrey,   '  /clear         forget the conversation, here and on disk');
   EmitCLn(clGrey,   '  /compact       drop the oldest turns, keep the recent ones');
+  EmitCLn(clGrey,   '  /compact full  replace the transcript with a model-written summary');
   EmitCLn(clGrey,   '  /resume        reload the saved conversation');
   EmitCLn(clGrey,   '  /save          write the conversation now');
   EmitCLn(clGrey,   '  /cwd           show the session root');
@@ -416,13 +461,41 @@ begin
   end
   else if Cmd = '/compact' then
   begin
-    Dropped := Agent.Compact(CompactKeepBytes);
-    if Dropped = 0 then
-      EmitCLn(clGrey, Format('  nothing to compact (%d messages, %d bytes)',
-        [Agent.MessageCount, Agent.TranscriptBytes]))
+    if Arg = 'full' then
+    begin
+      { The expensive kind: one request buys a transcript that keeps the
+        substance of the dropped turns instead of forgetting them. }
+      AtLineStart := True;
+      MdReset;
+      if Agent.CompactWithSummary(Err) then
+      begin
+        MdFinish;
+        AtLineStart := True;
+        NeedNewLine;
+        EmitCLn(clGrey, Format('  compacted to a summary (%d messages, %d bytes)',
+          [Agent.MessageCount, Agent.TranscriptBytes]));
+        if not Agent.SaveSession(SessionPath(uTools.RootDir), Err) then
+          EmitCLn(clYellow, '  (but the session could not be saved: ' + Err + ')');
+      end
+      else
+      begin
+        MdFinish;
+        AtLineStart := True;
+        NeedNewLine;
+        EmitCLn(clRed, '  could not summarize: ' + Err);
+        EmitCLn(clGrey, '  the conversation is unchanged');
+      end;
+    end
     else
-      EmitCLn(clGrey, Format('  dropped %d older messages, %d left (%d bytes)',
-        [Dropped, Agent.MessageCount, Agent.TranscriptBytes]));
+    begin
+      Dropped := Agent.Compact(CompactKeepBytes);
+      if Dropped = 0 then
+        EmitCLn(clGrey, Format('  nothing to compact (%d messages, %d bytes)',
+          [Agent.MessageCount, Agent.TranscriptBytes]))
+      else
+        EmitCLn(clGrey, Format('  dropped %d older messages, %d left (%d bytes)',
+          [Dropped, Agent.MessageCount, Agent.TranscriptBytes]));
+    end;
   end
   else if Cmd = '/cwd' then
     EmitCLn(clGrey, '  ' + uTools.RootDir)
@@ -464,6 +537,9 @@ begin
     if (Agent.CacheReadTokens > 0) or (Agent.CacheWriteTokens > 0) then
       EmitCLn(clGrey, Format('  cache: %d tokens read (90%% off), %d written',
         [Agent.CacheReadTokens, Agent.CacheWriteTokens]));
+    if Agent.ContextTokens > 0 then
+      EmitCLn(clGrey, Format('  context: %d tokens in the last request',
+        [Agent.ContextTokens]));
   end
   else
     EmitCLn(clRed, '  unknown command: ' + Cmd);
@@ -542,6 +618,8 @@ begin
       Agent.OnText := @OnText;
       Agent.OnThinking := @OnThinking;
       Agent.OnToolStart := @OnToolStart;
+      Agent.OnToolUseBegin := @OnToolUseBegin;
+      Agent.OnToolArg := @OnToolArg;
       Agent.OnToolResult := @OnToolResult;
       Agent.OnNotice := @OnNotice;
       Agent.Ask := @AskPermission;
@@ -605,8 +683,12 @@ begin
         end;
         { A session that runs long enough will eventually exceed the context
           window, and the failure mode is the whole turn being rejected.
-          Trimming first costs the oldest exchanges instead. }
-        if Agent.TranscriptBytes > CompactKeepBytes then
+          Trimming first costs the oldest exchanges instead.  Two triggers:
+          the byte count (a proxy, available before the first request) and
+          the token count the API actually reported, which is the measured
+          truth and catches token-dense transcripts the byte guess misses. }
+        if (Agent.TranscriptBytes > CompactKeepBytes) or
+           (Agent.ContextTokens > CompactTokens) then
         begin
           Dropped := Agent.Compact(CompactKeepBytes);
           if Dropped > 0 then

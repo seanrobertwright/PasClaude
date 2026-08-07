@@ -22,6 +22,9 @@ type
     Status: Integer;
     Body: string;      { collected when OnChunk is nil }
     Error: string;
+    { From the Retry-After response header, in milliseconds; 0 when absent.
+      A 429 that names its own wait beats any guess the client makes. }
+    RetryAfterMs: Integer;
   end;
 
 { POSTs Body to Url.  Headers is a CRLF-separated block ('' for none).
@@ -31,18 +34,27 @@ type
 function HttpPost(const Url, Headers, Body: string;
   OnChunk: TChunkProc; Ctx: Pointer): THttpResult;
 
+{ GETs Url and collects the whole body, capped at MaxBytes (0 for no cap).
+  Same transport, no streaming callback: the one caller is the fetch tool,
+  which wants the document, not the arrival. }
+function HttpGet(const Url, Headers: string; MaxBytes: Integer): THttpResult;
+
 function HttpAvailable: Boolean;
 
 type
   { Stands in for the network.  See HttpTransport. }
   TPostProc = function(const Url, Headers, Body: string;
     OnChunk: TChunkProc; Ctx: Pointer): THttpResult;
+  TGetProc = function(const Url, Headers: string;
+    MaxBytes: Integer): THttpResult;
 
 var
   { When set, requests go here instead of to WinHTTP.  This exists so the
     agent loop can be driven end to end against scripted responses; nothing
     in the shipped program assigns it. }
   HttpTransport: TPostProc = nil;
+  { The same seam for GET, used by the fetch tool's tests. }
+  HttpGetTransport: TGetProc = nil;
 
 implementation
 
@@ -52,6 +64,7 @@ const
   WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY = 4;
   WINHTTP_FLAG_SECURE                 = $00800000;
   WINHTTP_QUERY_STATUS_CODE           = 19;
+  WINHTTP_QUERY_RETRY_AFTER           = 35;
   WINHTTP_QUERY_FLAG_NUMBER           = $20000000;
   INTERNET_DEFAULT_HTTPS_PORT         = 443;
   WINHTTP_OPTION_RECEIVE_TIMEOUT      = 6;
@@ -153,29 +166,28 @@ begin
   Result := Format('WinHTTP error %d', [GetLastError]);
 end;
 
-function HttpPost(const Url, Headers, Body: string;
-  OnChunk: TChunkProc; Ctx: Pointer): THttpResult;
+{ One request over WinHTTP, shared by POST (streamed) and GET (collected).
+  Verb decides which; a GET sends no body and ignores OnChunk. }
+function HttpExec(const Verb, Url, Headers, Body: string;
+  OnChunk: TChunkProc; Ctx: Pointer; MaxBytes: Integer): THttpResult;
 var
   Host, Path: string;
   Port: Word;
   Sess, Conn, Req: Pointer;
-  HdrW, HostW, PathW: WideString;
+  HdrW, HostW, PathW, VerbW, RetryW: WideString;
   Status, Len: DWORD;
   Buf: array[0..8191] of Byte;
   Got: DWORD;
   Chunk: string;
   Aborted, IsError: Boolean;
   Timeout: DWORD;
+  RetrySecs: Integer;
 begin
   Result.Ok := False;
   Result.Status := 0;
   Result.Body := '';
   Result.Error := '';
-
-  { A substituted transport takes the whole call, so the code above it runs
-    unchanged. }
-  if Assigned(HttpTransport) then
-    Exit(HttpTransport(Url, Headers, Body, OnChunk, Ctx));
+  Result.RetryAfterMs := 0;
 
   if not LoadWinHttp then
   begin
@@ -211,7 +223,8 @@ begin
     end;
     try
       PathW := UTF8Decode(Path);
-      Req := wOpenRequest(Conn, 'POST', PWideChar(PathW), nil, nil, nil,
+      VerbW := UTF8Decode(Verb);
+      Req := wOpenRequest(Conn, PWideChar(VerbW), PWideChar(PathW), nil, nil, nil,
         WINHTTP_FLAG_SECURE);
       if Req = nil then
       begin
@@ -238,6 +251,22 @@ begin
           nil, @Status, Len, nil) then
           Result.Status := Integer(Status);
 
+        { Retry-After arrives as text - it may be a date, which is ignored;
+          the delta-seconds form is what rate limits actually send. }
+        SetLength(RetryW, 32);
+        Len := Length(RetryW) * SizeOf(WideChar);
+        if wQueryHeaders(Req, WINHTTP_QUERY_RETRY_AFTER, nil,
+          PWideChar(RetryW), Len, nil) then
+        begin
+          SetLength(RetryW, Len div SizeOf(WideChar));
+          RetrySecs := StrToIntDef(Trim(UTF8Encode(RetryW)), 0);
+          { Clamped: a server asking for an hour is answered by giving up,
+            not by an unkillable hour-long sleep. }
+          if RetrySecs > 60 then RetrySecs := 60;
+          if RetrySecs > 0 then
+            Result.RetryAfterMs := RetrySecs * 1000;
+        end;
+
         { On a non-2xx the body is an error document, not a stream, so it is
           collected whole for the caller to show. }
         IsError := (Result.Status < 200) or (Result.Status > 299);
@@ -252,7 +281,16 @@ begin
           if Got = 0 then Break;
           SetString(Chunk, PAnsiChar(@Buf[0]), Got);
           if IsError or not Assigned(OnChunk) then
-            Result.Body := Result.Body + Chunk
+          begin
+            Result.Body := Result.Body + Chunk;
+            { A caller with a cap wants the front of the document, not an
+              unbounded slurp of one; the transfer stops once it is spent. }
+            if (MaxBytes > 0) and (Length(Result.Body) >= MaxBytes) then
+            begin
+              SetLength(Result.Body, MaxBytes);
+              Break;
+            end;
+          end
           else if not OnChunk(Chunk, Ctx) then
           begin
             Aborted := True;
@@ -274,6 +312,23 @@ begin
   finally
     wCloseHandle(Sess);
   end;
+end;
+
+function HttpPost(const Url, Headers, Body: string;
+  OnChunk: TChunkProc; Ctx: Pointer): THttpResult;
+begin
+  { A substituted transport takes the whole call, so the code above it runs
+    unchanged. }
+  if Assigned(HttpTransport) then
+    Exit(HttpTransport(Url, Headers, Body, OnChunk, Ctx));
+  Result := HttpExec('POST', Url, Headers, Body, OnChunk, Ctx, 0);
+end;
+
+function HttpGet(const Url, Headers: string; MaxBytes: Integer): THttpResult;
+begin
+  if Assigned(HttpGetTransport) then
+    Exit(HttpGetTransport(Url, Headers, MaxBytes));
+  Result := HttpExec('GET', Url, Headers, '', nil, nil, MaxBytes);
 end;
 
 finalization

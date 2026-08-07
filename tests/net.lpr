@@ -291,12 +291,33 @@ begin
   end;
 end;
 
+{ The GET path the fetch tool rides.  Same transport underneath, but the
+  verb, the collected body and the byte cap are its own code. }
+procedure TestRealGet;
+var
+  R: THttpResult;
+begin
+  R := HttpGet('https://postman-echo.com/get?probe=pasclaude', '', 0);
+  Check(R.Ok, 'a real HTTPS GET succeeds: ' + R.Error);
+  Check(Pos('"probe"', R.Body) > 0, 'the response body is collected');
+
+  { The cap must cut the transfer, not just the returned string. }
+  R := HttpGet('https://postman-echo.com/get?probe=pasclaude', '', 50);
+  Check(R.Ok, 'a capped GET still succeeds: ' + R.Error);
+  Check(Length(R.Body) = 50, Format('the cap is honoured, got %d bytes',
+    [Length(R.Body)]));
+
+  R := HttpGet('http://example.com/x', '', 0);
+  Check(not R.Ok, 'plain http is refused for GET too');
+end;
+
 begin
   TestAvailability;
   TestBadUrls;
   TestRealPost;
   TestLargeResponse;
   TestAbort;
+  TestRealGet;
   TestAnthropicErrorPath;
   TestRequestReachesApi;
   TestWireIntoDecoder;

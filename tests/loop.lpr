@@ -25,10 +25,14 @@ var
   FailUntil: Integer = 0;     { ... up to and including this call number }
   FailStatus: Integer = 529;
   FailBody: string = '';
+  { When nonzero, failed responses carry this Retry-After (already in ms). }
+  FakeRetryAfterMs: Integer = 0;
 
   Prose: string = '';
   Notices: string = '';
   ToolLog: string = '';
+  ToolBegins: string = '';
+  ToolArgs: string = '';
   { Set by the cancellation tests; the transport counts chunks it emitted. }
   CancelAfterChunks: Integer = -1;
   ChunksSeen: Integer = 0;
@@ -63,6 +67,16 @@ procedure CapResult(const Name, Output: string);
 begin
 end;
 
+procedure CapToolBegin(const Name, Id: string);
+begin
+  ToolBegins := ToolBegins + Name + ';';
+end;
+
+procedure CapToolArg(const S: string);
+begin
+  ToolArgs := ToolArgs + S;
+end;
+
 { The stand-in transport: records the request, replays the next scripted
   response, and hands it to the caller in small chunks so the streaming path
   is used rather than bypassed. }
@@ -76,6 +90,7 @@ begin
   Result.Status := 0;
   Result.Body := '';
   Result.Error := '';
+  Result.RetryAfterMs := 0;
 
   SetLength(Requests, Length(Requests) + 1);
   Requests[High(Requests)] := Body;
@@ -84,6 +99,7 @@ begin
   if (FailAfter >= 0) and (CallCount > FailAfter) and (CallCount <= FailUntil) then
   begin
     Result.Status := FailStatus;
+    Result.RetryAfterMs := FakeRetryAfterMs;
     if FailBody <> '' then
       Result.Body := FailBody
     else
@@ -170,10 +186,13 @@ begin
   FailUntil := 0;
   FailStatus := 529;
   FailBody := '';
+  FakeRetryAfterMs := 0;
   ChunksSeen := 0;
   Prose := '';
   Notices := '';
   ToolLog := '';
+  ToolBegins := '';
+  ToolArgs := '';
 end;
 
 function SessionDir: string;
@@ -951,6 +970,218 @@ begin
   end;
 end;
 
+{ A 429 that names its own wait should be waited out as told, not guessed
+  at.  The notice line reports the wait actually used, which is how the
+  choice is observable without measuring wall-clock time. }
+procedure TestRetryHonorsRetryAfter;
+var
+  A: TAgent;
+  Err: string;
+  Ok: Boolean;
+begin
+  ResetScript;
+  uTools.RootDir := SessionDir;
+  SetLength(Replies, 2);
+  Replies[0] := TextReply('unused');
+  Replies[1] := TextReply('recovered');
+  FailAfter := 0;
+  FailUntil := 1;
+  FailStatus := 429;
+  FakeRetryAfterMs := 7;
+
+  A := MakeAgent;
+  try
+    Ok := A.Send('hello', Err);
+    Check(Ok, 'the turn recovers after the named wait: ' + Err);
+    Check(Pos('retrying in 7ms', Notices) > 0,
+      'the server''s Retry-After was used instead of the default backoff, got: '
+      + Notices);
+  finally
+    A.Free;
+  end;
+end;
+
+{ Without a Retry-After the default widening backoff still applies. }
+procedure TestRetryDefaultBackoffWithoutHeader;
+var
+  A: TAgent;
+  Err: string;
+begin
+  ResetScript;
+  uTools.RootDir := SessionDir;
+  SetLength(Replies, 2);
+  Replies[0] := TextReply('unused');
+  Replies[1] := TextReply('recovered');
+  FailAfter := 0;
+  FailUntil := 1;
+
+  A := MakeAgent;
+  try
+    A.Send('hello', Err);
+    Check(Pos(Format('retrying in %dms', [uAgent.RetryBaseMs]), Notices) > 0,
+      'no header means the default backoff, got: ' + Notices);
+  finally
+    A.Free;
+  end;
+end;
+
+{ Summary compaction: the transcript becomes one exchange carrying the
+  model's summary, and a later turn works from it. }
+procedure TestCompactWithSummary;
+var
+  A: TAgent;
+  Err: string;
+  Ok: Boolean;
+  Doc, Msgs: TJson;
+begin
+  ResetScript;
+  uTools.RootDir := SessionDir;
+  SetLength(Replies, 3);
+  Replies[0] := TextReply('First answer.');
+  Replies[1] := TextReply('We discussed the answer 42 and edited note.txt.');
+  Replies[2] := TextReply('Continuing from the summary.');
+
+  A := MakeAgent;
+  try
+    A.Send('what is the answer?', Err);
+    Check(A.MessageCount = 2, 'two messages before compaction');
+
+    Ok := A.CompactWithSummary(Err);
+    Check(Ok, 'summary compaction succeeds: ' + Err);
+    Check(A.MessageCount = 2, 'the compacted transcript is one exchange');
+    Check(Pos('42 and edited note.txt', A.Transcript) > 0,
+      'the summary text is in the new transcript');
+    Check(Pos('what is the answer?', A.Transcript) = 0,
+      'the original turns are gone');
+
+    { The transcript must still be legal: a follow-up turn sends fine and
+      opens with the summary user message. }
+    Ok := A.Send('go on', Err);
+    Check(Ok, 'a turn after summary compaction works: ' + Err);
+    Doc := JsonParse(Requests[High(Requests)]);
+    try
+      Msgs := Doc.Find('messages');
+      Check(Msgs.Item(0).Str('role') = 'user',
+        'the compacted transcript opens with a user message');
+    finally
+      Doc.Free;
+    end;
+  finally
+    A.Free;
+  end;
+end;
+
+{ A summary request that fails must leave the conversation exactly as it
+  was - this is the mutation a suite is most likely to miss, because every
+  assertion about the failure itself still passes. }
+procedure TestCompactWithSummaryFailureRestores;
+var
+  A: TAgent;
+  Err, Before: string;
+  Ok: Boolean;
+begin
+  ResetScript;
+  uTools.RootDir := SessionDir;
+  SetLength(Replies, 1);
+  Replies[0] := TextReply('First answer.');
+
+  A := MakeAgent;
+  try
+    A.Send('question one', Err);
+    Before := A.Transcript;
+
+    FailAfter := 1;
+    FailUntil := 99;
+    FailStatus := 400;
+    FailBody := '{"error":{"type":"invalid_request_error","message":"nope"}}';
+    Ok := A.CompactWithSummary(Err);
+    Check(not Ok, 'a failed summary request reports failure');
+    Check(A.Transcript = Before,
+      'the conversation survives a failed summary byte for byte');
+  finally
+    A.Free;
+  end;
+end;
+
+{ An empty summary - the model answered with nothing usable - is a refusal,
+  not a replacement. }
+procedure TestCompactWithSummaryEmptyRestores;
+var
+  A: TAgent;
+  Err, Before: string;
+  Ok: Boolean;
+begin
+  ResetScript;
+  uTools.RootDir := SessionDir;
+  SetLength(Replies, 2);
+  Replies[0] := TextReply('First answer.');
+  Replies[1] := TextReply('   ');
+
+  A := MakeAgent;
+  try
+    A.Send('question one', Err);
+    Before := A.Transcript;
+    Ok := A.CompactWithSummary(Err);
+    Check(not Ok, 'an empty summary is refused');
+    Check(A.Transcript = Before, 'and the conversation is untouched');
+  finally
+    A.Free;
+  end;
+end;
+
+{ The streaming display hooks: the tool name fires when its block opens,
+  and the argument JSON streams through in fragments. }
+procedure TestToolUseStreamingHooks;
+var
+  A: TAgent;
+  Err: string;
+begin
+  ResetScript;
+  uTools.RootDir := SessionDir;
+  uTools.AllowAllEdits := True;
+  WriteSessionFile('note.txt', 'the answer is 42');
+  SetLength(Replies, 2);
+  Replies[0] := ToolReply('t1', 'read_file', '{"path":"note.txt"}');
+  Replies[1] := TextReply('Done.');
+
+  A := MakeAgent;
+  A.OnToolUseBegin := @CapToolBegin;
+  A.OnToolArg := @CapToolArg;
+  try
+    A.Send('read it', Err);
+    Check(ToolBegins = 'read_file;',
+      'the tool name was announced when its block opened, got: ' + ToolBegins);
+    Check(ToolArgs = '{"path":"note.txt"}',
+      'the argument JSON streamed through the hook, got: ' + ToolArgs);
+  finally
+    A.Free;
+  end;
+end;
+
+{ ContextTokens is the API's own count of the last prompt, which is what
+  the token-aware compaction trigger reads. }
+procedure TestContextTokens;
+var
+  A: TAgent;
+  Err: string;
+begin
+  ResetScript;
+  uTools.RootDir := SessionDir;
+  SetLength(Replies, 1);
+  Replies[0] := TextReply('hi');
+
+  A := MakeAgent;
+  try
+    Check(A.ContextTokens = 0, 'context tokens start at zero');
+    A.Send('hello', Err);
+    Check(A.ContextTokens = 10,
+      Format('context tokens reflect the last prompt, got %d',
+        [A.ContextTokens]));
+  finally
+    A.Free;
+  end;
+end;
+
 begin
   { Every request in this suite goes to the stand-in rather than the network. }
   uHttp.HttpTransport := @FakePost;
@@ -971,6 +1202,13 @@ begin
   TestRetryOnOverload;
   TestNoRetryOnPermanentError;
   TestRetriesGiveUp;
+  TestRetryHonorsRetryAfter;
+  TestRetryDefaultBackoffWithoutHeader;
+  TestCompactWithSummary;
+  TestCompactWithSummaryFailureRestores;
+  TestCompactWithSummaryEmptyRestores;
+  TestToolUseStreamingHooks;
+  TestContextTokens;
 
   WriteLn;
   if Fails = 0 then

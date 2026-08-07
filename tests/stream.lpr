@@ -391,7 +391,7 @@ begin
       Check(Doc.Find('stream').AsBoolean, 'streaming is requested');
 
       Tools := Doc.Find('tools');
-      Check((Tools <> nil) and (Tools.Count = 6), 'all six tools are declared');
+      Check((Tools <> nil) and (Tools.Count = 7), 'all seven tools are declared');
       SawRead := False;
       for I := 0 to Tools.Count - 1 do
       begin

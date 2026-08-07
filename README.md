@@ -54,6 +54,7 @@ contents are appended to the system prompt as binding instructions.
 | `/help` | list the commands |
 | `/clear` | forget the conversation, here and on disk |
 | `/compact` | drop the oldest turns, keep the recent ones |
+| `/compact full` | replace the transcript with a model-written summary |
 | `/resume` | reload the saved conversation |
 | `/save` | write the conversation now |
 | `/cwd` | show the session root |
@@ -62,12 +63,20 @@ contents are appended to the system prompt as binding instructions.
 | `/cost` | turns and tokens used |
 | `/exit` | quit (Ctrl+C also works) |
 
-Pressing `Esc` while a reply is streaming stops it. Whatever arrived is kept,
-any tool the model was about to call is not run, and the conversation stays
-usable for the next question.
+Pressing `Esc` while a reply is streaming stops it, and so does `Ctrl+C`:
+outside the prompt the default Ctrl+C handler would kill the process
+mid-turn, skipping every `finally` block - console restoration included - so
+it is caught and treated as the cancel the user meant. Whatever arrived is
+kept, any tool the model was about to call is not run, and the conversation
+stays usable for the next question. `Ctrl+Break` keeps its default meaning:
+a user reaching for it wants the process gone, not the reply stopped.
 
 Transient failures (429, 529, 5xx) are retried up to three times with a
-widening delay, and the wait is interruptible.
+widening delay, and the wait is interruptible. When the response carries a
+`Retry-After` header the server's own wait is used instead of the guess -
+guessing shorter re-hits the limit, guessing longer wastes the user's time.
+The value is clamped to a minute; a server asking for an hour is answered by
+giving up, not by an unkillable hour-long sleep.
 
 At the prompt, the arrow keys move the caret and walk the command history,
 `Home`/`End` (or `Ctrl+A`/`Ctrl+E`) jump to either end, and `Ctrl+U` clears
@@ -103,6 +112,22 @@ back to roughly 100 KB by dropping the oldest exchanges; `/compact` does it on
 demand. The cut is walked forward to a real user message, because a transcript
 that opens with an assistant turn - or with tool results whose call has been
 removed - is refused.
+
+Bytes are a proxy for the thing that actually fills the window, so a second
+trigger reads the measured truth: the prompt token count the API reported for
+the last request (`/cost` shows it as `context:`). Past 150k tokens the trim
+runs even when the byte count looks fine, which catches token-dense
+transcripts the byte guess misses.
+
+`/compact full` is the expensive kind: it asks the model to summarize the
+conversation - what was asked, what was done, exact paths, decisions and
+their reasons, what is unfinished - and replaces the whole transcript with
+that summary as one legal exchange. One request buys a transcript that keeps
+the substance of the dropped turns instead of forgetting them. The old
+transcript is only replaced after a non-empty summary has fully arrived;
+a failed request, a cancellation, or an empty answer restores the
+conversation byte for byte, because a compaction that destroys the
+conversation on a dropped connection is worse than no compaction.
 
 ## Sessions
 
@@ -164,9 +189,24 @@ the first's conversation on its very first save.
 | `write_file` | yes | creates intermediate directories |
 | `edit_file` | yes | one hunk or several at once; all must match or none apply |
 | `bash` | yes | `cmd.exe /C`, output merged, 120 s timeout |
+| `fetch` | yes | HTTPS GET, capped at 200 KB, own "always" class |
 
 At each prompt you can answer `y` (once), `a` (always, for that class of tool)
 or `n`. Read-only tools never ask.
+
+`fetch` reaches the outside world, so it asks - and its "always" answer is
+its own class, separate from the edit tools, because approving edits forever
+should not quietly approve network access too. Only `https://` URLs are
+accepted, the response is cut at 200 KB during the transfer rather than
+after it, and a body that is not valid UTF-8 is scrubbed rather than
+hex-dumped: a page in another encoding is still mostly readable text,
+unlike a binary file.
+
+A tool call shows up the moment its block opens in the stream - the name
+first, then the argument JSON echoed as it arrives (capped at 160
+characters) - so a long argument stream, a big `write_file` say, reads as
+progress rather than as a hang. The full description line follows once the
+arguments are complete.
 
 A `.gitignore` at the root filters listings and searches - build output is
 noise the model pays tokens to look at. The reading of the format is
@@ -338,6 +378,16 @@ hunk commit to the output as it applies is unobservable, because the caller
 only reads the text after total success and discards it on any failure - the
 atomicity the test pins lives at the call boundary, which is the boundary
 that matters.
+
+This round's additions were mutation-checked the same way. Making the retry
+loop ignore `Retry-After` fails 1 assertion (the notice line reports the wait
+actually used, which is how the choice is observable without measuring
+wall-clock time). Breaking the restore path in `CompactWithSummary` fails 2 -
+the byte-for-byte survival assertions, the same class of mutation as the
+loader's validate-before-replace, and just as invisible to any "was it
+refused?" test. Making `fetch` skip its permission gate fails 1, and zeroing
+the prompt-token capture fails 1. The Ctrl+C handler is driven directly by
+the test with synthetic events, since a suite cannot press the key.
 
 A third defect turned up the same way as the first two - by using the program
 rather than reading it. `/clear` printed "conversation cleared" and left the

@@ -5,7 +5,7 @@ program smoke;
 
 {$mode objfpc}{$H+}
 
-uses SysUtils, uJson, uTools;
+uses SysUtils, uJson, uHttp, uTools;
 
 var
   Fails: Integer = 0;
@@ -161,9 +161,86 @@ begin
   { The caller owns the schema, so it is freed here rather than leaked. }
   Sch := ToolsSchema;
   try
-    Check(Sch.Count = 6, 'the schema exposes six tools');
+    Check(Sch.Count = 7, 'the schema exposes seven tools');
   finally
     Sch.Free;
+  end;
+end;
+
+{ The fetch tool, against a stand-in transport: no network in this suite. }
+var
+  FakeGetUrl: string;
+  FakeGetResult: THttpResult;
+
+function FakeGet(const Url, Headers: string; MaxBytes: Integer): THttpResult;
+begin
+  FakeGetUrl := Url;
+  Result := FakeGetResult;
+end;
+
+procedure TestFetch;
+var
+  J: TJson;
+  Out_: string;
+  IsErr: Boolean;
+begin
+  uHttp.HttpGetTransport := @FakeGet;
+  try
+    { Denied by default: fetch reaches the outside world, so it asks. }
+    uTools.AllowAllFetch := False;
+    J := TJson.NewObj;
+    J.AddStr('url', 'https://example.com/doc');
+    Out_ := Run('fetch', J, IsErr);
+    Check(IsErr and (Pos('denied', Out_) > 0),
+      'fetch is denied without approval');
+
+    uTools.AllowAllFetch := True;
+
+    { Not https, refused before any prompt or request. }
+    J := TJson.NewObj;
+    J.AddStr('url', 'http://example.com/doc');
+    Out_ := Run('fetch', J, IsErr);
+    Check(IsErr and (Pos('https', Out_) > 0), 'fetch refuses plain http');
+
+    { The happy path returns the body. }
+    FakeGetResult.Ok := True;
+    FakeGetResult.Status := 200;
+    FakeGetResult.Body := 'hello from the web';
+    FakeGetResult.Error := '';
+    FakeGetResult.RetryAfterMs := 0;
+    J := TJson.NewObj;
+    J.AddStr('url', 'https://example.com/doc');
+    Out_ := Run('fetch', J, IsErr);
+    Check((not IsErr) and (Out_ = 'hello from the web'),
+      'fetch returns the body: ' + Out_);
+    Check(FakeGetUrl = 'https://example.com/doc',
+      'the requested URL reached the transport');
+
+    { A failure carries the error and any body the server sent. }
+    FakeGetResult.Ok := False;
+    FakeGetResult.Status := 404;
+    FakeGetResult.Body := 'not here';
+    FakeGetResult.Error := 'HTTP 404';
+    J := TJson.NewObj;
+    J.AddStr('url', 'https://example.com/missing');
+    Out_ := Run('fetch', J, IsErr);
+    Check(IsErr and (Pos('HTTP 404', Out_) > 0) and (Pos('not here', Out_) > 0),
+      'a failed fetch reports status and body');
+
+    { A body that is not valid UTF-8 is scrubbed, never sent raw: one bad
+      byte in a tool result poisons the whole request. }
+    FakeGetResult.Ok := True;
+    FakeGetResult.Status := 200;
+    FakeGetResult.Body := 'caf' + #$E9 + ' latin-1';
+    FakeGetResult.Error := '';
+    J := TJson.NewObj;
+    J.AddStr('url', 'https://example.com/latin1');
+    Out_ := Run('fetch', J, IsErr);
+    Check((not IsErr) and IsValidUtf8(Out_),
+      'a non-UTF-8 body is converted to valid UTF-8');
+  finally
+    uHttp.HttpGetTransport := nil;
+    uTools.AllowAllFetch := False;
   end;
 end;
 
@@ -172,6 +249,7 @@ var
 begin
   TestJson;
   TestTools;
+  TestFetch;
   Schema := ToolsSchema;
   try
     Check(Pos('"input_schema"', Schema.ToJson) > 0, 'the schema serialises');

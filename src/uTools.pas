@@ -25,6 +25,7 @@ var
   { Set once the user picks "always" for a tool class. }
   AllowAllEdits: Boolean = False;
   AllowAllBash: Boolean = False;
+  AllowAllFetch: Boolean = False;
 
 const
   { pasclaude's own state directory, kept out of listings and searches.  The
@@ -76,11 +77,14 @@ function RunShellQuiet(const Cmd: string; out ExitCode: Integer): string;
 
 implementation
 
-uses SysUtils, Classes, Process, Windows;
+uses SysUtils, Classes, Process, Windows, uHttp;
 
 const
   MaxReadBytes = 400 * 1024;   { keeps a stray huge file out of the context }
   MaxOutBytes  = 30 * 1024;    { cap on any single tool result }
+  { A fetched page larger than this is cut; the model gets the front, which
+    is where documents put what they are about. }
+  MaxFetchBytes = 200 * 1024;
   { Diff lines shown in a permission prompt.  Enough to judge a normal edit,
     short enough that a big one does not scroll the question off screen. }
   PreviewLines = 40;
@@ -831,6 +835,14 @@ begin
     'Run a shell command in the session root and return its output. ' +
     'Use it to build, run tests, or inspect the system. Requires user approval.',
     P, ['command']));
+
+  P := TJson.NewObj;
+  P.Add('url', StrProp('The https:// URL to fetch.'));
+  Result.Push(MakeTool('fetch',
+    'Fetch a URL over HTTPS and return the response body as text. ' +
+    'Use it to read documentation, APIs, or reference pages. ' +
+    'Requires user approval.',
+    P, ['url']));
 end;
 
 { --------------------------------------------------------------- execution -- }
@@ -857,6 +869,8 @@ begin
     if Length(S) > 120 then S := Copy(S, 1, 117) + '...';
     Result := '$ ' + S;
   end
+  else if Name = 'fetch' then
+    Result := 'fetch ' + Input.Str('url')
   else
     Result := Name;
 end;
@@ -935,12 +949,14 @@ end;
 { Asks the user, honouring any standing "always" answer for this tool class. }
 function Permit(const Name, Detail: string; Ask: TAskProc): Boolean;
 var
-  IsBash: Boolean;
+  IsBash, IsFetch: Boolean;
   A: TPermission;
 begin
   IsBash := Name = 'bash';
+  IsFetch := Name = 'fetch';
   if IsBash and AllowAllBash then Exit(True);
-  if (not IsBash) and AllowAllEdits then Exit(True);
+  if IsFetch and AllowAllFetch then Exit(True);
+  if (not IsBash) and (not IsFetch) and AllowAllEdits then Exit(True);
   if Ask = nil then Exit(False);
 
   A := Ask(Name, Detail);
@@ -948,7 +964,9 @@ begin
     pmAllowOnce: Result := True;
     pmAllowAlways:
       begin
-        if IsBash then AllowAllBash := True else AllowAllEdits := True;
+        if IsBash then AllowAllBash := True
+        else if IsFetch then AllowAllFetch := True
+        else AllowAllEdits := True;
         Result := True;
       end;
   else
@@ -1161,6 +1179,41 @@ begin
     if Result = '' then Result := '(no output)';
     Result := Result + Format(#10'[exit code %d]', [Code]);
     IsError := Code <> 0;
+  end
+
+  else if Name = 'fetch' then
+  begin
+    Text := Input.Str('url');
+    if Copy(Text, 1, 8) <> 'https://' then
+    begin
+      IsError := True;
+      Exit('only https:// URLs can be fetched: ' + Text);
+    end;
+    if not Permit(Name, DescribeTool(Name, Input), Ask) then
+    begin
+      IsError := True;
+      Exit('the user denied this fetch');
+    end;
+    with HttpGet(Text, 'accept: text/html, application/json, text/plain'#13#10 +
+      'user-agent: pasclaude/0.1', MaxFetchBytes) do
+    begin
+      if not Ok then
+      begin
+        IsError := True;
+        if Body <> '' then
+          Exit(Error + #10 + Clip(Body))
+        else
+          Exit(Error);
+      end;
+      Text := Body;
+    end;
+    { The body is whatever the server sent; anything not valid UTF-8 is
+      scrubbed rather than hex-dumped, because a page in another encoding is
+      still mostly readable text, unlike a binary file. }
+    if not IsValidUtf8(Text) then
+      Text := OemToUtf8(Text);
+    if Text = '' then Text := '(empty response)';
+    Result := Clip(Text);
   end
 
   else

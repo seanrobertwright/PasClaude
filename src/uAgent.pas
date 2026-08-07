@@ -47,6 +47,13 @@ type
     FTotalIn, FTotalOut: Int64;
     FCacheWrite, FCacheRead: Int64;
     FTurns: Integer;
+    { From the last failed response's Retry-After header, for the retry loop.
+      Zero when the server named no wait. }
+    FRetryAfterMs: Integer;
+    { Prompt tokens of the most recent request, as the API counted them:
+      plain input plus both cache columns.  This is the real size of the
+      context, where TranscriptBytes is only a proxy for it. }
+    FLastPromptTokens: Int64;
 
     function BuildBody: string;
     { One request/response exchange.  Returns the blocks the model produced. }
@@ -70,6 +77,12 @@ type
     OnToolStart: TToolProc;
     OnToolResult: TToolProc;
     OnNotice: TTextProc;           { status and error lines }
+    { Fires when a tool_use block opens in the stream, before its arguments
+      have finished arriving - the earliest moment the user can be told what
+      the model is doing.  Detail carries the tool's id. }
+    OnToolUseBegin: TToolProc;
+    { Streamed fragments of the tool's argument JSON, as they arrive. }
+    OnToolArg: TTextProc;
     Ask: TAskProc;
     { Polled between chunks so the user can abandon a long reply. }
     ShouldCancel: TCancelProc;
@@ -85,9 +98,17 @@ type
     { Drops the oldest exchanges, keeping roughly the last KeepBytes worth of
       transcript.  Returns the number of messages removed. }
     function Compact(KeepBytes: Integer): Integer;
+    { Asks the model to summarize the conversation, then replaces the whole
+      transcript with that summary.  The old transcript is restored intact on
+      any failure, so a refusal or a dropped connection costs nothing.  The
+      summary streams through OnText like any reply. }
+    function CompactWithSummary(out Err: string): Boolean;
     { Bytes the transcript currently occupies as JSON. }
     function TranscriptBytes: Integer;
     function MessageCount: Integer;
+    { Prompt tokens of the most recent request - the context's true size.
+      Zero until a request has been made. }
+    function ContextTokens: Int64;
     { Drops a trailing user message that never got an answer.  Returns True if
       one was removed. }
     function TrimUnansweredQuestion: Boolean;
@@ -368,6 +389,8 @@ begin
       St^.Blocks[Idx].Id := CB.Str('id');
       St^.Blocks[Idx].Name := CB.Str('name');
       St^.Blocks[Idx].Text := '';
+      if Assigned(St^.Agent.OnToolUseBegin) then
+        St^.Agent.OnToolUseBegin(St^.Blocks[Idx].Name, St^.Blocks[Idx].Id);
     end
     else if K = 'thinking' then
     begin
@@ -403,8 +426,12 @@ begin
     else if K = 'signature_delta' then
       St^.Blocks[Idx].Signature := St^.Blocks[Idx].Signature + Delta.Str('signature')
     else if K = 'input_json_delta' then
+    begin
       { Tool arguments stream as raw JSON text and are parsed once complete. }
-      St^.Blocks[Idx].Text := St^.Blocks[Idx].Text + Delta.Str('partial_json');
+      Frag := Delta.Str('partial_json');
+      St^.Blocks[Idx].Text := St^.Blocks[Idx].Text + Frag;
+      if Assigned(St^.Agent.OnToolArg) then St^.Agent.OnToolArg(Frag);
+    end;
   end
 
   else if T = 'message_delta' then
@@ -510,6 +537,11 @@ begin
   Result := FMessages.Count;
 end;
 
+function TAgent.ContextTokens: Int64;
+begin
+  Result := FLastPromptTokens;
+end;
+
 { A turn that failed - no key, no network, a rejected request - leaves the
   user's question in the transcript with nothing answering it.  Saving that
   and resuming it produces two user messages in a row, which is a shape the
@@ -607,6 +639,90 @@ end;
 function TAgent.TokensOut: Int64;
 begin
   Result := FTotalOut;
+end;
+
+{ Replaces the transcript with a model-written summary of it.  Dropping old
+  turns loses what they established; asking the model to carry the substance
+  forward in prose keeps it, at the cost of one request.
+
+  The request is an ordinary exchange - transcript plus one instruction - so
+  it streams and retries like any other.  The transcript is only replaced
+  after a non-empty summary has fully arrived; every failure path restores
+  the conversation exactly as it was, because a compaction that destroys the
+  conversation on a dropped connection is worse than no compaction. }
+function TAgent.CompactWithSummary(out Err: string): Boolean;
+var
+  Backup, StopReason, Summary: string;
+  Blocks: TPartialBlocks;
+  Cancelled: Boolean;
+  Restored, Msg, Arr, B: TJson;
+  I: Integer;
+
+  procedure Restore;
+  begin
+    Restored := JsonParse(Backup);
+    if Restored = nil then Exit;   { cannot happen: Backup came from ToJson }
+    FMessages.Free;
+    FMessages := Restored;
+  end;
+
+begin
+  Err := '';
+  Result := False;
+  if FMessages.Count = 0 then
+  begin
+    Err := 'nothing to summarize';
+    Exit;
+  end;
+
+  Backup := FMessages.ToJson;
+  AppendUserText(
+    'Summarize this conversation so far for your own future reference. ' +
+    'Write plain prose, no tool calls. Preserve: what the user asked for, ' +
+    'what was done and how, exact file paths and names involved, decisions ' +
+    'made and their reasons, and anything still unfinished. Omit pleasantries ' +
+    'and dead ends.');
+
+  if not SendWithRetry(Blocks, StopReason, Err, Cancelled) then
+  begin
+    Restore;
+    Exit;
+  end;
+  if Cancelled then
+  begin
+    Restore;
+    Err := 'cancelled';
+    Exit;
+  end;
+
+  Summary := '';
+  for I := 0 to High(Blocks) do
+    if Blocks[I].Kind = bkText then
+      Summary := Summary + Blocks[I].Text;
+  if Trim(Summary) = '' then
+  begin
+    Restore;
+    Err := 'the model returned no summary';
+    Exit;
+  end;
+
+  { The new transcript is one legal exchange: the summary as a user message
+    (a transcript must open with one) and a short assistant acknowledgement,
+    so the next question follows an assistant turn as the API requires. }
+  FMessages.Free;
+  FMessages := TJson.NewArr;
+  AppendUserText('Summary of the conversation so far, carried over after ' +
+    'compaction:'#10#10 + Summary);
+  Arr := TJson.NewArr;
+  B := TJson.NewObj;
+  B.AddStr('type', 'text');
+  B.AddStr('text', 'Understood. I have the context and will continue from it.');
+  Arr.Push(B);
+  Msg := TJson.NewObj;
+  Msg.AddStr('role', 'assistant');
+  Msg.Add('content', Arr);
+  FMessages.Push(Msg);
+  Result := True;
 end;
 
 function TAgent.CacheWriteTokens: Int64;
@@ -723,6 +839,10 @@ begin
 
   Body := BuildBody;
   Res := HttpPost(ApiUrl, Headers, Body, @StreamChunk, @St);
+  { Clamped on this side too: a substituted transport may leave the field
+    uninitialized, and a nonsense wait must not become a nonsense sleep. }
+  FRetryAfterMs := Res.RetryAfterMs;
+  if (FRetryAfterMs < 0) or (FRetryAfterMs > 60000) then FRetryAfterMs := 0;
 
   { A user-cancelled transfer is not a failure: whatever was decoded before
     the abort is kept, so the partial reply stays in the transcript and the
@@ -734,6 +854,7 @@ begin
     Inc(FCacheWrite, St.CacheWrite);
     Inc(FCacheRead, St.CacheRead);
     Inc(FTotalOut, St.OutTok);
+    FLastPromptTokens := St.InTok + St.CacheWrite + St.CacheRead;
     Blocks := St.Blocks;
     StopReason := 'cancelled';
     Exit(True);
@@ -773,6 +894,7 @@ begin
   Inc(FCacheWrite, St.CacheWrite);
   Inc(FCacheRead, St.CacheRead);
   Inc(FTotalOut, St.OutTok);
+  FLastPromptTokens := St.InTok + St.CacheWrite + St.CacheRead;
   Blocks := St.Blocks;
   StopReason := St.StopReason;
   Result := True;
@@ -1203,8 +1325,11 @@ begin
     if Attempt = MaxRetries then Exit;
 
     { 1s, 2s, 4s by default.  Long enough to clear a burst, short enough that
-      the user does not think the program has hung. }
+      the user does not think the program has hung.  When the server named
+      its own wait in Retry-After, that wins: guessing shorter re-hits the
+      limit, guessing longer wastes the user's time. }
     Wait := RetryBaseMs shl Attempt;
+    if FRetryAfterMs > 0 then Wait := FRetryAfterMs;
     if Assigned(OnNotice) then
       OnNotice(Format('%s - retrying in %dms (%d of %d)',
         [Err, Wait, Attempt + 1, MaxRetries]));
