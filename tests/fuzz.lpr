@@ -8,7 +8,7 @@ program fuzz;
 
 {$mode objfpc}{$H+}
 
-uses SysUtils, Classes, Windows, uJson, uTools, uAgent, uHttp;
+uses SysUtils, Classes, Windows, uJson, uMcp, uTools, uAgent, uHttp;
 
 var
   Fails: Integer = 0;
@@ -953,6 +953,138 @@ begin
   Check(SubagentDepth = 0, 'and no failed call left the depth raised');
 end;
 
+{ Every way a real MCP server can misbehave, driven against bin\srvmock.exe -
+  a real child with real pipes, because the scripted wire in smoke.lpr cannot
+  produce a process that is genuinely there and genuinely silent, and that is
+  the case the whole deadline design exists for.
+
+  Determinism comes from bounded waits and from the fact that every path here
+  ends in McpClose, which is also what keeps the run leak-free under -gh: a
+  live child holding the stderr spool is both an unfreed handle and a file
+  that cannot be deleted. }
+procedure TestMcpHostileServer;
+var
+  Exe, Dir, Err, N, V, P, Text: string;
+  C, Waited: Integer;
+  Arr: TJson;
+  IsErr, Ok: Boolean;
+  Started: QWord;
+  F: TFileStream;
+
+  function Start(const Flags, ErrName: string): Integer;
+  var
+    E: string;
+  begin
+    Result := McpSpawn('mock', '"' + Exe + '" ' + Flags, '',
+      Dir + ErrName, [], E);
+  end;
+
+begin
+  Exe := ExtractFilePath(ParamStr(0)) + 'srvmock.exe';
+  Check(FileExists(Exe), 'the stand-in server binary was built');
+  if not FileExists(Exe) then Exit;
+  Dir := IncludeTrailingPathDelimiter(SessionDir);
+
+  { A server that hears the request and says nothing.  This is the assertion
+    the whole unit is built around: without the peek-before-read loop it does
+    not fail, it never returns. }
+  C := Start('--hang', 'hang.err');
+  Check(C >= 0, 'a hanging server starts');
+  Ok := McpHandshake(C, N, V, P, Err);
+  Check(Ok, '--hang still completes the handshake: ' + Err);
+  Started := GetTickCount64;
+  Ok := McpCallTool(C, 'ping', nil, 800, Text, IsErr, Err);
+  Check(not Ok, 'and then a call that is never answered fails');
+  Check(GetTickCount64 - Started < 6000,
+    Format('bounded by the deadline, not by the server (%d ms)',
+      [GetTickCount64 - Started]));
+  Check(McpState(C) = msDead, 'and the connection is marked dead');
+  { Not McpAlive, which would answer from the recorded state: the count only
+    falls when the connection was actually torn down, which is the difference
+    between killing a hung server and walking away from it. }
+  Check(McpConnectionCount = 0, 'and the child was killed, not abandoned');
+  McpClose(C);
+
+  { A server that exits mid-session.  The next call must be an error naming
+    what happened, never a wait. }
+  C := Start('--die', 'die.err');
+  Check(C >= 0, 'a dying server starts');
+  McpHandshake(C, N, V, P, Err);
+  Waited := 0;
+  while McpAlive(C) and (Waited < 40) do
+  begin
+    Sleep(50);
+    Inc(Waited);
+  end;
+  Ok := McpListTools(C, Arr, Err);
+  Check(not Ok, '--die makes the next request fail: ' + Err);
+  if Arr <> nil then Arr.Free;
+  McpClose(C);
+  Check(McpExitCode(C) = 3, 'and the exit code is latched for the report');
+
+  { Non-JSON on stdout is out of spec, and dying on it would hand a broken
+    server the power to end the session. }
+  C := Start('--junk', 'junk.err');
+  Ok := McpHandshake(C, N, V, P, Err);
+  Check(Ok, '--junk still completes the handshake: ' + Err);
+  Ok := McpListTools(C, Arr, Err);
+  Check(Ok, 'and tools/list still succeeds: ' + Err);
+  if Arr <> nil then
+  try
+    Check(Arr.Count = 2, 'with both tools intact');
+  finally
+    Arr.Free;
+  end;
+  McpClose(C);
+
+  { CRLF is also out of spec and also survivable.  Refusing it would be a
+    diagnosis nobody could make from the outside. }
+  C := Start('--crlf', 'crlf.err');
+  Ok := McpHandshake(C, N, V, P, Err);
+  Check(Ok, '--crlf parses: ' + Err);
+  McpClose(C);
+
+  { Pagination against a real child, so the cursor really does travel. }
+  C := Start('--pages', 'pages.err');
+  McpHandshake(C, N, V, P, Err);
+  Ok := McpListTools(C, Arr, Err);
+  Check(Ok, '--pages lists: ' + Err);
+  if Arr <> nil then
+  try
+    Check(Arr.Count = 3, 'and all three pages arrive');
+  finally
+    Arr.Free;
+  end;
+  McpClose(C);
+
+  { stderr goes to the spool, never to the console: a chatty server would
+    otherwise scribble across a streaming reply. }
+  C := Start('--chatty', 'chatty.err');
+  Ok := McpHandshake(C, N, V, P, Err);
+  Check(Ok, '--chatty completes the handshake despite the noise: ' + Err);
+  McpClose(C);
+  F := nil;
+  try
+    F := TFileStream.Create(Dir + 'chatty.err', fmOpenRead or fmShareDenyNone);
+    Check(F.Size >= 100000,
+      Format('and 100 KB of stderr landed in the spool (%d bytes)', [F.Size]));
+  finally
+    F.Free;
+  end;
+
+  { A single result far larger than the model should ever be handed. }
+  C := Start('--big', 'big.err');
+  McpHandshake(C, N, V, P, Err);
+  Ok := McpCallTool(C, 'ping', nil, 10000, Text, IsErr, Err);
+  Check(Ok, '--big answers: ' + Err);
+  Check(Length(Text) < McpMaxResultBytes + 200,
+    Format('and the answer is capped (%d bytes)', [Length(Text)]));
+  McpClose(C);
+
+  McpShutdownAll;
+  Check(McpConnectionCount = 0, 'and no connection outlives the test');
+end;
+
 begin
   TestBinaryFileDoesNotCorruptBody;
   TestNulByteIsEscaped;
@@ -966,6 +1098,7 @@ begin
   TestBackgroundJobsHostile;
   TestHostileSearchResult;
   TestAgentDefinitions;
+  TestMcpHostileServer;
 
   WriteLn;
   if Fails = 0 then

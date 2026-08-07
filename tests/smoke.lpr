@@ -5,7 +5,7 @@ program smoke;
 
 {$mode objfpc}{$H+}
 
-uses SysUtils, Classes, uJson, uHttp, uTools, uAgent, uRegex;
+uses SysUtils, Classes, uJson, uHttp, uMcp, uTools, uAgent, uRegex;
 
 var
   Fails: Integer = 0;
@@ -1021,6 +1021,418 @@ begin
   uTools.AllowAllEdits := False;
 end;
 
+{ --------------------------------------------------------------- MCP ---
+  The stand-in wire, in the spirit of loop.lpr's FakePost: the protocol runs
+  against a script instead of a process, so framing, pagination, the deadline
+  and every hostile byte sequence are testable with no child at all.  One
+  reply is consumed per request that carries an id - a notification consumes
+  none - and %ID% is substituted so a response answers the question that was
+  actually asked rather than a number the script guessed.
+
+  WireChunk is nine bytes for the same reason FakePost's is: every frame
+  therefore arrives split across several reads, so the reassembly path is the
+  only path the tests ever exercise. }
+var
+  Replies: array of string;
+  ReplyN: Integer = 0;
+  WireIn: string = '';
+  WireOut: string = '';
+  WireChunk: Integer = 9;
+  WireAlive: Boolean = True;
+  WireBroken: Boolean = False;
+  WireSeq: Integer = 0;
+  WireClosed: Integer = 0;
+
+procedure ScriptReset;
+begin
+  SetLength(Replies, 0);
+  ReplyN := 0;
+  WireIn := '';
+  WireOut := '';
+  WireChunk := 9;
+  WireAlive := True;
+  WireBroken := False;
+  WireClosed := 0;
+end;
+
+procedure Script(const S: string);
+begin
+  SetLength(Replies, Length(Replies) + 1);
+  Replies[High(Replies)] := S;
+end;
+
+function WireOpen(const Cmd, WorkDir, ErrLog: string; out Wire: Integer;
+  out Err: string): Boolean;
+begin
+  Err := '';
+  Inc(WireSeq);
+  Wire := WireSeq;
+  Result := True;
+end;
+
+function WireSend(Wire: Integer; const Data: string): Boolean;
+var
+  Doc: TJson;
+  R: string;
+  Id: Integer;
+begin
+  WireIn := WireIn + Data;
+  Result := True;
+  Doc := JsonParse(Trim(Data));
+  if Doc = nil then Exit;
+  Id := -1;
+  try
+    if Doc.Find('id') <> nil then Id := Round(Doc.Num('id'));
+  finally
+    Doc.Free;
+  end;
+  if Id < 0 then Exit;
+  if ReplyN > High(Replies) then Exit;      { script exhausted: silence }
+  R := StringReplace(Replies[ReplyN], '%ID%', IntToStr(Id), [rfReplaceAll]);
+  Inc(ReplyN);
+  if R <> '' then WireOut := WireOut + R + #10;
+end;
+
+function WirePoll(Wire: Integer; out Data: string; out Alive: Boolean): Boolean;
+begin
+  Data := '';
+  Alive := WireAlive;
+  if WireBroken then Exit(False);
+  if WireOut <> '' then
+  begin
+    Data := Copy(WireOut, 1, WireChunk);
+    Delete(WireOut, 1, Length(Data));
+  end;
+  Result := True;
+end;
+
+procedure WireClose(Wire: Integer; out ExitCode: Integer);
+begin
+  ExitCode := 7;
+  Inc(WireClosed);
+end;
+
+procedure InstallWire;
+begin
+  McpWire.Open := @WireOpen;
+  McpWire.Send := @WireSend;
+  McpWire.Poll := @WirePoll;
+  McpWire.Close := @WireClose;
+end;
+
+procedure RemoveWire;
+begin
+  McpWire.Open := nil;
+  McpWire.Send := nil;
+  McpWire.Poll := nil;
+  McpWire.Close := nil;
+end;
+
+function CountLf(const S: string): Integer;
+var
+  I: Integer;
+begin
+  Result := 0;
+  for I := 1 to Length(S) do if S[I] = #10 then Inc(Result);
+end;
+
+const
+  InitOk = '{"jsonrpc":"2.0","id":%ID%,"result":{"protocolVersion":' +
+    '"2025-06-18","capabilities":{},"serverInfo":{"name":"srv",' +
+    '"version":"1.0"}}}';
+  ListTwo = '{"jsonrpc":"2.0","id":%ID%,"result":{"tools":[' +
+    '{"name":"echo","description":"d","inputSchema":{"type":"object"}},' +
+    '{"name":"ping","description":"d","inputSchema":{"type":"object"}}]}}';
+
+{ Opens a scripted connection that has already shaken hands.  Returns -1 when
+  the handshake itself failed, which every caller treats as fatal. }
+function Shook(out C: Integer): Boolean;
+var
+  Err, N, V, P: string;
+begin
+  C := McpSpawn('mock', 'mock-command', '', '', [], Err);
+  Result := (C >= 0) and McpHandshake(C, N, V, P, Err);
+end;
+
+procedure TestMcpScripted;
+var
+  C: Integer;
+  Err, SName, SVer, SProto, Text, Big: string;
+  Arr, Args: TJson;
+  IsErr, Ok: Boolean;
+  Started: QWord;
+begin
+  Check(not McpWireInstalled,
+    'the shipped program installs no stand-in MCP wire');
+  InstallWire;
+  try
+    { --- the handshake --- }
+    ScriptReset;
+    Script(InitOk);
+    C := McpSpawn('mock', 'mock-command', '', '', [], Err);
+    Check(C >= 0, 'a scripted server opens');
+    Ok := McpHandshake(C, SName, SVer, SProto, Err);
+    Check(Ok, 'the handshake completes: ' + Err);
+    Check(SName = 'srv', 'and reports the server name');
+    Check(SProto = '2025-06-18', 'and the negotiated protocol version');
+    Check(Pos('"method":"initialize"', WireIn) > 0, 'initialize was sent');
+    Check(Pos('"method":"notifications/initialized"', WireIn) > 0,
+      'and so was notifications/initialized - a strict server answers ' +
+      'nothing until it arrives');
+    Check(CountLf(WireIn) = 2,
+      'two messages, two newlines: the framing is one line per message');
+    Check(McpState(C) = msRunning, 'and the connection is running');
+    McpShutdownAll;
+    Check(McpConnectionCount = 0, 'shutdown closes every connection');
+    Check(WireClosed = 1, 'and the wire was told');
+
+    { A server is entitled to answer with a version other than ours.  A
+      client that demanded a match would be the "nothing ever starts"
+      failure. }
+    ScriptReset;
+    Script('{"jsonrpc":"2.0","id":%ID%,"result":{"protocolVersion":' +
+      '"2025-11-25","serverInfo":{"name":"older","version":"9"}}}');
+    C := McpSpawn('mock', 'mock-command', '', '', [], Err);
+    Check(McpHandshake(C, SName, SVer, SProto, Err),
+      'a different protocol version is accepted, not refused');
+    Check(SProto = '2025-11-25', 'and reported as what it is');
+    McpShutdownAll;
+
+    { A result that is not an object is the one fatal handshake answer. }
+    ScriptReset;
+    Script('{"jsonrpc":"2.0","id":%ID%,"result":"yes"}');
+    C := McpSpawn('mock', 'mock-command', '', '', [], Err);
+    Check(not McpHandshake(C, SName, SVer, SProto, Err),
+      'a non-object result fails the handshake');
+    McpShutdownAll;
+
+    { --- tools/list becomes tool records --- }
+    ScriptReset;
+    Script(InitOk);
+    Script(ListTwo);
+    Check(Shook(C), 'a listing server shakes hands');
+    Ok := McpListTools(C, Arr, Err);
+    Check(Ok, 'tools/list succeeds: ' + Err);
+    if Arr <> nil then
+    try
+      Check(Arr.Count = 2, 'and yields both declarations');
+      Check(Arr.Item(0).Str('name') = 'echo', 'in the order the server gave');
+    finally
+      Arr.Free;
+    end;
+    McpShutdownAll;
+
+    { --- pagination --- }
+    ScriptReset;
+    Script(InitOk);
+    Script('{"jsonrpc":"2.0","id":%ID%,"result":{"tools":[{"name":"a"}],' +
+      '"nextCursor":"c2"}}');
+    Script('{"jsonrpc":"2.0","id":%ID%,"result":{"tools":[{"name":"b"}],' +
+      '"nextCursor":"c3"}}');
+    Script('{"jsonrpc":"2.0","id":%ID%,"result":{"tools":[{"name":"c"}]}}');
+    Check(Shook(C), 'a paginating server shakes hands');
+    Check(McpListTools(C, Arr, Err), 'and every page is followed');
+    if Arr <> nil then
+    try
+      Check(Arr.Count = 3, 'so all three tools arrive');
+    finally
+      Arr.Free;
+    end;
+    Check(Pos('"cursor":"c2"', WireIn) > 0, 'and the cursor was echoed back');
+    McpShutdownAll;
+
+    { --- a call round trip, including the escaping the framing depends on --- }
+    ScriptReset;
+    Script(InitOk);
+    Script('{"jsonrpc":"2.0","id":%ID%,"result":{"content":[' +
+      '{"type":"text","text":"pong"},{"type":"image",' +
+      '"mimeType":"image/png","data":"AAAA"}]}}');
+    Check(Shook(C), 'a calling server shakes hands');
+    Args := TJson.NewObj;
+    Args.AddStr('text', 'two' + #10 + 'lines');
+    try
+      Ok := McpCallTool(C, 'echo', Args, 2000, Text, IsErr, Err);
+      Check(Ok, 'tools/call round-trips: ' + Err);
+    finally
+      Args.Free;
+    end;
+    Check(not IsErr, 'and reports no error');
+    Check(Pos('pong', Text) > 0, 'and carries the text block');
+    Check(Pos('[image image/png', Text) > 0,
+      'and a non-text block becomes a placeholder, not base64');
+    Check(Pos('\n', WireIn) > 0,
+      'a newline inside a value is escaped on the wire');
+    Check(CountLf(WireIn) = 3,
+      'so three messages are still three lines - the compact writer is what ' +
+      'makes one-message-per-line true');
+    McpShutdownAll;
+
+    { --- both error channels --- }
+    ScriptReset;
+    Script(InitOk);
+    Script('{"jsonrpc":"2.0","id":%ID%,"error":{"code":-32602,' +
+      '"message":"unknown tool"}}');
+    Script('{"jsonrpc":"2.0","id":%ID%,"result":{"content":[' +
+      '{"type":"text","text":"it refused"}],"isError":true}}');
+    Check(Shook(C), 'an erroring server shakes hands');
+    Check(McpCallTool(C, 'nope', nil, 2000, Text, IsErr, Err),
+      'a JSON-RPC error is an answer, not a transport failure');
+    Check(IsErr and (Pos('mcp error -32602', Text) > 0),
+      'and reaches the model as a failed result: ' + Text);
+    Check(McpCallTool(C, 'boom', nil, 2000, Text, IsErr, Err),
+      'and so is result.isError');
+    Check(IsErr and (Pos('it refused', Text) > 0),
+      'with the server text intact');
+    McpShutdownAll;
+
+    { --- junk on stdout, and an unsolicited request --- }
+    ScriptReset;
+    Script(InitOk);
+    Script('this is not JSON' + #10 + '{"broken":' + #10 +
+      '{"jsonrpc":"2.0","id":900,"method":"roots/list"}' + #10 +
+      '{"jsonrpc":"2.0","id":4242,"result":{"tools":[]}}' + #10 +
+      '{"jsonrpc":"2.0","id":%ID%,"result":{"content":[' +
+      '{"type":"text","text":"survived"}]}}');
+    Check(Shook(C), 'a noisy server shakes hands');
+    Ok := McpCallTool(C, 'echo', nil, 2000, Text, IsErr, Err);
+    Check(Ok, 'junk lines are discarded, not fatal: ' + Err);
+    Check(Text = 'survived', 'and the real answer is still found');
+    Check(Pos('-32601', WireIn) > 0,
+      'a request from the server gets an answer so it is not left waiting');
+    McpShutdownAll;
+
+    { --- a server that never answers --- }
+    ScriptReset;
+    Script(InitOk);
+    Check(Shook(C), 'a silent server shakes hands');
+    Started := GetTickCount64;
+    Check(not McpCallTool(C, 'echo', nil, 200, Text, IsErr, Err),
+      'a call that is never answered fails');
+    Check(GetTickCount64 - Started < 3000, 'and fails on the deadline');
+    Check(Pos('did not answer', Err) > 0, 'saying so: ' + Err);
+    Check(McpState(C) = msDead,
+      'a server that ignored one request is not trusted with the next');
+    Check(WireClosed = 1, 'and it was killed, not merely abandoned');
+    Check(not McpCallTool(C, 'echo', nil, 200, Text, IsErr, Err),
+      'and a later call on a dead connection fails cleanly');
+    McpShutdownAll;
+
+    { --- a server that dies mid-call --- }
+    ScriptReset;
+    Script(InitOk);
+    Check(Shook(C), 'a doomed server shakes hands');
+    WireAlive := False;
+    Check(not McpCallTool(C, 'echo', nil, 5000, Text, IsErr, Err),
+      'a server that exits mid-call fails the call');
+    Check(McpState(C) = msDead, 'and is marked dead');
+    Check(Pos('stopped', Err) > 0, 'naming what happened: ' + Err);
+    McpShutdownAll;
+
+    { A broken pipe says the same thing by a different route. }
+    ScriptReset;
+    Script(InitOk);
+    Check(Shook(C), 'a third server shakes hands');
+    WireBroken := True;
+    Check(not McpCallTool(C, 'echo', nil, 5000, Text, IsErr, Err),
+      'a broken pipe is EOF, not a hang');
+    McpShutdownAll;
+
+    { --- a result too large to pass on whole --- }
+    ScriptReset;
+    Script(InitOk);
+    Script('{"jsonrpc":"2.0","id":%ID%,"result":{"content":[' +
+      '{"type":"text","text":"' + StringOfChar('x', 200000) + '"}]}}');
+    Check(Shook(C), 'a verbose server shakes hands');
+    WireChunk := 65536;
+    Ok := McpCallTool(C, 'echo', nil, 5000, Text, IsErr, Err);
+    Check(Ok, 'a huge result still returns: ' + Err);
+    Check(Length(Text) < McpMaxResultBytes + 200,
+      Format('and is capped (%d bytes)', [Length(Text)]));
+    Check(Pos('the rest is cut', Text) > 0, 'and says it was cut');
+    McpShutdownAll;
+
+    { --- a request we refuse to send --- }
+    ScriptReset;
+    Script(InitOk);
+    Check(Shook(C), 'a fourth server shakes hands');
+    Big := StringOfChar('y', McpMaxRequestBytes + 1000);
+    Args := TJson.NewObj;
+    Args.AddStr('text', Big);
+    try
+      Check(not McpCallTool(C, 'echo', Args, 500, Text, IsErr, Err),
+        'an oversized request is refused locally');
+    finally
+      Args.Free;
+    end;
+    Check(Pos('too large', Err) > 0,
+      'without ever touching the pipe: ' + Err);
+    Check(McpState(C) = msRunning,
+      'and the connection survives, because nothing was written');
+    McpShutdownAll;
+
+    { --- a line that never ends --- }
+    ScriptReset;
+    Script(InitOk);
+    Check(Shook(C), 'a fifth server shakes hands');
+    WireChunk := 65536;
+    WireOut := StringOfChar('z', McpMaxLineBytes + 4096);
+    Check(not McpCallTool(C, 'echo', nil, 20000, Text, IsErr, Err),
+      'an unterminated line is bounded, not buffered forever');
+    Check(Pos('unterminated', Err) > 0, 'saying so: ' + Err);
+    Check(McpState(C) = msDead, 'and the connection is dropped');
+    McpShutdownAll;
+  finally
+    McpShutdownAll;
+    RemoveWire;
+    ScriptReset;
+  end;
+  Check(not McpWireInstalled, 'and the wire is put back');
+end;
+
+{ The half a scripted wire cannot reach: real pipes, real inheritance, a real
+  EOF and a real exit code. }
+procedure TestMcpServerProcess;
+var
+  C: Integer;
+  Exe, ErrLog, Err, SName, SVer, SProto, Text: string;
+  Arr: TJson;
+  IsErr, Ok: Boolean;
+begin
+  Exe := ExtractFilePath(ParamStr(0)) + 'srvmock.exe';
+  Check(FileExists(Exe), 'the stand-in server binary was built: ' + Exe);
+  if not FileExists(Exe) then Exit;
+  ErrLog := IncludeTrailingPathDelimiter(GetTempDir) + 'pasclaude-mcp.err';
+
+  C := McpSpawn('mock', '"' + Exe + '"', '', ErrLog, [], Err);
+  if C < 0 then Check(False, 'a real server starts: ' + Err)
+  else Check(True, 'a real server starts');
+  if C < 0 then Exit;
+  try
+    Ok := McpHandshake(C, SName, SVer, SProto, Err);
+    Check(Ok, 'and completes the handshake over real pipes: ' + Err);
+    Check((SName = 'srv') and (SProto = '2025-06-18'),
+      'reporting its name and version');
+    Ok := McpListTools(C, Arr, Err);
+    Check(Ok, 'tools/list over a pipe: ' + Err);
+    if Arr <> nil then
+    try
+      Check(Arr.Count = 2, 'yields both tools');
+    finally
+      Arr.Free;
+    end;
+    Ok := McpCallTool(C, 'ping', nil, 10000, Text, IsErr, Err);
+    Check(Ok, 'tools/call over a pipe: ' + Err);
+    Check((not IsErr) and (Pos('pong', Text) > 0), 'and answers pong');
+    Check(McpAlive(C), 'and the child is still there');
+  finally
+    McpClose(C);
+  end;
+  Check(McpConnectionCount = 0, 'closing brings the connection count to zero');
+  Check(McpState(C) = msDead,
+    'and a stale index answers dead rather than somebody else''s server');
+  SysUtils.DeleteFile(ErrLog);
+end;
+
 procedure TestPermissionPersistence;
 var
   P: string;
@@ -1093,6 +1505,8 @@ begin
   TestTodos;
   TestSubagentGate;
   TestPermissionPersistence;
+  TestMcpScripted;
+  TestMcpServerProcess;
   Schema := ToolsSchema;
   try
     Check(Pos('"input_schema"', Schema.ToJson) > 0, 'the schema serialises');

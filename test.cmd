@@ -32,6 +32,17 @@ if not exist "%UNITS%" md "%UNITS%"
 set FLAGS=-MObjFPC -Scghi -O1 -vew -Fu"%ROOT%src" -FU"%UNITS%" -FE"%OUT%"
 set RC=0
 
+rem The MCP transport tests need something to talk to.  srvmock is a fixture,
+rem not a suite: it is built here but its exit code is nobody's pass or fail,
+rem and it is built WITHOUT -gh on purpose - heaptrc's report on exit would go
+rem down the same stdout the protocol is framed on and corrupt every reply.
+"%FPC%" %FLAGS% -o"%OUT%\srvmock.exe" "%ROOT%tests\srvmock.lpr" >nul
+if errorlevel 1 (
+  echo BUILD FAILED: srvmock
+  "%FPC%" %FLAGS% -o"%OUT%\srvmock.exe" "%ROOT%tests\srvmock.lpr"
+  exit /b 1
+)
+
 rem -gh makes the RTL report anything the suite allocated and did not free.
 rem JSON ownership here is manual, so a leak is a real defect, not noise.
 for %%T in (%SUITES%) do (
