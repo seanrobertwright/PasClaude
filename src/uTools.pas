@@ -33,8 +33,21 @@ const
     to skip it, and two copies of the literal would drift. }
   StateDirName = '.pasclaude';
 
+  { The server-side web search tool's type string.  Anthropic versions these
+    by date; older models take the basic 'web_search_20250305' instead.
+    Rather than sniffing the model id - the mistake README already records -
+    a rejection by the server disables the feature for the session and the
+    turn is retried, so a wrong string here costs one request, not a run. }
+  WebSearchToolType = 'web_search_20260209';
+
 { The tool list, as the API expects it under "tools". }
 function ToolsSchema: TJson;
+
+{ The web search declaration.  Declaration only: the API executes this tool
+  on its own servers, so there is no RunTool branch, no DescribeTool arm and
+  no permission gate for it - the consent is the declaration itself, which
+  the host makes conditional.  Caller takes ownership. }
+function WebSearchToolDef: TJson;
 
 { Runs Name with Input.  Returns the text result; IsError says whether the
   model should treat it as a failure.  Ask may be nil, which denies anything
@@ -1934,6 +1947,18 @@ begin
     'and execution counts of the cell survive a replace. Requires user ' +
     'approval, like any other file change.',
     P, ['path', 'cell', 'edit_mode']));
+end;
+
+{ Unlike everything in ToolsSchema this carries no input_schema: a server-side
+  tool's arguments are the API's business, not ours.  max_uses caps how many
+  searches one turn may run, which is the only spend control available for a
+  tool the client never executes. }
+function WebSearchToolDef: TJson;
+begin
+  Result := TJson.NewObj;
+  Result.AddStr('type', WebSearchToolType);
+  Result.AddStr('name', 'web_search');
+  Result.AddNum('max_uses', 5);
 end;
 
 { --------------------------------------------------------------- execution -- }

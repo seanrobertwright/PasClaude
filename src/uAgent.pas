@@ -32,11 +32,18 @@ type
   end;
   TModelList = array of TModelInfo;
 
-  TBlockKind = (bkText, bkThinking, bkToolUse);
+  { bkServerToolUse is a tool the API runs for us: same shape as bkToolUse,
+    but no RunTool ever sees it.  bkResult is a verbatim passthrough of a
+    block this client does not interpret and must nevertheless echo back on
+    the next request - its Text holds the block's own JSON, captured whole
+    from content_block_start.  Making bkResult the fallback for any
+    unrecognised type is what keeps a future server-side block from being
+    silently flattened into empty prose. }
+  TBlockKind = (bkText, bkThinking, bkToolUse, bkServerToolUse, bkResult);
 
   TPartialBlock = record
     Kind: TBlockKind;
-    Text: string;        { prose, reasoning, or accumulated tool JSON }
+    Text: string;        { prose, reasoning, accumulated tool JSON, or raw block JSON }
     Id: string;
     Name: string;
     Signature: string;   { thinking blocks must be echoed back verbatim }
@@ -61,8 +68,17 @@ type
       context, where TranscriptBytes is only a proxy for it. }
     FLastPromptTokens: Int64;
     FThinkingBudget: Integer;
+    { Off unless the user turned it on this session.  When off the tool is
+      not declared at all, so the model cannot reach the network and the
+      declaration costs nothing. }
+    FWebSearch: Boolean;
 
     function BuildBody: string;
+    { Turns web search off after the server refused the declaration, so the
+      turn can be retried without it.  True when it did, meaning the caller
+      should try the same round again.  A tool the server will not accept
+      must cost one request, not every request for the rest of the run. }
+    function DisableWebSearchAfterRejection(const Err: string): Boolean;
     { One request/response exchange.  Returns the blocks the model produced. }
     function SendOnce(out Blocks: TPartialBlocks; out StopReason: string;
       out Err: string; out Cancelled: Boolean): Boolean;
@@ -147,6 +163,11 @@ type
       request carries a thinking block allowance and max_tokens grows to
       leave room for the visible reply on top of the reasoning. }
     property ThinkingBudget: Integer read FThinkingBudget write FThinkingBudget;
+    { Whether the server-side web search tool is declared to the API.  Off by
+      default: the search runs on Anthropic's side, so there is no per-call
+      hook to ask permission at, which makes this switch the whole of the
+      user's consent to reaching the outside world. }
+    property WebSearch: Boolean read FWebSearch write FWebSearch;
 
     { Test seam.  Feeds raw response bytes through the same decoder the live
       stream uses, so the SSE handling can be exercised without a network.
@@ -375,7 +396,7 @@ procedure ApplyEvent(St: PStream; Ev: TJson);
 var
   T, K: string;
   Idx: Integer;
-  CB, Delta, Msg, Usage, ErrObj: TJson;
+  CB, Delta, Msg, Usage, ErrObj, Content: TJson;
   Frag: string;
 begin
   T := Ev.Str('type');
@@ -415,15 +436,52 @@ begin
       if Assigned(St^.Agent.OnToolUseBegin) then
         St^.Agent.OnToolUseBegin(St^.Blocks[Idx].Name, St^.Blocks[Idx].Id);
     end
+    else if K = 'server_tool_use' then
+    begin
+      { The API runs this one itself.  It is recorded exactly like a local
+        tool call because the transcript has to carry it back verbatim, but
+        RunTools skips it - there is nothing here to execute. }
+      St^.Blocks[Idx].Kind := bkServerToolUse;
+      St^.Blocks[Idx].Id := CB.Str('id');
+      St^.Blocks[Idx].Name := CB.Str('name');
+      St^.Blocks[Idx].Text := '';
+      if Assigned(St^.Agent.OnToolUseBegin) then
+        St^.Agent.OnToolUseBegin(St^.Blocks[Idx].Name, St^.Blocks[Idx].Id);
+    end
     else if K = 'thinking' then
     begin
       St^.Blocks[Idx].Kind := bkThinking;
       St^.Blocks[Idx].Text := CB.Str('thinking');
     end
-    else
+    else if K = 'text' then
     begin
       St^.Blocks[Idx].Kind := bkText;
       St^.Blocks[Idx].Text := CB.Str('text');
+    end
+    else
+    begin
+      { Anything else - a search result, a redacted thinking block, whatever
+        ships next - is captured whole and replayed unchanged.  Coercing it
+        to text, as this branch used to, dropped it from the transcript
+        entirely and broke the echo the API requires. }
+      St^.Blocks[Idx].Kind := bkResult;
+      St^.Blocks[Idx].Text := CB.ToJson;
+      if K = 'web_search_tool_result' then
+      begin
+        { A network fetch that leaves no trace in the transcript would be the
+          one tool where silence is least acceptable, so the result is
+          summarised for the host the same way a local tool's would be. }
+        Frag := '';
+        Content := CB.Find('content');
+        if (Content <> nil) and (Content.Kind = jkArr) then
+          Frag := Format('%d results', [Content.Count])
+        else if Content <> nil then
+          Frag := 'error: ' + Content.Str('error_code')
+        else
+          Frag := 'no results';
+        if Assigned(St^.Agent.OnToolResult) then
+          St^.Agent.OnToolResult('web_search', Frag);
+      end;
     end;
   end
 
@@ -431,6 +489,16 @@ begin
   begin
     Idx := Round(Ev.Num('index'));
     EnsureSlot(St, Idx);
+    { A delta for a raw-captured block means the capture from
+      content_block_start was only the opening of it, so replaying that
+      capture would echo a half-formed block.  Blanking the slot drops the
+      block instead, which is the safer of the two wrong answers. }
+    if St^.Blocks[Idx].Kind = bkResult then
+    begin
+      St^.Blocks[Idx].Kind := bkText;
+      St^.Blocks[Idx].Text := '';
+      Exit;
+    end;
     Delta := Ev.Find('delta');
     if Delta = nil then Exit;
     K := Delta.Str('type');
@@ -530,6 +598,9 @@ begin
   FSystem := SystemPrompt;
   FMessages := TJson.NewArr;
   FMaxTokens := 8192;
+  { Stated rather than left to the zero value, because "off" is a decision
+    here and not an accident of initialisation. }
+  FWebSearch := False;
 end;
 
 destructor TAgent.Destroy;
@@ -835,7 +906,7 @@ function TAgent.BuildBody: string;
 var
   Root, Msgs, M, C: TJson;
   I: Integer;
-  SysBlock, SysArr, Content, LastBlock, CC: TJson;
+  SysBlock, SysArr, Content, LastBlock, CC, Tools: TJson;
 begin
   Root := TJson.NewObj;
   try
@@ -882,7 +953,13 @@ begin
       SysArr.Push(SysBlock);
       Root.Add('system', SysArr);
     end;
-    Root.Add('tools', ToolsSchema);
+    { Web search is declared only when the user asked for it.  Absent, the
+      model has no way to reach the network and the session pays no tokens
+      for a tool it may not use; ownership is unchanged, the array still
+      goes to Root. }
+    Tools := ToolsSchema;
+    if FWebSearch then Tools.Push(WebSearchToolDef);
+    Root.Add('tools', Tools);
 
     { The transcript is copied rather than handed over, because FMessages
       must survive this request for the next turn. }
@@ -919,6 +996,28 @@ begin
   finally
     Root.Free;
   end;
+end;
+
+{ Whether an API key or a subscription token may declare web search, and
+  whether this dated type string is still the current one, are both things
+  only a live server can answer.  Rather than guess, the failure is caught:
+  a rejection that names the tool turns it off and the round is retried, so
+  the worst case is one wasted request and a notice instead of a session
+  where every turn fails.  The match is on the message the API sends back,
+  which SendOnce has already appended to Err. }
+function TAgent.DisableWebSearchAfterRejection(const Err: string): Boolean;
+var
+  Low: string;
+begin
+  Result := False;
+  if not FWebSearch then Exit;
+  Low := LowerCase(Err);
+  if Pos('web_search', Low) = 0 then Exit;
+  if (Pos('400', Low) = 0) and (Pos('invalid_request', Low) = 0) then Exit;
+  FWebSearch := False;
+  if Assigned(OnNotice) then
+    OnNotice('web search rejected by the API - disabled for this session');
+  Result := True;
 end;
 
 function TAgent.SendOnce(out Blocks: TPartialBlocks; out StopReason: string;
@@ -1063,6 +1162,30 @@ begin
             if Input = nil then Input := TJson.NewObj;
           end;
           B.Add('input', Input);
+        end;
+      bkServerToolUse:
+        begin
+          { Identical to a local tool call but for the type, which the API
+            uses to pair the call with the result block it produced. }
+          B := TJson.NewObj;
+          B.AddStr('type', 'server_tool_use');
+          B.AddStr('id', Blocks[I].Id);
+          B.AddStr('name', Blocks[I].Name);
+          if Trim(Blocks[I].Text) = '' then
+            Input := TJson.NewObj
+          else
+          begin
+            Input := JsonParse(Blocks[I].Text);
+            if Input = nil then Input := TJson.NewObj;
+          end;
+          B.Add('input', Input);
+        end;
+      bkResult:
+        begin
+          { Echoed byte-for-byte: this client never understood the block, so
+            reconstructing it is the one thing guaranteed to be wrong. }
+          B := JsonParse(Blocks[I].Text);
+          if B = nil then Continue;
         end;
     else
       Continue;
@@ -1514,6 +1637,15 @@ begin
   begin
     if not SendWithRetry(Blocks, StopReason, Err, Cancelled) then
     begin
+      { A refusal of the web search declaration is recoverable: the tool is
+        dropped and the identical round goes out again.  This costs one of
+        the tool rounds, which is the right bound - a server that keeps
+        refusing cannot spin here forever. }
+      if DisableWebSearchAfterRejection(Err) then
+      begin
+        Err := '';
+        Continue;
+      end;
       { The turn dies here, possibly with tool results already appended that
         the model never saw.  Leaving them would make the next question a
         second user turn in a row, so the tail is unwound before giving up. }
@@ -1537,6 +1669,13 @@ begin
       if Assigned(OnNotice) then OnNotice('cancelled');
       Exit(True);
     end;
+    { A long server-side tool run stops the turn early with pause_turn rather
+      than finishing it.  The documented resume is simply to send again with
+      the assistant turn already appended, which RecordAssistant has just
+      done - so the next round is the resume.  Without this the turn would
+      end here looking complete but cut off mid-thought.  MaxToolRounds
+      bounds how many times a turn may pause. }
+    if StopReason = 'pause_turn' then Continue;
     if not RunTools(Blocks) then
       Exit(True);
     { A tool ran, so the model gets another go with the results in hand. }
@@ -1578,7 +1717,35 @@ end;
 { The API rejects a request whose last assistant message contains a tool_use
   with no matching tool_result.  After a cancellation that is exactly the
   state, so those blocks are stripped; if nothing else remains, the message
-  goes too. }
+  goes too.
+
+  A server-side call is the same hazard with a different shape: its result
+  arrives as a later block of the same message rather than in a following
+  user turn, so a cancel landing between the two leaves a dangling
+  server_tool_use the API refuses just as firmly.  Those are dropped only
+  when their result never arrived - a completed pair must survive intact. }
+function HasResultFor(Content: TJson; const Id: string): Boolean;
+var
+  I: Integer;
+  B: TJson;
+  T: string;
+begin
+  Result := False;
+  if (Content = nil) or (Id = '') then Exit;
+  for I := 0 to Content.Count - 1 do
+  begin
+    B := Content.Item(I);
+    if B = nil then Continue;
+    T := B.Str('type');
+    { Every server tool names its result block <tool>_tool_result, so the
+      suffix matches web search and whatever ships beside it later. }
+    if (Length(T) > Length('_tool_result')) and
+       (Copy(T, Length(T) - Length('_tool_result') + 1, MaxInt) = '_tool_result') and
+       (B.Str('tool_use_id') = Id) then
+      Exit(True);
+  end;
+end;
+
 procedure TAgent.DropUnansweredToolCalls;
 var
   Last, Content, Keep: TJson;
@@ -1592,7 +1759,9 @@ begin
 
   Keep := TJson.NewArr;
   for I := 0 to Content.Count - 1 do
-    if Content.Item(I).Str('type') <> 'tool_use' then
+    if (Content.Item(I).Str('type') <> 'tool_use') and
+       not ((Content.Item(I).Str('type') = 'server_tool_use') and
+            not HasResultFor(Content, Content.Item(I).Str('id'))) then
       Keep.Push(JsonParse(Content.Item(I).ToJson));
 
   if Keep.Count = Content.Count then

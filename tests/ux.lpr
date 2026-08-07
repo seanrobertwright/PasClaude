@@ -605,6 +605,41 @@ begin
     A.Free;
   end;
 
+  { A server-side search leaves a call and a result block in the same
+    assistant message.  The unanswered-tool-call rule is about tool_use
+    specifically, so a saved session carrying those blocks must reload
+    rather than being read as a dangling call. }
+  A := TAgent.Create('k', 'm', 'sys');
+  try
+    A.AppendUserText('look it up');
+    SetLength(Blocks, 2);
+    Blocks[0].Kind := bkServerToolUse;
+    Blocks[0].Id := 'srv_1';
+    Blocks[0].Name := 'web_search';
+    Blocks[0].Text := '{"query":"pascal"}';
+    Blocks[0].Signature := '';
+    Blocks[1].Kind := bkResult;
+    Blocks[1].Id := '';
+    Blocks[1].Name := '';
+    Blocks[1].Text := '{"type":"web_search_tool_result","tool_use_id":"srv_1",' +
+                      '"content":[{"type":"web_search_result","title":"P"}]}';
+    Blocks[1].Signature := '';
+    A.ApplyBlocks(Blocks, Ran);
+    Check(not Ran, 'a server-side call runs nothing locally');
+    Check(A.SaveSession(Path, Err), 'a session with a web search saves');
+  finally
+    A.Free;
+  end;
+  A := TAgent.Create('k', 'm', 'sys');
+  try
+    Check(A.LoadSession(Path, Err), 'a web search exchange reloads: ' + Err);
+    Check(Pos('server_tool_use', A.Transcript) > 0, 'the search call survived');
+    Check(Pos('web_search_tool_result', A.Transcript) > 0,
+      'its result survived with it');
+  finally
+    A.Free;
+  end;
+
   { Everything below is a file the program did not write.  Each one must be
     refused with the current conversation left intact - a bad file on disk
     should cost the user nothing. }

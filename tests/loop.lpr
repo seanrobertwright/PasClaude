@@ -1305,6 +1305,243 @@ begin
   end;
 end;
 
+{ Web search is a server-side tool: pasclaude declares it and the API runs it.
+  Declaring it is therefore the whole of the user's consent, so it must be
+  absent from the body unless the session asked for it. }
+procedure TestWebSearchDeclaration;
+var
+  A: TAgent;
+  Doc, Tools: TJson;
+  I, Local, Web: Integer;
+begin
+  ResetScript;
+  A := MakeAgent;
+  try
+    A.AppendUserText('hello');
+
+    Doc := JsonParse(A.RequestBody);
+    try
+      Tools := Doc.Find('tools');
+      Local := 0;
+      Web := 0;
+      for I := 0 to Tools.Count - 1 do
+        if Tools.Item(I).Str('name') = 'web_search' then Inc(Web)
+        else Inc(Local);
+      Check(Web = 0, 'web search is not declared by default');
+      Check(Local = 11, Format('the local tools are all declared (%d)', [Local]));
+    finally
+      Doc.Free;
+    end;
+
+    A.WebSearch := True;
+    Doc := JsonParse(A.RequestBody);
+    try
+      Tools := Doc.Find('tools');
+      Local := 0;
+      Web := 0;
+      for I := 0 to Tools.Count - 1 do
+        if Tools.Item(I).Str('name') = 'web_search' then
+        begin
+          Inc(Web);
+          Check(Tools.Item(I).Str('type') = uTools.WebSearchToolType,
+            'the declaration carries the dated type string');
+          Check(Tools.Item(I).Find('input_schema') = nil,
+            'a server-side tool declares no input schema');
+        end
+        else Inc(Local);
+      Check(Web = 1, 'web search is declared exactly once when it is on');
+      Check(Local = 11, 'the local tools are still all declared');
+    finally
+      Doc.Free;
+    end;
+  finally
+    A.Free;
+  end;
+end;
+
+{ A turn that stops with pause_turn is not finished: the server-side tool loop
+  hit its own iteration cap and the documented resume is to send again with the
+  assistant turn appended.  Treating it as an ending truncates the answer. }
+procedure TestPauseTurnResumes;
+var
+  A: TAgent;
+  Err: string;
+  Doc: TJson;
+  I: Integer;
+  TwoUsers: Boolean;
+begin
+  ResetScript;
+  SetLength(Replies, 2);
+  Replies[0] :=
+    Ev('{"type":"message_start","message":{"usage":{"input_tokens":10,"output_tokens":1}}}') +
+    Ev('{"type":"content_block_start","index":0,"content_block":' +
+       '{"type":"server_tool_use","id":"srv1","name":"web_search"}}') +
+    Ev('{"type":"content_block_delta","index":0,"delta":' +
+       '{"type":"input_json_delta","partial_json":"{\"query\":\"x\"}"}}') +
+    Ev('{"type":"content_block_start","index":1,"content_block":' +
+       '{"type":"web_search_tool_result","tool_use_id":"srv1","content":[]}}') +
+    Ev('{"type":"message_delta","delta":{"stop_reason":"pause_turn"},"usage":{"output_tokens":9}}');
+  Replies[1] := TextReply('here is what I found');
+
+  A := MakeAgent;
+  try
+    A.WebSearch := True;
+    Check(A.Send('look it up', Err), 'a paused turn completes: ' + Err);
+    Check(CallCount = 2, Format('the paused turn is resumed with a second request (%d)',
+      [CallCount]));
+    Check(Prose = 'here is what I found', 'the resumed turn produces the reply');
+
+    Doc := JsonParse(A.Transcript);
+    try
+      TwoUsers := False;
+      for I := 1 to Doc.Count - 1 do
+        if (Doc.Item(I).Str('role') = 'user') and
+           (Doc.Item(I - 1).Str('role') = 'user') then TwoUsers := True;
+      Check(not TwoUsers, 'the resumed transcript alternates legally');
+      Check(Doc.Item(Doc.Count - 1).Str('role') = 'assistant',
+        'the turn ends on the assistant');
+    finally
+      Doc.Free;
+    end;
+  finally
+    A.Free;
+  end;
+end;
+
+{ Whether this key and this model will accept the web search declaration is
+  something only the server knows.  A rejection must cost one request, not the
+  session: the tool is dropped and the same round is sent again. }
+procedure TestWebSearchRejectionSelfHeals;
+var
+  A: TAgent;
+  Err: string;
+  Doc, Tools: TJson;
+  I: Integer;
+  SawWeb: Boolean;
+begin
+  ResetScript;
+  SetLength(Replies, 2);
+  Replies[0] := TextReply('unused');
+  Replies[1] := TextReply('answered anyway');
+  { Call one is refused by name; call two goes through. }
+  FailAfter := 0;
+  FailUntil := 1;
+  FailStatus := 400;
+  FailBody := '{"type":"error","error":{"type":"invalid_request_error",' +
+              '"message":"tools.11: unexpected tool type web_search"}}';
+
+  A := MakeAgent;
+  try
+    A.WebSearch := True;
+    Check(A.Send('search please', Err), 'the turn survives a rejected declaration: ' + Err);
+    Check(CallCount = 2, Format('exactly one request was wasted (%d)', [CallCount]));
+    Check(not A.WebSearch, 'web search is off after the rejection');
+    Check(Pos('web search', Notices) > 0, 'a notice names web search: ' + Notices);
+    Check(Prose = 'answered anyway', 'the retried round produces the reply');
+
+    Doc := JsonParse(Requests[1]);
+    try
+      Tools := Doc.Find('tools');
+      SawWeb := False;
+      for I := 0 to Tools.Count - 1 do
+        if Tools.Item(I).Str('name') = 'web_search' then SawWeb := True;
+      Check(not SawWeb, 'the retried body no longer carries the tool');
+    finally
+      Doc.Free;
+    end;
+  finally
+    A.Free;
+  end;
+  ResetScript;
+end;
+
+{ A server-side call and its result are two blocks of one assistant message,
+  so a cancel can land between them.  The API rejects a server_tool_use with
+  no result just as firmly as an unanswered tool_use - but a completed pair
+  must survive, or the search is lost from the conversation. }
+procedure TestCancelDropsDanglingServerToolUse;
+
+  function TranscriptHas(A: TAgent; const BlockType: string): Boolean;
+  var
+    Doc, Content: TJson;
+    I, J: Integer;
+  begin
+    Result := False;
+    Doc := JsonParse(A.Transcript);
+    try
+      for I := 0 to Doc.Count - 1 do
+      begin
+        Content := Doc.Item(I).Find('content');
+        if Content = nil then Continue;
+        for J := 0 to Content.Count - 1 do
+          if Content.Item(J).Str('type') = BlockType then Result := True;
+      end;
+    finally
+      Doc.Free;
+    end;
+  end;
+
+var
+  A: TAgent;
+  Err, Head, Tail: string;
+  I: Integer;
+begin
+  Head :=
+    Ev('{"type":"message_start","message":{"usage":{"input_tokens":10,"output_tokens":1}}}') +
+    Ev('{"type":"content_block_start","index":0,"content_block":' +
+       '{"type":"server_tool_use","id":"srv1","name":"web_search"}}') +
+    Ev('{"type":"content_block_delta","index":0,"delta":' +
+       '{"type":"input_json_delta","partial_json":"{\"query\":\"x\"}"}}');
+  Tail := '';
+  for I := 1 to 40 do
+    Tail := Tail + Ev('{"type":"content_block_delta","index":2,"delta":' +
+                      '{"type":"text_delta","text":"tail "}}');
+
+  { The cancel lands after the call block but before any result. }
+  ResetScript;
+  SetLength(Replies, 1);
+  Replies[0] := Head +
+    Ev('{"type":"content_block_start","index":2,"content_block":{"type":"text","text":""}}') +
+    Tail;
+  A := MakeAgent;
+  try
+    A.WebSearch := True;
+    A.ShouldCancel := @WantsCancel;
+    ChunksSeen := 0;
+    CancelAfterChunks := 60;
+    A.Send('look it up', Err);
+    Check(not TranscriptHas(A, 'server_tool_use'),
+      'a server call with no result is dropped from the transcript');
+  finally
+    A.Free;
+  end;
+  CancelAfterChunks := -1;
+
+  { The same cancel with the result already in hand must keep both. }
+  ResetScript;
+  SetLength(Replies, 1);
+  Replies[0] := Head +
+    Ev('{"type":"content_block_start","index":1,"content_block":' +
+       '{"type":"web_search_tool_result","tool_use_id":"srv1","content":[]}}') +
+    Ev('{"type":"content_block_start","index":2,"content_block":{"type":"text","text":""}}') +
+    Tail;
+  A := MakeAgent;
+  try
+    A.WebSearch := True;
+    A.ShouldCancel := @WantsCancel;
+    ChunksSeen := 0;
+    CancelAfterChunks := 90;
+    A.Send('look it up', Err);
+    Check(TranscriptHas(A, 'server_tool_use'),
+      'an answered server call survives the cancel');
+    Check(TranscriptHas(A, 'web_search_tool_result'),
+      'and its result survives with it');
+  finally
+    A.Free;
+  end;
+  CancelAfterChunks := -1;
+end;
+
 begin
   { Every request in this suite goes to the stand-in rather than the network. }
   uHttp.HttpTransport := @FakePost;
@@ -1334,6 +1571,10 @@ begin
   TestContextTokens;
   TestThinkingBudgetInRequest;
   TestOauthRequestShape;
+  TestWebSearchDeclaration;
+  TestPauseTurnResumes;
+  TestWebSearchRejectionSelfHeals;
+  TestCancelDropsDanglingServerToolUse;
 
   WriteLn;
   if Fails = 0 then

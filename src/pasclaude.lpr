@@ -199,9 +199,9 @@ end;
 { ------------------------------------------------------------- completion -- }
 
 const
-  SlashCommands: array[0..16] of string = (
+  SlashCommands: array[0..17] of string = (
     '/help', '/clear', '/compact', '/diff', '/jobs', '/memory', '/init',
-    '/rewind', '/sessions', '/think',
+    '/rewind', '/sessions', '/think', '/web',
     '/resume', '/save', '/cwd', '/model', '/yolo', '/cost', '/exit');
 
 { Candidates for the token being completed: slash commands when the token
@@ -525,6 +525,7 @@ begin
   EmitCLn(clGrey,   '  /init          have the model write a CLAUDE.md for this project');
   EmitCLn(clGrey,   '  /rewind        undo turns: conversation and edited files');
   EmitCLn(clGrey,   '  /think [n]     extended thinking: on, off, or a token budget');
+  EmitCLn(clGrey,   '  /web [on|off]  let the model search the web (off by default)');
   EmitCLn(clGrey,   '  /resume        reload the saved conversation');
   EmitCLn(clGrey,   '  /save          write the conversation now');
   EmitCLn(clGrey,   '  /cwd           show the session root');
@@ -1225,6 +1226,29 @@ begin
     else
       EmitCLn(clGrey, '  extended thinking off');
   end
+  else if Cmd = '/web' then
+  begin
+    { The search runs on Anthropic's servers, so there is no tool call here to
+      gate and no prompt to raise per query - this switch is the whole of the
+      consent, which is why the notice spells out what it grants.  Not
+      persisted, for the same reason /yolo is not: a standing file meaning
+      "and every future session may reach the internet" is a wider grant than
+      the word implied. }
+    if (Arg = '') or (Arg = 'on') then
+    begin
+      Agent.WebSearch := True;
+      EmitCLn(clYellow, '  web search on: the model can now reach the internet on its');
+      EmitCLn(clYellow, '  own for the rest of this session. Individual searches are not');
+      EmitCLn(clYellow, '  prompted for.');
+    end
+    else if Arg = 'off' then
+    begin
+      Agent.WebSearch := False;
+      EmitCLn(clGrey, '  web search off');
+    end
+    else
+      EmitCLn(clRed, '  /web takes on or off');
+  end
   else if Cmd = '/save' then
   begin
     { /save <name> makes a named copy the autosave never overwrites, which
@@ -1362,6 +1386,7 @@ var
   ArgI: Integer;
   PrintPrompt: string = '';
   PrintMode: Boolean = False;
+  WebFlag: Boolean = False;
   Piped: string;
 
 begin
@@ -1376,6 +1401,10 @@ begin
          (ParamStr(ArgI - 1) = '--print')) then Continue;
       if (Arg = '--resume') or (Arg = '-r') then
         Resume := True
+      else if Arg = '--web' then
+        { Print mode leaves Ask nil, so nothing there can be approved
+          interactively; without a flag a -p run could never search. }
+        WebFlag := True
       else if (Arg = '-p') or (Arg = '--print') then
       begin
         PrintMode := True;
@@ -1383,8 +1412,9 @@ begin
       end
       else if (Arg = '--help') or (Arg = '-h') or (Arg = '/?') then
       begin
-        EmitCLn(clBright, 'pasclaude [directory] [--resume] [-p "prompt"]');
+        EmitCLn(clBright, 'pasclaude [directory] [--resume] [--web] [-p "prompt"]');
         EmitCLn(clGrey, '  --resume  continue the conversation saved in that directory');
+        EmitCLn(clGrey, '  --web     let the model search the web (off by default)');
         EmitCLn(clGrey, '  -p        answer one prompt and exit (reads stdin when piped)');
         { Halt skips the finally block, so the console has to be put back
           here or the caller's codepage stays switched to UTF-8. }
@@ -1452,6 +1482,7 @@ begin
       Agent.OnNotice := @OnNotice;
       Agent.Ask := @AskPermission;
       Agent.ShouldCancel := @UserWantsStop;
+      if WebFlag then Agent.WebSearch := True;
       uTerm.CompleteProvider := @Complete;
 
       { Print mode: one prompt in, one answer out, exit code says how it

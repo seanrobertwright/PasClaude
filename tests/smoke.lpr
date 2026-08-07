@@ -465,6 +465,34 @@ begin
   finally
     Sch.Free;
   end;
+
+  { Web search is declared, never executed: the API runs it on its own
+    servers.  A RunTool branch for it would mean this client tried to do the
+    search itself, which the unknown-tool answer below rules out. }
+  Tool := WebSearchToolDef;
+  try
+    Check(Tool.Kind = jkObj, 'the web search declaration is an object');
+    Check(Tool.Str('type') = WebSearchToolType,
+      'it carries the dated type string: ' + Tool.Str('type'));
+    Check(Tool.Str('name') = 'web_search', 'and the tool name');
+    Check(Tool.Num('max_uses') > 0, 'and a cap on searches per turn');
+    Check(Tool.Find('input_schema') = nil,
+      'a server-side tool declares no input schema');
+  finally
+    Tool.Free;
+  end;
+
+  Sch := ToolsSchema;
+  try
+    Check(Sch.Count = 11, 'the local schema is unchanged by web search');
+  finally
+    Sch.Free;
+  end;
+
+  J := TJson.NewObj;
+  Out_ := Run('web_search', J, IsErr);
+  Check(IsErr and (Out_ = 'unknown tool: web_search'),
+    'web_search is never executed locally: ' + Out_);
 end;
 
 { The fetch tool, against a stand-in transport: no network in this suite. }

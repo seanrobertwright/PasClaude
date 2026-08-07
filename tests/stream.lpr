@@ -351,6 +351,137 @@ begin
   end;
 end;
 
+{ The web search result block, exactly as the API frames it: complete in the
+  content_block_start event, with no deltas to follow. }
+const
+  SearchResultBlock =
+    '{"type":"web_search_tool_result","tool_use_id":"srvtoolu_01",' +
+    '"content":[{"type":"web_search_result","title":"Pascal","url":' +
+    '"https://example.com/a"},{"type":"web_search_result","title":"FPC",' +
+    '"url":"https://example.com/b"}]}';
+
+function SearchStream: string;
+begin
+  Result :=
+    Ev('{"type":"message_start","message":{"usage":{"input_tokens":40,"output_tokens":1}}}') +
+    Ev('{"type":"content_block_start","index":0,"content_block":' +
+       '{"type":"server_tool_use","id":"srvtoolu_01","name":"web_search"}}') +
+    Ev('{"type":"content_block_delta","index":0,"delta":' +
+       '{"type":"input_json_delta","partial_json":"{\"que"}}') +
+    Ev('{"type":"content_block_delta","index":0,"delta":' +
+       '{"type":"input_json_delta","partial_json":"ry\":\"free pascal\"}"}}') +
+    Ev('{"type":"content_block_stop","index":0}') +
+    Ev('{"type":"content_block_start","index":1,"content_block":' +
+       SearchResultBlock + '}') +
+    Ev('{"type":"content_block_stop","index":1}') +
+    Ev('{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":44}}');
+end;
+
+{ Web search runs on the API's side, so the two blocks it produces are things
+  this client never executes but must carry back verbatim on the next request.
+  The old decoder coerced both to empty text and RecordAssistant then dropped
+  them, which broke that echo silently. }
+procedure TestServerToolBlocks;
+var
+  A: TAgent;
+  Blocks: TPartialBlocks;
+  Stop, Err: string;
+  Ran: Boolean;
+  Size: Integer;
+  Doc, Msgs, C: TJson;
+begin
+  for Size := 0 to 1 do
+  begin
+    A := TAgent.Create('k', 'm', '');
+    try
+      if Size = 0 then
+        Blocks := A.DecodeStream(Shred(SearchStream, 7), Stop, Err)
+      else
+        Blocks := A.DecodeStream(Shred(SearchStream, 13), Stop, Err);
+
+      Check(Length(Blocks) = 2, Format('a search reply decodes to two blocks (%d)',
+        [Length(Blocks)]));
+      if Length(Blocks) <> 2 then Exit;
+      Check(Blocks[0].Kind = bkServerToolUse, 'the search call decodes as a server tool use');
+      Check(Blocks[0].Name = 'web_search', 'the server tool keeps its name');
+      Check(Blocks[0].Id = 'srvtoolu_01', 'the server tool keeps its id');
+      Check(Blocks[0].Text = '{"query":"free pascal"}',
+        'the query JSON is reassembled across chunk boundaries: ' + Blocks[0].Text);
+      Check(Blocks[1].Kind = bkResult, 'the search result decodes as a raw result block');
+
+      { The transcript has to carry both back, the result byte-for-byte. }
+      A.ApplyBlocks(Blocks, Ran);
+      Check(not Ran, 'a server-side tool call runs nothing locally');
+      Doc := JsonParse(A.Transcript);
+      try
+        Check(Doc <> nil, 'the transcript parses');
+        if Doc = nil then Exit;
+        Check(Doc.Count = 1, 'one assistant message was recorded');
+        if Doc.Count <> 1 then Exit;
+        C := Doc.Item(0).Find('content');
+        Check((C <> nil) and (C.Count = 2), 'both blocks survive into the transcript');
+        if (C = nil) or (C.Count <> 2) then Exit;
+        Check(C.Item(0).Str('type') = 'server_tool_use',
+          'the call is echoed as a server_tool_use block');
+        Check(C.Item(0).Find('input').Str('query') = 'free pascal',
+          'the accumulated arguments are echoed as parsed input');
+        Check(C.Item(1).ToJson = SearchResultBlock,
+          'the result block is echoed byte-for-byte: ' + C.Item(1).ToJson);
+      finally
+        Doc.Free;
+      end;
+    finally
+      A.Free;
+    end;
+  end;
+end;
+
+{ A block type the decoder does not know is captured whole from its start
+  event.  If a delta then arrives for it, that capture was only the opening
+  of the block, so replaying it would echo something half-formed - the block
+  is dropped instead. }
+procedure TestUnknownBlockWithDeltaDropped;
+var
+  A: TAgent;
+  Blocks: TPartialBlocks;
+  Stop, Err: string;
+  Ran: Boolean;
+  Doc, Msgs, C: TJson;
+  I: Integer;
+  Saw: Boolean;
+begin
+  A := TAgent.Create('k', 'm', '');
+  try
+    Blocks := A.DecodeStream([
+      Ev('{"type":"content_block_start","index":0,"content_block":' +
+         '{"type":"some_future_block","payload":"partial"}}'),
+      Ev('{"type":"content_block_delta","index":0,"delta":' +
+         '{"type":"some_future_delta","payload":"more"}}'),
+      Ev('{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}'),
+      Ev('{"type":"content_block_delta","index":1,"delta":' +
+         '{"type":"text_delta","text":"Done."}}'),
+      Ev('{"type":"message_delta","delta":{"stop_reason":"end_turn"}}')],
+      Stop, Err);
+    A.ApplyBlocks(Blocks, Ran);
+    Doc := JsonParse(A.Transcript);
+    try
+      Check(Doc <> nil, 'the transcript parses after an unknown block');
+      if Doc = nil then Exit;
+      C := Doc.Item(0).Find('content');
+      Saw := False;
+      for I := 0 to C.Count - 1 do
+        if C.Item(I).Str('type') = 'some_future_block' then Saw := True;
+      Check(not Saw, 'a truncated unknown block is dropped rather than echoed');
+      Check((C.Count = 1) and (C.Item(0).Str('text') = 'Done.'),
+        'the rest of the message is unaffected');
+    finally
+      Doc.Free;
+    end;
+  finally
+    A.Free;
+  end;
+end;
+
 { The request body has to satisfy the API's schema, and a malformed one is
   only reported after authentication - which a test cannot reach. So the shape
   is checked directly here. }
@@ -485,6 +616,8 @@ begin
   TestToolLoop;
   TestDeniedToolStillAnswers;
   TestPlainReplyEndsTurn;
+  TestServerToolBlocks;
+  TestUnknownBlockWithDeltaDropped;
   TestRequestBody;
   TestAwkwardTextRoundTrips;
   WriteLn;
