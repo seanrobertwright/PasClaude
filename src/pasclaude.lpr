@@ -1020,16 +1020,28 @@ begin
     EmitCLn(clYellow, '  (the rewound session could not be saved: ' + Err + ')');
 end;
 
+{ The logo: logo.png's </> mark as ASCII art, blue like the source image,
+  with the wordmark beside it.  Three lines tall - enough to read as the
+  mark, small enough that the banner is still a banner. }
 procedure ShowBanner;
+var
+  Auth: string;
 begin
-  EmitCLn(clCyan, Format('pasclaude %s', [Version]));
+  EmitLn;
+  EmitC(clBlue,  '    /    ');  EmitC(clBright, '/');  EmitC(clBlue, '  \');
+  EmitLn;
+  EmitC(clBlue,  '   <    ');  EmitC(clBright, '/');  EmitC(clBlue, '    >');
+  EmitC(clBright, '     pasclaude');  EmitC(clGrey, ' v' + Version);
+  EmitLn;
+  EmitC(clBlue,  '    \  ');  EmitC(clBright, '/');  EmitC(clBlue, '    /');
+  EmitC(clGrey, '      a coding agent in Free Pascal');
+  EmitLn;
+  EmitLn;
+  Auth := Agent.Model;
+  if BannerAuth <> '' then Auth := Auth + ' (' + BannerAuth + ')';
+  EmitCLn(clGrey, '  ' + Auth);
   EmitCLn(clGrey, '  ' + uTools.RootDir);
-  if BannerAuth <> '' then
-    EmitCLn(clGrey, '  ' + Agent.Model + ' (' + BannerAuth + ')')
-  else
-    EmitCLn(clGrey, '  ' + Agent.Model);
-  EmitCLn(clGrey, '  /help for commands, /exit to quit');
-  EmitCLn(clGrey, '  Esc stops a reply in progress');
+  EmitCLn(clGrey, '  /help for commands, /exit to quit, Esc stops a reply');
   EmitLn;
 end;
 

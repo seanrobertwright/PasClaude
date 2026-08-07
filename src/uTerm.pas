@@ -33,6 +33,9 @@ procedure Emit(const S: string);                      { no newline }
 procedure EmitLn(const S: string = '');
 procedure EmitC(C: TColor; const S: string);
 procedure EmitCLn(C: TColor; const S: string = '');
+{ Bright white text on a blue field, for the logo.  One write on the VT
+  path; attribute round trip on legacy consoles. }
+procedure EmitLogo(const S: string);
 
 { ------------------------------------------------------- markdown streaming --
 
@@ -318,6 +321,25 @@ end;
 procedure EmitCLn(C: TColor; const S: string);
 begin
   EmitC(C, S + sLineBreak);
+end;
+
+{ The logo block: bright white on the logo's blue.  On a VT console the
+  24-bit background matches the source image (royal blue); legacy consoles
+  get the nearest attribute pair. }
+procedure EmitLogo(const S: string);
+begin
+  if VtActive then
+    RawWrite(#27'[48;2;41;82;209m'#27'[97m' + S + #27'[0m')
+  else
+  begin
+    if HOut <> 0 then
+      SetConsoleTextAttribute(HOut,
+        BACKGROUND_BLUE or
+        FOREGROUND_RED or FOREGROUND_GREEN or FOREGROUND_BLUE or
+        FOREGROUND_INTENSITY);
+    RawWrite(S);
+    if HOut <> 0 then SetConsoleTextAttribute(HOut, SavedAttr);
+  end;
 end;
 
 { ------------------------------------------------------- markdown streaming -- }
