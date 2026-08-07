@@ -211,8 +211,27 @@ text preserves what was missing at the time. Unchecked items remain open.
   tool-class grants, the approved bash programs and the trusted fingerprints
   for `hooks.json` and each MCP server. It lives outside the project on
   purpose: a repository that could ship its own copy would be answering its
-  own permission questions. Still missing: deny rules — nothing can be marked
-  never-allowed. And the move is silent — a session that had accumulated
+  own permission questions. Deny rules exist now: one string per rule,
+  `tool:<glob>`, `bash:<program-glob>` or `path:<glob>`, in
+  `%LOCALAPPDATA%\pasclaude\deny.json` (global, `/deny add|remove`) or in a
+  `"deny"` array in the per-root approvals file (hand-edited, round-tripped
+  verbatim). A rule is checked at the top of `RunTool` and inside `SafePath`,
+  above every allow-all, the bash prefix table, the nil-`Ask` check and a
+  `PreToolUse` hook's allow, so nothing — `/yolo`, an "always", a hook —
+  overrides one; a refusal names the rule and the file it came from, and an
+  unparseable rule is reported at startup rather than silently ignored. Path
+  rules canonicalise (8.3 names, junctions, case, `..`) and also hide the file
+  from `list_dir` and `search`. `-p` inherits deny rules and still inherits no
+  approvals. Narrower than Claude Code in three ways, all deliberate:
+  `bash:` filters the program name of each `cmd.exe` segment and cannot follow
+  `%VAR%` expansion, a `for` loop, a renamed copy or a `.cmd` wrapper —
+  `tool:bash` is the airtight form; `path:` covers pasclaude's file tools and
+  not the shell, so `bash: type .env` is untouched by it, and a hardlink is a
+  different path to every API Windows offers; and `fetch:<host>` was
+  considered and refused, because WinHTTP follows redirects and a host rule
+  would match the URL typed rather than the host that answered. No deny rule
+  is ever read from the project tree. And the move is silent — a session that
+  had accumulated
   approvals in an in-repo `.pasclaude\permissions.json` is simply re-asked,
   with no notice explaining why.*
 - [ ] **Permission modes** — no plan mode, no accept-edits mode, no

@@ -941,6 +941,11 @@ begin
     works: the root first, because the ignore rules and every path guard read
     it, and the system prompt after, because it names the root. }
   uTools.RootDir := Root;
+  { Deny rules, and nothing else out of the approvals store.  They are the one
+    kind of rule it is safe to hand an embedder unasked, because they are the
+    one kind that cannot grant anything: FAgent.Ask stays nil below, so this
+    session inherits the user's refusals and none of their approvals. }
+  uTools.LoadDenyRules(uTools.ApprovalsPath, uTools.GlobalDenyPath);
   uTools.LoadIgnoreRules;
   FAgent := TAgent.Create(ApiKey, AModel, SdkFullSystem);
   FAgent.Ask := nil;

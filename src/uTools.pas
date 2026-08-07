@@ -233,6 +233,12 @@ function RunTool(const Name: string; Input: TJson; Ask: TAskProc;
   invisible to every test that goes through a tool. }
 function Permit(const Name, Detail: string; Ask: TAskProc): Boolean;
 
+{ The bash gate, which is a different predicate: an "always" there records a
+  program rather than a class.  Exposed for the same reason as Permit - the
+  two of them together are the whole answer to "can this be overridden", and
+  a test that only went through RunTool could not tell which line refused. }
+function PermitBash(const Cmd, Detail: string; Ask: TAskProc): Boolean;
+
 { A one-line description used in the transcript and in permission prompts. }
 function DescribeTool(const Name: string; Input: TJson): string;
 
@@ -255,6 +261,104 @@ function IsValidUtf8(const S: string): Boolean;
   no escaping the root, no reaching into pasclaude's own state.  Exposed so
   @file mentions face the same guard as tool calls. }
 function ResolveInRoot(const P: string; out Full: string; out Err: string): Boolean;
+
+{ ---- deny rules ----
+  The one kind of permission state that only ever narrows.  A rule is one
+  string, "kind:pattern", and there are exactly three kinds because there are
+  exactly three choke points every route to the thing has to pass:
+
+    tool:<name-glob>   tool:bash  tool:fetch  tool:mcp__github__*
+    bash:<prog-glob>   bash:rm    bash:del
+    path:<glob>        path:.env  path:**/*.pem  path:/secrets/**
+
+  tool: and bash: are read at the top of RunTool, above the PreToolUse fire;
+  path: is read inside SafePath, where every path-taking tool, @-mention and
+  @import already funnels.  Neither point is reachable past an approval: a
+  deny beats /yolo, a persisted "always", accept-edits and a hook's allow,
+  because all of those are consulted further down.
+
+  Three limits, stated here because a deny rule the user misreads as wider
+  than it is is worse than no rule at all:
+
+  1. bash: is a NAME FILTER, not a guarantee.  It reads the first token of
+     every cmd.exe segment, so "git status && rm -rf x" is caught where the
+     approval prefix table gives up - but it cannot follow %VAR% expansion,
+     a for loop, a renamed copy or a .cmd wrapper that calls the program.
+     tool:bash is the airtight form.
+  2. path: protects pasclaude's file tools, not the shell.  "type .env" run
+     through bash never touches SafePath.  Denying a path from the shell
+     needs tool:bash or a bash: rule.
+  3. Hardlinks evade path:.  Canonicalisation resolves junctions, 8.3 names
+     and case, but a second name for the same bytes is a different path by
+     every API Windows offers.  Making one needs the shell, which is gated
+     separately.
+
+  fetch:<host> is deliberately not offered: WinHTTP follows redirects and
+  uHttp sets no redirect policy, so a host rule would match the URL the model
+  typed and not the host that answered.  tool:fetch is the honest version. }
+type
+  TDenyRule = record
+    Text: string;      { verbatim, as written in the file - what a message names }
+    Kind: string;      { 'tool' | 'bash' | 'path' }
+    Pattern: string;   { lowercased, '/' separators }
+    Source: string;    { the file it came from, so /deny can say which line to delete }
+    Err: string;       { '' when in force; otherwise why it is not }
+  end;
+  TDenyRuleArray = array of TDenyRule;
+
+const
+  { A bound on the hottest guard in the program.  Past it a rule is kept and
+    reported with a reason rather than dropped, because a rule that vanishes
+    silently is the failure this whole feature exists to avoid. }
+  MaxDenyRules = 256;
+
+{ Every rule, in force or not, in the order it was loaded. }
+function  DenyRules: TDenyRuleArray;
+{ How many are actually in force.  Bad ones are not counted, only reported. }
+function  DenyRuleCount: Integer;
+function  DenyRulesInForce: Boolean;
+{ True when at least one path: rule is in force.  Separate because it is what
+  buys the early exit in DenyPathReason: with no path rule, a SafePath call
+  opens no handles and pays one boolean. }
+function  DenyPathRulesInForce: Boolean;
+{ The text of every rule that could not be parsed, for the startup warning. }
+function  BadDenyRules: TStringArray;
+procedure AddDenyRule(const Text, Source: string);
+procedure ClearDenyRules;                                   { test seam }
+{ Reads ONLY the "deny" array of each file.  It must never grow to read a
+  grant key: the host calls it before print mode halts, which is the whole
+  reason a -p run inherits deny rules and no approvals. }
+procedure LoadDenyRules(const RootApprovals, Global: string);
+{ %LOCALAPPDATA%\pasclaude\deny.json - global, every root.  '' when there is
+  no home to put it in, which means the same as an empty file. }
+function  GlobalDenyPath: string;
+{ The global file's rules as written, and the write-back.  /deny add and
+  /deny remove are the only widening operation in the feature and they go
+  through here, so the JSON stays in this unit with the rest of it. }
+function  GlobalDenyList: TStringArray;
+function  SaveGlobalDenyList(const A: TStringArray; out Err: string): Boolean;
+
+{ Each returns '' for "not denied", otherwise the exact sentence the user and
+  the model both read: refused by deny rule "path:.env" (<file>). }
+function  DenyToolReason(const Name: string): string;
+function  DenyBashReason(const Cmd: string): string;
+function  DenyPathReason(const Full: string): string;
+{ The walkers' cheaper cousin: no canonicalisation, because FindFirst already
+  produced a long name under an already-resolved root. }
+function  DenyWalkReason(const RelPath, BaseName: string): string;
+{ 8.3 names expanded, junctions followed, case as the filesystem holds it.
+  Public so the tests can assert the resolution directly rather than through
+  a refusal, which would not distinguish "canonicalises" from "expands". }
+function  CanonicalPath(const P: string): string;
+
+{ The trailing, uncached system-prompt block: everything the model has to be
+  told about how this session is set up that is not part of its identity.
+  '' with default settings, and BuildRequest then emits no second block at
+  all, so an ordinary session's request body is unchanged and so is its
+  prompt cache.  Deny contributes one sentence and deliberately not the
+  patterns - naming .env in the prompt advertises a target.  Permission modes
+  and additional working directories are the other two contributors. }
+function  SessionNote: string;
 
 { Loads the root .gitignore, if any.  Called once at startup and after /clear
   of the cache would make no sense - the file rarely changes mid-session. }
@@ -635,8 +739,57 @@ const
     short enough that a big one does not scroll the question off screen. }
   PreviewLines = 40;
 
+{ ---------------------------------------------------------- glob matching -- }
+
+{ Matches Pattern against one path segment or segment run, with * spanning
+  anything except a separator.  It sits here, above the path guard, rather
+  than beside the .gitignore reader that was its first caller: the deny rules
+  match with it too and the guard runs before either. }
+function SegMatch(const Pattern, S: string): Boolean;
+var
+  P, T: Integer;
+  StarP, StarT: Integer;
+begin
+  P := 1;
+  T := 1;
+  StarP := 0;
+  StarT := 0;
+  while T <= Length(S) do
+  begin
+    if (P <= Length(Pattern)) and
+       ((Pattern[P] = S[T]) or (Pattern[P] = '?')) then
+    begin
+      Inc(P);
+      Inc(T);
+    end
+    else if (P <= Length(Pattern)) and (Pattern[P] = '*') then
+    begin
+      StarP := P;
+      StarT := T;
+      Inc(P);
+    end
+    else if StarP > 0 then
+    begin
+      { Backtrack: the star swallows one more character, but never a
+        separator - that is what keeps *.txt from matching a\b.txt. }
+      if S[StarT] = '/' then Exit(False);
+      Inc(StarT);
+      P := StarP + 1;
+      T := StarT;
+    end
+    else
+      Exit(False);
+  end;
+  while (P <= Length(Pattern)) and (Pattern[P] = '*') do
+    Inc(P);
+  Result := P > Length(Pattern);
+end;
+
 { ------------------------------------------------------------ path safety -- }
 
+{ Up here, ahead of the deny rules, because they need the root to say what a
+  path looks like relative to the project - and the guard that reads them is
+  the next thing below. }
 function NormalizeRoot: string;
 begin
   if RootDir = '' then
@@ -644,11 +797,576 @@ begin
   Result := ExcludeTrailingPathDelimiter(ExpandFileName(RootDir));
 end;
 
+{ ------------------------------------------------------------- deny rules -- }
+
+{ FPC 3.2.2's Windows unit declares neither of these, and both are ordinary
+  kernel32 exports.  GetFinalPathNameByHandleW is what follows a junction and
+  expands an 8.3 name; GetLongPathNameW is the fallback for the one reachable
+  failure of the handle route - a file another process holds with share-mode
+  zero - because a deny rule that stops applying while somebody has the file
+  open in an editor is exactly the silent miss this feature exists to avoid. }
+const
+  FILE_FLAG_BACKUP_SEMANTICS = $02000000;
+
+function GetFinalPathNameByHandleW(H: THandle; Buf: PWideChar;
+  Cch, Flags: DWORD): DWORD; stdcall; external 'kernel32'
+  name 'GetFinalPathNameByHandleW';
+function GetLongPathNameW(Src, Buf: PWideChar; Cch: DWORD): DWORD; stdcall;
+  external 'kernel32' name 'GetLongPathNameW';
+
+var
+  DenyList: array of TDenyRule;
+  { Counted rather than recomputed: DenyPathReason runs on every path a tool
+    names, and with no path rule at all it must not open a handle or even
+    walk the list. }
+  DenyInForce: Integer = 0;
+  DenyPathInForce: Integer = 0;
+
+function DenyRules: TDenyRuleArray;
+begin
+  Result := DenyList;
+end;
+
+function DenyRuleCount: Integer;
+begin
+  Result := DenyInForce;
+end;
+
+function DenyRulesInForce: Boolean;
+begin
+  Result := DenyInForce > 0;
+end;
+
+function DenyPathRulesInForce: Boolean;
+begin
+  Result := DenyPathInForce > 0;
+end;
+
+function BadDenyRules: TStringArray;
+var
+  I, N: Integer;
+begin
+  SetLength(Result, 0);
+  N := 0;
+  for I := 0 to High(DenyList) do
+    if DenyList[I].Err <> '' then
+    begin
+      SetLength(Result, N + 1);
+      Result[N] := DenyList[I].Text;
+      Inc(N);
+    end;
+end;
+
+{ Splits "kind:pattern".  An unrecognised rule is kept with its reason rather
+  than dropped: a user who wrote read:.env believing it protected something
+  has to be told it does not, and a rule that vanished on load would leave
+  nothing to tell them with. }
+procedure ParseDenyRule(var R: TDenyRule);
+var
+  C: Integer;
+begin
+  R.Kind := '';
+  R.Pattern := '';
+  R.Err := '';
+  C := Pos(':', R.Text);
+  if C = 0 then
+  begin
+    R.Err := 'expected kind:pattern (tool:, bash: or path:)';
+    Exit;
+  end;
+  R.Kind := LowerCase(Trim(Copy(R.Text, 1, C - 1)));
+  R.Pattern := LowerCase(Trim(Copy(R.Text, C + 1, MaxInt)));
+  if (R.Kind <> 'tool') and (R.Kind <> 'bash') and (R.Kind <> 'path') then
+  begin
+    R.Err := 'unknown rule kind "' + R.Kind + '" (use tool:, bash: or path:)';
+    Exit;
+  end;
+  if R.Pattern = '' then
+  begin
+    R.Err := 'no pattern after ' + R.Kind + ':';
+    Exit;
+  end;
+  { One spelling of a path from here on, so the matcher never has to know
+    which separator the user happened to type. }
+  if R.Kind = 'path' then
+    R.Pattern := StringReplace(R.Pattern, '\', '/', [rfReplaceAll]);
+end;
+
+procedure AddDenyRule(const Text, Source: string);
+var
+  R: TDenyRule;
+  I: Integer;
+begin
+  R.Text := Trim(Text);
+  if R.Text = '' then Exit;
+  { The same rule from both files is one rule; the first source named is the
+    one /deny points at, which is the one that would still apply. }
+  for I := 0 to High(DenyList) do
+    if DenyList[I].Text = R.Text then Exit;
+  R.Source := Source;
+  ParseDenyRule(R);
+  if (R.Err = '') and (DenyInForce >= MaxDenyRules) then
+    R.Err := Format('more than %d deny rules; this one is not in force',
+      [MaxDenyRules]);
+  SetLength(DenyList, Length(DenyList) + 1);
+  DenyList[High(DenyList)] := R;
+  if R.Err = '' then
+  begin
+    Inc(DenyInForce);
+    if R.Kind = 'path' then Inc(DenyPathInForce);
+  end;
+end;
+
+procedure ClearDenyRules;
+begin
+  SetLength(DenyList, 0);
+  DenyInForce := 0;
+  DenyPathInForce := 0;
+end;
+
+{ The path matcher, with the gitignore intuition the ignore reader already
+  half-implements: ** spans separators, * does not, and ? matches one
+  character that is not a separator.  "a/**/b" also matches "a/b", because a
+  pattern that needed an intervening directory would surprise everyone who
+  has ever written one. }
+function PathGlobMatch(const Pattern, S: string): Boolean;
+
+  function M(P, T: Integer): Boolean;
+  begin
+    while True do
+    begin
+      if P > Length(Pattern) then Exit(T > Length(S));
+      if (Pattern[P] = '*') and (P < Length(Pattern)) and
+         (Pattern[P + 1] = '*') then
+      begin
+        Inc(P, 2);
+        if (P <= Length(Pattern)) and (Pattern[P] = '/') then
+        begin
+          if M(P + 1, T) then Exit(True);   { ** swallowed nothing }
+          Inc(P);                           { ...or the separator too }
+        end;
+        if P > Length(Pattern) then Exit(True);
+        while T <= Length(S) + 1 do
+        begin
+          if M(P, T) then Exit(True);
+          Inc(T);
+        end;
+        Exit(False);
+      end
+      else if Pattern[P] = '*' then
+      begin
+        Inc(P);
+        if P > Length(Pattern) then
+          Exit(Pos('/', Copy(S, T, MaxInt)) = 0);
+        while T <= Length(S) + 1 do
+        begin
+          if M(P, T) then Exit(True);
+          if (T <= Length(S)) and (S[T] = '/') then Exit(False);
+          Inc(T);
+        end;
+        Exit(False);
+      end
+      else if (T <= Length(S)) and
+              ((Pattern[P] = S[T]) or
+               ((Pattern[P] = '?') and (S[T] <> '/'))) then
+      begin
+        Inc(P);
+        Inc(T);
+      end
+      else
+        Exit(False);
+    end;
+  end;
+
+begin
+  Result := M(1, 1);
+end;
+
+{ A pattern with no separator in it is a name rule and matches the base name
+  at any depth - path:.env catches src\.env without anybody having to think
+  about where they are.  A pattern with one is a whole-path rule, anchored to
+  whatever it is being matched against; a leading / is allowed and means the
+  same thing, because that is what a user who writes /secrets/** expects and
+  the alternative - a floating pattern that matches a\secrets\x too - is the
+  unpredictable reading. }
+function PathPatternHits(const Pattern, Slashed, Base: string): Boolean;
+var
+  Pat: string;
+begin
+  if Pos('/', Pattern) = 0 then
+    Exit(SegMatch(Pattern, Base));
+  Pat := Pattern;
+  if (Pat <> '') and (Pat[1] = '/') then Delete(Pat, 1, 1);
+  Result := PathGlobMatch(Pat, Slashed);
+end;
+
+{ The long, junction-free, filesystem-cased spelling of P, or the best
+  approximation of it that Windows will give up.  Conversions go through
+  UnicodeString because both APIs are wide-only; a path outside the system
+  codepage survives no worse here than it does through FindFirst, which is
+  the standard the rest of this unit already sets. }
+function ResolvedForm(const P: string): string;
+var
+  W, Out_: UnicodeString;
+  H: THandle;
+  N: DWORD;
+begin
+  Result := '';
+  W := UnicodeString(P);
+  SetLength(Out_, 1024);
+  H := CreateFileW(PWideChar(W), 0, FILE_SHARE_READ or FILE_SHARE_WRITE or
+    FILE_SHARE_DELETE, nil, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, 0);
+  if H <> INVALID_HANDLE_VALUE then
+  begin
+    N := GetFinalPathNameByHandleW(H, PWideChar(Out_), Length(Out_), 0);
+    CloseHandle(H);
+    if (N > 0) and (N < DWORD(Length(Out_))) then
+    begin
+      SetLength(Out_, N);
+      Result := string(Out_);
+      { The API answers in \\?\ form, which nothing else in this program
+        spells that way. }
+      if Copy(Result, 1, 8) = '\\?\UNC\' then
+        Result := '\\' + Copy(Result, 9, MaxInt)
+      else if Copy(Result, 1, 4) = '\\?\' then
+        Result := Copy(Result, 5, MaxInt);
+      Exit;
+    end;
+    SetLength(Out_, 1024);
+  end;
+  { No handle - the file may be held exclusively, or gone.  This expands 8.3
+    names without opening anything, but it does not follow junctions; a
+    name rule (path:.env) still catches what a whole-path rule would miss. }
+  N := GetLongPathNameW(PWideChar(W), PWideChar(Out_), Length(Out_));
+  if (N > 0) and (N < DWORD(Length(Out_))) then
+  begin
+    SetLength(Out_, N);
+    Result := string(Out_);
+  end;
+end;
+
+function CanonicalPath(const P: string): string;
+var
+  Head, Tail, Fixed, Parent: string;
+begin
+  Result := ExpandFileName(P);
+  Head := ExcludeTrailingPathDelimiter(Result);
+  Tail := '';
+  { Up the tree until something exists.  write_file names files that are not
+    there yet, and a rule about a directory has to cover them: the resolved
+    ancestor plus the literal tail is the only honest answer. }
+  while Head <> '' do
+  begin
+    Fixed := ResolvedForm(Head);
+    if Fixed <> '' then
+      Exit(ExcludeTrailingPathDelimiter(Fixed) + Tail);
+    Parent := ExcludeTrailingPathDelimiter(ExtractFileDir(Head));
+    if (Parent = '') or (Parent = Head) then Break;
+    Tail := PathDelim + ExtractFileName(Head) + Tail;
+    Head := Parent;
+  end;
+end;
+
+function DenyReasonText(const R: TDenyRule): string;
+begin
+  Result := Format('refused by deny rule "%s"', [R.Text]);
+  if R.Source <> '' then
+    Result := Result + ' (' + R.Source + ')';
+end;
+
+{ Both spellings of one absolute path, lowercased with / separators: the
+  whole thing, and the part under the session root when it is under it.  A
+  rule written the way a user thinks about their project - path:src/**.pas -
+  has to match the same file a rule written absolutely does. }
+procedure PathForms(const Full: string; out Slashed, RelForm, Base: string);
+var
+  Root: string;
+begin
+  Slashed := LowerCase(StringReplace(Full, '\', '/', [rfReplaceAll]));
+  Base := LowerCase(ExtractFileName(ExcludeTrailingPathDelimiter(Full)));
+  RelForm := '';
+  Root := LowerCase(StringReplace(NormalizeRoot, '\', '/', [rfReplaceAll]));
+  if Copy(Slashed, 1, Length(Root) + 1) = Root + '/' then
+    RelForm := Copy(Slashed, Length(Root) + 2, MaxInt);
+end;
+
+function DenyPathReason(const Full: string): string;
+var
+  I: Integer;
+  Slashed, RelForm, Base, CSlashed, CRel, CBase: string;
+  Canon: string;
+begin
+  Result := '';
+  { The early exit that keeps the guard free for everyone who has no path
+    rule: no list walk, no handle, one integer test. }
+  if DenyPathInForce = 0 then Exit;
+  PathForms(Full, Slashed, RelForm, Base);
+  { Canonicalisation can only ever ADD matches.  Both forms are tested and
+    either one denies, so a rule can never stop applying because Windows
+    reported a path in an unexpected spelling. }
+  Canon := CanonicalPath(Full);
+  PathForms(Canon, CSlashed, CRel, CBase);
+  for I := 0 to High(DenyList) do
+    if (DenyList[I].Err = '') and (DenyList[I].Kind = 'path') then
+      if PathPatternHits(DenyList[I].Pattern, Slashed, Base) or
+         ((RelForm <> '') and
+          PathPatternHits(DenyList[I].Pattern, RelForm, Base)) or
+         PathPatternHits(DenyList[I].Pattern, CSlashed, CBase) or
+         ((CRel <> '') and
+          PathPatternHits(DenyList[I].Pattern, CRel, CBase)) then
+        Exit(DenyReasonText(DenyList[I]));
+end;
+
+function DenyWalkReason(const RelPath, BaseName: string): string;
+var
+  I: Integer;
+  Slashed, Base: string;
+begin
+  Result := '';
+  if DenyPathInForce = 0 then Exit;
+  Slashed := LowerCase(StringReplace(RelPath, '\', '/', [rfReplaceAll]));
+  Base := LowerCase(BaseName);
+  for I := 0 to High(DenyList) do
+    if (DenyList[I].Err = '') and (DenyList[I].Kind = 'path') then
+      if PathPatternHits(DenyList[I].Pattern, Slashed, Base) then
+        Exit(DenyReasonText(DenyList[I]));
+end;
+
+function DenyToolReason(const Name: string): string;
+var
+  I: Integer;
+  N: string;
+begin
+  Result := '';
+  if DenyInForce = 0 then Exit;
+  N := LowerCase(Trim(Name));
+  if N = '' then Exit;
+  for I := 0 to High(DenyList) do
+    if (DenyList[I].Err = '') and (DenyList[I].Kind = 'tool') then
+      if SegMatch(DenyList[I].Pattern, N) then
+        Exit(DenyReasonText(DenyList[I]));
+end;
+
+{ The first token of one cmd.exe segment, with the decoration a program name
+  can carry taken off: quotes, a directory, the .exe.  "C:\bin\rm.exe" and rm
+  are the same program and an "always" answer already reads them that way. }
+function SegmentProgram(const S: string): string;
+var
+  I: Integer;
+  Tok: string;
+begin
+  Result := '';
+  I := 1;
+  while (I <= Length(S)) and (S[I] in [' ', #9]) do Inc(I);
+  Tok := '';
+  if (I <= Length(S)) and (S[I] = '"') then
+  begin
+    Inc(I);
+    while (I <= Length(S)) and (S[I] <> '"') do
+    begin
+      Tok := Tok + S[I];
+      Inc(I);
+    end;
+  end
+  else
+    while (I <= Length(S)) and not (S[I] in [' ', #9]) do
+    begin
+      Tok := Tok + S[I];
+      Inc(I);
+    end;
+  if Tok = '' then Exit;
+  Tok := ExtractFileName(Tok);
+  if LowerCase(ExtractFileExt(Tok)) = '.exe' then
+    SetLength(Tok, Length(Tok) - 4);
+  Result := LowerCase(Tok);
+end;
+
+function DenyBashReason(const Cmd: string): string;
+var
+  I, J, Start: Integer;
+  Prog: string;
+  InQuote: Boolean;
+  Heads: TStringArray;
+  N: Integer;
+begin
+  Result := '';
+  if DenyInForce = 0 then Exit;
+
+  { Every segment cmd.exe would run, not just the first: the approval prefix
+    table gives up on a chained command and returns '', which is right for
+    granting and useless for refusing.  A separator wearing a ^ is not a
+    separator; a ^ inside a token is left alone, so r^m reads as the program
+    r^m and is NOT caught.  That gap is real and documented - closing it
+    means writing a cmd.exe parser, and half of one would be worse. }
+  SetLength(Heads, 0);
+  N := 0;
+  Start := 1;
+  InQuote := False;
+  I := 1;
+  while I <= Length(Cmd) do
+  begin
+    if Cmd[I] = '^' then
+    begin
+      Inc(I, 2);
+      Continue;
+    end;
+    if Cmd[I] = '"' then InQuote := not InQuote
+    else if (not InQuote) and (Cmd[I] in ['&', '|', ';', '(', ')', #10, #13]) then
+    begin
+      SetLength(Heads, N + 1);
+      Heads[N] := Copy(Cmd, Start, I - Start);
+      Inc(N);
+      Start := I + 1;
+    end;
+    Inc(I);
+  end;
+  SetLength(Heads, N + 1);
+  Heads[N] := Copy(Cmd, Start, MaxInt);
+
+  for J := 0 to High(Heads) do
+  begin
+    Prog := SegmentProgram(Heads[J]);
+    if Prog = '' then Continue;
+    for I := 0 to High(DenyList) do
+      if (DenyList[I].Err = '') and (DenyList[I].Kind = 'bash') then
+        if SegMatch(DenyList[I].Pattern, Prog) then
+          Exit(DenyReasonText(DenyList[I]));
+  end;
+end;
+
+function GlobalDenyPath: string;
+var
+  Home: string;
+begin
+  Result := '';
+  { SysUtils. qualified for the same reason ApprovalsPath does it: the
+    Windows unit has a raw API of the same name in scope. }
+  Home := Trim(SysUtils.GetEnvironmentVariable('LOCALAPPDATA'));
+  if Home = '' then
+    Home := Trim(SysUtils.GetEnvironmentVariable('USERPROFILE'));
+  if Home = '' then Exit;
+  Result := IncludeTrailingPathDelimiter(Home) + 'pasclaude' + PathDelim +
+    'deny.json';
+end;
+
+{ Reads the "deny" array out of one file.  Anything else in the file is not
+  looked at - see the note on LoadDenyRules. }
+function ReadDenyArray(const Path: string): TStringArray;
+var
+  F: TFileStream;
+  Text: string;
+  Root, Arr: TJson;
+  I: Integer;
+begin
+  SetLength(Result, 0);
+  if (Path = '') or not FileExists(Path) then Exit;
+  try
+    F := TFileStream.Create(Path, fmOpenRead or fmShareDenyNone);
+    try
+      SetLength(Text, F.Size);
+      if F.Size > 0 then F.ReadBuffer(Text[1], F.Size);
+    finally
+      F.Free;
+    end;
+  except
+    Exit;
+  end;
+  Root := JsonParse(Text);
+  if Root = nil then Exit;
+  try
+    Arr := Root.Find('deny');
+    if (Arr = nil) or (Arr.Kind <> jkArr) then Exit;
+    SetLength(Result, Arr.Count);
+    for I := 0 to Arr.Count - 1 do
+      Result[I] := Arr.Item(I).AsString;
+  finally
+    Root.Free;
+  end;
+end;
+
+var
+  { The per-root file's deny array exactly as it was read, so SavePermissions
+    can put it back byte for byte.  Without this a rule somebody added by hand
+    is erased the moment the session exits, which is the opposite of what a
+    hand-editable file promises - and it is a silent loss, not a compile
+    error, which is why TestDenyRoundTrip exists. }
+  RootDenyRaw: TStringArray;
+
+procedure LoadDenyRules(const RootApprovals, Global: string);
+var
+  A: TStringArray;
+  I: Integer;
+begin
+  A := ReadDenyArray(Global);
+  for I := 0 to High(A) do
+    AddDenyRule(A[I], Global);
+  RootDenyRaw := ReadDenyArray(RootApprovals);
+  for I := 0 to High(RootDenyRaw) do
+    AddDenyRule(RootDenyRaw[I], RootApprovals);
+end;
+
+function GlobalDenyList: TStringArray;
+begin
+  Result := ReadDenyArray(GlobalDenyPath);
+end;
+
+function SaveGlobalDenyList(const A: TStringArray; out Err: string): Boolean;
+var
+  Root, Arr: TJson;
+  Text, Path: string;
+  F: TFileStream;
+  I: Integer;
+begin
+  Err := '';
+  Path := GlobalDenyPath;
+  if Path = '' then
+  begin
+    Err := 'no LOCALAPPDATA or USERPROFILE to keep deny.json in';
+    Exit(False);
+  end;
+  Root := TJson.NewObj;
+  try
+    Arr := TJson.NewArr;
+    for I := 0 to High(A) do
+      Arr.Push(TJson.NewStr(A[I]));
+    Root.Add('deny', Arr);
+    Text := Root.ToJson;
+  finally
+    Root.Free;
+  end;
+  Result := False;
+  try
+    ForceDirectories(ExtractFileDir(Path));
+    F := TFileStream.Create(Path, fmCreate);
+    try
+      if Text <> '' then F.WriteBuffer(Text[1], Length(Text));
+    finally
+      F.Free;
+    end;
+    Result := True;
+  except
+    on E: Exception do Err := E.Message;
+  end;
+end;
+
+function SessionNote: string;
+begin
+  Result := '';
+  { The plan-mode paragraph and the additional-working-directories block are
+    the other two contributions, in that order above this one.  The patterns
+    are deliberately absent: the model needs to know a refusal is policy, or
+    it burns turns retrying, and it does not need a list of what to try. }
+  if DenyRulesInForce then
+    Result := Result +
+      'Some tools and paths are refused by deny rules; a refusal names the ' +
+      'rule. Do not attempt to work around one.'#10;
+end;
+
 { Resolves P under the session root.  Fails when the result would sit outside
   the root, which is the only place this program is allowed to touch. }
 function SafePath(const P: string; out Full: string; out Err: string): Boolean;
 var
-  Root, Cand: string;
+  Root, Cand, Reason: string;
 begin
   Err := '';
   Root := NormalizeRoot;
@@ -682,6 +1400,20 @@ begin
       (Cand[Length(Root) + 2 + Length(StateDirName)] = PathDelim)) then
   begin
     Err := StateDirName + ' holds pasclaude''s own session state and is not accessible';
+    Exit(False);
+  end;
+
+  { The path deny rules, on the resolved candidate and nowhere else.  This is
+    the only place in the program that turns a path argument into an absolute
+    path, so ..\ tricks, 8.3 names and junctions are unwound exactly once, and
+    read_file, write_file, edit_file, notebook_edit, list_dir, the change
+    preview, @-mentions and the SDK's @import all arrive here - a path-taking
+    tool added later cannot forget the rule.  The refusal rides out on Err,
+    which every one of those callers already turns into a tool_result. }
+  Reason := DenyPathReason(Cand);
+  if Reason <> '' then
+  begin
+    Err := Reason;
     Exit(False);
   end;
 
@@ -750,48 +1482,6 @@ begin
   finally
     L.Free;
   end;
-end;
-
-{ Matches Pattern against one path segment or segment run, with * spanning
-  anything except a separator. }
-function SegMatch(const Pattern, S: string): Boolean;
-var
-  P, T: Integer;
-  StarP, StarT: Integer;
-begin
-  P := 1;
-  T := 1;
-  StarP := 0;
-  StarT := 0;
-  while T <= Length(S) do
-  begin
-    if (P <= Length(Pattern)) and
-       ((Pattern[P] = S[T]) or (Pattern[P] = '?')) then
-    begin
-      Inc(P);
-      Inc(T);
-    end
-    else if (P <= Length(Pattern)) and (Pattern[P] = '*') then
-    begin
-      StarP := P;
-      StarT := T;
-      Inc(P);
-    end
-    else if StarP > 0 then
-    begin
-      { Backtrack: the star swallows one more character, but never a
-        separator - that is what keeps *.txt from matching a\b.txt. }
-      if S[StarT] = '/' then Exit(False);
-      Inc(StarT);
-      P := StarP + 1;
-      T := StarT;
-    end
-    else
-      Exit(False);
-  end;
-  while (P <= Length(Pattern)) and (Pattern[P] = '*') do
-    Inc(P);
-  Result := P > Length(Pattern);
 end;
 
 function IsIgnored(const RelPath: string; IsDir: Boolean): Boolean;
@@ -1050,16 +1740,22 @@ var
           RelName := Copy(IncludeTrailingPathDelimiter(Dir) + R.Name,
             Length(RootPrefix) + 1, MaxInt);
           { .git and build output would flood the listing with noise. }
+          { And a denied path is not announced either.  SafePath stops the
+            model naming it; this stops the listing telling it there is
+            something there to name - the same two mechanisms the state
+            directory needs, for the same reason. }
           if (R.Attr and faDirectory) <> 0 then
           begin
             if (R.Name = '.git') or (R.Name = 'node_modules') or
                (CompareText(R.Name, StateDirName) = 0) then Continue;
             if IsIgnored(RelName, True) then Continue;
+            if DenyWalkReason(RelName, R.Name) <> '' then Continue;
             Dirs.Add(R.Name);
           end
           else
           begin
             if IsIgnored(RelName, False) then Continue;
+            if DenyWalkReason(RelName, R.Name) <> '' then Continue;
             Files.Add(Format('%s (%d bytes)', [R.Name, R.Size]));
           end;
         until FindNext(R) <> 0;
@@ -1168,11 +1864,17 @@ var
           if (R.Name = '.git') or (R.Name = 'node_modules') or
              (CompareText(R.Name, StateDirName) = 0) then Continue;
           if IsIgnored(RelName, True) then Continue;
+          { A denied directory is not descended into and a denied file is not
+            read.  Without this half, search would happily print a line out of
+            the very file SafePath refuses to open - the single most damaging
+            way a path rule could look enforced and not be. }
+          if DenyWalkReason(RelName, R.Name) <> '' then Continue;
           Walk(IncludeTrailingPathDelimiter(Dir) + R.Name, Depth + 1);
         end
         else if Matches(R.Name) and (R.Size < MaxReadBytes) then
         begin
           if IsIgnored(RelName, False) then Continue;
+          if DenyWalkReason(RelName, R.Name) <> '' then Continue;
           if not LoadFileText(IncludeTrailingPathDelimiter(Dir) + R.Name, LText, LErr) then
             Continue;
           { A hit goes straight into a JSON request body, where one bad byte
@@ -3356,6 +4058,17 @@ begin
   for I := High(Snapshots) downto 0 do
   begin
     if Snapshots[I].Turn < TurnNo then Continue;
+    { A rewind writes a copy taken before the rule existed.  A rule added
+      mid-session must not be undone by restoring over the path it covers, so
+      the snapshot is skipped and said out loud - a file silently left alone
+      by a rewind reads as a broken rewind. }
+    Err := DenyPathReason(Snapshots[I].Full);
+    if Err <> '' then
+    begin
+      Notes := Notes + 'left alone ' + Rel(Snapshots[I].Full) + ': ' +
+        Err + #10;
+      Continue;
+    end;
     if Snapshots[I].Existed then
     begin
       if SaveFileText(Snapshots[I].Full, Snapshots[I].Text, Err) then
@@ -3407,7 +4120,16 @@ end;
   file can mean.
 
   AllowAllMcp is deliberately absent: it is set only by /yolo, and /yolo is
-  never saved at all. }
+  never saved at all.
+
+  One more key, "deny":["bash:rm",...], and it is the first with the opposite
+  polarity - it can only narrow.  It is read by LoadDenyRules, not here, and
+  for a reason worth stating: LoadDenyRules runs before print mode halts, so a
+  -p run inherits every deny rule and no grant at all.  Two readers of one
+  file, and only one of them may ever run early.  SavePermissions writes the
+  array back verbatim, including a line it could not parse, because the file
+  is hand-edited and a rule silently erased on exit is worse than one that
+  never worked. }
 procedure LoadPermissions(const Path: string);
 var
   F: TFileStream;
@@ -3470,6 +4192,13 @@ begin
     for I := 0 to High(Trusted) do
       Progs.AddStr(Trusted[I].Key, Trusted[I].Fingerprint);
     Root.Add('trusted', Progs);
+    { Verbatim from what was loaded, unparseable lines included.  This unit
+      never adds to this array - /deny writes the global file - so writing
+      back exactly what was read is the whole contract. }
+    Progs := TJson.NewArr;
+    for I := 0 to High(RootDenyRaw) do
+      Progs.Push(TJson.NewStr(RootDenyRaw[I]));
+    Root.Add('deny', Progs);
     Text := Root.ToJson;
   finally
     Root.Free;
@@ -4004,6 +4733,14 @@ var
   IsBash, IsFetch, IsMcp: Boolean;
   A: TPermission;
 begin
+  { [DENY] first, before anything can short-circuit past it.  RunTool already
+    refused this call, so nothing reaches here - the line exists so a reader
+    of the predicate sees deny-first without having to trust the caller, and
+    so a fifth entry point added later cannot be talked into a yes.  Any new
+    gate opens with this line and PermitBash's pair of them; that is a
+    copy-paste rule on purpose, not a memory test. }
+  if DenyToolReason(Name) <> '' then Exit(False);
+
   IsBash := Name = 'bash';
   IsFetch := Name = 'fetch';
   IsMcp := Copy(Name, 1, Length(McpNamePrefix)) = McpNamePrefix;
@@ -4062,6 +4799,13 @@ var
   A: TPermission;
   P: string;
 begin
+  { [DENY], the pair of them, commented with the line at the top of Permit.
+    The program name is an argument here rather than a tool name, so it needs
+    its own read - above AllowAllBash and above the prefix table, which is
+    what makes a deny rule beat both /yolo and a persisted "always". }
+  if DenyToolReason('bash') <> '' then Exit(False);
+  if DenyBashReason(Cmd) <> '' then Exit(False);
+
   if AllowAllBash then Exit(True);
   if BashPrefixAllowed(Cmd) then Exit(True);
   if Ask = nil then Exit(False);
@@ -5700,21 +6444,51 @@ function RunTool(const Name: string; Input: TJson; Ask: TAskProc;
 var
   Call: THookCall;
   HO: THookOutcome;
+  Reason: string;
 begin
+  { R0-R8.  The prologue is one ordered decision procedure and the order is
+    the whole of the argument; nothing may be inserted above the [DENY] steps.
+
+    R0 }
   IsError := False;
 
-  { Cleared before anything can set it.  A hook's allow belongs to the call it
-    was answered for; one surviving into the next call is an approval nobody
-    gave, and task makes nested calls real. }
+  { R1.  Cleared before anything can set it.  A hook's allow belongs to the
+    call it was answered for; one surviving into the next call is an approval
+    nobody gave, and task makes nested calls real. }
   HookAllowPending := False;
 
+  { R2.  A rule cannot be matched against nothing. }
   if Input = nil then
   begin
     IsError := True;
     Exit('missing tool input');
   end;
 
-  { This, not the schema, is where read-only is true.  The schema is advice
+  { R3 [DENY].  Above the hook fire, because a hook is a program a repository
+    ships and handing it the arguments of a call the user forbade is a leak
+    even when the hook cannot allow it.  Above the subagent boundary only
+    because "refused by deny rule" is the more useful of the two messages.
+    Nothing below - not a class allow-all, not a persisted prefix, not a hook
+    allow, not /yolo - is consulted before this line runs.
+
+    R3b takes the bash program name, which is an argument rather than a tool
+    name and so needs its own read; doing it here keeps it above the hook fire
+    with every other deny. }
+  Reason := DenyToolReason(Name);
+  if (Reason = '') and (Name = 'bash') then
+    Reason := DenyBashReason(Input.Str('command'));
+  if Reason <> '' then
+  begin
+    { Byte for byte the shape a permission denial already takes, so uAgent's
+      one-tool_result-per-tool_use invariant holds by construction. }
+    IsError := True;
+    Exit(Reason);
+  end;
+
+  { R4.  Plan mode goes here, above the subagent boundary and above the hook
+    fire, and is owned by the permission-modes work rather than by this one. }
+
+  { R5.  This, not the schema, is where read-only is true.  The schema is advice
     to the model and nothing stops it naming a tool it was never offered; and
     the permission gate is no backstop here, because Permit short-circuits on
     AllowAllEdits and PermitBash on a persisted "always", so under /yolo a
@@ -5729,6 +6503,7 @@ begin
     Exit('not available to a subagent: ' + Name);
   end;
 
+  { R6 }
   if HooksEnabled then
   begin
     Call := uHooks.HookCall(hePreTool);
@@ -5747,8 +6522,10 @@ begin
     HookAllowPending := HO.Allowed;
   end;
 
+  { R7 }
   Result := RunToolInner(Name, Input, Ask, IsError);
 
+  { R8 }
   if HooksEnabled then
   begin
     { Whether or not a gate consumed it, the allow dies with its tool call. }

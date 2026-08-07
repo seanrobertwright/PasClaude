@@ -1013,6 +1013,7 @@ var
   Root, Msgs, M, C: TJson;
   I: Integer;
   SysBlock, SysArr, Content, LastBlock, CC, Tools: TJson;
+  Note: string;
 begin
   Root := TJson.NewObj;
   try
@@ -1057,6 +1058,20 @@ begin
       CC.AddStr('type', 'ephemeral');
       SysBlock.Add('cache_control', CC);
       SysArr.Push(SysBlock);
+      { Whatever is true of this session rather than of the program: deny
+        rules, and later the permission mode and the extra roots.  It goes
+        AFTER the marked block and carries no marker of its own, so a session
+        that turns one of these on does not invalidate the cached prefix -
+        and with everything at its default uTools.SessionNote is '', no second
+        block is emitted, and the body is byte-identical to before. }
+      Note := uTools.SessionNote;
+      if Note <> '' then
+      begin
+        SysBlock := TJson.NewObj;
+        SysBlock.AddStr('type', 'text');
+        SysBlock.AddStr('text', Note);
+        SysArr.Push(SysBlock);
+      end;
       Root.Add('system', SysArr);
     end;
     { Web search is declared only when the user asked for it.  Absent, the

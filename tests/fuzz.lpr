@@ -1369,6 +1369,348 @@ begin
   Result := pmAllowOnce;
 end;
 
+{ ------------------------------------------------------------- deny rules -- }
+
+var
+  AskedCount: Integer = 0;
+
+{ The most permissive answer there is, so a refusal below can only have come
+  from a rule and never from a hesitant fixture. }
+function SayAlways(const Title, Detail: string): TPermission;
+begin
+  Inc(AskedCount);
+  Result := pmAllowAlways;
+end;
+
+procedure DenyFixtureReset;
+begin
+  uTools.ClearDenyRules;
+  uTools.RootDir := SessionDir;
+  uTools.AllowAllEdits := False;
+  uTools.AllowAllBash := False;
+  uTools.AllowAllFetch := False;
+  uTools.AllowAllMcp := False;
+  uTools.ClearBashPrefixes;
+  AskedCount := 0;
+end;
+
+{ 'never read .env' has to survive every spelling Windows will accept for the
+  same file: a relative path, an absolute one, the wrong case, an 8.3 alias, a
+  junction, and a walk out and back through '..'. }
+procedure TestDenyPathCanonical;
+var
+  Dir, Env, Junction, Short: string;
+  J: TJson;
+  Out_: string;
+  IsErr: Boolean;
+  Code: Integer;
+
+  procedure Refuses(const P, Why: string);
+  begin
+    J := TJson.NewObj;
+    J.AddStr('path', P);
+    Out_ := RunTool('read_file', J, IsErr);
+    Check(IsErr and (Pos('refused by deny rule', Out_) > 0) and
+          (Pos('path:.env', Out_) > 0), Why + ': ' + P);
+  end;
+
+begin
+  DenyFixtureReset;
+  Dir := IncludeTrailingPathDelimiter(SessionDir) + 'denyfix';
+  ForceDirectories(Dir);
+  Env := IncludeTrailingPathDelimiter(Dir) + '.env';
+  WriteFileText(Env, 'SECRET=SENTINEL');
+  WriteFileText(IncludeTrailingPathDelimiter(Dir) + 'notes.txt', 'ordinary');
+
+  { Junctions need no privilege; a symlink would. }
+  Junction := IncludeTrailingPathDelimiter(Dir) + 'jn';
+  if not DirectoryExists(Junction) then
+    RunShellQuiet('mklink /J "' + ExcludeTrailingPathDelimiter(Junction) +
+      '" "' + ExcludeTrailingPathDelimiter(Dir) + '"', Code);
+
+  uTools.AddDenyRule('path:.env', 'test');
+  Check(uTools.DenyRuleCount = 1, 'one path rule is in force');
+
+  Refuses('denyfix\.env', 'a relative path is refused');
+  Refuses(Env, 'and the absolute path');
+  Refuses(UpperCase(Env), 'and the same path in the wrong case');
+  Refuses('denyfix\.\sub\..\.env', 'and one that walks out and back');
+  if DirectoryExists(Junction) then
+  begin
+    Refuses('denyfix\jn\.env', 'and one through a junction');
+    Refuses('denyfix\jn\jn\.env', 'and one through two');
+  end;
+
+  { The 8.3 alias only exists when the volume has short names enabled, which
+    is why its presence is checked rather than assumed.  Only the leaf is
+    taken short: a wholly short absolute path is refused a step earlier, by
+    the root check, which would prove nothing about the rule. }
+  Short := ExtractShortPathName(Env);
+  if (Short <> '') and (CompareText(ExtractFileName(Short), '.env') <> 0) then
+    Refuses('denyfix\' + ExtractFileName(Short), 'and the 8.3 alias');
+
+  { The distinction the mutation test turns on: ExpandFileName alone would
+    pass every assertion above that does not involve a junction or a short
+    name, so CanonicalPath is asserted directly too. }
+  if (Short <> '') and (CompareText(ExtractFileName(Short), '.env') <> 0) then
+    Check(Copy(LowerCase(CanonicalPath(Short)), Length(CanonicalPath(Short)) - 3,
+      4) = '.env', 'CanonicalPath expands an 8.3 name: ' + CanonicalPath(Short));
+  Out_ := CanonicalPath(IncludeTrailingPathDelimiter(Dir) + 'nosuch\deeper\.env');
+  Check(Copy(Out_, Length(Out_) - 3, 4) = '.env',
+    'and answers for a file that does not exist yet: ' + Out_);
+  Check(Pos('\\?\', Out_) = 0, 'without the \\?\ spelling nothing else uses');
+
+  J := TJson.NewObj;
+  J.AddStr('path', 'denyfix\notes.txt');
+  Out_ := RunTool('read_file', J, IsErr);
+  Check((not IsErr) and (Pos('ordinary', Out_) > 0),
+    'an unrelated file in the same directory still reads');
+
+  uTools.ClearDenyRules;
+  Check(not uTools.DenyRulesInForce, 'and clearing the rules releases it');
+end;
+
+{ The property the whole feature rests on: a deny rule is not overridable by
+  anything, including everything /yolo does. }
+procedure TestDenyBeatsEverything;
+var
+  J: TJson;
+  Out_: string;
+  IsErr: Boolean;
+begin
+  DenyFixtureReset;
+  { The /yolo state, plus a persisted "always" for the very program that is
+    about to be refused. }
+  uTools.AllowAllEdits := True;
+  uTools.AllowAllBash := True;
+  uTools.AllowAllFetch := True;
+  uTools.AllowAllMcp := True;
+  uTools.AllowBashPrefix('rm x');
+
+  uTools.AddDenyRule('tool:write_file', 'test');
+  uTools.AddDenyRule('bash:rm', 'test');
+  uTools.AddDenyRule('tool:fetch', 'test');
+
+  J := TJson.NewObj;
+  J.AddStr('path', 'yolo.txt');
+  J.AddStr('content', 'x');
+  Out_ := uTools.RunTool('write_file', J, @SayAlways, IsErr);
+  J.Free;
+  Check(IsErr and (Pos('refused by deny rule', Out_) > 0),
+    'a denied tool is refused under every allow-all: ' + Out_);
+  Check(not FileExists(IncludeTrailingPathDelimiter(SessionDir) + 'yolo.txt'),
+    'and nothing was written');
+
+  J := TJson.NewObj;
+  J.AddStr('command', 'rm -rf x');
+  Out_ := uTools.RunTool('bash', J, @SayAlways, IsErr);
+  J.Free;
+  Check(IsErr and (Pos('refused by deny rule', Out_) > 0),
+    'a denied bash program is refused past AllowAllBash and a stored prefix');
+
+  J := TJson.NewObj;
+  J.AddStr('url', 'https://example.com/');
+  Out_ := uTools.RunTool('fetch', J, @SayAlways, IsErr);
+  J.Free;
+  Check(IsErr and (Pos('refused by deny rule', Out_) > 0),
+    'and fetch, past AllowAllFetch');
+
+  { The belt-and-braces lines in the gate itself, tested independently of
+    RunTool so that deleting either place fails something. }
+  Check(not uTools.Permit('write_file', 'detail', @SayAlways),
+    'Permit itself refuses a denied tool');
+  Check(not uTools.PermitBash('rm -rf x', 'detail', @SayAlways),
+    'and PermitBash a denied program');
+
+  Check(AskedCount = 0,
+    'and the user was never asked about any of it');
+
+  DenyFixtureReset;
+end;
+
+{ A PreToolUse hook can turn a question into a yes.  It must not be able to
+  turn a refusal into one - and, before that, a call the user forbade must
+  never reach the hook at all: a hook is a program a repository ships, and
+  its arguments are the leak. }
+procedure TestDenyBeatsHookAllow;
+var
+  Notes, Out_, Marker: string;
+  J: TJson;
+  IsErr: Boolean;
+begin
+  DenyFixtureReset;
+  Marker := IncludeTrailingPathDelimiter(SessionDir) + 'hookran.txt';
+  if FileExists(Marker) then SysUtils.DeleteFile(Marker);
+  WriteHooks('{"hooks":{"PreToolUse":[{"command":' +
+    '"echo ran > \"' + StringReplace(Marker, '\', '\\', [rfReplaceAll]) +
+    '\" & echo {\"decision\":\"allow\"}"}]}}');
+  uHooks.LoadHooks(True, Notes);
+  Check(uHooks.HooksEnabled, 'the allowing hook is loaded');
+
+  { Positive control: with no rule, the hook runs and leaves its marker. }
+  J := TJson.NewObj;
+  J.AddStr('command', 'echo hello');
+  Out_ := uTools.RunTool('bash', J, nil, IsErr);
+  J.Free;
+  Check(FileExists(Marker), 'and it runs for an ordinary call');
+
+  SysUtils.DeleteFile(Marker);
+  uTools.AddDenyRule('tool:bash', 'test');
+  J := TJson.NewObj;
+  J.AddStr('command', 'echo hello');
+  Out_ := uTools.RunTool('bash', J, @SayAlways, IsErr);
+  J.Free;
+  Check(IsErr and (Pos('refused by deny rule', Out_) > 0),
+    'a hook''s allow cannot lift a deny rule: ' + Out_);
+  Check(not FileExists(Marker),
+    'and the forbidden call''s arguments never reached the hook');
+
+  uHooks.ClearHooks;
+  WriteHooks('{}');
+  DenyFixtureReset;
+end;
+
+{ The approvals store moved out of the project because a repository must not
+  answer its own permission questions.  A deny rule only narrows, which is the
+  argument for reading one from the project - and it is still refused, because
+  strictness in one place buys looseness in another: denying search pushes the
+  model onto bash, where an "always" the user already gave is waiting. }
+procedure TestDenyRulesNotFromProject;
+var
+  Local, Profile, Base, InTree, Global: string;
+  J: TJson;
+  Out_: string;
+  IsErr: Boolean;
+begin
+  Local := SysUtils.GetEnvironmentVariable('LOCALAPPDATA');
+  Profile := SysUtils.GetEnvironmentVariable('USERPROFILE');
+  Base := ExcludeTrailingPathDelimiter(SessionDir) + '-appdata';
+  ForceDirectories(Base);
+  try
+    SetEnvironmentVariable('LOCALAPPDATA', PChar(Base));
+    DenyFixtureReset;
+    WriteFileText(IncludeTrailingPathDelimiter(SessionDir) + 'plain.txt', 'here');
+
+    { Three plausible project-supplied locations, all ignored. }
+    ForceDirectories(IncludeTrailingPathDelimiter(SessionDir) + StateDirName);
+    InTree := IncludeTrailingPathDelimiter(SessionDir) + StateDirName +
+      PathDelim + 'deny.json';
+    WriteFileText(InTree, '{"deny":["tool:read_file"]}');
+    WriteFileText(IncludeTrailingPathDelimiter(SessionDir) + 'deny.json',
+      '{"deny":["tool:read_file"]}');
+    WriteFileText(IncludeTrailingPathDelimiter(SessionDir) + StateDirName +
+      PathDelim + 'permissions.json', '{"deny":["tool:read_file"]}');
+
+    uTools.LoadDenyRules(ApprovalsPath, GlobalDenyPath);
+    Check(uTools.DenyRuleCount = 0,
+      'a deny.json committed to the repository denies nothing');
+    J := TJson.NewObj;
+    J.AddStr('path', 'plain.txt');
+    Out_ := RunTool('read_file', J, IsErr);
+    Check((not IsErr) and (Pos('here', Out_) > 0), 'and the tool still runs');
+
+    { The other half: without it, a loader that never loaded anything would
+      pass everything above. }
+    Global := GlobalDenyPath;
+    Check(Pos(UpperCase(Base), UpperCase(Global)) = 1,
+      'the global deny file is under LOCALAPPDATA: ' + Global);
+    ForceDirectories(ExtractFileDir(Global));
+    WriteFileText(Global, '{"deny":["tool:read_file"]}');
+    uTools.ClearDenyRules;
+    uTools.LoadDenyRules(ApprovalsPath, GlobalDenyPath);
+    Check(uTools.DenyRuleCount = 1, 'the same rule outside the tree is in force');
+    J := TJson.NewObj;
+    J.AddStr('path', 'plain.txt');
+    Out_ := RunTool('read_file', J, IsErr);
+    Check(IsErr and (Pos('refused by deny rule', Out_) > 0),
+      'and now the tool is refused: ' + Out_);
+    SysUtils.DeleteFile(Global);
+    SysUtils.DeleteFile(InTree);
+    SysUtils.DeleteFile(IncludeTrailingPathDelimiter(SessionDir) + 'deny.json');
+  finally
+    SetEnvironmentVariable('LOCALAPPDATA', PChar(Local));
+    SetEnvironmentVariable('USERPROFILE', PChar(Profile));
+    DenyFixtureReset;
+  end;
+end;
+
+{ A rule that cannot be enforced must never look enforced.  The startup
+  warning is the only thing between an unparseable line and a user who
+  believes they are protected, so the rule has to survive parsing to be
+  reported at all. }
+procedure TestDenyBadRuleIsNotSilent;
+var
+  Bad: TStringArray;
+  Rules: TDenyRuleArray;
+  I, WithErr: Integer;
+begin
+  DenyFixtureReset;
+  uTools.AddDenyRule('read:.env', 'test');
+  uTools.AddDenyRule('path:', 'test');
+  uTools.AddDenyRule('tool:*', 'test');
+  uTools.AddDenyRule('nonsense', 'test');
+
+  Bad := uTools.BadDenyRules;
+  Check(Length(Bad) = 3, Format('three rules are reported unusable (%d)',
+    [Length(Bad)]));
+  Check((Length(Bad) = 3) and (Bad[0] = 'read:.env') and (Bad[1] = 'path:') and
+        (Bad[2] = 'nonsense'), 'and they are named verbatim');
+  Check(uTools.DenyRuleCount = 1, 'only the usable one is counted in force');
+
+  Rules := uTools.DenyRules;
+  WithErr := 0;
+  for I := 0 to High(Rules) do
+    if Rules[I].Err <> '' then Inc(WithErr);
+  Check(Length(Rules) = 4, 'every rule is kept, usable or not');
+  Check(WithErr = 3, 'and each unusable one carries a reason');
+
+  Check(uTools.DenyPathReason(IncludeTrailingPathDelimiter(SessionDir) +
+    '.env') = '', 'an unparseable path rule matches nothing at all');
+  Check(uTools.DenyToolReason('read_file') <> '',
+    'while tool:* is in force and matches everything');
+  DenyFixtureReset;
+end;
+
+{ bash: reads the first token of every cmd.exe segment, which is more than
+  the approval prefix table can do and less than a shell parser would.  The
+  gap is pinned here as a gap, so closing it later is a deliberate change. }
+procedure TestDenyBashSegments;
+
+  procedure Refuses(const Cmd: string);
+  begin
+    Check(uTools.DenyBashReason(Cmd) <> '', 'refused: ' + Cmd);
+  end;
+
+  procedure Allows(const Cmd, Why: string);
+  begin
+    Check(uTools.DenyBashReason(Cmd) = '', Why + ': ' + Cmd);
+  end;
+
+begin
+  DenyFixtureReset;
+  uTools.AddDenyRule('bash:rm', 'test');
+
+  Refuses('rm -rf x');
+  Refuses('git status && rm -rf x');
+  Refuses('echo a | rm x');
+  Refuses('a & RM.EXE x');
+  Refuses('"C:\bin\rm.exe" x');
+  Refuses('(rm x)');
+  Refuses('a ; rm x');
+  Refuses('echo one'#10'rm x');
+
+  Allows('ripgrep rm', 'a program whose name merely starts the same');
+  Allows('echo rm', 'an argument that happens to be the name');
+  Allows('grm x', 'and a longer name that contains it');
+  { The documented limit, asserted as a limit.  cmd.exe runs r^m as rm; this
+    rule does not follow escapes inside a token and says so. }
+  Allows('r^m x', 'a caret escape is a documented gap, not a match');
+
+  Check(uTools.BashPrefix('git status && rm -rf x') = '',
+    'and the approval prefix table still gives up where this does not');
+  DenyFixtureReset;
+end;
+
 { The discovery cache is a file in the project directory, so a repository can
   ship one whose entries match its own .mcp.json - no server has to run for
   its contents to be believed.  Loading those for a server the user refused
@@ -1904,6 +2246,12 @@ begin
   TestHooksHostileConfig;
   TestHooksHostileBehaviour;
   TestApprovalsOutOfTree;
+  TestDenyPathCanonical;
+  TestDenyBeatsEverything;
+  TestDenyBeatsHookAllow;
+  TestDenyRulesNotFromProject;
+  TestDenyBadRuleIsNotSilent;
+  TestDenyBashSegments;
   TestMcpConfig;
   TestMcpSchemaTrust;
   TestMcpHostileServer;

@@ -540,6 +540,167 @@ begin
   uTools.AllowAllEdits := True;
 end;
 
+{ A deny rule refuses inside RunTool rather than at the gate, which is a new
+  early exit on the path uAgent's one-tool_result-per-tool_use invariant
+  depends on.  The transcript has to be exactly what a permission denial
+  produces, or the next request is one the API rejects. }
+procedure TestDenyProducesToolResult;
+var
+  A: TAgent;
+  Err: string;
+  Doc, Msg, C: TJson;
+  Found: Integer;
+  I: Integer;
+begin
+  ResetScript;
+  uTools.RootDir := SessionDir;
+  uTools.ClearDenyRules;
+  { The most permissive state there is, so the refusal can only be the rule. }
+  uTools.AllowAllEdits := True;
+  uTools.AddDenyRule('path:secret.txt', 'test');
+
+  SetLength(Replies, 2);
+  Replies[0] := ToolReply('t1', 'write_file',
+    '{"path":"secret.txt","content":"x"}');
+  Replies[1] := TextReply('Understood, that path is off limits.');
+
+  A := MakeAgent;
+  try
+    A.Send('write the secret', Err);
+    Check(CallCount = 2, 'the turn continues after a deny rule refuses');
+    Check(not FileExists(IncludeTrailingPathDelimiter(SessionDir) +
+      'secret.txt'), 'and nothing was written');
+    Check(IsValidUtf8(Requests[1]), 'the follow-up body is valid UTF-8');
+
+    Doc := JsonParse(Requests[1]);
+    try
+      Msg := Doc.Find('messages').Item(2).Find('content');
+      Found := 0;
+      for I := 0 to Msg.Count - 1 do
+        if Msg.Item(I).Str('tool_use_id') = 't1' then Inc(Found);
+      Check(Found = 1, Format('exactly one tool_result for the tool_use (%d)',
+        [Found]));
+      C := Msg.Item(0);
+      Check(C.Bool('is_error'), 'marked as an error result');
+      Check(Pos('refused by deny rule', C.Str('content')) > 0,
+        'naming the refusal: ' + C.Str('content'));
+      Check(Pos('path:secret.txt', C.Str('content')) > 0,
+        'and the rule itself, so a rule is not mistaken for a bug');
+    finally
+      Doc.Free;
+    end;
+    Check(Prose = 'Understood, that path is off limits.',
+      'and the conversation reaches a normal reply');
+
+    { The one line the whole session-note design turns on. }
+    Doc := JsonParse(Requests[0]);
+    try
+      Check(Doc.Find('system').Count = 2,
+        'a session with rules in force carries a second system block');
+      Check(Doc.Find('system').Item(1).Find('cache_control') = nil,
+        'and it is deliberately not part of the cached prefix');
+    finally
+      Doc.Free;
+    end;
+  finally
+    A.Free;
+  end;
+  uTools.ClearDenyRules;
+
+  { And with everything at its default the body is what it always was. }
+  ResetScript;
+  SetLength(Replies, 1);
+  Replies[0] := TextReply('hello');
+  A := MakeAgent;
+  try
+    A.Send('hi', Err);
+    Doc := JsonParse(Requests[0]);
+    try
+      Check(Doc.Find('system').Count = 1,
+        'with no rules there is no second block at all');
+    finally
+      Doc.Free;
+    end;
+  finally
+    A.Free;
+  end;
+end;
+
+{ Print mode has no human, so it must never be the most permissive mode.  The
+  ordering that guarantees it is that the host calls LoadDenyRules before the
+  print-mode halt and LoadPermissions after; this pins the half of it that
+  lives in this unit. }
+procedure TestPrintModeInheritsNoGrants;
+var
+  Base, Appr, Global: string;
+  A: TJson;
+  Out_: string;
+  IsErr: Boolean;
+  Saved: string;
+begin
+  uTools.ClearDenyRules;
+  uTools.ClearBashPrefixes;
+  uTools.ClearTrust;
+  uTools.AllowAllEdits := False;
+  uTools.AllowAllBash := False;
+  uTools.RootDir := SessionDir;
+
+  Saved := SysUtils.GetEnvironmentVariable('LOCALAPPDATA');
+  Base := ExcludeTrailingPathDelimiter(SessionDir) + '-appdata';
+  ForceDirectories(Base);
+  try
+    SetEnvironmentVariable('LOCALAPPDATA', PChar(Base));
+    Appr := uTools.ApprovalsPath;
+    Global := uTools.GlobalDenyPath;
+    ForceDirectories(ExtractFileDir(Appr));
+    ForceDirectories(ExtractFileDir(Global));
+    with TStringList.Create do
+    try
+      Text := '{"allow_bash":true,"bash_programs":["git"],' +
+        '"trusted":{"hooks.json":"deadbeefdeadbeef"},"deny":["tool:fetch"]}';
+      SaveToFile(Appr);
+      Text := '{"deny":["tool:search"]}';
+      SaveToFile(Global);
+    finally
+      Free;
+    end;
+
+    { Exactly the call print mode makes, and nothing else. }
+    uTools.LoadDenyRules(Appr, Global);
+    Check(uTools.DenyRuleCount = 2, 'both files'' deny rules arrive');
+    Check(not uTools.AllowAllBash, 'and allow_bash beside them does not');
+    Check(not uTools.AllowAllEdits, 'nor allow_edits');
+    Check(not uTools.BashPrefixAllowed('git status'),
+      'nor a persisted bash program');
+    Check(uTools.TrustedFingerprint('hooks.json') = '',
+      'nor a trusted fingerprint');
+
+    { With Ask nil - print mode's other half - a denied tool says why, and an
+      ordinary read still works. }
+    A := TJson.NewObj;
+    A.AddStr('url', 'https://example.com/');
+    Out_ := uTools.RunTool('fetch', A, nil, IsErr);
+    A.Free;
+    Check(IsErr and (Pos('refused by deny rule', Out_) > 0),
+      'a denied tool is refused under -p: ' + Out_);
+    A := TJson.NewObj;
+    A.AddStr('pattern', 'nothing-in-particular');
+    Out_ := uTools.RunTool('search', A, nil, IsErr);
+    A.Free;
+    Check(IsErr and (Pos('refused by deny rule', Out_) > 0),
+      'including a tool that is otherwise ungated');
+    WriteSessionFile('plain.txt', 'ordinary');
+    A := TJson.NewObj;
+    A.AddStr('path', 'plain.txt');
+    Out_ := uTools.RunTool('read_file', A, nil, IsErr);
+    A.Free;
+    Check(not IsErr, 'while an ungated, undenied tool still runs');
+  finally
+    SetEnvironmentVariable('LOCALAPPDATA', PChar(Saved));
+    uTools.ClearDenyRules;
+  end;
+end;
+
 { Conversation state has to persist across separate turns. }
 procedure TestConversationPersists;
 var
@@ -2792,6 +2953,8 @@ begin
   TestRoundLimit;
   TestMidLoopFailure;
   TestDeniedToolContinues;
+  TestDenyProducesToolResult;
+  TestPrintModeInheritsNoGrants;
   TestConversationPersists;
   TestParallelToolCalls;
   TestResumedSessionRunsThroughTheLoop;

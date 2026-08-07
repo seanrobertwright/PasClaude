@@ -200,8 +200,8 @@ end;
 { ------------------------------------------------------------- completion -- }
 
 const
-  SlashCommands: array[0..22] of string = (
-    '/help', '/clear', '/compact', '/diff', '/hooks', '/jobs', '/mcp',
+  SlashCommands: array[0..23] of string = (
+    '/help', '/clear', '/compact', '/deny', '/diff', '/hooks', '/jobs', '/mcp',
     '/memory', '/init', '/rewind', '/sessions', '/skills', '/plugins',
     '/think', '/web',
     '/resume', '/save', '/cwd', '/model', '/yolo', '/cost', '/exit', '/quit');
@@ -368,6 +368,7 @@ begin
   EmitCLn(clGrey,   '  /save          write the conversation now');
   EmitCLn(clGrey,   '  /cwd           show the session root');
   EmitCLn(clGrey,   '  /model [name]  pick a model from a list, or set one by name');
+  EmitCLn(clGrey,   '  /deny          rules nothing can override; add <rule>, remove <n>');
   EmitCLn(clGrey,   '  /yolo          approve every tool for this session');
   EmitCLn(clGrey,   '  /cost          tokens used so far');
   EmitCLn(clGrey,   '  /exit          quit (Ctrl+C also works)');
@@ -913,6 +914,117 @@ begin
     EmitCLn(clYellow, '  not running (not trusted this session, or /hooks off)');
 end;
 
+{ /deny, /deny add <rule>, /deny remove <n>.  The listing names the file each
+  rule came from, because the predictable thing to do with a rule you no
+  longer want is to delete its line and the user has to know which file.
+
+  "remove" is the single widening operation in the whole feature, and it lives
+  here and nowhere else: a slash command is host-side text typed by a human at
+  a console.  It is unreachable from -p, from the SDK protocol, from a hook,
+  from an MCP server, from a subagent, and from anything the model can emit. }
+procedure ShowDeny(const Arg: string);
+var
+  Rules: uTools.TDenyRuleArray;
+  List: TStringArray;
+  I, N: Integer;
+  Cmd, Rest, Err: string;
+  Sp: Integer;
+begin
+  Sp := Pos(' ', Arg);
+  if Sp > 0 then
+  begin
+    Cmd := LowerCase(Copy(Arg, 1, Sp - 1));
+    Rest := Trim(Copy(Arg, Sp + 1, MaxInt));
+  end
+  else
+  begin
+    Cmd := LowerCase(Trim(Arg));
+    Rest := '';
+  end;
+
+  if (Cmd = 'add') and (Rest <> '') then
+  begin
+    List := uTools.GlobalDenyList;
+    SetLength(List, Length(List) + 1);
+    List[High(List)] := Rest;
+    if not uTools.SaveGlobalDenyList(List, Err) then
+    begin
+      EmitCLn(clRed, '  could not write deny.json: ' + Err);
+      Exit;
+    end;
+    { Reloaded rather than appended in memory, so what is in force is always
+      exactly what the files say - the state a restart would produce. }
+    uTools.ClearDenyRules;
+    uTools.LoadDenyRules(PermissionsPath, uTools.GlobalDenyPath);
+    EmitCLn(clGrey, '  added: ' + Rest);
+  end
+  else if (Cmd = 'remove') and (Rest <> '') then
+  begin
+    Rules := uTools.DenyRules;
+    N := StrToIntDef(Rest, 0);
+    if (N < 1) or (N > Length(Rules)) then
+    begin
+      EmitCLn(clRed, '  not a listed number: ' + Rest);
+      Exit;
+    end;
+    if Rules[N - 1].Source <> uTools.GlobalDenyPath then
+    begin
+      EmitCLn(clYellow, '  that rule is in ' + Rules[N - 1].Source);
+      EmitCLn(clGrey,   '  delete its line there; this command only writes deny.json');
+      Exit;
+    end;
+    Rest := Rules[N - 1].Text;
+    List := uTools.GlobalDenyList;
+    N := -1;
+    for I := 0 to High(List) do
+      if List[I] = Rest then N := I;
+    if N < 0 then
+    begin
+      EmitCLn(clRed, '  that rule is no longer in deny.json');
+      Exit;
+    end;
+    for I := N to High(List) - 1 do List[I] := List[I + 1];
+    SetLength(List, Length(List) - 1);
+    if not uTools.SaveGlobalDenyList(List, Err) then
+    begin
+      EmitCLn(clRed, '  could not write deny.json: ' + Err);
+      Exit;
+    end;
+    uTools.ClearDenyRules;
+    uTools.LoadDenyRules(PermissionsPath, uTools.GlobalDenyPath);
+    EmitCLn(clGrey, '  removed: ' + Rest);
+  end;
+
+  Rules := uTools.DenyRules;
+  if Length(Rules) = 0 then
+  begin
+    EmitCLn(clGrey, '  no deny rules (/deny add tool:bash, /deny add path:.env)');
+    EmitCLn(clGrey, '  they live in ' + uTools.GlobalDenyPath);
+    Exit;
+  end;
+  for I := 0 to High(Rules) do
+  begin
+    if Rules[I].Err = '' then
+      EmitCLn(clGrey, Format('  %2d  %-28s %s',
+        [I + 1, Rules[I].Text, Rules[I].Source]))
+    else
+    begin
+      EmitCLn(clYellow, Format('  %2d  %-28s NOT IN FORCE: %s',
+        [I + 1, Rules[I].Text, Rules[I].Err]));
+      EmitCLn(clGrey,   '      ' + Rules[I].Source);
+    end;
+  end;
+  EmitLn;
+  { The three limits, printed where the user is looking at the rules they
+    believe protect them.  A rule misread as wider than it is is worse than
+    no rule at all. }
+  EmitCLn(clGrey, '  bash: rules filter the program name of each cmd.exe segment.');
+  EmitCLn(clGrey, '  They cannot follow %VAR% expansion, a for loop, a renamed copy');
+  EmitCLn(clGrey, '  or a .cmd wrapper - tool:bash is the airtight form.');
+  EmitCLn(clGrey, '  path: rules cover pasclaude''s file tools, not the shell: a');
+  EmitCLn(clGrey, '  command run through bash never passes them. Hardlinks evade them.');
+end;
+
 { /mcp, /mcp restart <name>, /mcp refresh.  Every configured server is shown,
   including the ones contributing nothing: a server dropped in silence reads
   as a broken program, and the point of asking the user to approve a program
@@ -1208,6 +1320,12 @@ begin
   if BannerAuth <> '' then Auth := Auth + ' (' + BannerAuth + ')';
   EmitCLn(clGrey, '  ' + Auth);
   EmitCLn(clGrey, '  ' + uTools.RootDir);
+  { Only when there are any: a user in a stricter state than they believe is a
+    smaller problem than one in a looser state, but a refusal nobody can
+    explain is still a bug report. }
+  if uTools.DenyRulesInForce then
+    EmitCLn(clGrey, Format('  %d deny rules in force (/deny)',
+      [uTools.DenyRuleCount]));
   EmitCLn(clGrey, '  /help for commands, /exit to quit, Esc stops a reply');
   EmitLn;
 end;
@@ -1453,6 +1571,8 @@ begin
     ShowHooks(Arg)
   else if Cmd = '/mcp' then
     ShowMcp(Arg)
+  else if Cmd = '/deny' then
+    ShowDeny(Arg)
   else if Cmd = '/yolo' then
   begin
     uTools.AllowAllEdits := True;
@@ -1472,6 +1592,11 @@ begin
       grant than the word implied.  The per-answer approvals do persist,
       because each named the thing it covered. }
     EmitCLn(clYellow, '  every tool is now approved for this session');
+    { Said out loud, because "every" would otherwise be read as every.  A deny
+      rule is checked above all four of the flags just set, and above the
+      prompt they replace. }
+    if uTools.DenyRulesInForce then
+      EmitCLn(clYellow, '  deny rules still apply');
   end
   else if Cmd = '/cost' then
   begin
@@ -1538,6 +1663,7 @@ var
   SkillNames: string;
   SkillList: uTools.TSkillInfoArray;
   NewPlugins: TStringArray;
+  BadRules: TStringArray;
   Handled: Boolean;
   Dropped: Integer;
   Resume: Boolean = False;
@@ -1669,6 +1795,19 @@ begin
     end;
     uTools.RootDir := GetCurrentDir;
     uTools.LoadIgnoreRules;
+    { Deny rules load here, before the print-mode halt below, where the
+      standing approvals deliberately do not: a rule can only ever narrow, so
+      a scripted run may inherit one without becoming more permissive than an
+      interactive session started the same way.  LoadDenyRules reads only the
+      "deny" array of each file - if it ever grew to read a grant key, -p
+      would silently start inheriting approvals. }
+    uTools.LoadDenyRules(PermissionsPath, uTools.GlobalDenyPath);
+    { An unparseable rule is not in force, and the only thing standing between
+      that and a user who believes they are protected is this line. }
+    BadRules := uTools.BadDenyRules;
+    for ArgI := 0 to High(BadRules) do
+      EmitCLn(clYellow, '  deny rule not understood, NOT in force: ' +
+        BadRules[ArgI] + ' (/deny)');
     { Beside LoadIgnoreRules and therefore BEFORE the print-mode halt below,
       on purpose: a scripted run honours an enablement the user already made
       but, having no console, can never create one.  Skills need no enabling

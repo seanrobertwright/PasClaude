@@ -2042,6 +2042,48 @@ begin
   end;
 end;
 
+{ The three rule kinds, matched the way a hand-editing user has to be able to
+  predict.  The whole-path form is the one that would be easy to get wrong:
+  making it also match a base name would turn every path rule into a rule
+  about a name, which is a different and much wider promise. }
+procedure TestDenyRuleParsing;
+begin
+  uTools.ClearDenyRules;
+  uTools.AddDenyRule('tool:bash', 'test');
+  uTools.AddDenyRule('tool:mcp__github__*', 'test');
+  uTools.AddDenyRule('bash:npm', 'test');
+  uTools.AddDenyRule('path:.env', 'test');
+  uTools.AddDenyRule('path:src/**/*.pem', 'test');
+  uTools.AddDenyRule('path:/secrets/**', 'test');
+  Check(uTools.DenyRuleCount = 6, 'six rules parse and are in force');
+
+  Check(uTools.DenyToolReason('bash') <> '', 'tool:bash denies bash');
+  Check(Pos('refused by deny rule "tool:bash" (test)',
+    uTools.DenyToolReason('bash')) = 1, 'and names the rule and its file');
+  Check(uTools.DenyToolReason('mcp__github__list') <> '',
+    'a tool glob covers one server''s tools');
+  Check(uTools.DenyToolReason('mcp__other__list') = '', 'and not another''s');
+  Check(uTools.DenyToolReason('write_file') = '', 'and nothing unrelated');
+
+  Check(uTools.DenyBashReason('npm install') <> '', 'bash:npm denies npm');
+  Check(uTools.DenyBashReason('npmx install') = '', 'and not npmx');
+
+  Check(uTools.DenyWalkReason('src\a\b\k.pem', 'k.pem') <> '',
+    'a ** pattern spans directories');
+  Check(uTools.DenyWalkReason('other\k.pem', 'k.pem') = '',
+    'while a pattern with a separator is anchored, not a name rule');
+  Check(uTools.DenyWalkReason('deep\nested\.env', '.env') <> '',
+    'and a pattern without one matches the base name at any depth');
+  Check(uTools.DenyWalkReason('secrets\x', 'x') <> '',
+    'a leading slash anchors to the root');
+  Check(uTools.DenyWalkReason('a\secrets\x', 'x') = '',
+    'and does not float down the tree');
+
+  uTools.ClearDenyRules;
+  Check((uTools.DenyRuleCount = 0) and (not uTools.DenyRulesInForce) and
+        (Length(uTools.DenyRules) = 0), 'and clearing empties all of it');
+end;
+
 procedure TestPermissionPersistence;
 var
   P: string;
@@ -2620,6 +2662,7 @@ begin
   TestSkillCatalogue;
   TestSkillTool;
   TestPluginPrecedence;
+  TestDenyRuleParsing;
   TestPermissionPersistence;
   TestToolRegistry;
   TestMcpApprovals;

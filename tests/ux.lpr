@@ -985,6 +985,98 @@ end;
   request, and is saved again, growing every turn.  Worse, edit_file could
   rewrite the history of the turn currently running.  It is therefore hidden
   from listings and searches and refused by the path guard. }
+{ A denied file must be invisible, not merely unreadable.  SafePath stops the
+  model naming it; without the walker half, search would print the secret line
+  out of the very file read_file refuses to open - the most damaging way a
+  path rule could look enforced and not be. }
+procedure TestDeniedPathIsInvisible;
+var
+  Input: TJson;
+  IsErr: Boolean;
+  Out_: string;
+begin
+  WriteLn('-- deny rules --');
+  uTools.ClearDenyRules;
+  WriteFileText(IncludeTrailingPathDelimiter(TmpRoot) + '.env',
+    'SECRET=SENTINELDENY'#10);
+  WriteFileText(IncludeTrailingPathDelimiter(TmpRoot) + 'ok.txt',
+    'SENTINELDENY lives here too'#10);
+
+  uTools.AddDenyRule('path:.env', 'test');
+
+  Input := TJson.NewObj;
+  Input.AddStr('path', '.');
+  Out_ := RunTool('list_dir', Input, nil, IsErr);
+  Input.Free;
+  Check(Pos('.env', Out_) = 0, 'list_dir does not announce a denied file');
+  Check(Pos('ok.txt', Out_) > 0, 'but still lists the rest of the directory');
+
+  Input := TJson.NewObj;
+  Input.AddStr('pattern', 'SENTINELDENY');
+  Out_ := RunTool('search', Input, nil, IsErr);
+  Input.Free;
+  Check(Pos('ok.txt', Out_) > 0, 'search still finds an ordinary file');
+  Check(Pos('.env', Out_) = 0, 'and never reports a line out of a denied one');
+
+  Input := TJson.NewObj;
+  Input.AddStr('path', '.env');
+  Out_ := RunTool('read_file', Input, nil, IsErr);
+  Input.Free;
+  Check(IsErr and (Pos('refused by deny rule', Out_) > 0),
+    'and read_file refuses it, naming the rule: ' + Out_);
+
+  { The other direction, so the three assertions above are the rule's doing
+    and not an accident of the fixture. }
+  uTools.ClearDenyRules;
+  Input := TJson.NewObj;
+  Input.AddStr('path', '.');
+  Out_ := RunTool('list_dir', Input, nil, IsErr);
+  Input.Free;
+  Check(Pos('.env', Out_) > 0, 'with the rule gone the file is listed again');
+  Input := TJson.NewObj;
+  Input.AddStr('path', '.env');
+  Out_ := RunTool('read_file', Input, nil, IsErr);
+  Input.Free;
+  Check(not IsErr, 'and read again');
+  SysUtils.DeleteFile(IncludeTrailingPathDelimiter(TmpRoot) + '.env');
+end;
+
+{ The approvals file is hand-edited, so a line somebody typed into it has to
+  survive the session that read it.  Nothing else in this program writes the
+  deny array, which is exactly why forgetting the write-back would be silent. }
+procedure TestDenyRoundTrip;
+var
+  P, Raw: string;
+begin
+  P := IncludeTrailingPathDelimiter(TmpRoot) + 'approvals-roundtrip.json';
+  uTools.ClearDenyRules;
+  uTools.ClearBashPrefixes;
+  uTools.AllowAllBash := False;
+  WriteFileText(P, '{"allow_bash":true,"deny":["bash:rm","garbage"]}');
+
+  uTools.LoadDenyRules(P, '');
+  uTools.LoadPermissions(P);
+  Check(uTools.DenyRuleCount = 1, 'the usable rule is in force');
+  Check(Length(uTools.BadDenyRules) = 1, 'and the other is reported, not dropped');
+
+  uTools.SavePermissions(P);
+  Raw := ReadFileText(P);
+  Check(Pos('"bash:rm"', Raw) > 0, 'a hand-added rule survives the save');
+  Check(Pos('"garbage"', Raw) > 0,
+    'including one this program could not parse: ' + Raw);
+
+  { Deleting a line does the predictable thing, next run. }
+  WriteFileText(P, '{"allow_bash":true,"deny":["bash:rm"]}');
+  uTools.ClearDenyRules;
+  uTools.LoadDenyRules(P, '');
+  Check(uTools.DenyRuleCount = 1, 'deleting a line removes exactly that rule');
+  Check(Length(uTools.BadDenyRules) = 0, 'and nothing else');
+
+  uTools.ClearDenyRules;
+  uTools.AllowAllBash := False;
+  SysUtils.DeleteFile(P);
+end;
+
 procedure TestStateDirIsHidden;
 var
   Input: TJson;
@@ -2472,6 +2564,8 @@ begin
     TestPreview;
     TestCompact;
     TestSession;
+    TestDeniedPathIsInvisible;
+    TestDenyRoundTrip;
     TestStateDirIsHidden;
     TestEditor;
     TestMentions;
@@ -2500,6 +2594,7 @@ begin
       put on disk outlives it in module state. }
     uTools.ClearSkills;
     uTools.ClearPluginState;
+    uTools.ClearDenyRules;
     uTools.RootDir := '';
     Cleanup(TmpRoot);
   end;
