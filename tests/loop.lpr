@@ -1325,10 +1325,13 @@ begin
       Local := 0;
       Web := 0;
       for I := 0 to Tools.Count - 1 do
-        if Tools.Item(I).Str('name') = 'web_search' then Inc(Web)
-        else Inc(Local);
+        if Tools.Item(I).Str('name') = 'web_search' then Inc(Web);
+      { Source-contributed tools are excluded by name, so configuring an MCP
+        server can never move a number that lives in this file. }
+      Local := uTools.CountBuiltinTools(Tools) - Web;
       Check(Web = 0, 'web search is not declared by default');
-      Check(Local = 12, Format('the local tools are all declared (%d)', [Local]));
+      Check(Local = uTools.BuiltinToolCount,
+        Format('the local tools are all declared (%d)', [Local]));
     finally
       Doc.Free;
     end;
@@ -1347,10 +1350,11 @@ begin
             'the declaration carries the dated type string');
           Check(Tools.Item(I).Find('input_schema') = nil,
             'a server-side tool declares no input schema');
-        end
-        else Inc(Local);
+        end;
+      Local := uTools.CountBuiltinTools(Tools) - Web;
       Check(Web = 1, 'web search is declared exactly once when it is on');
-      Check(Local = 12, 'the local tools are still all declared');
+      Check(Local = uTools.BuiltinToolCount,
+        'the local tools are still all declared');
     finally
       Doc.Free;
     end;
@@ -1881,6 +1885,188 @@ begin
   end;
 end;
 
+{ A whole turn against a real MCP server: the declaration reaches the request
+  body through ToolsSchema, the model asks for the tool by its namespaced
+  name, the dispatcher routes it back down the registry to uMcp, and the
+  answer comes back as a tool_result.  The point of doing it end to end is
+  the invariant uAgent.RunTools depends on - every tool_use gets a
+  tool_result, including the ones that are refused. }
+procedure TestMcpTurn;
+var
+  A: TAgent;
+  Doc, Tools, Msgs, C: TJson;
+  Exe, Err, Body, Hash: string;
+  I, DeclAt, Local: Integer;
+  NoArgs: array of string;
+  SavedMcp, SavedEdits, Ok: Boolean;
+begin
+  Exe := ExtractFilePath(ParamStr(0)) + 'srvmock.exe';
+  Check(FileExists(Exe), 'the stand-in MCP server binary was built');
+  if not FileExists(Exe) then Exit;
+
+  SavedMcp := uTools.AllowAllMcp;
+  SavedEdits := uTools.AllowAllEdits;
+  uTools.RootDir := SessionDir;
+  uTools.ClearMcpServers;
+  uTools.ClearTrust;
+  WriteSessionFile('.mcp.json',
+    '{"mcpServers":{"mock":{"command":' + JsonQuote(Exe) + '}}}');
+
+  { Approve without a prompt by recording the fingerprint the loader will
+    compute.  That the test can compute the same hash is itself the assertion
+    that the recorded approval is bound to the command line and not to the
+    server's name. }
+  SetLength(NoArgs, 0);
+  Hash := uTools.McpCommandHash(Exe, NoArgs, NoArgs);
+  uTools.RecordTrust('mcp:mock', Hash);
+
+  { A previous run's discovery cache would make the first connect a cache hit
+    and silently skip the half of this being tested. }
+  SysUtils.DeleteFile(IncludeTrailingPathDelimiter(SessionDir) + StateDirName +
+    PathDelim + 'mcp-cache.json');
+
+  Check(uTools.LoadMcpConfig(uTools.McpConfigPath, Err),
+    'the project config loads: ' + Err);
+  uTools.McpApproveAll(nil, nil);
+  Check(uTools.McpServerStatus('mock') <> mcDenied,
+    'a recorded fingerprint answers the question without a prompt');
+  uTools.McpConnectApproved(nil);
+  Check(uTools.McpServerStatus('mock') = mcConnected,
+    'and the first run connects and discovers');
+  Check(uTools.McpServerToolCount('mock') = 2,
+    Format('with both of its tools ingested (%d)',
+      [uTools.McpServerToolCount('mock')]));
+
+  { The steady state: the tool list comes off disk, nothing is spawned at the
+    prompt, and the first real call below pays for the start-up.  A server
+    that takes ten seconds to boot must not cost that at every launch. }
+  uTools.ClearMcpServers;
+  uTools.LoadMcpConfig(uTools.McpConfigPath, Err);
+  uTools.McpApproveAll(nil, nil);
+  uTools.McpConnectApproved(nil);
+  Check(uTools.McpServerStatus('mock') = mcCached,
+    'the next run declares from the cache instead of connecting');
+  Check(uTools.McpServerToolCount('mock') = 2,
+    'with the same tools');
+
+  try
+    { (a) the declaration is in the body, after every built-in. }
+    ResetScript;
+    A := MakeAgent;
+    try
+      A.AppendUserText('hello');
+      Doc := JsonParse(A.RequestBody);
+      try
+        Tools := Doc.Find('tools');
+        DeclAt := -1;
+        for I := 0 to Tools.Count - 1 do
+          if Tools.Item(I).Str('name') = 'mcp__mock__echo' then DeclAt := I;
+        Local := uTools.CountBuiltinTools(Tools);
+        Check(DeclAt >= Local,
+          Format('the MCP declaration follows the built-ins (%d of %d)',
+            [DeclAt, Tools.Count]));
+        Check((DeclAt >= 0) and
+              (Tools.Item(DeclAt).Find('input_schema') <> nil) and
+              (Tools.Item(DeclAt).Find('input_schema').Str('type') = 'object'),
+          'and carries a usable input schema');
+        Check(Local = uTools.BuiltinToolCount,
+          'and the built-in count is unchanged by it');
+      finally
+        Doc.Free;
+      end;
+    finally
+      A.Free;
+    end;
+
+    { (b) the call round trips through the registry to the server. }
+    uTools.AllowAllMcp := True;
+    ResetScript;
+    SetLength(Replies, 2);
+    Replies[0] := ToolReply('tu_1', 'mcp__mock__echo', '{"text":"hi"}');
+    Replies[1] := TextReply('done');
+    A := MakeAgent;
+    try
+      Check(A.Send('call it', Err), 'the turn completes: ' + Err);
+      Check(Length(Requests) = 2, 'in two requests');
+      Doc := JsonParse(Requests[1]);
+      try
+        Msgs := Doc.Find('messages');
+        C := Msgs.Item(Msgs.Count - 1).Find('content');
+        Check((C <> nil) and (C.Count = 1) and
+              (C.Item(0).Str('type') = 'tool_result') and
+              (C.Item(0).Str('tool_use_id') = 'tu_1'),
+          'the answer comes back as exactly one matching tool_result');
+        Check(Pos('pong', C.Item(0).Str('content')) > 0,
+          'carrying what the server said: ' + C.Item(0).Str('content'));
+      finally
+        Doc.Free;
+      end;
+    finally
+      A.Free;
+    end;
+
+    { (c) a denial is still a tool_result.  Anything else is a transcript the
+      API rejects, which is a far worse failure than a refused tool. }
+    uTools.AllowAllMcp := False;
+    uTools.AllowAllEdits := True;   { the catch-all must not cover this }
+    uTools.ClearTrust;
+    ResetScript;
+    SetLength(Replies, 2);
+    Replies[0] := ToolReply('tu_2', 'mcp__mock__echo', '{"text":"hi"}');
+    Replies[1] := TextReply('fine');
+    A := MakeAgent;
+    try
+      Check(A.Send('call it', Err), 'a denied turn still completes: ' + Err);
+      Doc := JsonParse(Requests[1]);
+      try
+        Msgs := Doc.Find('messages');
+        C := Msgs.Item(Msgs.Count - 1).Find('content');
+        Check((C <> nil) and (C.Count = 1) and
+              (C.Item(0).Str('type') = 'tool_result') and
+              (C.Item(0).Str('tool_use_id') = 'tu_2'),
+          'the denial is reported as a tool_result, not as a missing block');
+        Check(C.Item(0).Bool('is_error'), 'marked as an error');
+        Check(Pos('denied', C.Item(0).Str('content')) > 0,
+          'and saying so: ' + C.Item(0).Str('content'));
+      finally
+        Doc.Free;
+      end;
+    finally
+      A.Free;
+    end;
+
+    { (d) neither the declaration nor the call is available to a subagent. }
+    Check(uTools.EnterSubagent, 'claim the subagent slot');
+    try
+      Tools := uTools.ToolsSchema;
+      try
+        Body := Tools.ToJson;
+        Check(Pos('mcp__', Body) = 0, 'a subagent is told about no MCP tool');
+      finally
+        Tools.Free;
+      end;
+      Doc := TJson.NewObj;
+      try
+        Body := uTools.RunTool('mcp__mock__echo', Doc, nil, Ok);
+        Check(Ok and (Pos('not available to a subagent', Body) > 0),
+          'and the call is refused at the boundary: ' + Body);
+      finally
+        Doc.Free;
+      end;
+    finally
+      uTools.LeaveSubagent;
+    end;
+  finally
+    { Before anything else touches this directory: a live child holding the
+      stderr spool is both an unfreed handle and a file that cannot be
+      deleted. }
+    uTools.ClearMcpServers;
+    uTools.ClearTrust;
+    uTools.AllowAllMcp := SavedMcp;
+    uTools.AllowAllEdits := SavedEdits;
+  end;
+end;
+
 begin
   { Every request in this suite goes to the stand-in rather than the network. }
   uHttp.HttpTransport := @FakePost;
@@ -1919,6 +2105,7 @@ begin
   TestSubagentCost;
   TestSubagentCancel;
   TestSubagentRoundCap;
+  TestMcpTurn;
 
   WriteLn;
   if Fails = 0 then

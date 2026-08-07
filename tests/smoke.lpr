@@ -444,7 +444,8 @@ begin
   { The caller owns the schema, so it is freed here rather than leaked. }
   Sch := ToolsSchema;
   try
-    Check(Sch.Count = 12, 'the schema exposes twelve tools');
+    Check(CountBuiltinTools(Sch) = BuiltinToolCount,
+      'the schema exposes every built-in tool');
     { A tool that exists in RunTool but not in the schema is one the model
       never learns about, and no other test would notice. }
     Tool := nil;
@@ -484,7 +485,8 @@ begin
 
   Sch := ToolsSchema;
   try
-    Check(Sch.Count = 12, 'the local schema is unchanged by web search');
+    Check(CountBuiltinTools(Sch) = BuiltinToolCount,
+      'the local schema is unchanged by web search');
   finally
     Sch.Free;
   end;
@@ -937,7 +939,8 @@ begin
 
   Sch := ToolsSchema;
   try
-    Check(Sch.Count = 12, 'the full schema is twelve tools');
+    Check(CountBuiltinTools(Sch) = BuiltinToolCount,
+      'the full schema is every built-in tool');
   finally
     Sch.Free;
   end;
@@ -1152,6 +1155,255 @@ var
 begin
   C := McpSpawn('mock', 'mock-command', '', '', [], Err);
   Result := (C >= 0) and McpHandshake(C, N, V, P, Err);
+end;
+
+{ ---------------------------------------------------- the tool registry -- }
+
+{ A stand-in source: two declarations and a handler that reports what it was
+  called with.  Everything about the registry that matters is visible from
+  outside - where the declarations land in the array, which names reach the
+  handler, and what happens when a handler misbehaves. }
+function OneStub(const Name: string): TJson;
+var
+  S: TJson;
+begin
+  S := TJson.NewObj;
+  S.AddStr('type', 'object');
+  Result := TJson.NewObj;
+  Result.AddStr('name', Name);
+  Result.AddStr('description', 'a stand-in');
+  Result.Add('input_schema', S);
+end;
+
+function StubDeclare: TJson;
+begin
+  Result := TJson.NewArr;
+  Result.Push(OneStub('stub__one'));
+  Result.Push(OneStub('stub__two'));
+end;
+
+function StubRun(const Name: string; Input: TJson; Ask: TAskProc;
+  out IsError: Boolean): string;
+begin
+  IsError := False;
+  if Name = 'stub__boom' then
+    raise Exception.Create('the handler exploded');
+  Result := 'stub ran ' + Name;
+end;
+
+function EmptyDeclare: TJson;
+begin
+  Result := TJson.NewArr;
+end;
+
+procedure TestToolRegistry;
+var
+  Sch: TJson;
+  Err, Out_: string;
+  IsErr, Ok: Boolean;
+  I, StubAt: Integer;
+begin
+  ClearToolSources;
+  Check(ToolSourceCount = 0, 'the registry starts empty once cleared');
+
+  Check(not RegisterToolSource('', @StubDeclare, @StubRun, Err),
+    'an empty prefix is refused');
+  Ok := RegisterToolSource('read_', @StubDeclare, @StubRun, Err);
+  Check((not Ok) and (Err <> ''),
+    'a prefix that could shadow read_file is refused: ' + Err);
+  Check(not RegisterToolSource('Stub__', @StubDeclare, @StubRun, Err),
+    'an upper-case prefix is refused');
+  Check(not RegisterToolSource('stub__', nil, @StubRun, Err),
+    'a source with no declare procedure is refused');
+
+  Ok := RegisterToolSource('stub__', @StubDeclare, @StubRun, Err);
+  Check(Ok and (Err = ''), 'a well-formed prefix registers');
+  Check(ToolSourceCount = 1, 'and the count says so');
+  Check(ToolSourcePrefix(0) = 'stub__', 'and the prefix round-trips');
+  Check(not RegisterToolSource('stub__', @StubDeclare, @StubRun, Err),
+    'the same prefix twice is refused');
+  Check(not RegisterToolSource('stub__x__', @StubDeclare, @StubRun, Err),
+    'and so is one that overlaps it, so dispatch cannot depend on order');
+
+  Sch := ToolsSchema;
+  try
+    Check(CountBuiltinTools(Sch) = BuiltinToolCount,
+      'the built-in count is untouched by a source');
+    Check(Sch.Count = BuiltinToolCount + 2,
+      Format('and the source added two declarations (%d)', [Sch.Count]));
+    StubAt := -1;
+    for I := 0 to Sch.Count - 1 do
+      if (Sch.Item(I).Str('name') = 'stub__one') and (StubAt < 0) then
+        StubAt := I;
+    { Order matters: the source loop sits below the read-only cut, so a source
+      declaration can only ever appear after every built-in. }
+    Check(StubAt = BuiltinToolCount,
+      Format('source declarations come after the built-ins (at %d)', [StubAt]));
+    Check(Sch.Item(Sch.Count - 1).Str('name') = 'stub__two',
+      'in the order the source produced them');
+  finally
+    Sch.Free;
+  end;
+
+  Out_ := Run('stub__one', TJson.NewObj, IsErr);
+  Check((not IsErr) and (Out_ = 'stub ran stub__one'),
+    'a prefixed name reaches the source: ' + Out_);
+  Out_ := Run('stub__never_declared', TJson.NewObj, IsErr);
+  Check(Out_ = 'stub ran stub__never_declared',
+    'dispatch is by prefix, not by what was declared');
+
+  { The one line that matters most: uAgent does not catch, so an exception
+    escaping a handler would skip the tool_result entirely. }
+  Out_ := Run('stub__boom', TJson.NewObj, IsErr);
+  Check(IsErr and (Pos('the handler exploded', Out_) > 0),
+    'a handler that raises becomes an error result, not an escape: ' + Out_);
+
+  Out_ := Run('other__thing', TJson.NewObj, IsErr);
+  Check(IsErr and (Out_ = 'unknown tool: other__thing'),
+    'a name no source claims is still unknown: ' + Out_);
+
+  { A subagent is never told about a source's tools, and never gets to call
+    one: the schema cut is an Exit, and IsSubagentTool holds the boundary. }
+  Check(EnterSubagent, 'claim the subagent slot');
+  try
+    Sch := ToolsSchema;
+    try
+      Check(Sch.Count = 3, 'a subagent still sees only the three read tools');
+      Check(Pos('stub__', Sch.ToJson) = 0,
+        'and is told about no source tool at all');
+    finally
+      Sch.Free;
+    end;
+    Out_ := Run('stub__one', TJson.NewObj, IsErr);
+    Check(IsErr and (Pos('not available to a subagent', Out_) > 0),
+      'and a source call is refused before any source is consulted: ' + Out_);
+  finally
+    LeaveSubagent;
+  end;
+
+  { A source that declares nothing must not disturb the array. }
+  ClearToolSources;
+  Ok := RegisterToolSource('none__', @EmptyDeclare, @StubRun, Err);
+  Check(Ok, 'an empty declarer registers');
+  Sch := ToolsSchema;
+  try
+    Check(Sch.Count = BuiltinToolCount,
+      'and contributes nothing to the schema');
+  finally
+    Sch.Free;
+  end;
+
+  ClearToolSources;
+  Out_ := Run('mcp__nope__x', TJson.NewObj, IsErr);
+  Check(IsErr and (Out_ = 'unknown tool: mcp__nope__x'),
+    'with no source registered even an mcp name is unknown: ' + Out_);
+  { Put MCP back: everything after this expects the shipped registration. }
+  RegisterMcpToolSource;
+  Check(ToolSourceCount = 1, 'and the MCP source is back');
+end;
+
+{ --------------------------------------------------- MCP approval storage -- }
+
+procedure TestMcpApprovals;
+var
+  H1, H2, H3, H4, P: string;
+  A1, A2: array of string;
+begin
+  SetLength(A1, 2);
+  A1[0] := '-y';
+  A1[1] := 'server-github';
+  SetLength(A2, 0);
+
+  H1 := McpCommandHash('npx', A1, A2);
+  Check(Length(H1) = 8, 'a command hash is eight hex digits: ' + H1);
+  A1[1] := 'server-gitlab';
+  H2 := McpCommandHash('npx', A1, A2);
+  Check(H1 <> H2, 'changing an argument changes the hash');
+  H3 := McpCommandHash('npm', A1, A2);
+  Check(H2 <> H3, 'changing the command changes the hash');
+
+  SetLength(A2, 2);
+  A2[0] := 'TOKEN';
+  A2[1] := 'HOST';
+  H3 := McpCommandHash('npx', A1, A2);
+  Check(H3 <> H2, 'adding an environment key changes the hash');
+  A2[0] := 'HOST';
+  A2[1] := 'TOKEN';
+  H4 := McpCommandHash('npx', A1, A2);
+  Check(H3 = H4, 'but the order two variables were written in does not');
+
+  { Expansion happens before hashing, so what the fingerprint covers is the
+    command line that will actually run. }
+  Check(McpExpandVars('${PASCLAUDE_NOT_SET_ANYWHERE:-fallback}') = 'fallback',
+    'an unset variable takes its default');
+  Check(McpExpandVars('${PASCLAUDE_NOT_SET_ANYWHERE}') = '',
+    'and an unset variable with no default is empty');
+  Check(McpExpandVars('a${PASCLAUDE_NOT_SET_ANYWHERE:-b}c') = 'abc',
+    'expansion happens in the middle of a string too');
+
+  { The trust store round-trips through the permissions file, and only ever
+    widens, exactly as the three boolean classes do. }
+  P := IncludeTrailingPathDelimiter(GetTempDir) + 'pasclaude-mcp-perms.json';
+  DeleteFile(P);
+  ClearTrust;
+  RecordTrust('mcp:github', H1);
+  RecordTrust('mcp-call:github', H1);
+  SavePermissions(P);
+  ClearTrust;
+  Check(TrustedFingerprint('mcp:github') = '', 'the wipe took the approvals');
+  LoadPermissions(P);
+  Check(TrustedFingerprint('mcp:github') = H1,
+    'the spawn approval survived the restart');
+  Check(TrustedFingerprint('mcp-call:github') = H1, 'and the per-call one');
+  Check(TrustedFingerprint('mcp:other') = '',
+    'and nothing was approved that was not written');
+
+  ClearTrust;
+  SavePermissions(P);            { the file now records nothing }
+  RecordTrust('mcp:github', H1); { and this session grants something }
+  LoadPermissions(P);
+  Check(TrustedFingerprint('mcp:github') = H1,
+    'loading an empty file never revokes a live grant');
+
+  { The fingerprint is the point: a changed command line is a new question. }
+  Check(TrustedFingerprint('mcp:github') <> H2,
+    'and a different command line does not match the recorded one');
+
+  DeleteFile(P);
+  ClearTrust;
+end;
+
+{ ------------------------------------------------------ the fourth class -- }
+
+procedure TestMcpPermissionClass;
+var
+  SavedEdits, SavedMcp: Boolean;
+begin
+  SavedEdits := uTools.AllowAllEdits;
+  SavedMcp := uTools.AllowAllMcp;
+  try
+    { The hole this guards: the edits class is the catch-all, so a class that
+      forgets to exclude itself from it inherits every /yolo edit approval. }
+    uTools.AllowAllEdits := True;
+    uTools.AllowAllMcp := False;
+    ClearTrust;
+    Check(not Permit('mcp__foo__x', 'detail', nil),
+      'an MCP call is not covered by a standing approval for edits');
+    Check(Permit('write_file', 'detail', nil),
+      'while a write still is');
+
+    uTools.AllowAllMcp := True;
+    Check(Permit('mcp__foo__x', 'detail', nil),
+      'and its own class approval does cover it');
+
+    uTools.AllowAllMcp := False;
+    uTools.AllowAllEdits := False;
+    Check(not Permit('mcp__foo__x', 'detail', nil),
+      'a nil Ask denies, as it does for every other class');
+  finally
+    uTools.AllowAllEdits := SavedEdits;
+    uTools.AllowAllMcp := SavedMcp;
+  end;
 end;
 
 procedure TestMcpScripted;
@@ -1505,6 +1757,9 @@ begin
   TestTodos;
   TestSubagentGate;
   TestPermissionPersistence;
+  TestToolRegistry;
+  TestMcpApprovals;
+  TestMcpPermissionClass;
   TestMcpScripted;
   TestMcpServerProcess;
   Schema := ToolsSchema;

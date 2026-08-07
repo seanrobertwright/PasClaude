@@ -10,7 +10,7 @@ program pasclaude;
 {$mode objfpc}{$H+}
 
 uses
-  SysUtils, Classes, DateUtils, uTerm, uJson, uHttp, uTools, uAgent;
+  SysUtils, Classes, DateUtils, uTerm, uJson, uHttp, uMcp, uTools, uAgent;
 
 const
   Version = '0.1';
@@ -199,8 +199,8 @@ end;
 { ------------------------------------------------------------- completion -- }
 
 const
-  SlashCommands: array[0..17] of string = (
-    '/help', '/clear', '/compact', '/diff', '/jobs', '/memory', '/init',
+  SlashCommands: array[0..18] of string = (
+    '/help', '/clear', '/compact', '/diff', '/jobs', '/mcp', '/memory', '/init',
     '/rewind', '/sessions', '/think', '/web',
     '/resume', '/save', '/cwd', '/model', '/yolo', '/cost', '/exit');
 
@@ -525,6 +525,7 @@ begin
   EmitCLn(clGrey,   '  /compact full  replace the transcript with a model-written summary');
   EmitCLn(clGrey,   '  /diff          list the files this session has changed');
   EmitCLn(clGrey,   '  /jobs          background commands still running');
+  EmitCLn(clGrey,   '  /mcp           MCP servers: status, restart, refresh');
   EmitCLn(clGrey,   '  /memory        show the project memory (CLAUDE.md)');
   EmitCLn(clGrey,   '  /init          have the model write a CLAUDE.md for this project');
   EmitCLn(clGrey,   '  /rewind        undo turns: conversation and edited files');
@@ -842,6 +843,99 @@ begin
   end;
 end;
 
+{ uTools' progress channel during startup.  Connecting several servers takes
+  seconds and happens before the banner, so it has to say what it is waiting
+  for; an empty line is a paragraph break, which is what the approval preamble
+  wants before the first prompt. }
+procedure McpNotice(const Text: string);
+begin
+  if Text = '' then EmitLn else EmitCLn(clGrey, '  ' + Text);
+end;
+
+{ Splits one tab-separated row of uTools.McpServerList. }
+function Field(const S: string; N: Integer): string;
+var
+  L: TStringList;
+begin
+  Result := '';
+  L := TStringList.Create;
+  try
+    L.Delimiter := #9;
+    L.StrictDelimiter := True;
+    L.DelimitedText := S;
+    if (N >= 0) and (N < L.Count) then Result := L[N];
+  finally
+    L.Free;
+  end;
+end;
+
+{ /mcp, /mcp restart <name>, /mcp refresh.  Every configured server is shown,
+  including the ones contributing nothing: a server dropped in silence reads
+  as a broken program, and the point of asking the user to approve a program
+  is that they can then see what became of it. }
+procedure ShowMcp(const Arg: string);
+var
+  Rows: TStringArray;
+  I: Integer;
+  Status, Err, Sub, Rest: string;
+  Col: TColor;
+  Sp: Integer;
+begin
+  Sp := Pos(' ', Arg);
+  if Sp > 0 then
+  begin
+    Sub := LowerCase(Copy(Arg, 1, Sp - 1));
+    Rest := Trim(Copy(Arg, Sp + 1, MaxInt));
+  end
+  else
+  begin
+    Sub := LowerCase(Arg);
+    Rest := '';
+  end;
+
+  if Sub = 'restart' then
+  begin
+    if uTools.McpRestart(Rest, Err) then
+      EmitCLn(clGrey, '  ' + Rest + ' will reconnect on its next call')
+    else
+      EmitCLn(clRed, '  ' + Err);
+    Exit;
+  end
+  else if Sub = 'refresh' then
+  begin
+    EmitCLn(clGrey, '  reconnecting...');
+    uTools.McpRefresh(Err);
+    if Err <> '' then EmitCLn(clYellow, '  ' + Err);
+    { The tool list the model was told about this session is deliberately not
+      replaced: the tools array renders ahead of the system prompt under one
+      cache breakpoint, so swapping it mid-session throws away the whole
+      prompt cache on every turn afterwards. }
+    EmitCLn(clGrey, '  the refreshed tool list applies to the next run');
+  end;
+
+  Rows := uTools.McpServerList;
+  if Length(Rows) = 0 then
+  begin
+    EmitCLn(clGrey, '  no MCP servers configured (.mcp.json in the session root)');
+    Exit;
+  end;
+  for I := 0 to High(Rows) do
+  begin
+    Status := Field(Rows[I], 1);
+    if Status = 'connected' then Col := clGreen
+    else if (Status = 'dead') or (Status = 'denied') or
+            (Status = 'failed to start') then Col := clRed
+    else Col := clGrey;
+    EmitC(clBright, '  ' + Field(Rows[I], 0) + '  ');
+    EmitC(Col, Status);
+    EmitCLn(clGrey, Format('  %s tools, %s skipped',
+      [Field(Rows[I], 2), Field(Rows[I], 3)]));
+    EmitCLn(clGrey, '      ' + Field(Rows[I], 4));
+    if Field(Rows[I], 5) <> '' then
+      EmitCLn(clGrey, '      ' + Field(Rows[I], 5));
+  end;
+end;
+
 { A bare /model lists what the key can actually use and takes a number.
   Typing a model id from memory is guesswork about a namespace that changes
   under you - the retired-default 404 was exactly that - so the list comes
@@ -1112,6 +1206,9 @@ begin
       that survived it would be a process the user has no name for and no
       way to stop short of Task Manager. }
     uTools.ClearJobs;
+    { MCP connections deliberately survive /clear, as the rewind snapshots and
+      the approved bash programs do: a running server is a capability this
+      session has, not something the conversation said. }
     { The saved copy has to go too.  Otherwise "cleared" means only "cleared
       until you resume", and a user who cleared something they did not want
       kept would find it again on the next run. }
@@ -1301,11 +1398,19 @@ begin
     else
       PickModel;
   end
+  else if Cmd = '/mcp' then
+    ShowMcp(Arg)
   else if Cmd = '/yolo' then
   begin
     uTools.AllowAllEdits := True;
     uTools.AllowAllBash := True;
     uTools.AllowAllFetch := True;
+    { The per-call MCP class only.  /yolo deliberately does not grant a server
+      permission to be spawned: that question was answered before this session
+      knew what .mcp.json contained, and "stop asking me about these tools" is
+      not the same sentence as "run whatever programs a cloned repository
+      names". }
+    uTools.AllowAllMcp := True;
     YoloSession := True;
     { Deliberately not persisted: /yolo is "I trust this session", and a
       standing file that quietly means "and every future one" is a wider
@@ -1394,6 +1499,7 @@ var
   PrintMode: Boolean = False;
   WebFlag: Boolean = False;
   Piped: string;
+  McpErr: string = '';
 
 begin
   TermInit;
@@ -1556,6 +1662,18 @@ begin
       { Standing approvals survive restarts.  Print mode skips this: a
         scripted run must not inherit interactive grants, nor write any. }
       LoadPermissions(PermissionsPath);
+
+      { After LoadPermissions, so an approval already given suppresses the
+        prompt, and after the print-mode Halt above, which is what makes a
+        scripted run structurally unable to be the thing that first executes a
+        repository's code - print mode never reaches here at all, and would
+        arrive with a nil Ask and deny everything if it did. }
+      if uTools.LoadMcpConfig(uTools.McpConfigPath, McpErr) then
+      begin
+        uTools.McpApproveAll(@AskPermission, @McpNotice);
+        uTools.McpConnectApproved(@McpNotice);
+      end;
+      if McpErr <> '' then EmitCLn(clYellow, '  ' + McpErr);
 
       ShowBanner;
 
@@ -1721,6 +1839,10 @@ begin
       while the console is still in a sane state.  uTools' finalization
       repeats this as the backstop for the paths that skip a finally. }
     uTools.ClearJobs;
+    { Same reasoning one unit down: an MCP server outliving the program that
+      launched it is a process the user did not start by hand and cannot name.
+      uMcp's finalization repeats this for the paths that skip a finally. }
+    uMcp.McpShutdownAll;
     TermDone;
   end;
 end.

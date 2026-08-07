@@ -962,6 +962,217 @@ end;
   ends in McpClose, which is also what keeps the run leak-free under -gh: a
   live child holding the stderr spool is both an unfreed handle and a file
   that cannot be deleted. }
+{ .mcp.json names programs a project wants run on this machine, so every
+  refusal here is the difference between "the user was asked about a program"
+  and "a program ran".  The template is TestAgentDefinitions above: a bare
+  name that becomes part of a path, filtered rather than resolved. }
+procedure TestMcpConfig;
+var
+  Path, Err: string;
+
+  procedure Config(const Body: string);
+  begin
+    WriteFileText(Path, Body);
+    LoadMcpConfig(Path, Err);
+  end;
+
+begin
+  uTools.RootDir := SessionDir;
+  ClearMcpServers;
+  ClearTrust;
+  Path := IncludeTrailingPathDelimiter(SessionDir) + '.mcp.json';
+
+  Config('{"mcpServers":{"../evil":{"command":"calc.exe"}}}');
+  Check(McpServerCount = 0, 'a server name that walks a path is refused');
+  Config('{"mcpServers":{"a\\b":{"command":"calc.exe"}}}');
+  Check(McpServerCount = 0, 'a name with a separator is refused');
+  Config('{"mcpServers":{"a.b":{"command":"calc.exe"}}}');
+  Check(McpServerCount = 0, 'a name with a dot is refused');
+  Config('{"mcpServers":{"a' + #7 + 'b":{"command":"calc.exe"}}}');
+  Check(McpServerCount = 0, 'a name with a control character is refused');
+  Check(Pos('not a bare name', Err) > 0, 'and the refusal is reported: ' + Err);
+
+  Config('{"mcpServers":{"ok":{"command":""}}}');
+  Check(McpServerCount = 0, 'a server with no command is refused');
+  Config('{"mcpServers":{"ok":{}}}');
+  Check(McpServerCount = 0, 'and so is one with no command at all');
+
+  { Unsupported is not the same as ignored: the entry is listed so the user
+    who wrote it learns why nothing happened. }
+  Config('{"mcpServers":{"remote":{"url":"https://example.com/mcp"}}}');
+  Check(McpServerCount = 1, 'a url entry is kept, not dropped');
+  Check(McpServerStatus('remote') = mcUnsupported,
+    'and reported as an unsupported transport');
+  Check(McpServerToolCount('remote') = 0, 'and contributes no tool');
+  Config('{"mcpServers":{"remote":{"type":"http","command":"x"}}}');
+  Check(McpServerStatus('remote') = mcUnsupported,
+    'a non-stdio type is unsupported too');
+
+  Config('{"mcpServers":{"a":{"command":"x"},"a":{"command":"y"}}}');
+  Check(McpServerCount = 1, 'a duplicate server name contributes once');
+
+  Config('not json at all');
+  Check((McpServerCount = 0) and (Err <> ''),
+    'unparseable config: no servers and a reason: ' + Err);
+  Config('{"servers":{"a":{"command":"x"}}}');
+  Check((McpServerCount = 0) and (Pos('mcpServers', Err) > 0),
+    'a config with no mcpServers object says so: ' + Err);
+
+  { A 5 MB .mcp.json is not a configuration. }
+  WriteFileText(Path, '{"mcpServers":{"a":{"command":"' +
+    StringOfChar('x', 5 * 1024 * 1024) + '"}}}');
+  LoadMcpConfig(Path, Err);
+  Check((McpServerCount = 0) and (Pos('not a configuration', Err) > 0),
+    'an absurdly large config is refused rather than loaded: ' + Err);
+
+  { Expansion happens before hashing, so an unset variable still yields a
+    server that can be offered - just with an empty argument. }
+  Config('{"mcpServers":{"e":{"command":"prog",' +
+    '"args":["${PASCLAUDE_UNSET_XYZ}","${PASCLAUDE_UNSET_XYZ:-def}"]}}}');
+  Check(McpServerCount = 1, 'a server with unset variables still loads');
+  Check(McpServerStatus('e') = mcPending, 'and waits for approval');
+
+  { Nothing is spawned without an answer, and nobody to ask is no. }
+  McpApproveAll(nil, nil);
+  Check(McpServerStatus('e') = mcDenied,
+    'a nil Ask denies rather than approves');
+  Check(McpConnectApproved(nil) = 0, 'and nothing is connected');
+  Check(McpConnectionCount = 0, 'and no process was created');
+
+  ClearMcpServers;
+  ClearTrust;
+  SysUtils.DeleteFile(Path);
+end;
+
+{ Everything a server says about its tools goes straight into our request
+  body, where one bad declaration breaks every turn rather than one call. }
+procedure TestMcpSchemaTrust;
+var
+  D: TJson;
+  CName, OName, DText, Why: string;
+  Ok: Boolean;
+  Long: string;
+
+  function Decl(const Body: string): TJson;
+  begin
+    Result := JsonParse(Body);
+  end;
+
+  procedure Refused(const Body, What: string);
+  var
+    J: TJson;
+    A, B, C, W: string;
+  begin
+    J := Decl(Body);
+    try
+      Check((J <> nil) and (not McpValidateTool(J, 'srv', A, B, C, W)) and
+            (W <> ''), What + ': ' + W);
+    finally
+      J.Free;
+    end;
+  end;
+
+begin
+  Refused('{"name":"t"}', 'a tool with no inputSchema is skipped');
+  Refused('{"name":"t","inputSchema":"a string"}',
+    'an inputSchema that is a string is skipped');
+  Refused('{"name":"t","inputSchema":[]}',
+    'an inputSchema that is an array is skipped');
+  Refused('{"name":"t","inputSchema":{"type":"array"}}',
+    'an inputSchema typed as something other than object is skipped');
+  Refused('{"name":"","inputSchema":{"type":"object"}}',
+    'a tool with no name is skipped');
+
+  { The API's ceiling is 64 characters, not 128.  mcp__ + srv + __ leaves 55,
+    so a 90-character tool name cannot be made to fit and is skipped rather
+    than mangled into a name nobody advertised. }
+  Refused('{"name":"' + StringOfChar('t', 90) +
+    '","inputSchema":{"type":"object"}}',
+    'a 90-character tool name is skipped');
+
+  { 200 levels of nesting, walked only 16 deep. }
+  Long := StringOfChar('[', 200) + StringOfChar(']', 200);
+  Refused('{"name":"t","inputSchema":{"type":"object","properties":' +
+    Long + '}}', 'a schema nested 200 deep is skipped');
+
+  Long := '';
+  while Length(Long) < 200000 do
+    Long := Long + '"p' + IntToStr(Length(Long)) + '":{"type":"string"},';
+  Refused('{"name":"t","inputSchema":{"type":"object","properties":{' +
+    Copy(Long, 1, Length(Long) - 1) + '}}}',
+    'a 200 KB schema is rejected, not truncated');
+
+  { A missing type is filled in rather than refused: it is the one defect a
+    server can have that costs nothing to correct. }
+  D := Decl('{"name":"go","description":"d","inputSchema":{"properties":{}}}');
+  try
+    Ok := McpValidateTool(D, 'srv', CName, OName, DText, Why);
+    Check(Ok, 'a schema with no type is accepted');
+    Check(CName = 'mcp__srv__go', 'and composed under the mcp namespace');
+    Check(OName = 'go', 'and remembers what the server calls it');
+    Check(Pos('"type":"object"', DText) > 0, 'with object filled in');
+    Check(Pos('annotations', DText) = 0, 'and annotations dropped');
+  finally
+    D.Free;
+  end;
+
+  { Untrusted metadata is dropped rather than forwarded. }
+  D := Decl('{"name":"go","title":"T","description":"d",' +
+    '"annotations":{"destructiveHint":false},"outputSchema":{"type":"object"},' +
+    '"inputSchema":{"type":"object"}}');
+  try
+    Ok := McpValidateTool(D, 'srv', CName, OName, DText, Why);
+    Check(Ok and (Pos('annotations', DText) = 0) and
+          (Pos('outputSchema', DText) = 0) and (Pos('"title"', DText) = 0),
+      'title, outputSchema and annotations never reach the model');
+  finally
+    D.Free;
+  end;
+
+  { A lone 0x80 is not valid UTF-8; the API rejects the whole request over
+    one such byte, so the declaration is repaired or dropped, never passed
+    through and never cut with Copy. }
+  D := Decl('{"name":"go","description":"a' + #$80 + 'b",' +
+    '"inputSchema":{"type":"object"}}');
+  try
+    Ok := McpValidateTool(D, 'srv', CName, OName, DText, Why);
+    Check((not Ok) or IsValidUtf8(DText),
+      'a description with a lone 0x80 never leaves as invalid UTF-8');
+  finally
+    D.Free;
+  end;
+
+  D := Decl('{"name":"go","description":"' + StringOfChar('d', 200000) +
+    '","inputSchema":{"type":"object"}}');
+  try
+    Ok := McpValidateTool(D, 'srv', CName, OName, DText, Why);
+    Check((not Ok) or (Length(DText) <= McpMaxSchemaBytes),
+      'and an enormous description never produces an oversized declaration');
+  finally
+    D.Free;
+  end;
+
+  { A 60-character server plus a 30-character tool cannot both fit.  The
+    server segment gives, because the tool segment is the name the server
+    advertised and the user will read in an approval prompt. }
+  CName := McpComposeName(StringOfChar('s', 60), StringOfChar('t', 30));
+  Check((CName <> '') and (Length(CName) <= McpMaxToolNameLen),
+    Format('a long pair composes within the ceiling (%d)', [Length(CName)]));
+  Check(Pos('__' + StringOfChar('t', 30), CName) > 0,
+    'with the tool segment intact and the server segment truncated');
+
+  { Two servers whose names differ only past the truncation point compose to
+    the same thing; the caller must skip the second, not emit a duplicate. }
+  Check(McpComposeName(StringOfChar('s', 60) + 'A', StringOfChar('t', 30)) =
+        McpComposeName(StringOfChar('s', 60) + 'B', StringOfChar('t', 30)),
+    'and truncation can genuinely collide, which is why duplicates are skipped');
+
+  Check(McpComposeName('a b/c', 'x') = 'mcp__a_b_c__x',
+    'characters outside the API name set become underscores');
+  Check(McpComposeName('srv', StringOfChar('t', 80)) = '',
+    'and a tool segment that cannot fit at all yields no name');
+end;
+
 procedure TestMcpHostileServer;
 var
   Exe, Dir, Err, N, V, P, Text: string;
@@ -1098,6 +1309,8 @@ begin
   TestBackgroundJobsHostile;
   TestHostileSearchResult;
   TestAgentDefinitions;
+  TestMcpConfig;
+  TestMcpSchemaTrust;
   TestMcpHostileServer;
 
   WriteLn;

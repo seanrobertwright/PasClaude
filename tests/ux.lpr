@@ -2098,6 +2098,86 @@ end;
 
 { ------------------------------------------------------------------- main -- }
 
+{ /mcp is the only place a user can see what became of a program a project
+  asked to run, so the panel has to account for every configured server -
+  including the ones that contribute nothing.  A server that vanished from
+  the list would look like a feature that does not work rather than like a
+  decision somebody made. }
+procedure TestMcpPanel;
+var
+  Rows: TStringArray;
+  Path, Err, All: string;
+
+  function Row(const Name: string): string;
+  var
+    K: Integer;
+  begin
+    Result := '';
+    for K := 0 to High(Rows) do
+      if Copy(Rows[K], 1, Length(Name) + 1) = Name + #9 then Result := Rows[K];
+  end;
+
+begin
+  Path := IncludeTrailingPathDelimiter(TmpRoot) + '.mcp.json';
+  uTools.ClearMcpServers;
+  uTools.ClearTrust;
+  WriteFileText(Path,
+    '{"mcpServers":{' +
+    '"remote":{"url":"https://example.com/mcp"},' +
+    '"local":{"command":"' + StringOfChar('c', 4000) + '"}}}');
+  uTools.LoadMcpConfig(uTools.McpConfigPath, Err);
+
+  Rows := uTools.McpServerList;
+  Check(Length(Rows) = 2, Format('every configured server gets a line (%d)',
+    [Length(Rows)]));
+  Check(Pos('stdio only', Row('remote')) > 0,
+    'an unsupported transport is reported, not silently dropped: ' +
+    Row('remote'));
+  Check(Pos('pending approval', Row('local')) > 0,
+    'and a server nobody has answered for yet says so');
+  { The whole row, not just the command column: a 4000-character command line
+    that wrapped would push everything else off the screen. }
+  Check(Length(Row('local')) < 200,
+    Format('an absurd command line is elided rather than wrapped (%d)',
+      [Length(Row('local'))]));
+
+  { Skip counts are part of the line, so a server contributing three of forty
+    tools cannot look correct. }
+  All := Row('local');
+  Check(Length(All) - Length(StringReplace(All, #9, '', [rfReplaceAll])) = 5,
+    'each line carries name, status, tools, skipped, command and note');
+
+  { Nobody to ask is no, and the panel says which. }
+  uTools.McpApproveAll(nil, nil);
+  Rows := uTools.McpServerList;
+  Check(Pos('denied', Row('local')) > 0,
+    'a denied server is shown as denied: ' + Row('local'));
+  Check(Pos('stdio only', Row('remote')) > 0,
+    'and an unsupported one is not re-labelled by the approval pass');
+
+  Check(not uTools.McpRestart('nosuchserver', Err),
+    'restarting a server that does not exist fails');
+  Check(Pos('no such server', Err) > 0,
+    'and says so rather than silently succeeding: ' + Err);
+  Check(uTools.McpRestart('local', Err), 'restarting a known one succeeds');
+
+  { The command line the user reads must be the expanded one, since that is
+    what a fingerprint covers and what would actually run. }
+  uTools.ClearMcpServers;
+  WriteFileText(Path,
+    '{"mcpServers":{"e":{"command":"prog","args":["${PASCLAUDE_UX_UNSET:-shown}"]}}}');
+  uTools.LoadMcpConfig(uTools.McpConfigPath, Err);
+  Rows := uTools.McpServerList;
+  Check(Pos('shown', Row('e')) > 0,
+    'the panel shows the expanded command line: ' + Row('e'));
+
+  uTools.ClearMcpServers;
+  uTools.ClearTrust;
+  Rows := uTools.McpServerList;
+  Check(Length(Rows) = 0, 'and clearing leaves nothing behind');
+  DeleteFile(Path);
+end;
+
 procedure Cleanup(const Dir: string);
 var
   R: TSearchRec;
@@ -2143,10 +2223,14 @@ begin
     TestVt;
     TestRewind;
     TestJobList;
+    TestMcpPanel;
   finally
     { Before the cleanup, not after: a live child holding a spool handle under
       TmpRoot would make the recursive delete fail. }
     uTools.ClearJobs;
+    { And the MCP connections, for exactly the same reason: a live server
+      holding its stderr spool under TmpRoot blocks the delete. }
+    uTools.ClearMcpServers;
     uTools.RootDir := '';
     Cleanup(TmpRoot);
   end;

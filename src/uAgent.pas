@@ -252,7 +252,7 @@ var
 
 implementation
 
-uses SysUtils, Classes, uHttp;
+uses SysUtils, Classes, uHttp, uMcp;
 
 var
   { The agent whose tool call is currently running, so a nested agent spawned
@@ -2001,10 +2001,23 @@ begin
   end;
 end;
 
+{ Whether the user has asked for the current turn to stop, asked from outside
+  any agent.  ActiveAgent is set around every tool call, so during an MCP wait
+  it is exactly the agent whose call is being waited on. }
+function CancelDuringTool: Boolean;
+begin
+  Result := ForceCancel or (Assigned(ActiveAgent) and ActiveAgent.WantsCancel);
+end;
+
 initialization
   { The ladder crossing: uTools declares the hole because it is the unit that
     needs a way to run one, and the unit that knows what an agent is fills it.
     The same shape uHttp uses for the network transport. }
   uTools.SubagentRunner := @RunSubagent;
+  { The same shape again, one rung further down.  Polish, not safety: uMcp's
+    deadline is what guarantees a hung server cannot hang pasclaude, and this
+    only lets Escape cut a sixty-second call short rather than waiting it
+    out. }
+  uMcp.McpShouldCancel := @CancelDuringTool;
 
 end.

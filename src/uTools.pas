@@ -26,6 +26,30 @@ type
   TSubagentProc = function(const Prompt, SystemExtra: string;
     out Reply, Err: string): Boolean;
 
+  { ---- the dynamic tool registry ----
+    A tool source contributes declarations and executes the calls that land on
+    them.  Declare returns a freshly built array which the caller owns
+    entirely, elements included; Run has exactly the ladder's own contract -
+    the result text, IsError set on every failure path, and no exception.
+    That last clause is enforced here rather than trusted, because uAgent's
+    tool loop does not catch: an exception escaping a handler would skip the
+    tool_result the API requires and leave a transcript that cannot be sent. }
+  TToolDeclareProc = function: TJson;
+  TToolRunProc = function(const Name: string; Input: TJson; Ask: TAskProc;
+    out IsError: Boolean): string;
+
+  { What a configured MCP server is doing.  Every one of these is rendered by
+    /mcp, including the ones that contribute nothing: a server silently
+    dropped reads as a broken program, and the whole point of asking the user
+    to approve a program is that they can see what happened to it. }
+  TMcpStatus = (mcPending, mcDenied, mcUnsupported, mcCached, mcConnected,
+                mcDead, mcFailed);
+
+  { The host's one-line progress channel, so this unit can say "connecting
+    foo" during a startup that takes seconds without knowing what a console
+    is.  Nil is silence, not an error. }
+  TMcpNoticeProc = procedure(const Text: string);
+
 var
   { Session root; every path argument is resolved relative to it. }
   RootDir: string = '';
@@ -33,6 +57,11 @@ var
   AllowAllEdits: Boolean = False;
   AllowAllBash: Boolean = False;
   AllowAllFetch: Boolean = False;
+  { The fourth approval class, and the only one that is never persisted: it is
+    set by /yolo alone.  A per-server "always" is recorded against the exact
+    command line instead, which is the same reasoning that makes an "always"
+    for bash approve a program rather than a command line. }
+  AllowAllMcp: Boolean = False;
   { Filled in by uAgent's initialization.  Nil means this build cannot run a
     subagent at all: the task tool is then not advertised and, if the model
     names it anyway, it reports a plain error.  Deny-by-default applied to a
@@ -61,8 +90,68 @@ const
     which is why it lives here beside the depth cap rather than there. }
   SubagentMaxRounds = 12;
 
+  { How many tool sources may be registered.  Small on purpose: the list is
+    scanned per tool call and per schema build, and eight is already more
+    extension points than this program has features. }
+  MaxToolSources = 8;
+
+  { The tools compiled into this program, counted so no test file has to
+    carry the number.  Every one of them is declared when a subagent runner
+    is installed; without one, task is absent and the count is one lower. }
+  BuiltinToolCount = 12;
+
+  { The one namespace MCP tools live in.  No built-in name contains a double
+    underscore and none ever may - that is what makes it impossible for a
+    server to shadow read_file, without a check against a list of built-ins
+    that would need updating every time a thirteenth tool lands. }
+  McpNamePrefix = 'mcp__';
+
+  { The API's own ceiling on a tool name: ^[a-zA-Z0-9_-]{1,64}$.  Load-bearing
+    for namespacing, because mcp__ + server + __ + tool overruns it easily. }
+  McpMaxToolNameLen = 64;
+
+  { One tool's whole declaration.  Rejected, never truncated: a cut schema is
+    a lie the model will act on, and it would act on it every turn. }
+  McpMaxSchemaBytes = 8192;
+  { How deeply a schema may nest before we stop believing in it. }
+  McpMaxSchemaDepth = 16;
+  { Per server, so one enthusiastic server cannot crowd out the rest. }
+  McpMaxTools = 64;
+  { The budget for MCP declarations across ALL servers, not per server: this
+    text lands in the cached request prefix ahead of the system prompt, so a
+    per-server cap would be unbounded in aggregate exactly where it matters. }
+  McpMaxDeclBytes = 32768;
+  { A description is the one field with no structural limit of its own. }
+  McpMaxDescBytes = 4096;
+  { .mcp.json is a small hand-written file.  A megabyte of it is not a
+    configuration, it is something else wearing the name. }
+  McpMaxConfigBytes = 1024 * 1024;
+
 { The tool list, as the API expects it under "tools". }
 function ToolsSchema: TJson;
+
+{ How many of Arr's declarations are built-in - that is, are not contributed
+  by a registered tool source.  The suites assert against BuiltinToolCount
+  through this, so configuring an MCP server can never move a number that
+  lives in a test file. }
+function CountBuiltinTools(Arr: TJson): Integer;
+
+{ Registers a source under Prefix, which must match ^[a-z][a-z0-9_]*__$ .
+  False with Err set when the shape is wrong, when the prefix duplicates or
+  overlaps an existing one - so at most one source can ever match a name and
+  dispatch does not depend on registration order - or when the table is full.
+  Called from a higher unit's initialization or from host startup, the way
+  SubagentRunner is filled. }
+function RegisterToolSource(const Prefix: string; Declare: TToolDeclareProc;
+  Run: TToolRunProc; out Err: string): Boolean;
+{ Test seam: forget every source.  A suite that calls this and wants MCP tools
+  afterwards has to call RegisterMcpToolSource again. }
+procedure ClearToolSources;
+function ToolSourceCount: Integer;
+function ToolSourcePrefix(I: Integer): string;
+{ Puts the MCP source back after ClearToolSources; also what initialization
+  calls, so there is one definition of what MCP registers as. }
+procedure RegisterMcpToolSource;
 
 { The web search declaration.  Declaration only: the API executes this tool
   on its own servers, so there is no RunTool branch, no DescribeTool arm and
@@ -75,6 +164,13 @@ function WebSearchToolDef: TJson;
   needing permission. }
 function RunTool(const Name: string; Input: TJson; Ask: TAskProc;
   out IsError: Boolean): string;
+
+{ The class gate itself: asks the user about Name unless a standing approval
+  for its class already covers it.  Exposed because the classes are the part
+  of this program most worth pinning from outside - the failure it guards
+  against is a new class silently inheriting the edits catch-all, and that is
+  invisible to every test that goes through a tool. }
+function Permit(const Name, Detail: string; Ask: TAskProc): Boolean;
 
 { A one-line description used in the transcript and in permission prompts. }
 function DescribeTool(const Name: string; Input: TJson): string;
@@ -230,9 +326,112 @@ procedure LoadPermissions(const Path: string);
   session works identically, approvals just will not persist. }
 procedure SavePermissions(const Path: string);
 
+{ ---- the trust store ----
+  One object in permissions.json, key = what was approved, value = a
+  fingerprint of exactly what it was approved as.  A boolean would say "this
+  project's config is trusted" forever; a fingerprint says "these bytes are",
+  and the moment they change the question is asked again.  Same idea as an
+  "always" for bash recording the program rather than the command line.
+  Keys in use: 'mcp:<server>' for permission to run the program at all, and
+  'mcp-call:<server>' for a standing yes to its tool calls. }
+function TrustedFingerprint(const Key: string): string;   { '' when absent }
+procedure RecordTrust(const Key, Fingerprint: string);
+procedure ClearTrust;                                     { test seam }
+
+{ ---- MCP servers ----
+  A project's .mcp.json names programs to run.  That is the one genuinely new
+  risk in this feature: cloning a repository and starting pasclaude in it
+  would otherwise execute code its author chose.  So the file is read, the
+  expanded command lines are shown, and nothing is spawned until the user has
+  said yes to each one - once per exact command line, not once per name,
+  because the name is a label the same file controls. }
+
+{ <root>\.mcp.json.  The one config this program reads through the ordinary
+  path guard rather than around it: it genuinely is a project file, it is
+  meant to be committed and shared, and the tools can see and edit it.  That
+  is accepted rather than worked around - the gate is the spawn prompt, not
+  the file being hidden, and config is read once at startup so a mid-session
+  rewrite changes nothing until the next launch, where the changed command
+  line has no matching fingerprint and is asked about by name. }
+function McpConfigPath: string;
+
+{ Replaces the server table with what Path declares.  False when there is
+  nothing usable; Err is set only for a real problem, so a missing file is a
+  quiet False.  ${VAR} and ${VAR:-default} are expanded before the command
+  line is hashed, so what the fingerprint covers is what will actually run. }
+function LoadMcpConfig(const Path: string; out Err: string): Boolean;
+
+{ The spawn gate.  Asks once per server whose fingerprint is not already
+  recorded; a nil Ask denies everything and spawns nothing, which is what
+  makes print mode structurally unable to be the thing that first runs a
+  repository's code. }
+procedure McpApproveAll(Ask: TAskProc; Notice: TMcpNoticeProc);
+
+{ Connects the approved servers that have no cached tool list and returns how
+  many came up.  Sequential and bounded per server; a cached server is not
+  spawned at all and connects on its first actual call. }
+function McpConnectApproved(Notice: TMcpNoticeProc): Integer;
+
+{ The registered source's two halves. }
+function McpDeclare: TJson;
+function McpRun(const Name: string; Input: TJson; Ask: TAskProc;
+  out IsError: Boolean): string;
+
+{ One line per configured server for /mcp, tab-separated:
+  name, status, tools, skipped, command, note.  Same shape as
+  BackgroundJobList, and for the same reason: a program started on the user's
+  behalf has to be visible without asking the model about it. }
+function McpServerList: TStringArray;
+function McpServerCount: Integer;                  { test seam }
+function McpServerStatus(const Name: string): TMcpStatus;
+function McpServerToolCount(const Name: string): Integer;
+function McpStatusWord(S: TMcpStatus): string;
+
+{ Drops one server's connection so its next call reconnects.  False when the
+  name is unknown - a restart that silently succeeds on a typo is worse than
+  one that fails. }
+function McpRestart(const Name: string; out Err: string): Boolean;
+{ Reconnects everything approved and rewrites the discovery cache.  The tool
+  list the model was told about is NOT changed: the tools array renders ahead
+  of the system prompt under one cache breakpoint, so a mid-session change
+  throws the whole prompt cache away every turn it happens. }
+function McpRefresh(out Err: string): Boolean;
+{ Test seam: closes every connection and forgets every server.  A suite must
+  call this before deleting its temporary directory, for the same reason it
+  must call ClearJobs first - a live child holding the stderr spool makes the
+  delete fail. }
+procedure ClearMcpServers;
+
+{ ---- name composition and validation, public so the tests can drive them -- }
+
+{ mcp__<server>__<tool>, sanitized and length-checked.  '' when it cannot be
+  made to fit, which skips the tool: a name we invented cannot be referenced
+  by the user in an approval and reads to the model as a broken machine. }
+function McpComposeName(const Server, Tool: string): string;
+function McpSanitizeSegment(const S: string): string;
+{ True when Decl can be forwarded to the API.  DeclText is the validated
+  declaration, ready to re-parse; Why says what was wrong when it cannot. }
+function McpValidateTool(Decl: TJson; const Server: string;
+  out ComposedName, OrigName, DeclText, Why: string): Boolean;
+function McpExpandVars(const S: string): string;
+
+{ ---- approvals ---- }
+
+{ 8 hex digits over the expanded command line, its arguments and the sorted
+  names of its environment overrides.  Sorted keys, because the order two
+  variables appear in a JSON object says nothing about what will run; the
+  arguments are not sorted, because their order is exactly what runs. }
+function McpCommandHash(const Cmd: string;
+  const Args, EnvKeys: array of string): string;
+{ True when this MCP tool's server has a standing per-call approval whose
+  fingerprint still matches its current command line. }
+function McpCallApproved(const ToolName: string): Boolean;
+{ Records one, keyed to the live command line. }
+procedure AllowMcpServer(const ToolName: string);
+
 implementation
 
-uses Classes, Process, Windows, uHttp, uRegex, uNotebook;
+uses Classes, Process, Windows, uHttp, uRegex, uNotebook, uMcp;
 
 const
   MaxReadBytes = 400 * 1024;   { keeps a stray huge file out of the context }
@@ -1591,6 +1790,179 @@ begin
   SetLength(BashPrefixes, 0);
 end;
 
+{ ------------------------------------------------------- the tool registry -- }
+
+type
+  TToolSource = record
+    Prefix: string;
+    Declare: TToolDeclareProc;
+    Run: TToolRunProc;
+  end;
+
+var
+  ToolSources: array of TToolSource;
+
+{ ^[a-z][a-z0-9_]*__$ .  The trailing double underscore is the whole point:
+  it is a structural invariant rather than a check against the list of
+  built-in names, so it does not have to be revisited when a thirteenth
+  built-in lands, and no source can ever shadow one. }
+function ValidSourcePrefix(const P: string): Boolean;
+var
+  I: Integer;
+begin
+  Result := False;
+  if Length(P) < 3 then Exit;
+  if Copy(P, Length(P) - 1, 2) <> '__' then Exit;
+  if not (P[1] in ['a'..'z']) then Exit;
+  for I := 1 to Length(P) do
+    if not (P[I] in ['a'..'z', '0'..'9', '_']) then Exit;
+  Result := True;
+end;
+
+function RegisterToolSource(const Prefix: string; Declare: TToolDeclareProc;
+  Run: TToolRunProc; out Err: string): Boolean;
+var
+  I: Integer;
+begin
+  Err := '';
+  Result := False;
+  if not ValidSourcePrefix(Prefix) then
+  begin
+    Err := 'a tool source prefix must match ^[a-z][a-z0-9_]*__$ : ' + Prefix;
+    Exit;
+  end;
+  if (Declare = nil) or (Run = nil) then
+  begin
+    Err := 'a tool source needs both a declare and a run procedure';
+    Exit;
+  end;
+  if Length(ToolSources) >= MaxToolSources then
+  begin
+    Err := 'no room for another tool source';
+    Exit;
+  end;
+  { Overlap either way, not just equality: if one prefix could be the start of
+    another, two sources could match one name and dispatch would depend on
+    registration order.  Refusing the overlap is what makes the scan below
+    order-independent. }
+  for I := 0 to High(ToolSources) do
+    if (Copy(Prefix, 1, Length(ToolSources[I].Prefix)) = ToolSources[I].Prefix) or
+       (Copy(ToolSources[I].Prefix, 1, Length(Prefix)) = Prefix) then
+    begin
+      Err := 'tool source prefix overlaps ' + ToolSources[I].Prefix + ': ' + Prefix;
+      Exit;
+    end;
+  SetLength(ToolSources, Length(ToolSources) + 1);
+  ToolSources[High(ToolSources)].Prefix := Prefix;
+  ToolSources[High(ToolSources)].Declare := Declare;
+  ToolSources[High(ToolSources)].Run := Run;
+  Result := True;
+end;
+
+procedure ClearToolSources;
+begin
+  SetLength(ToolSources, 0);
+end;
+
+function ToolSourceCount: Integer;
+begin
+  Result := Length(ToolSources);
+end;
+
+function ToolSourcePrefix(I: Integer): string;
+begin
+  if (I < 0) or (I > High(ToolSources)) then Exit('');
+  Result := ToolSources[I].Prefix;
+end;
+
+{ Finds the one source that owns Name and runs it.  The try/except is the
+  single most important line in the registry: uAgent's tool loop does not
+  catch, so an exception escaping a third-party handler would skip the
+  tool_result and leave a transcript the API refuses. }
+function DispatchToolSource(const Name: string; Input: TJson; Ask: TAskProc;
+  out IsError: Boolean; out Output: string): Boolean;
+var
+  I: Integer;
+begin
+  Result := False;
+  IsError := False;
+  Output := '';
+  for I := 0 to High(ToolSources) do
+    if Copy(Name, 1, Length(ToolSources[I].Prefix)) = ToolSources[I].Prefix then
+    begin
+      Result := True;
+      try
+        Output := ToolSources[I].Run(Name, Input, Ask, IsError);
+      except
+        on E: Exception do
+        begin
+          IsError := True;
+          Output := 'tool source failed: ' + E.Message;
+        end;
+      end;
+      Exit;
+    end;
+end;
+
+function CountBuiltinTools(Arr: TJson): Integer;
+var
+  I, J: Integer;
+  N: string;
+  FromSource: Boolean;
+begin
+  Result := 0;
+  if (Arr = nil) or (Arr.Kind <> jkArr) then Exit;
+  for I := 0 to Arr.Count - 1 do
+  begin
+    N := Arr.Item(I).Str('name');
+    FromSource := False;
+    for J := 0 to High(ToolSources) do
+      if Copy(N, 1, Length(ToolSources[J].Prefix)) = ToolSources[J].Prefix then
+        FromSource := True;
+    if not FromSource then Inc(Result);
+  end;
+end;
+
+{ --------------------------------------------------------- the trust store -- }
+
+type
+  TTrustEntry = record
+    Key, Fingerprint: string;
+  end;
+
+var
+  Trusted: array of TTrustEntry;
+
+function TrustedFingerprint(const Key: string): string;
+var
+  I: Integer;
+begin
+  Result := '';
+  for I := 0 to High(Trusted) do
+    if Trusted[I].Key = Key then Exit(Trusted[I].Fingerprint);
+end;
+
+procedure RecordTrust(const Key, Fingerprint: string);
+var
+  I: Integer;
+begin
+  if (Key = '') or (Fingerprint = '') then Exit;
+  for I := 0 to High(Trusted) do
+    if Trusted[I].Key = Key then
+    begin
+      Trusted[I].Fingerprint := Fingerprint;
+      Exit;
+    end;
+  SetLength(Trusted, Length(Trusted) + 1);
+  Trusted[High(Trusted)].Key := Key;
+  Trusted[High(Trusted)].Fingerprint := Fingerprint;
+end;
+
+procedure ClearTrust;
+begin
+  SetLength(Trusted, 0);
+end;
+
 { ---------------------------------------------------------- changed files -- }
 
 var
@@ -1900,9 +2272,15 @@ end;
 { ------------------------------------------------- permission persistence -- }
 
 { The file is JSON: {"allow_edits":bool,"allow_bash":bool,"allow_fetch":bool,
-  "bash_programs":["git","build",...]}.  Deliberately not the transcript
-  format and deliberately tiny - it is user-editable state, and someone
-  deleting a line from it must be able to predict what that does. }
+  "bash_programs":["git","build",...],"trusted":{"mcp:github":"3f9a1c04"}}.
+  Deliberately not the transcript format and deliberately tiny - it is
+  user-editable state, and someone deleting a line from it must be able to
+  predict what that does.  Deleting a "trusted" entry means being asked about
+  that program again, which is the most useful thing a line in a permissions
+  file can mean.
+
+  AllowAllMcp is deliberately absent: it is set only by /yolo, and /yolo is
+  never saved at all. }
 procedure LoadPermissions(const Path: string);
 var
   F: TFileStream;
@@ -1934,6 +2312,12 @@ begin
     if (Progs <> nil) and (Progs.Kind = jkArr) then
       for I := 0 to Progs.Count - 1 do
         AllowBashPrefix(Progs.Item(I).AsString);
+    { Same only-widen rule: a fingerprint on disk can add a standing yes but
+      an absent one cannot take back a yes given this session. }
+    Progs := Root.Find('trusted');
+    if (Progs <> nil) and (Progs.Kind = jkObj) then
+      for I := 0 to Progs.Count - 1 do
+        RecordTrust(Progs.Key(I), Progs.Item(I).AsString);
   finally
     Root.Free;
   end;
@@ -1955,6 +2339,10 @@ begin
     for I := 0 to High(BashPrefixes) do
       Progs.Push(TJson.NewStr(BashPrefixes[I]));
     Root.Add('bash_programs', Progs);
+    Progs := TJson.NewObj;
+    for I := 0 to High(Trusted) do
+      Progs.AddStr(Trusted[I].Key, Trusted[I].Fingerprint);
+    Root.Add('trusted', Progs);
     Text := Root.ToJson;
   finally
     Root.Free;
@@ -2029,7 +2417,8 @@ end;
 
 function ToolsSchema: TJson;
 var
-  P: TJson;
+  P, Decl: TJson;
+  I, J: Integer;
 begin
   Result := TJson.NewArr;
 
@@ -2203,6 +2592,31 @@ begin
       'reading - "which unit owns X", "where is Y configured". It cannot ' +
       'change anything, run commands, or start a subagent of its own.',
       P, ['prompt']));
+  end;
+
+  { Registered sources last, and below the read-only cut above rather than
+    guarded by a check of their own: the cut is an Exit, so nothing written
+    after it can ever run inside a subagent, whoever writes it.  A tool that
+    came from outside this program is therefore invisible to a subagent by
+    construction.
+
+    Take rather than Item: Push adopts what it is given, so reading a child out
+    and pushing it would leave two owners and -gh would find the second free.
+    Take detaches by substituting a null in place, which is why this walks the
+    indices once rather than repeatedly taking index 0 - the array does not
+    shrink, and a "while Count > 0" would never end.  Freeing the wrapper
+    disposes of the nulls left behind. }
+  for I := 0 to High(ToolSources) do
+  begin
+    Decl := ToolSources[I].Declare();
+    if Decl = nil then Continue;
+    try
+      if Decl.Kind = jkArr then
+        for J := 0 to Decl.Count - 1 do
+          Result.Push(Decl.Take(J));
+    finally
+      Decl.Free;
+    end;
   end;
 end;
 
@@ -2418,17 +2832,29 @@ begin
   Result := True;
 end;
 
-{ Asks the user, honouring any standing "always" answer for this tool class. }
 function Permit(const Name, Detail: string; Ask: TAskProc): Boolean;
 var
-  IsBash, IsFetch: Boolean;
+  IsBash, IsFetch, IsMcp: Boolean;
   A: TPermission;
 begin
   IsBash := Name = 'bash';
   IsFetch := Name = 'fetch';
+  IsMcp := Copy(Name, 1, Length(McpNamePrefix)) = McpNamePrefix;
+
   if IsBash and AllowAllBash then Exit(True);
   if IsFetch and AllowAllFetch then Exit(True);
-  if (not IsBash) and (not IsFetch) and AllowAllEdits then Exit(True);
+  if IsMcp and AllowAllMcp then Exit(True);
+  { The edits class is the catch-all, so every new class has to be excluded
+    here as well as tested above.  A class that forgets this line silently
+    inherits AllowAllEdits, which is the same /yolo hole the subagent comment
+    in RunTool warns about: an approval the user gave for file edits would
+    quietly cover running a third-party program's tools. }
+  if (not IsBash) and (not IsFetch) and (not IsMcp) and AllowAllEdits then
+    Exit(True);
+
+  { A standing yes recorded against the server's actual command line. }
+  if IsMcp and McpCallApproved(Name) then Exit(True);
+
   if Ask = nil then Exit(False);
 
   A := Ask(Name, Detail);
@@ -2438,6 +2864,9 @@ begin
       begin
         if IsBash then AllowAllBash := True
         else if IsFetch then AllowAllFetch := True
+        { Per server, not a blanket flag, and keyed to the command line - the
+          same shape as AllowBashPrefix recording a program. }
+        else if IsMcp then AllowMcpServer(Name)
         else AllowAllEdits := True;
         Result := True;
       end;
@@ -2562,6 +2991,1034 @@ begin
       Detail := Detail + #10 + Preview;
   end;
   Result := Permit(Name, Detail, Ask);
+end;
+
+{ -------------------------------------------------------- MCP servers -- }
+
+{ The policy half of MCP: which programs a project may run, what their tools
+  are called here, what of their output we are willing to forward, and who
+  said yes.  The wire itself is uMcp's, which knows none of this. }
+
+type
+  TMcpToolRec = record
+    Name: string;   { the composed mcp__server__tool the model sees }
+    Orig: string;   { what the server calls it, which is what we send back }
+    Decl: string;   { the validated declaration, as text }
+  end;
+
+  TMcpServerRec = record
+    Name, Command, Hash, WorkDir, Transport: string;
+    Note, LastErr, ErrLog: string;
+    EnvPairs: array of string;
+    TimeoutMs: Integer;
+    Status: TMcpStatus;
+    Approved: Boolean;
+    Conn: Integer;
+    Skipped: Integer;
+    Tools: array of TMcpToolRec;
+  end;
+
+var
+  McpServers: array of TMcpServerRec;
+  { Set by McpDeclare, not incremented by it: the declaration list is rebuilt
+    on every request, so a counter would climb with the turn number rather
+    than describe the configuration. }
+  McpBudgetDropped: Integer = 0;
+
+function McpConfigPath: string;
+begin
+  Result := IncludeTrailingPathDelimiter(NormalizeRoot) + '.mcp.json';
+end;
+
+{ Both of these are under the state directory and therefore both bypass
+  SafePath, which refuses everything there by design.  The substitute guard is
+  the one AgentsDir uses: the only part that comes from the file is a bare
+  name filtered for the path-bearing characters, so the directory part is
+  constructed and cannot be walked out of. }
+function McpDir: string;
+begin
+  Result := IncludeTrailingPathDelimiter(NormalizeRoot) + StateDirName +
+    PathDelim + 'mcp' + PathDelim;
+end;
+
+function McpCachePath: string;
+begin
+  Result := IncludeTrailingPathDelimiter(NormalizeRoot) + StateDirName +
+    PathDelim + 'mcp-cache.json';
+end;
+
+function McpFind(const Name: string): Integer;
+var
+  I: Integer;
+begin
+  Result := -1;
+  for I := 0 to High(McpServers) do
+    if CompareText(McpServers[I].Name, Name) = 0 then Exit(I);
+end;
+
+function McpServerCount: Integer;
+begin
+  Result := Length(McpServers);
+end;
+
+function McpServerStatus(const Name: string): TMcpStatus;
+var
+  I: Integer;
+begin
+  I := McpFind(Name);
+  if I < 0 then Exit(mcFailed);
+  Result := McpServers[I].Status;
+end;
+
+function McpServerToolCount(const Name: string): Integer;
+var
+  I: Integer;
+begin
+  I := McpFind(Name);
+  if I < 0 then Exit(0);
+  Result := Length(McpServers[I].Tools);
+end;
+
+function McpStatusWord(S: TMcpStatus): string;
+begin
+  case S of
+    mcPending:     Result := 'pending approval';
+    mcDenied:      Result := 'denied';
+    mcUnsupported: Result := 'unsupported transport (stdio only)';
+    mcCached:      Result := 'cached, connects on first use';
+    mcConnected:   Result := 'connected';
+    mcDead:        Result := 'dead';
+  else
+    Result := 'failed to start';
+  end;
+end;
+
+procedure ClearMcpServers;
+var
+  I: Integer;
+begin
+  for I := 0 to High(McpServers) do
+    if McpServers[I].Conn >= 0 then uMcp.McpClose(McpServers[I].Conn);
+  SetLength(McpServers, 0);
+  McpBudgetDropped := 0;
+end;
+
+{ ---- variable expansion, name composition, validation ---- }
+
+function McpExpandVars(const S: string): string;
+var
+  I, J, K: Integer;
+  Body, VName, Def: string;
+begin
+  Result := '';
+  I := 1;
+  while I <= Length(S) do
+  begin
+    if (S[I] = '$') and (I < Length(S)) and (S[I + 1] = '{') then
+    begin
+      J := I + 2;
+      while (J <= Length(S)) and (S[J] <> '}') do Inc(J);
+      if J > Length(S) then
+      begin
+        { An expansion nobody closed is text.  Refusing the whole file over it
+          would turn a typo in one server's arguments into "MCP is broken
+          today". }
+        Result := Result + Copy(S, I, MaxInt);
+        Exit;
+      end;
+      Body := Copy(S, I + 2, J - I - 2);
+      K := Pos(':-', Body);
+      if K > 0 then
+      begin
+        VName := Copy(Body, 1, K - 1);
+        Def := Copy(Body, K + 2, MaxInt);
+      end
+      else
+      begin
+        VName := Body;
+        Def := '';
+      end;
+      { Qualified: the Windows unit's own GetEnvironmentVariable is the raw
+        API and shadows SysUtils' string version in this scope. }
+      VName := SysUtils.GetEnvironmentVariable(VName);
+      if VName = '' then VName := Def;
+      Result := Result + VName;
+      I := J + 1;
+    end
+    else
+    begin
+      Result := Result + S[I];
+      Inc(I);
+    end;
+  end;
+end;
+
+function McpSanitizeSegment(const S: string): string;
+var
+  I: Integer;
+begin
+  Result := Trim(S);
+  for I := 1 to Length(Result) do
+    if not (Result[I] in ['A'..'Z', 'a'..'z', '0'..'9', '_', '-']) then
+      Result[I] := '_';
+end;
+
+function McpComposeName(const Server, Tool: string): string;
+var
+  Sv, Tl: string;
+  Room: Integer;
+begin
+  Result := '';
+  Sv := McpSanitizeSegment(Server);
+  Tl := McpSanitizeSegment(Tool);
+  if (Sv = '') or (Tl = '') then Exit;
+  { What is left for the server segment once the prefix, the separator and the
+    tool's own name are paid for.  The server segment is the one that gives:
+    the tool name is what the server advertised and what the user will read in
+    an approval prompt, and shortening it would make the model call something
+    by a name nobody chose. }
+  Room := McpMaxToolNameLen - Length(McpNamePrefix) - 2 - Length(Tl);
+  if Room < 1 then Exit;
+  if Length(Sv) > Room then Sv := Copy(Sv, 1, Room);
+  Result := McpNamePrefix + Sv + '__' + Tl;
+end;
+
+{ True when J nests deeper than N.  Asked as a bounded question rather than
+  "how deep is it", so a schema built to be deep costs a walk of N and not a
+  walk of itself. }
+function DeeperThan(J: TJson; N: Integer): Boolean;
+var
+  I: Integer;
+begin
+  Result := False;
+  if J = nil then Exit;
+  if not (J.Kind in [jkArr, jkObj]) then Exit;
+  if N <= 0 then Exit(True);
+  for I := 0 to J.Count - 1 do
+    if DeeperThan(J.Item(I), N - 1) then Exit(True);
+end;
+
+function McpValidateTool(Decl: TJson; const Server: string;
+  out ComposedName, OrigName, DeclText, Why: string): Boolean;
+var
+  Schema, Out_, Copy_: TJson;
+  Desc: string;
+begin
+  Result := False;
+  ComposedName := '';
+  OrigName := '';
+  DeclText := '';
+  Why := '';
+
+  if (Decl = nil) or (Decl.Kind <> jkObj) then
+  begin
+    Why := 'not an object';
+    Exit;
+  end;
+  OrigName := Trim(Decl.Str('name'));
+  if OrigName = '' then
+  begin
+    Why := 'no name';
+    Exit;
+  end;
+  ComposedName := McpComposeName(Server, OrigName);
+  if ComposedName = '' then
+  begin
+    Why := 'name too long';
+    Exit;
+  end;
+
+  Schema := Decl.Find('inputSchema');
+  if (Schema = nil) or (Schema.Kind <> jkObj) then
+  begin
+    Why := 'inputSchema is not an object';
+    Exit;
+  end;
+  { A missing type is filled in; a type that says something else is refused.
+    "array" here would be forwarded verbatim into our request body and break
+    every turn, not one call. }
+  if (Schema.Find('type') <> nil) and (Schema.Str('type') <> 'object') then
+  begin
+    Why := 'inputSchema type is not object';
+    Exit;
+  end;
+  if DeeperThan(Schema, McpMaxSchemaDepth) then
+  begin
+    Why := 'schema nests too deeply';
+    Exit;
+  end;
+
+  Desc := Decl.Str('description');
+  if not IsValidUtf8(Desc) then Desc := OemToUtf8(Desc);
+  Desc := Utf8Cut(Desc, McpMaxDescBytes);
+
+  { title, outputSchema and annotations are dropped rather than forwarded.
+    The spec says a client must treat annotations as untrusted unless the
+    server is, and "the user approved running this program" is not the same
+    statement as "believe what it says about its own side effects". }
+  Out_ := TJson.NewObj;
+  try
+    Out_.AddStr('name', ComposedName);
+    Out_.AddStr('description', Desc);
+    Copy_ := JsonParse(Schema.ToJson);
+    if Copy_ = nil then
+    begin
+      Why := 'schema does not round-trip';
+      Exit;
+    end;
+    if Copy_.Find('type') = nil then Copy_.AddStr('type', 'object');
+    Out_.Add('input_schema', Copy_);
+    DeclText := Out_.ToJson;
+  finally
+    Out_.Free;
+  end;
+
+  if not IsValidUtf8(DeclText) then
+  begin
+    DeclText := OemToUtf8(DeclText);
+    if not IsValidUtf8(DeclText) then
+    begin
+      Why := 'not valid UTF-8';
+      DeclText := '';
+      Exit;
+    end;
+  end;
+  { Rejected, not cut.  A truncated schema does not parse, and one that did
+    would be a lie the model acts on every turn for the rest of the session. }
+  if Length(DeclText) > McpMaxSchemaBytes then
+  begin
+    Why := 'schema too large';
+    DeclText := '';
+    Exit;
+  end;
+  Result := True;
+end;
+
+{ ---- approvals ---- }
+
+function Fnv1a(const S: string; Seed: QWord): QWord;
+var
+  I: Integer;
+begin
+  Result := Seed;
+  for I := 1 to Length(S) do
+  begin
+    Result := Result xor QWord(Byte(S[I]));
+    Result := Result * QWord($100000001B3);
+  end;
+end;
+
+function McpCommandHash(const Cmd: string;
+  const Args, EnvKeys: array of string): string;
+var
+  H: QWord;
+  L: TStringList;
+  I: Integer;
+begin
+  H := Fnv1a(Cmd, QWord($CBF29CE484222325));
+  H := Fnv1a(#0, H);
+  for I := Low(Args) to High(Args) do
+  begin
+    H := Fnv1a(Args[I], H);
+    H := Fnv1a(#0, H);
+  end;
+  H := Fnv1a(#0, H);
+  { Sorted, because the order two variables happen to appear in a JSON object
+    says nothing about what will run.  The arguments above are deliberately
+    not sorted, because their order is exactly what will run. }
+  L := TStringList.Create;
+  try
+    for I := Low(EnvKeys) to High(EnvKeys) do L.Add(EnvKeys[I]);
+    L.Sort;
+    for I := 0 to L.Count - 1 do
+    begin
+      H := Fnv1a(L[I], H);
+      H := Fnv1a(#0, H);
+    end;
+  finally
+    L.Free;
+  end;
+  Result := LowerCase(IntToHex(LongWord(H xor (H shr 32)), 8));
+end;
+
+{ The server a composed tool name belongs to, found by matching the name we
+  built rather than by splitting on '__': a truncated server segment and a
+  tool name containing underscores make splitting a guess, and the table has
+  the answer. }
+function McpServerOfTool(const ToolName: string): Integer;
+var
+  I, J: Integer;
+begin
+  Result := -1;
+  for I := 0 to High(McpServers) do
+    for J := 0 to High(McpServers[I].Tools) do
+      if McpServers[I].Tools[J].Name = ToolName then Exit(I);
+end;
+
+function McpCallApproved(const ToolName: string): Boolean;
+var
+  I: Integer;
+begin
+  Result := False;
+  I := McpServerOfTool(ToolName);
+  if I < 0 then Exit;
+  Result := (McpServers[I].Hash <> '') and
+    (TrustedFingerprint('mcp-call:' + McpServers[I].Name) = McpServers[I].Hash);
+end;
+
+procedure AllowMcpServer(const ToolName: string);
+var
+  I: Integer;
+begin
+  I := McpServerOfTool(ToolName);
+  if I < 0 then Exit;
+  RecordTrust('mcp-call:' + McpServers[I].Name, McpServers[I].Hash);
+end;
+
+{ ---- configuration ---- }
+
+{ The same filter LoadAgentDefinition applies to an agent type, for the same
+  reason: the name becomes part of a path (the stderr spool, the cache key),
+  and it comes from a file the project author wrote. }
+function ValidServerName(const N: string): Boolean;
+var
+  I: Integer;
+begin
+  Result := False;
+  if (N = '') or (Length(N) > 64) then Exit;
+  for I := 1 to Length(N) do
+    if (N[I] in ['\', '/', ':', '.']) or (N[I] < ' ') then Exit;
+  Result := True;
+end;
+
+function QuoteArg(const A: string): string;
+begin
+  if (A <> '') and (Pos(' ', A) = 0) and (Pos('"', A) = 0) then Exit(A);
+  Result := '"' + StringReplace(A, '"', '\"', [rfReplaceAll]) + '"';
+end;
+
+procedure NoteReason(var S: string; const Reason: string);
+begin
+  if Reason = '' then Exit;
+  if Pos(Reason, S) > 0 then Exit;
+  if S <> '' then S := S + ', ';
+  S := S + Reason;
+end;
+
+function LoadMcpConfig(const Path: string; out Err: string): Boolean;
+var
+  F: TFileStream;
+  Text, Name, Cmd, PErr: string;
+  Root, Servers, S, A, E: TJson;
+  I, J: Integer;
+  Args, EnvKeys: array of string;
+  Rec: TMcpServerRec;
+begin
+  Err := '';
+  Result := False;
+  ClearMcpServers;
+  if not FileExists(Path) then Exit;
+  Text := '';
+  try
+    F := TFileStream.Create(Path, fmOpenRead or fmShareDenyNone);
+    try
+      if F.Size > McpMaxConfigBytes then
+      begin
+        Err := Format('%s is %d bytes; that is not a configuration',
+          [ExtractFileName(Path), F.Size]);
+        Exit;
+      end;
+      SetLength(Text, F.Size);
+      if F.Size > 0 then F.ReadBuffer(Text[1], F.Size);
+    finally
+      F.Free;
+    end;
+  except
+    on Ex: Exception do
+    begin
+      Err := 'cannot read ' + ExtractFileName(Path) + ': ' + Ex.Message;
+      Exit;
+    end;
+  end;
+
+  Root := JsonParse(Text, PErr);
+  if Root = nil then
+  begin
+    Err := ExtractFileName(Path) + ' is not valid JSON: ' + PErr;
+    Exit;
+  end;
+  try
+    Servers := Root.Find('mcpServers');
+    if (Servers = nil) or (Servers.Kind <> jkObj) then
+    begin
+      Err := ExtractFileName(Path) + ' has no mcpServers object';
+      Exit;
+    end;
+    for I := 0 to Servers.Count - 1 do
+    begin
+      Name := Servers.Key(I);
+      S := Servers.Item(I);
+      if not ValidServerName(Name) then
+      begin
+        NoteReason(Err, 'refused a server whose name is not a bare name');
+        Continue;
+      end;
+      if McpFind(Name) >= 0 then
+      begin
+        NoteReason(Err, 'refused a duplicate server name');
+        Continue;
+      end;
+      if (S = nil) or (S.Kind <> jkObj) then
+      begin
+        NoteReason(Err, 'refused a server entry that is not an object');
+        Continue;
+      end;
+
+      Rec.Name := Name;
+      Rec.Note := '';
+      Rec.LastErr := '';
+      Rec.Hash := '';
+      Rec.WorkDir := NormalizeRoot;
+      Rec.ErrLog := McpDir + Name + '.err';
+      Rec.Status := mcPending;
+      Rec.Approved := False;
+      Rec.Conn := -1;
+      Rec.Skipped := 0;
+      SetLength(Rec.Tools, 0);
+      SetLength(Rec.EnvPairs, 0);
+      Rec.TimeoutMs := Round(S.Num('timeoutMs', uMcp.McpCallMs));
+      if Rec.TimeoutMs < 1000 then Rec.TimeoutMs := 1000;
+      if Rec.TimeoutMs > 600000 then Rec.TimeoutMs := 600000;
+
+      Rec.Transport := LowerCase(Trim(S.Str('type')));
+      if Rec.Transport = '' then Rec.Transport := 'stdio';
+      { Listed, never silently dropped.  A user who wrote an http entry and
+        saw nothing at all would conclude the feature is broken rather than
+        that this build does not speak that transport. }
+      if (S.Find('url') <> nil) or (Rec.Transport <> 'stdio') then
+      begin
+        Rec.Status := mcUnsupported;
+        Rec.Command := Trim(S.Str('url'));
+        if Rec.Command = '' then Rec.Command := Trim(S.Str('command'));
+        Rec.Note := 'this build speaks stdio only';
+        SetLength(McpServers, Length(McpServers) + 1);
+        McpServers[High(McpServers)] := Rec;
+        Continue;
+      end;
+
+      { Expansion happens before the hash, so the fingerprint covers what will
+        actually run.  Hashing the template instead would let the environment,
+        rather than the approved file, decide what the program is. }
+      Cmd := Trim(McpExpandVars(S.Str('command')));
+      if Cmd = '' then
+      begin
+        NoteReason(Err, 'refused a server with no command');
+        Continue;
+      end;
+
+      SetLength(Args, 0);
+      A := S.Find('args');
+      if (A <> nil) and (A.Kind = jkArr) then
+        for J := 0 to A.Count - 1 do
+        begin
+          SetLength(Args, Length(Args) + 1);
+          Args[High(Args)] := McpExpandVars(A.Item(J).AsString);
+        end;
+
+      SetLength(EnvKeys, 0);
+      E := S.Find('env');
+      if (E <> nil) and (E.Kind = jkObj) then
+        for J := 0 to E.Count - 1 do
+        begin
+          SetLength(EnvKeys, Length(EnvKeys) + 1);
+          EnvKeys[High(EnvKeys)] := E.Key(J);
+          SetLength(Rec.EnvPairs, Length(Rec.EnvPairs) + 1);
+          Rec.EnvPairs[High(Rec.EnvPairs)] :=
+            E.Key(J) + '=' + McpExpandVars(E.Item(J).AsString);
+        end;
+
+      Rec.Command := QuoteArg(Cmd);
+      for J := 0 to High(Args) do
+        Rec.Command := Rec.Command + ' ' + QuoteArg(Args[J]);
+      Rec.Hash := McpCommandHash(Cmd, Args, EnvKeys);
+
+      SetLength(McpServers, Length(McpServers) + 1);
+      McpServers[High(McpServers)] := Rec;
+    end;
+  finally
+    Root.Free;
+  end;
+  Result := Length(McpServers) > 0;
+end;
+
+{ ---- the discovery cache ---- }
+
+procedure McpLoadCache;
+var
+  F: TFileStream;
+  Text, Path: string;
+  Root, Arr, It: TJson;
+  I, J, K: Integer;
+begin
+  Path := McpCachePath;
+  if not FileExists(Path) then Exit;
+  Text := '';
+  try
+    F := TFileStream.Create(Path, fmOpenRead or fmShareDenyNone);
+    try
+      if F.Size > McpMaxConfigBytes then Exit;
+      SetLength(Text, F.Size);
+      if F.Size > 0 then F.ReadBuffer(Text[1], F.Size);
+    finally
+      F.Free;
+    end;
+  except
+    Exit;
+  end;
+  Root := JsonParse(Text);
+  if Root = nil then Exit;
+  try
+    if Root.Kind <> jkObj then Exit;
+    for I := 0 to High(McpServers) do
+    begin
+      if McpServers[I].Hash = '' then Continue;
+      Arr := Root.Find(McpServers[I].Name + '@' + McpServers[I].Hash);
+      if (Arr = nil) or (Arr.Kind <> jkArr) then Continue;
+      SetLength(McpServers[I].Tools, 0);
+      for J := 0 to Arr.Count - 1 do
+      begin
+        It := Arr.Item(J);
+        if (It = nil) or (It.Kind <> jkObj) then Continue;
+        if (It.Str('n') = '') or (It.Str('d') = '') then Continue;
+        K := Length(McpServers[I].Tools);
+        SetLength(McpServers[I].Tools, K + 1);
+        McpServers[I].Tools[K].Name := It.Str('n');
+        McpServers[I].Tools[K].Orig := It.Str('o');
+        McpServers[I].Tools[K].Decl := It.Str('d');
+      end;
+    end;
+  finally
+    Root.Free;
+  end;
+end;
+
+procedure McpSaveCache;
+var
+  Root, Arr, It: TJson;
+  Text: string;
+  F: TFileStream;
+  I, J: Integer;
+begin
+  Root := TJson.NewObj;
+  try
+    for I := 0 to High(McpServers) do
+    begin
+      if (McpServers[I].Hash = '') or (Length(McpServers[I].Tools) = 0) then
+        Continue;
+      Arr := TJson.NewArr;
+      for J := 0 to High(McpServers[I].Tools) do
+      begin
+        It := TJson.NewObj;
+        It.AddStr('n', McpServers[I].Tools[J].Name);
+        It.AddStr('o', McpServers[I].Tools[J].Orig);
+        It.AddStr('d', McpServers[I].Tools[J].Decl);
+        Arr.Push(It);
+      end;
+      Root.Add(McpServers[I].Name + '@' + McpServers[I].Hash, Arr);
+    end;
+    Text := Root.ToJson;
+  finally
+    Root.Free;
+  end;
+  try
+    ForceDirectories(ExtractFileDir(McpCachePath));
+    F := TFileStream.Create(McpCachePath, fmCreate);
+    try
+      if Text <> '' then F.WriteBuffer(Text[1], Length(Text));
+    finally
+      F.Free;
+    end;
+  except
+    { A cache that cannot be written costs a connect at the next start. }
+  end;
+end;
+
+{ ---- approval, connection, discovery ---- }
+
+procedure McpApproveAll(Ask: TAskProc; Notice: TMcpNoticeProc);
+var
+  I, NeedAsk: Integer;
+  Detail, Line: string;
+begin
+  NeedAsk := 0;
+  for I := 0 to High(McpServers) do
+  begin
+    if McpServers[I].Status = mcUnsupported then Continue;
+    if (McpServers[I].Hash <> '') and
+       (TrustedFingerprint('mcp:' + McpServers[I].Name) = McpServers[I].Hash) then
+    begin
+      McpServers[I].Approved := True;
+      Continue;
+    end;
+    Inc(NeedAsk);
+  end;
+  if NeedAsk = 0 then Exit;
+
+  { Said once, in full, before the first prompt: the question "may this
+    repository run a program on your machine" is answerable only by someone
+    who has been shown every program it names. }
+  if Assigned(Notice) then
+  begin
+    if NeedAsk = 1 then
+      Notice(Format('this project ships %s and asks to run 1 program before ' +
+        'you have read it:', [ExtractFileName(McpConfigPath)]))
+    else
+      Notice(Format('this project ships %s and asks to run %d programs ' +
+        'before you have read them:', [ExtractFileName(McpConfigPath), NeedAsk]));
+    for I := 0 to High(McpServers) do
+      if (McpServers[I].Status <> mcUnsupported) and
+         (not McpServers[I].Approved) then
+      begin
+        Line := '  ' + McpServers[I].Name;
+        while Length(Line) < 12 do Line := Line + ' ';
+        Notice(Line + McpServers[I].Command);
+      end;
+    Notice('');
+  end;
+
+  for I := 0 to High(McpServers) do
+  begin
+    if McpServers[I].Status = mcUnsupported then Continue;
+    if McpServers[I].Approved then Continue;
+    { Nobody to ask is no.  This is the whole of why print mode can never be
+      the thing that first executes a repository's code: it arrives here with
+      a nil Ask, exactly as every other deny-by-default path does. }
+    if Ask = nil then
+    begin
+      McpServers[I].Status := mcDenied;
+      McpServers[I].Note := 'nobody to ask';
+      Continue;
+    end;
+    Detail := 'run  ' + McpServers[I].Command + #10 +
+      'this program comes from the project directory, not from you.';
+    case Ask('mcp server "' + McpServers[I].Name + '"', Detail) of
+      pmAllowOnce:
+        McpServers[I].Approved := True;
+      pmAllowAlways:
+        begin
+          McpServers[I].Approved := True;
+          RecordTrust('mcp:' + McpServers[I].Name, McpServers[I].Hash);
+        end;
+    else
+      McpServers[I].Status := mcDenied;
+      McpServers[I].Note := 'you said no';
+    end;
+  end;
+end;
+
+function McpEnsureConnected(I: Integer): Boolean;
+var
+  Err, SN, SV, SP: string;
+  C: Integer;
+begin
+  Result := False;
+  if (I < 0) or (I > High(McpServers)) then Exit;
+  if not McpServers[I].Approved then
+  begin
+    McpServers[I].LastErr := 'not approved to run';
+    Exit;
+  end;
+  if (McpServers[I].Conn >= 0) and
+     (uMcp.McpState(McpServers[I].Conn) = msRunning) then Exit(True);
+  if McpServers[I].Conn >= 0 then
+  begin
+    { A server that died is not restarted behind the user's back: the exit
+      code is latched and reported, and /mcp restart is the way back.  What
+      happens here is only the tidying up of a slot we already know is dead. }
+    McpServers[I].Status := mcDead;
+    uMcp.McpClose(McpServers[I].Conn);
+    McpServers[I].Conn := -1;
+    Exit;
+  end;
+
+  ForceDirectories(McpDir);
+  C := uMcp.McpSpawn(McpServers[I].Name, McpServers[I].Command,
+    McpServers[I].WorkDir, McpServers[I].ErrLog, McpServers[I].EnvPairs, Err);
+  if C < 0 then
+  begin
+    McpServers[I].Status := mcFailed;
+    McpServers[I].LastErr := Err;
+    Exit;
+  end;
+  McpServers[I].Conn := C;
+  if not uMcp.McpHandshake(C, SN, SV, SP, Err) then
+  begin
+    uMcp.McpClose(C);
+    McpServers[I].Conn := -1;
+    McpServers[I].Status := mcFailed;
+    McpServers[I].LastErr := Err;
+    Exit;
+  end;
+  McpServers[I].LastErr := '';
+  Result := True;
+end;
+
+function McpDiscover(I: Integer): Boolean;
+var
+  Arr: TJson;
+  Err, CName, OName, DText, Why: string;
+  J, K, N: Integer;
+  Dup: Boolean;
+begin
+  Result := False;
+  if not uMcp.McpListTools(McpServers[I].Conn, Arr, Err) then
+  begin
+    McpServers[I].Status := mcFailed;
+    McpServers[I].LastErr := Err;
+    Exit;
+  end;
+  try
+    SetLength(McpServers[I].Tools, 0);
+    McpServers[I].Skipped := 0;
+    McpServers[I].Note := '';
+    for J := 0 to Arr.Count - 1 do
+    begin
+      if Length(McpServers[I].Tools) >= McpMaxTools then
+      begin
+        Inc(McpServers[I].Skipped);
+        NoteReason(McpServers[I].Note, 'over the per-server tool cap');
+        Continue;
+      end;
+      if not McpValidateTool(Arr.Item(J), McpServers[I].Name,
+                             CName, OName, DText, Why) then
+      begin
+        Inc(McpServers[I].Skipped);
+        NoteReason(McpServers[I].Note, Why);
+        Continue;
+      end;
+      Dup := False;
+      for K := 0 to High(McpServers[I].Tools) do
+        if McpServers[I].Tools[K].Name = CName then Dup := True;
+      if Dup then
+      begin
+        Inc(McpServers[I].Skipped);
+        NoteReason(McpServers[I].Note, 'duplicate after truncation');
+        Continue;
+      end;
+      N := Length(McpServers[I].Tools);
+      SetLength(McpServers[I].Tools, N + 1);
+      McpServers[I].Tools[N].Name := CName;
+      McpServers[I].Tools[N].Orig := OName;
+      McpServers[I].Tools[N].Decl := DText;
+    end;
+  finally
+    Arr.Free;
+  end;
+  Result := True;
+end;
+
+function McpConnectApproved(Notice: TMcpNoticeProc): Integer;
+var
+  I: Integer;
+begin
+  Result := 0;
+  McpLoadCache;
+  for I := 0 to High(McpServers) do
+  begin
+    if not McpServers[I].Approved then Continue;
+    if McpServers[I].Status = mcUnsupported then Continue;
+    { A cached tool list is the steady state: nothing is spawned at the
+      prompt, and the first real call pays for the start-up.  The divergence
+      this buys - we can advertise a tool the server no longer has - surfaces
+      as one clean tool error, which is a far smaller cost than adding the
+      server's boot time to every launch. }
+    if Length(McpServers[I].Tools) > 0 then
+    begin
+      McpServers[I].Status := mcCached;
+      Continue;
+    end;
+    if Assigned(Notice) then
+      Notice('mcp: connecting ' + McpServers[I].Name + '...');
+    if McpEnsureConnected(I) and McpDiscover(I) then
+    begin
+      McpServers[I].Status := mcConnected;
+      Inc(Result);
+    end;
+  end;
+  McpSaveCache;
+end;
+
+{ ---- the registered source ---- }
+
+function McpDeclare: TJson;
+var
+  I, J, Used, Dropped: Integer;
+  D: TJson;
+begin
+  Result := TJson.NewArr;
+  Used := 0;
+  Dropped := 0;
+  for I := 0 to High(McpServers) do
+    for J := 0 to High(McpServers[I].Tools) do
+    begin
+      { The budget is global and consumed in server order.  Per server it
+        would be unbounded in aggregate, and this text lands in the cached
+        request prefix ahead of the system prompt, which is the one place
+        where "a few servers each within their limit" is not a limit. }
+      if Used + Length(McpServers[I].Tools[J].Decl) > McpMaxDeclBytes then
+      begin
+        Inc(Dropped);
+        Continue;
+      end;
+      D := JsonParse(McpServers[I].Tools[J].Decl);
+      if D = nil then Continue;
+      Inc(Used, Length(McpServers[I].Tools[J].Decl));
+      Result.Push(D);
+    end;
+  McpBudgetDropped := Dropped;
+end;
+
+function McpRun(const Name: string; Input: TJson; Ask: TAskProc;
+  out IsError: Boolean): string;
+var
+  I, J, Si, Ti: Integer;
+  Detail, Text, Err: string;
+  IsErr: Boolean;
+begin
+  IsError := True;
+  Si := -1;
+  Ti := -1;
+  for I := 0 to High(McpServers) do
+    for J := 0 to High(McpServers[I].Tools) do
+      if McpServers[I].Tools[J].Name = Name then
+      begin
+        Si := I;
+        Ti := J;
+      end;
+  if Si < 0 then Exit('unknown MCP tool: ' + Name);
+
+  { The second permission level.  The first was "may this repository run this
+    program at all", answered before anything was spawned; this one is "may
+    that program act now", and it exists so the user sees a runaway loop
+    rather than as the security boundary - the boundary was the spawn. }
+  Detail := Format('mcp server "%s", tool %s', [McpServers[Si].Name,
+    McpServers[Si].Tools[Ti].Orig]) + #10 + 'run  ' + McpServers[Si].Command;
+  if not Permit(Name, Detail, Ask) then
+    Exit('permission denied: ' + Name);
+
+  if not McpEnsureConnected(Si) then
+    Exit(Format('mcp server "%s" is not running: %s (stderr: %s)',
+      [McpServers[Si].Name, McpServers[Si].LastErr, McpServers[Si].ErrLog]));
+
+  if not uMcp.McpCallTool(McpServers[Si].Conn, McpServers[Si].Tools[Ti].Orig,
+       Input, McpServers[Si].TimeoutMs, Text, IsErr, Err) then
+  begin
+    McpServers[Si].Status := mcDead;
+    McpServers[Si].LastErr := Err;
+    Exit(Format('mcp server "%s" did not answer: %s (exit %d, stderr: %s)',
+      [McpServers[Si].Name, Err, uMcp.McpExitCode(McpServers[Si].Conn),
+       McpServers[Si].ErrLog]));
+  end;
+
+  { Everything here is bytes a third-party program chose.  uMcp caps them but
+    deliberately does not repair them, because whether they are OEM console
+    output or something else is a question only this layer can answer - and
+    one byte that is not UTF-8 makes the API reject the whole request and
+    lose the conversation, not just this result. }
+  if not IsValidUtf8(Text) then Text := OemToUtf8(Text);
+  if Trim(Text) = '' then Text := '(the tool returned nothing)';
+  IsError := IsErr;
+  Result := Clip(Text);
+end;
+
+procedure RegisterMcpToolSource;
+var
+  Err: string;
+begin
+  { The answer is deliberately ignored.  The only way this refuses is a second
+    registration of mcp__, which is a programming error rather than anything a
+    user, a config file or a server can cause - and a build that got it wrong
+    fails the registry test, not a user's session. }
+  RegisterToolSource(McpNamePrefix, @McpDeclare, @McpRun, Err);
+end;
+
+{ ---- the panel ---- }
+
+function McpServerList: TStringArray;
+var
+  I: Integer;
+  Note, Cmd: string;
+begin
+  SetLength(Result, Length(McpServers));
+  for I := 0 to High(McpServers) do
+  begin
+    Note := McpServers[I].Note;
+    if McpServers[I].LastErr <> '' then NoteReason(Note, McpServers[I].LastErr);
+    if (McpServers[I].Status = mcDead) or (McpServers[I].Status = mcFailed) then
+      NoteReason(Note, 'stderr: ' + McpServers[I].ErrLog);
+    if uMcp.McpToolsChanged(McpServers[I].Conn) then
+      NoteReason(Note, 'tools changed - /mcp refresh to pick up');
+    { A command line is under the user's nose in a prompt, not in a table:
+      one that wraps the terminal for forty lines makes the whole panel
+      unreadable, and the full text is in .mcp.json either way. }
+    Cmd := McpServers[I].Command;
+    if Length(Cmd) > 100 then Cmd := Copy(Cmd, 1, 97) + '...';
+    Result[I] := McpServers[I].Name + #9 + McpStatusWord(McpServers[I].Status) +
+      #9 + IntToStr(Length(McpServers[I].Tools)) +
+      #9 + IntToStr(McpServers[I].Skipped + McpBudgetDropped) +
+      #9 + Cmd + #9 + Note;
+  end;
+end;
+
+function McpRestart(const Name: string; out Err: string): Boolean;
+var
+  I: Integer;
+begin
+  Err := '';
+  I := McpFind(Name);
+  if I < 0 then
+  begin
+    Err := 'no such server: ' + Name;
+    Exit(False);
+  end;
+  if McpServers[I].Conn >= 0 then
+  begin
+    uMcp.McpClose(McpServers[I].Conn);
+    McpServers[I].Conn := -1;
+  end;
+  McpServers[I].LastErr := '';
+  if Length(McpServers[I].Tools) > 0 then
+    McpServers[I].Status := mcCached
+  else
+    McpServers[I].Status := mcPending;
+  Result := True;
+end;
+
+function McpRefresh(out Err: string): Boolean;
+var
+  I: Integer;
+begin
+  Err := '';
+  Result := False;
+  for I := 0 to High(McpServers) do
+  begin
+    if not McpServers[I].Approved then Continue;
+    if McpServers[I].Status = mcUnsupported then Continue;
+    if McpServers[I].Conn >= 0 then
+    begin
+      uMcp.McpClose(McpServers[I].Conn);
+      McpServers[I].Conn := -1;
+    end;
+    SetLength(McpServers[I].Tools, 0);
+    if McpEnsureConnected(I) and McpDiscover(I) then
+    begin
+      McpServers[I].Status := mcConnected;
+      Result := True;
+    end
+    else
+      NoteReason(Err, McpServers[I].Name + ': ' + McpServers[I].LastErr);
+  end;
+  McpSaveCache;
 end;
 
 function RunTool(const Name: string; Input: TJson; Ask: TAskProc;
@@ -3000,12 +4457,24 @@ begin
     end;
   end
 
+  { Not one of ours.  A registered source may own it - and note that the
+    subagent boundary above has already run, so a name from a source is
+    refused inside a subagent before any source is consulted, because nothing
+    a source contributes is on IsSubagentTool's three-name list. }
+  else if DispatchToolSource(Name, Input, Ask, IsError, Result) then
+    { the source answered, in the ladder's own terms }
+
   else
   begin
     IsError := True;
     Result := 'unknown tool: ' + Name;
   end;
 end;
+
+initialization
+  { The same ladder-crossing shape uAgent uses to fill SubagentRunner, except
+    that both halves live in this unit, so there is nothing to wait for. }
+  RegisterMcpToolSource;
 
 finalization
   { A background job outliving the process that started it is the one failure
