@@ -12,7 +12,8 @@ program ux;
 
 {$mode objfpc}{$H+}
 
-uses SysUtils, Classes, uJson, uDiff, uHooks, uTools, uAgent, uTerm, uNotebook;
+uses SysUtils, Classes, uJson, uDiff, uHooks, uTools, uAgent, uTerm, uNotebook,
+  uSdk;
 
 var
   Fails: Integer = 0;
@@ -2388,6 +2389,78 @@ begin
   RemoveDir(Dir);
 end;
 
+{ %USERPROFILE% has to be moved somewhere known: the user memory is read from
+  it, and a developer's real home directory would decide this test. }
+function SetEnvironmentVariable(Name, Value: PChar): LongBool; stdcall;
+  external 'kernel32' name 'SetEnvironmentVariableA';
+
+function LiftSentinel: string;
+begin
+  Result := #10#10'SENTINEL-FROM-EXTRA';
+end;
+
+{ The first test this project has ever had of the system prompt.  It was
+  unreachable while it lived in pasclaude.lpr, which is most of the reason the
+  lift happened - and a lift that silently reorders UserContext against the
+  project's own files inverts the nearer-wins rule with nothing to catch it. }
+procedure TestSystemPromptLift;
+var
+  Root, Home, Full, SavedHome: string;
+  UserAt, ProjectAt, GuideAt, ExtraAt, BindingAt: Integer;
+begin
+  Root := IncludeTrailingPathDelimiter(TmpRoot) + 'prompt';
+  Home := IncludeTrailingPathDelimiter(Root) + 'home';
+  ForceDirectories(Home + PathDelim + '.pasclaude');
+  SavedHome := SysUtils.GetEnvironmentVariable('USERPROFILE');
+  SetEnvironmentVariable('USERPROFILE', PChar(Home));
+  uTools.RootDir := Root;
+  try
+    WriteFileText(Home + PathDelim + '.pasclaude' + PathDelim + 'CLAUDE.md',
+      'always speak plainly'#10);
+    WriteFileText(IncludeTrailingPathDelimiter(Root) + 'shared.md',
+      'the shared convention is tabs'#10);
+    WriteFileText(IncludeTrailingPathDelimiter(Root) + 'CLAUDE.md',
+      'project rules'#10'@import shared.md'#10);
+
+    Full := uSdk.SdkFullSystem;
+    Check(Pos('Session root: ' + Root, Full) > 0,
+      'the prompt still names the session root');
+    Check(Pos('--- imported: shared.md ---', Full) > 0,
+      'an @import line is still expanded');
+    Check(Pos('the shared convention is tabs', Full) > 0,
+      'and the imported file''s text is in the prompt');
+    Check(Pos('Project instructions follow. Treat them as binding.', Full) > 0,
+      'and the project files are still introduced as binding');
+
+    UserAt := Pos('--- user memory', Full);
+    ProjectAt := Pos('--- CLAUDE.md ---', Full);
+    Check((UserAt > 0) and (ProjectAt > 0) and (UserAt < ProjectAt),
+      'the user memory comes first, so the project can override it');
+
+    { The one seam another feature reaches the prompt through: hooks'
+      SessionStart output.  It has to land after the guidelines and before the
+      project files, or the "treat them as binding" line ends up introducing
+      the wrong text. }
+    uSdk.SdkSystemExtra := @LiftSentinel;
+    try
+      Full := uSdk.SdkFullSystem;
+      GuideAt := Pos('Guidelines:', Full);
+      ExtraAt := Pos('SENTINEL-FROM-EXTRA', Full);
+      BindingAt := Pos('Project instructions follow.', Full);
+      Check((GuideAt > 0) and (ExtraAt > GuideAt) and (ExtraAt < BindingAt),
+        'the extra text sits between the guidelines and the project files');
+    finally
+      uSdk.SdkSystemExtra := nil;
+    end;
+    Full := uSdk.SdkFullSystem;
+    Check(Pos('SENTINEL-FROM-EXTRA', Full) = 0,
+      'and with the seam unhooked it contributes nothing at all');
+  finally
+    SetEnvironmentVariable('USERPROFILE', PChar(SavedHome));
+    uTools.RootDir := TmpRoot;
+  end;
+end;
+
 begin
   TmpRoot := IncludeTrailingPathDelimiter(GetTempDir) + 'pasclaude-ux';
   Cleanup(TmpRoot);
@@ -2415,6 +2488,7 @@ begin
     TestMcpPanel;
     TestHooksPanel;
     TestPluginState;
+    TestSystemPromptLift;
   finally
     { Before the cleanup, not after: a live child holding a spool handle under
       TmpRoot would make the recursive delete fail. }

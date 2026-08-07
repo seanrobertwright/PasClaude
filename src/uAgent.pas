@@ -25,6 +25,16 @@ type
   TToolProc = procedure(const Name, Detail: string);
   { Polled while a response streams; True abandons the request. }
   TCancelProc = function: Boolean;
+  { Fires in RunTools with the tool's id and its effective input JSON - what
+    RunTool will actually be given, after this unit's own repair of an
+    unparseable argument stream.  The console never needed the id, because a
+    human reads the calls in order; a protocol does, because its consumer has
+    to pair a result with the call that produced it. }
+  TToolInputProc = procedure(const Id, Name, InputJson: string);
+  { Fires after the tool returns, carrying the id and the error flag.  IsError
+    is otherwise local to RunTools and reachable from no hook at all, so a
+    consumer could not tell a refusal from an answer. }
+  TToolDoneProc = procedure(const Id, Name, Output: string; IsError: Boolean);
 
   TModelInfo = record
     Id: string;           { what the API wants in "model" }
@@ -75,6 +85,10 @@ type
     { The tool-round ceiling for this agent.  A field rather than the constant
       because a subagent gets a lower one. }
     FMaxRounds: Integer;
+    { Whether the turn that just finished was aborted.  Cleared at the top of
+      every Send, so it always describes the most recent turn and never a
+      stale one. }
+    FTurnCancelled: Boolean;
 
     { The cancel test every poll site uses.  ShouldCancel is consume-on-read
       in the host (CtrlCPressed clears the flag as it answers), so a subagent
@@ -122,6 +136,12 @@ type
     OnToolUseBegin: TToolProc;
     { Streamed fragments of the tool's argument JSON, as they arrive. }
     OnToolArg: TTextProc;
+    { The id-carrying pair, for a consumer that has to match one to the other.
+      Both nil-safe and both additive: nothing that existed before this pair
+      changed shape, so every host that never assigns them behaves exactly as
+      it did. }
+    OnToolInput: TToolInputProc;
+    OnToolDone: TToolDoneProc;
     Ask: TAskProc;
     { Polled between chunks so the user can abandon a long reply. }
     ShouldCancel: TCancelProc;
@@ -191,6 +211,11 @@ type
     { The text of the last assistant message - what a subagent hands back to
       its caller as the whole result.  '' when there is none. }
     function LastAssistantText: string;
+    { True when the last Send ended because the user aborted it.  Send returns
+      True for a cancelled turn as well as a finished one - both leave a legal
+      transcript, which is what its Boolean means - so until now the only way
+      to tell them apart was to read the human-facing 'cancelled' notice. }
+    function TurnWasCancelled: Boolean;
 
     { Test seam.  Feeds raw response bytes through the same decoder the live
       stream uses, so the SSE handling can be exercised without a network.
@@ -677,6 +702,11 @@ begin
     end;
     Exit;
   end;
+end;
+
+function TAgent.TurnWasCancelled: Boolean;
+begin
+  Result := FTurnCancelled;
 end;
 
 destructor TAgent.Destroy;
@@ -1305,6 +1335,8 @@ begin
       end;
       try
         Detail := DescribeTool(Blocks[I].Name, Input);
+        if Assigned(OnToolInput) then
+          OnToolInput(Blocks[I].Id, Blocks[I].Name, Input.ToJson);
         if Assigned(OnToolStart) then OnToolStart(Blocks[I].Name, Detail);
         { Only the call itself is wrapped: this is the window in which a task
           tool may reach back for its parent, and saving the previous value
@@ -1319,6 +1351,8 @@ begin
         end;
         if Assigned(OnToolResult) then
           OnToolResult(Blocks[I].Name, Output);
+        if Assigned(OnToolDone) then
+          OnToolDone(Blocks[I].Id, Blocks[I].Name, Output, IsErr);
 
         R := TJson.NewObj;
         R.AddStr('type', 'tool_result');
@@ -1721,6 +1755,7 @@ begin
     with ActiveAgent set, and clearing it here would erase the very abort the
     subagent was started to propagate. }
   if ActiveAgent = nil then ForceCancel := False;
+  FTurnCancelled := False;
   AppendUserText(UserText);
 
   Inc(FTurns);
@@ -1752,6 +1787,7 @@ begin
         from the transcript so the API does not reject the next request. }
       DropUnansweredToolCalls;
       UnwindCancelledTail;
+      FTurnCancelled := True;
       if Assigned(OnNotice) then OnNotice('cancelled');
       Exit(True);
     end;
@@ -1775,6 +1811,7 @@ begin
     if WantsCancel then
     begin
       UnwindCancelledTail;
+      FTurnCancelled := True;
       if Assigned(OnNotice) then OnNotice('cancelled');
       Exit(True);
     end;

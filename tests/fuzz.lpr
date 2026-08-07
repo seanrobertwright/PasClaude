@@ -8,7 +8,8 @@ program fuzz;
 
 {$mode objfpc}{$H+}
 
-uses SysUtils, Classes, Windows, uJson, uMcp, uHooks, uTools, uAgent, uHttp;
+uses SysUtils, Classes, Windows, uJson, uMcp, uHooks, uTools, uAgent, uHttp,
+  uSdk;
 
 var
   Fails: Integer = 0;
@@ -1625,6 +1626,89 @@ begin
   Check(McpConnectionCount = 0, 'and no connection outlives the test');
 end;
 
+{ Everything the protocol emits has been somewhere this program does not
+  control.  These are the bytes that make a line unparseable, which costs the
+  driver the whole run and not just the field. }
+procedure TestSdkEncoderHardening;
+var
+  Line, Content, Decoded: string;
+  Doc: TJson;
+begin
+  { A lone #$FF is not UTF-8; a NUL and a CRLF are legal but have to be
+    escaped; the multi-byte character must come back whole. }
+  Content := 'before' + #$FF + #0 + #13#10 + 'caf' + #$C3#$A9 + ' after';
+  Line := uSdk.SdkToolResultLine('t1', 'read_file', Content, False);
+  Check(Pos(#10, Line) = 0, 'a result line with a CRLF in it is still one line');
+  Check(Pos(#0, Line) = 0, 'and carries no raw NUL');
+  Doc := JsonParse(Line);
+  Check(Doc <> nil, 'and parses');
+  if Doc <> nil then
+  try
+    Decoded := Doc.Str('content');
+    Check(uJson.IsValidUtf8(Decoded),
+      'the decoded content is valid UTF-8, so the API would accept it');
+  finally
+    Doc.Free;
+  end;
+
+  { The repair is wholesale by necessity - one bad byte means the buffer is
+    not UTF-8 and the only honest reading left is the OEM codepage, which
+    reinterprets everything.  So the multi-byte character is only guaranteed
+    where the content was valid to begin with, which is the ordinary case. }
+  Content := 'caf' + #$C3#$A9 + #13#10 + 'line two' + #0 + 'end';
+  Line := uSdk.SdkToolResultLine('t1b', 'read_file', Content, False);
+  Check(Pos(#10, Line) = 0, 'valid content with a CRLF is still one line');
+  Doc := JsonParse(Line);
+  Check(Doc <> nil, 'and parses');
+  if Doc <> nil then
+  try
+    Check(Pos(#$C3#$A9, Doc.Str('content')) > 0,
+      'and the multi-byte character survived intact');
+    Check(Pos(#13#10, Doc.Str('content')) > 0,
+      'as did the line break, decoded rather than dropped');
+  finally
+    Doc.Free;
+  end;
+
+  { An argument stream the model truncated.  Spliced in as a fragment it would
+    take the whole line down with it. }
+  Line := uSdk.SdkToolUseLine('t2', 'bash', '{oops');
+  Doc := JsonParse(Line);
+  Check(Doc <> nil, 'unparseable tool input still yields a parseable line');
+  if Doc <> nil then
+  try
+    Check((Doc.Find('input') <> nil) and (Doc.Find('input').Kind = jkObj) and
+          (Doc.Find('input').Count = 0),
+      'with an empty input object rather than a broken fragment');
+  finally
+    Doc.Free;
+  end;
+
+  { A non-object input - a bare array or number - is the same problem. }
+  Line := uSdk.SdkToolUseLine('t3', 'bash', '[1,2,3]');
+  Doc := JsonParse(Line);
+  Check((Doc <> nil) and (Doc.Find('input').Kind = jkObj),
+    'a non-object tool input becomes an empty object');
+  Doc.Free;
+
+  Line := uSdk.SdkDeltaLine('text', StringOfChar('z', 200 * 1024));
+  Check(Pos(#10, Line) = 0, 'a 200 KB delta is still one line');
+  Doc := JsonParse(Line);
+  Check((Doc <> nil) and (Length(Doc.Find('delta').Str('text')) = 200 * 1024),
+    'and its text is not truncated');
+  Doc.Free;
+
+  { The permission detail is a diff preview: the one field guaranteed to have
+    newlines in it. }
+  Line := uSdk.SdkPermissionRequestLine('p1', 'write_file', 'write_file',
+    '@@ -1,3 +1,3 @@'#10'- old line'#10'+ new line'#10'  context'#10);
+  Check(Pos(#10, Line) = 0, 'a multi-line diff preview stays on one line');
+  Doc := JsonParse(Line);
+  Check((Doc <> nil) and (Pos('+ new line', Doc.Str('detail')) > 0),
+    'and decodes back to the diff a user would have read');
+  Doc.Free;
+end;
+
 begin
   TestBinaryFileDoesNotCorruptBody;
   TestNulByteIsEscaped;
@@ -1644,6 +1728,7 @@ begin
   TestMcpConfig;
   TestMcpSchemaTrust;
   TestMcpHostileServer;
+  TestSdkEncoderHardening;
 
   WriteLn;
   if Fails = 0 then

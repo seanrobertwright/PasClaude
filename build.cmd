@@ -37,3 +37,13 @@ echo Using %FPC%
 "%FPC%" %FLAGS% -Fu"%ROOT%src" -FU"%UNITS%" -FE"%OUT%" -o"%OUT%\pasclaude.exe" "%ROOT%src\pasclaude.lpr"
 if errorlevel 1 exit /b 1
 echo Built %OUT%\pasclaude.exe
+
+rem The embedding example, built here so it cannot rot.  uSdk's claim is that
+rem a program can host the agent without a console; this is the only thing
+rem that checks it, because embed.lpr uses SysUtils and uSdk and nothing else.
+"%FPC%" %FLAGS% -Fu"%ROOT%src" -FU"%UNITS%" -FE"%OUT%" -o"%OUT%\embed.exe" "%ROOT%examples\embed.lpr"
+if errorlevel 1 (
+  echo BUILD FAILED: examples\embed.lpr
+  exit /b 1
+)
+echo Built %OUT%\embed.exe

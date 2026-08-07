@@ -11,7 +11,7 @@ program pasclaude;
 
 uses
   SysUtils, Classes, DateUtils, uTerm, uJson, uHttp, uMcp, uHooks, uTools,
-  uAgent;
+  uAgent, uSdk;
 
 const
   Version = '0.1';
@@ -200,11 +200,11 @@ end;
 { ------------------------------------------------------------- completion -- }
 
 const
-  SlashCommands: array[0..21] of string = (
+  SlashCommands: array[0..22] of string = (
     '/help', '/clear', '/compact', '/diff', '/hooks', '/jobs', '/mcp',
     '/memory', '/init', '/rewind', '/sessions', '/skills', '/plugins',
     '/think', '/web',
-    '/resume', '/save', '/cwd', '/model', '/yolo', '/cost', '/exit');
+    '/resume', '/save', '/cwd', '/model', '/yolo', '/cost', '/exit', '/quit');
 
 { Candidates for the token being completed: slash commands when the token
   opens the line with a slash, file and directory names under the session
@@ -331,191 +331,16 @@ end;
 
 { ---------------------------------------------------------- system prompt -- }
 
-{ One quiet git call at startup.  Knowing the branch and whether the tree is
-  dirty saves the model its most common first tool call, and mentioning git at
-  all tells it commits are welcome.  A directory that is not a repository
-  contributes nothing rather than an error. }
-function GitContext: string;
+{ The prompt assembly used to live here, which meant no suite could reach it:
+  nothing can link a program.  It now lives in uSdk, verbatim, and this is the
+  only thing left behind - the string a hook's SessionStart produced, handed
+  to uSdk through the one seam that exists for it. }
 var
-  Code: Integer;
-  Head, Stat: string;
+  HookSystemExtra: string = '';
 
-  function OneLine(const S: string): string;
-  var
-    P: Integer;
-  begin
-    Result := Trim(S);
-    P := Pos(#10, Result);
-    if P > 0 then SetLength(Result, P - 1);
-    Result := Trim(Result);
-  end;
-
-var
-  I, Lines: Integer;
+function SdkExtra: string;
 begin
-  Result := '';
-  Head := uTools.RunShellQuiet('git rev-parse --abbrev-ref HEAD', Code);
-  if Code <> 0 then Exit;
-  Head := OneLine(Head);
-  if Head = '' then Exit;
-
-  Stat := uTools.RunShellQuiet('git status --porcelain', Code);
-  Lines := 0;
-  if Code = 0 then
-    for I := 1 to Length(Stat) do
-      if Stat[I] = #10 then Inc(Lines);
-
-  Result := 'This is a git repository on branch "' + Head + '"';
-  if Lines = 0 then
-    Result := Result + ' with a clean tree.'
-  else
-    Result := Result + Format(' with %d changed files (git status/diff for detail).',
-      [Lines]);
-  Result := Result + #10#10;
-end;
-
-function SystemPrompt: string;
-var
-  GitInfo: string;
-begin
-  GitInfo := GitContext;
-  Result :=
-    'You are pasclaude, a terminal coding assistant working inside a user''s ' +
-    'project directory on Windows.' + #10#10 +
-    'Session root: ' + uTools.RootDir + #10#10 +
-    GitInfo +
-    'Guidelines:' + #10 +
-    '- Investigate before you act: read the relevant files rather than ' +
-    'guessing at their contents.' + #10 +
-    '- Prefer edit_file over write_file when changing an existing file.' + #10 +
-    '- Jupyter notebooks (.ipynb) read back as numbered cells; change them ' +
-    'with notebook_edit, not edit_file.' + #10 +
-    '- For a self-contained question that needs a lot of reading to answer - ' +
-    'which unit owns something, where a setting is used - hand it to task ' +
-    'and work from its answer, so this conversation is not filled with the ' +
-    'intermediate files.' + #10 +
-    '- Named skills may be available through the skill tool; check its list ' +
-    'before improvising a procedure this project has already written down.' + #10 +
-    '- Shell commands run through cmd.exe, so use Windows syntax.' + #10 +
-    '- After changing code, build or test it if there is an obvious way to ' +
-    'do so, and fix what you broke.' + #10 +
-    '- Keep replies short. The user is reading a terminal, not a report. ' +
-    'Explain what you did, not what you are about to do.' + #10 +
-    '- Write, edit and shell commands need the user''s approval, so batch ' +
-    'related changes rather than asking many times for trivia.';
-end;
-
-{ Expands @import lines in an instruction file: a line that is exactly
-  "@import <path>" (or Claude Code's bare "@path" form alone on a line) is
-  replaced by that file's contents.  One level only - an import cannot
-  import - because a cycle must terminate and one level covers the real
-  use: a shared conventions file included from CLAUDE.md.  The path faces
-  the session-root guard; anything it refuses stays as literal text. }
-function ExpandImports(const Text: string): string;
-var
-  L, F: TStringList;
-  I: Integer;
-  Line, Ref, Full, Err, Sub: string;
-begin
-  L := TStringList.Create;
-  try
-    L.Text := Text;
-    Result := '';
-    for I := 0 to L.Count - 1 do
-    begin
-      Line := Trim(L[I]);
-      Ref := '';
-      if Copy(Line, 1, 8) = '@import ' then
-        Ref := Trim(Copy(Line, 9, MaxInt))
-      else if (Length(Line) > 1) and (Line[1] = '@') and
-              (Pos(' ', Line) = 0) then
-        { The bare "@path" form, alone on its line. }
-        Ref := Copy(Line, 2, MaxInt);
-
-      if (Ref <> '') and uTools.ResolveInRoot(Ref, Full, Err) and
-         FileExists(Full) then
-      begin
-        Sub := '';
-        F := TStringList.Create;
-        try
-          try
-            F.LoadFromFile(Full);
-            Sub := F.Text;
-          except
-            Sub := '';
-          end;
-        finally
-          F.Free;
-        end;
-        if (Sub <> '') and uTools.IsValidUtf8(Sub) then
-        begin
-          Result := Result + '--- imported: ' + Ref + ' ---'#10 + Sub + #10;
-          Continue;
-        end;
-      end;
-      Result := Result + L[I] + #10;
-    end;
-  finally
-    L.Free;
-  end;
-end;
-
-{ The user-level memory: %USERPROFILE%\.pasclaude\CLAUDE.md, instructions
-  that follow the user across projects.  It loads before the project's own
-  files so a project can override it - nearer wins, as in Claude Code. }
-function UserContext: string;
-var
-  Path: string;
-  L: TStringList;
-begin
-  Result := '';
-  Path := IncludeTrailingPathDelimiter(GetEnvironmentVariable('USERPROFILE')) +
-    '.pasclaude' + PathDelim + 'CLAUDE.md';
-  if not FileExists(Path) then Exit;
-  L := TStringList.Create;
-  try
-    try
-      L.LoadFromFile(Path);
-      Result := #10#10 + '--- user memory (~\.pasclaude\CLAUDE.md) ---' + #10 +
-        L.Text;
-    except
-      { Unreadable user memory is not worth failing the session over. }
-    end;
-  finally
-    L.Free;
-  end;
-end;
-
-{ Project instructions, if the repository ships any.  This is how a project
-  tells the agent about its own conventions.  The user-level memory loads
-  first so the project's own files can override it - nearer wins. }
-function ProjectContext: string;
-var
-  Names: array[0..2] of string = ('AGENTS.md', 'CLAUDE.md', '.pasclaude.md');
-  I: Integer;
-  Path: string;
-  L: TStringList;
-begin
-  Result := UserContext;
-  for I := 0 to High(Names) do
-  begin
-    Path := IncludeTrailingPathDelimiter(uTools.RootDir) + Names[I];
-    if not FileExists(Path) then Continue;
-    L := TStringList.Create;
-    try
-      try
-        L.LoadFromFile(Path);
-        Result := Result + #10#10 + '--- ' + Names[I] + ' ---' + #10 +
-          ExpandImports(L.Text);
-      except
-        { An unreadable context file is not worth failing the session over. }
-      end;
-    finally
-      L.Free;
-    end;
-  end;
-  if Result <> '' then
-    Result := #10#10 + 'Project instructions follow. Treat them as binding.' + Result;
+  Result := HookSystemExtra;
 end;
 
 { ------------------------------------------------------------------ shell -- }
@@ -534,6 +359,7 @@ begin
   EmitCLn(clGrey,   '  /memory        show the project memory (CLAUDE.md)');
   EmitCLn(clGrey,   '  /init          have the model write a CLAUDE.md for this project');
   EmitCLn(clGrey,   '  /rewind        undo turns: conversation and edited files');
+  EmitCLn(clGrey,   '  /sessions      saved conversations in this directory');
   EmitCLn(clGrey,   '  /skills        skills this project offers; also rescans for new ones');
   EmitCLn(clGrey,   '  /plugins       installed plugins; /plugins enable|disable <name>');
   EmitCLn(clGrey,   '  /think [n]     extended thinking: on, off, or a token budget');
@@ -552,6 +378,8 @@ begin
   EmitCLn(clGrey,   '  .pasclaude\skills\<name>\SKILL.md is a skill the model can read.');
   EmitCLn(clGrey,   '  A directory in .pasclaude\plugins\ can carry all three, once you');
   EmitCLn(clGrey,   '  enable it by name. A skill added mid-session appears after /skills.');
+  EmitCLn(clGrey,   '  To drive pasclaude from another program: -p with');
+  EmitCLn(clGrey,   '  --output-format json|stream-json (see pasclaude --help).');
 end;
 
 { Hook failures, matcher budgets and load-time notes.  Yellow, because none of
@@ -1661,54 +1489,44 @@ end;
 
 { ------------------------------------------------------------------- main -- }
 
-{ A user-defined command: /name args reads .pasclaude\commands\name.md and
-  returns its contents as the prompt, with every $ARGUMENTS replaced by the
-  rest of the line.  The file is the prompt, nothing more - no frontmatter,
-  no scripting - because a prompt in a file already covers the real use:
-  the same request typed often, made one word. }
-function ExpandCustomCommand(const Line: string; out Ok: Boolean): string;
+{ ExpandCustomCommand moved to uSdk with the prompt assembly; the REPL calls
+  uSdk.SdkExpandCustomCommand below. }
+
+{ How this run reports itself, decided in the argument loop and consulted by
+  every startup failure below.  A driver that asked for JSON must never be
+  handed a sentence: it has one parser, and prose on stdout is indistinguishable
+  from a protocol line that went wrong. }
 var
-  Name, Args, Path: string;
-  Sp, I: Integer;
+  OutFormat: uSdk.TSdkFormat = uSdk.sfText;
+  StreamInput: Boolean = False;
+
+{ Every early exit goes through here.  Hint is the human's extra context and
+  is printed only in text mode - the machine gets the one line it can act on. }
+procedure FailStart(const Msg, Hint: string; Code: Integer);
+var
   L: TStringList;
+  I: Integer;
 begin
-  Result := '';
-  Ok := False;
-  Sp := Pos(' ', Line);
-  if Sp = 0 then
+  if OutFormat = uSdk.sfText then
   begin
-    Name := Copy(Line, 2, MaxInt);
-    Args := '';
+    EmitCLn(clRed, Msg);
+    if Hint <> '' then
+    begin
+      L := TStringList.Create;
+      try
+        L.Text := Hint;
+        for I := 0 to L.Count - 1 do EmitCLn(clGrey, '  ' + L[I]);
+      finally
+        L.Free;
+      end;
+    end;
   end
   else
-  begin
-    Name := Copy(Line, 2, Sp - 2);
-    Args := Trim(Copy(Line, Sp + 1, MaxInt));
-  end;
-  if Name = '' then Exit;
-  { The name is a filename; anything that could redirect the lookup out of
-    the commands directory is refused rather than resolved. }
-  for I := 1 to Length(Name) do
-    if Name[I] in ['\', '/', ':', '.'] then Exit;
-
-  { Through the resolver, so an enabled plugin's commands answer to /name too.
-    The filter above stays: it is one line, it is the same rule, and defence
-    in depth costs nothing here. }
-  Path := uTools.ResolveCommandFile(Name);
-  if Path = '' then Exit;
-
-  L := TStringList.Create;
-  try
-    try
-      L.LoadFromFile(Path);
-    except
-      Exit;
-    end;
-    Result := StringReplace(L.Text, '$ARGUMENTS', Args, [rfReplaceAll]);
-    Ok := Trim(Result) <> '';
-  finally
-    L.Free;
-  end;
+    uSdk.SdkEmit(uSdk.SdkErrorLine(Msg));
+  { Halt skips the finally block, so the console has to be put back here or
+    the caller's codepage stays switched to UTF-8. }
+  TermDone;
+  Halt(Code);
 end;
 
 var
@@ -1729,10 +1547,12 @@ var
   WebFlag: Boolean = False;
   Piped: string;
   McpErr: string = '';
-  HookExtra: string = '';
   HookNotes: string = '';
   HookOut: THookOutcome;
   HookCallRec: THookCall;
+  SdkOpts: uSdk.TSdkOptions;
+  SdkCode: Integer;
+  SkipNext: Boolean = False;
   StopActive: Boolean = False;
   Again: Boolean = False;
   TurnOk: Boolean = False;
@@ -1741,12 +1561,19 @@ begin
   TermInit;
   try
     Dir := '';
+    SkipNext := False;
     for ArgI := 1 to ParamCount do
     begin
       Arg := ParamStr(ArgI);
-      { -p consumed the next argument as its prompt on the pass before. }
-      if (ArgI > 1) and ((ParamStr(ArgI - 1) = '-p') or
-         (ParamStr(ArgI - 1) = '--print')) then Continue;
+      { The previous flag consumed this argument as its value.  A latch rather
+        than a backwards look at ParamStr(ArgI - 1), because there are now
+        three flags that take a value and asking "was the one before me any of
+        them" gets longer and wronger with each. }
+      if SkipNext then
+      begin
+        SkipNext := False;
+        Continue;
+      end;
       if (Arg = '--resume') or (Arg = '-r') then
         Resume := True
       else if Arg = '--web' then
@@ -1756,7 +1583,34 @@ begin
       else if (Arg = '-p') or (Arg = '--print') then
       begin
         PrintMode := True;
-        if ArgI < ParamCount then PrintPrompt := ParamStr(ArgI + 1);
+        if ArgI < ParamCount then
+        begin
+          PrintPrompt := ParamStr(ArgI + 1);
+          SkipNext := True;
+        end;
+      end
+      else if Arg = '--output-format' then
+      begin
+        if ArgI >= ParamCount then
+          FailStart('--output-format needs a value: text, json or stream-json',
+            '', 2);
+        if not uSdk.SdkParseFormat(ParamStr(ArgI + 1), OutFormat) then
+          FailStart('unknown output format: ' + ParamStr(ArgI + 1),
+            'text, json or stream-json', 2);
+        SkipNext := True;
+      end
+      else if Arg = '--input-format' then
+      begin
+        if ArgI >= ParamCount then
+          FailStart('--input-format needs a value: text or stream-json', '', 2);
+        if ParamStr(ArgI + 1) = 'text' then
+          StreamInput := False
+        else if ParamStr(ArgI + 1) = 'stream-json' then
+          StreamInput := True
+        else
+          FailStart('unknown input format: ' + ParamStr(ArgI + 1),
+            'text or stream-json', 2);
+        SkipNext := True;
       end
       else if (Arg = '--help') or (Arg = '-h') or (Arg = '/?') then
       begin
@@ -1765,28 +1619,41 @@ begin
         EmitCLn(clGrey, '  --web     let the model search the web (off by default)');
         EmitCLn(clGrey, '  -p        answer one prompt and exit (reads stdin when piped)');
         EmitCLn(clGrey, '            (-p never loads hooks: nobody is there to approve them)');
+        EmitCLn(clGrey, '  --output-format text|json|stream-json   (needs -p)');
+        EmitCLn(clGrey, '  --input-format  text|stream-json        (needs -p and stream-json out)');
+        EmitCLn(clGrey, '            json/stream-json put one JSON object per line on stdout,');
+        EmitCLn(clGrey, '            for driving pasclaude from another program.  Without');
+        EmitCLn(clGrey, '            --input-format stream-json there is nobody to approve');
+        EmitCLn(clGrey, '            anything, so every write, edit and shell command is refused.');
+        EmitCLn(clGrey, '            Note -p takes the next argument as its prompt, so put the');
+        EmitCLn(clGrey, '            format flags before it or give -p a prompt of its own.');
         { Halt skips the finally block, so the console has to be put back
           here or the caller's codepage stays switched to UTF-8. }
         TermDone;
         Halt(0);
       end
       else if Copy(Arg, 1, 1) = '-' then
-      begin
-        EmitCLn(clRed, 'unknown option: ' + Arg);
-        TermDone;
-        Halt(2);
-      end
+        FailStart('unknown option: ' + Arg, '', 2)
       else
         Dir := Arg;
     end;
+    { The formats only mean anything on the one-shot path.  Refusing rather
+      than ignoring, because a driver that mistyped its invocation would
+      otherwise sit waiting for a protocol nobody is speaking. }
+    if not PrintMode then
+    begin
+      if OutFormat <> uSdk.sfText then
+        FailStart('--output-format needs -p', '', 2);
+      if StreamInput then
+        FailStart('--input-format needs -p', '', 2);
+    end;
+    if StreamInput and (OutFormat <> uSdk.sfStreamJson) then
+      FailStart('--input-format stream-json needs --output-format stream-json',
+        'a driver that sends messages has to be able to read the answers', 2);
     if Dir <> '' then
     begin
       if not DirectoryExists(Dir) then
-      begin
-        EmitCLn(clRed, 'no such directory: ' + Dir);
-        TermDone;
-        Halt(2);
-      end;
+        FailStart('no such directory: ' + Dir, '', 2);
       SetCurrentDir(Dir);
     end;
     uTools.RootDir := GetCurrentDir;
@@ -1811,18 +1678,14 @@ begin
         UsingSubscription := True
       else
       begin
-        EmitCLn(clRed, 'ANTHROPIC_API_KEY is not set, and no subscription token was usable');
-        EmitCLn(clGrey, '  (' + SaveErr + ')');
-        EmitCLn(clGrey, '  set ANTHROPIC_API_KEY=sk-ant-..., or sign in to Claude Code once');
-        TermDone;
-        Halt(2);
+        FailStart('ANTHROPIC_API_KEY is not set, and no subscription token was usable',
+          '(' + SaveErr + ')'#10 +
+          'set ANTHROPIC_API_KEY=sk-ant-..., or sign in to Claude Code once', 2);
       end;
     end;
     if not HttpAvailable then
     begin
-      EmitCLn(clRed, 'winhttp.dll could not be loaded; no network available.');
-      TermDone;
-      Halt(2);
+      FailStart('winhttp.dll could not be loaded; no network available.', '', 2);
     end;
 
     ModelName := GetEnvironmentVariable('ANTHROPIC_MODEL');
@@ -1838,7 +1701,8 @@ begin
       deny-by-default means a config that cannot be asked about does not run.
       There is no override in v1 - that is a decision to make with a user in
       the room, not a default. }
-    HookExtra := '';
+    HookSystemExtra := '';
+    uSdk.SdkSystemExtra := @SdkExtra;
     if not PrintMode then
     begin
       uHooks.OnHookNotice := @HookNotice;
@@ -1862,13 +1726,18 @@ begin
             Halt(2);
           end;
           if Trim(HookOut.Text) <> '' then
-            HookExtra := #10#10'Session context follows.'#10 + HookOut.Text;
+            HookSystemExtra := #10#10'Session context follows.'#10 +
+              HookOut.Text;
         end;
       end;
     end;
 
-    Agent := TAgent.Create(ApiKey, ModelName,
-      SystemPrompt + ProjectContext + HookExtra);
+    { One call, in uSdk, for the whole prompt: the identity and guidelines,
+      then whatever a SessionStart hook contributed, then the project's own
+      instruction files.  The hook text sits between them because it is
+      session context rather than a standing rule, and the "treat them as
+      binding" line has to stay attached to the files it introduces. }
+    Agent := TAgent.Create(ApiKey, ModelName, uSdk.SdkFullSystem);
     try
       Agent.OnText := @OnText;
       Agent.OnThinking := @OnThinking;
@@ -1893,6 +1762,24 @@ begin
       if PrintMode then
       begin
         Agent.Ask := nil;
+        { The SDK path branches here, at exactly the point print mode already
+          branches: before HistoryLoad, LoadPermissions, the banner and the
+          session backup.  That is the cheapest possible proof the interactive
+          REPL cannot regress - a REPL session can never enter it.
+
+          With a driver on stdin there is nothing to slurp and nothing to
+          require: stdin is the driver's channel, and the first user message
+          arrives over it rather than on the command line. }
+        if (OutFormat <> uSdk.sfText) and StreamInput then
+        begin
+          SdkOpts.Format := OutFormat;
+          SdkOpts.StreamInput := True;
+          SdkOpts.SessionId := uSdk.SdkNewSessionId;
+          SdkOpts.PermissionMode := 'ask';
+          SdkCode := uSdk.SdkRun(Agent, SdkOpts, PrintPrompt, Err);
+          TermDone;
+          Halt(SdkCode);
+        end;
         { A piped stdin becomes context under the prompt, which is how
           type build.log | pasclaude -p "why did this fail?"  works. }
         Piped := '';
@@ -1910,13 +1797,24 @@ begin
         end;
         if Trim(PrintPrompt) = '' then
         begin
-          EmitCLn(clRed, 'print mode needs a prompt: -p "question" or piped stdin');
-          TermDone;
-          Halt(2);
+          FailStart('print mode needs a prompt: -p "question" or piped stdin',
+            '', 2);
         end;
         if Piped <> '' then
           PrintPrompt := PrintPrompt + #10#10 +
             'Input follows.'#10'---'#10 + Piped;
+
+        if OutFormat <> uSdk.sfText then
+        begin
+          SdkOpts.Format := OutFormat;
+          SdkOpts.StreamInput := False;
+          SdkOpts.SessionId := uSdk.SdkNewSessionId;
+          { No driver, so nobody can be asked and SdkRun leaves Ask nil. }
+          SdkOpts.PermissionMode := 'deny';
+          SdkCode := uSdk.SdkRun(Agent, SdkOpts, PrintPrompt, Err);
+          TermDone;
+          Halt(SdkCode);
+        end;
 
         MdReset;
         if Agent.Send(PrintPrompt, Err) then
@@ -2054,7 +1952,7 @@ begin
           substituted.  Checked after the built-ins so none can be shadowed. }
         if Line[1] = '/' then
         begin
-          Line := ExpandCustomCommand(Line, Handled);
+          Line := uSdk.SdkExpandCustomCommand(Line, Handled);
           if not Handled then
           begin
             EmitCLn(clRed, '  unknown command (no .pasclaude\commands match either)');

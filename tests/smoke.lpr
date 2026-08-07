@@ -5,7 +5,8 @@ program smoke;
 
 {$mode objfpc}{$H+}
 
-uses SysUtils, Classes, uJson, uHttp, uMcp, uHooks, uTools, uAgent, uRegex;
+uses SysUtils, Classes, uJson, uHttp, uMcp, uHooks, uTools, uAgent, uRegex,
+  uSdk;
 
 var
   Fails: Integer = 0;
@@ -2487,6 +2488,79 @@ begin
   uTools.RootDir := IncludeTrailingPathDelimiter(GetTempDir) + 'pasclaude-test';
 end;
 
+{ The init line is the first thing a driver ever reads, and everything in it
+  is derived rather than listed: a tool MCP or skills contributed appears
+  because ToolsSchema is walked, not because this encoder was updated.  The
+  suite runs under -gh, so the walk not freeing the schema array is caught as
+  an unfreed block rather than as a failed assertion. }
+procedure TestSdkInitInventory;
+var
+  Opts: uSdk.TSdkOptions;
+  Doc, Arr, Schema: TJson;
+  I: Integer;
+  Names: TStringArray;
+  Same: Boolean;
+begin
+  Opts.Format := uSdk.sfStreamJson;
+  Opts.StreamInput := False;
+  Opts.SessionId := uSdk.SdkNewSessionId;
+  Opts.PermissionMode := 'deny';
+  Check(Length(Opts.SessionId) = 36,
+    Format('a fresh session id is a 36-character GUID (%d)',
+      [Length(Opts.SessionId)]));
+
+  Doc := JsonParse(uSdk.SdkInitLine(Opts, 'some-model'));
+  Check(Doc <> nil, 'the init line parses');
+  if Doc = nil then Exit;
+  try
+    Check(Doc.Str('type') = 'system', 'it is a system message');
+    Check(Doc.Str('subtype') = 'init', 'of subtype init');
+    Check(Doc.Str('model') = 'some-model', 'naming the model in use');
+    Check(Doc.Str('permission_mode') = 'deny', 'and the permission mode');
+
+    Arr := Doc.Find('tools');
+    Schema := ToolsSchema;
+    try
+      Check((Arr <> nil) and (Arr.Count = Schema.Count),
+        Format('the tools array is the same length as the live schema (%d/%d)',
+          [Arr.Count, Schema.Count]));
+      Same := (Arr <> nil) and (Arr.Count = Schema.Count);
+      if Same then
+        for I := 0 to Schema.Count - 1 do
+          if Arr.Item(I).AsString <> Schema.Item(I).Str('name') then Same := False;
+      Check(Same, 'with the same names in the same order');
+    finally
+      Schema.Free;
+    end;
+
+    Arr := Doc.Find('agents');
+    Names := SubagentTypes;
+    Same := (Arr <> nil) and (Arr.Kind = jkArr) and (Arr.Count = Length(Names));
+    if Same then
+      for I := 0 to High(Names) do
+        if Arr.Item(I).AsString <> Names[I] then Same := False;
+    Check(Same, 'the agents array matches uTools.SubagentTypes');
+
+    Arr := Doc.Find('commands');
+    Names := uSdk.SdkCommandNames;
+    Same := (Arr <> nil) and (Arr.Kind = jkArr) and (Arr.Count = Length(Names));
+    if Same then
+      for I := 0 to High(Names) do
+        if Arr.Item(I).AsString <> Names[I] then Same := False;
+    Check(Same, 'and the commands array matches the commands directory');
+
+    { Present even when empty.  A driver that has to branch on a missing key
+      is a driver that gets it wrong on the build where the feature is off. }
+    Check((Doc.Find('mcp_servers') <> nil) and
+          (Doc.Find('mcp_servers').Kind = jkArr),
+      'mcp_servers is always an array, never absent or null');
+    Check((Doc.Find('skills') <> nil) and (Doc.Find('skills').Kind = jkArr),
+      'and so is skills');
+  finally
+    Doc.Free;
+  end;
+end;
+
 var
   Schema: TJson;
 begin
@@ -2518,6 +2592,7 @@ begin
   TestHookConfig;
   TestHookDispatch;
   TestHookPermission;
+  TestSdkInitInventory;
   Schema := ToolsSchema;
   try
     Check(Pos('"input_schema"', Schema.ToJson) > 0, 'the schema serialises');

@@ -12,7 +12,7 @@ program loop;
 
 {$mode objfpc}{$H+}
 
-uses SysUtils, Classes, uJson, uHttp, uHooks, uTools, uAgent;
+uses SysUtils, Classes, uJson, uHttp, uHooks, uTools, uAgent, uSdk;
 
 var
   Fails: Integer = 0;
@@ -2235,6 +2235,550 @@ begin
   end;
 end;
 
+
+{ ------------------------------------------------------------ SDK protocol -- }
+
+{ The protocol is driven entirely in process: uSdk writes through SdkSink and
+  reads through SdkSource, so a suite can be the driver on the other end of
+  the pipe without there being a pipe.  Both are restored to nil in a finally
+  by every test that installs them - they are globals, and one left behind
+  would silently swallow the output of every later test. }
+var
+  SdkLines: array of string;
+  DriverLines: array of string;
+  DriverAt: Integer = 0;
+
+procedure CollectLine(const S: string);
+begin
+  SetLength(SdkLines, Length(SdkLines) + 1);
+  SdkLines[High(SdkLines)] := S;
+end;
+
+function DriverLine(out S: string): Boolean;
+begin
+  S := '';
+  Result := DriverAt <= High(DriverLines);
+  if not Result then Exit;
+  S := DriverLines[DriverAt];
+  Inc(DriverAt);
+end;
+
+procedure Drive(const S: string);
+begin
+  SetLength(DriverLines, Length(DriverLines) + 1);
+  DriverLines[High(DriverLines)] := S;
+end;
+
+procedure ResetSdk;
+begin
+  SdkLines := nil;
+  DriverLines := nil;
+  DriverAt := 0;
+end;
+
+{ The message types in the order they were emitted, as one string.  Ordering
+  bugs - a result before its tool, an init inside the loop - are far easier to
+  read as a sequence than as a set of index comparisons. }
+function SdkTypes: string;
+var
+  I: Integer;
+  D: TJson;
+begin
+  Result := '';
+  for I := 0 to High(SdkLines) do
+  begin
+    D := JsonParse(SdkLines[I]);
+    if D = nil then
+    begin
+      Result := Result + '?;';
+      Continue;
+    end;
+    try
+      Result := Result + D.Str('type') + ';';
+    finally
+      D.Free;
+    end;
+  end;
+end;
+
+function SdkCountOf(const AType: string): Integer;
+var
+  I: Integer;
+  D: TJson;
+begin
+  Result := 0;
+  for I := 0 to High(SdkLines) do
+  begin
+    D := JsonParse(SdkLines[I]);
+    if D = nil then Continue;
+    try
+      if D.Str('type') = AType then Inc(Result);
+    finally
+      D.Free;
+    end;
+  end;
+end;
+
+{ The N-th line of a type, as raw text; '' when there is no such line. }
+function SdkNthOf(const AType: string; N: Integer): string;
+var
+  I, Seen: Integer;
+  D: TJson;
+  Hit: Boolean;
+begin
+  Result := '';
+  Seen := 0;
+  for I := 0 to High(SdkLines) do
+  begin
+    D := JsonParse(SdkLines[I]);
+    if D = nil then Continue;
+    try
+      Hit := D.Str('type') = AType;
+    finally
+      D.Free;
+    end;
+    if not Hit then Continue;
+    if Seen = N then Exit(SdkLines[I]);
+    Inc(Seen);
+  end;
+end;
+
+function EveryLineIsOneJsonObject: Boolean;
+var
+  I: Integer;
+  D: TJson;
+begin
+  Result := True;
+  for I := 0 to High(SdkLines) do
+  begin
+    if Pos(#10, SdkLines[I]) > 0 then Exit(False);
+    D := JsonParse(SdkLines[I]);
+    if (D = nil) or (D.Kind <> jkObj) then Result := False;
+    D.Free;
+    if not Result then Exit;
+  end;
+end;
+
+function SdkOptions(F: TSdkFormat; Stream: Boolean): TSdkOptions;
+begin
+  Result.Format := F;
+  Result.StreamInput := Stream;
+  Result.SessionId := 'sess-test';
+  if Stream then Result.PermissionMode := 'ask'
+  else Result.PermissionMode := 'deny';
+end;
+
+{ One turn with a tool in it, seen entirely through the wire. }
+procedure TestSdkStreamProtocol;
+var
+  A: TAgent;
+  Err, TU, TR, Deltas, Types: string;
+  Code, I: Integer;
+  Doc: TJson;
+begin
+  ResetScript;
+  ResetSdk;
+  uTools.RootDir := SessionDir;
+  uTools.AllowAllEdits := True;
+  WriteSessionFile('x.txt', 'hello from x');
+
+  SetLength(Replies, 2);
+  Replies[0] := ToolReply('t1', 'read_file', '{"path":"x.txt"}');
+  Replies[1] := TextReply('done');
+
+  uSdk.SdkSink := @CollectLine;
+  A := MakeAgent;
+  try
+    Code := uSdk.SdkRun(A, SdkOptions(sfStreamJson, False), 'read x', Err);
+    Check(Code = 0, 'a clean stream-json run exits 0');
+    Check(EveryLineIsOneJsonObject,
+      'every emitted line is exactly one JSON object with no embedded newline');
+
+    Types := SdkTypes;
+    Check(Copy(Types, 1, 12) = 'system;user;',
+      'the run opens with system/init then the user echo: ' + Types);
+    Check(Pos('tool_use;', Types) > 0, 'the tool call is announced');
+    Check((Pos('tool_use;', Types) > 0) and
+          (Pos('tool_use;', Types) < Pos('tool_result;', Types)),
+      'and the call is announced before its result');
+    Check(SdkCountOf('result') = 1, 'exactly one result line');
+    Check(Copy(Types, Length(Types) - Length('result;') + 1, MaxInt) = 'result;',
+      'and it is the last thing emitted: ' + Types);
+
+    Doc := JsonParse(SdkNthOf('system', 0));
+    try
+      Check(Doc.Str('subtype') = 'init', 'the system line is the init line');
+    finally
+      Doc.Free;
+    end;
+
+    TU := SdkNthOf('tool_use', 0);
+    Doc := JsonParse(TU);
+    try
+      Check(Doc.Str('id') = 't1', 'the tool_use carries the block id');
+      Check((Doc.Find('input') <> nil) and (Doc.Find('input').Kind = jkObj),
+        'and its input is a parsed object, not a quoted string');
+      Check(Doc.Find('input').Str('path') = 'x.txt',
+        'whose path is what the model asked for');
+    finally
+      Doc.Free;
+    end;
+
+    TR := SdkNthOf('tool_result', 0);
+    Doc := JsonParse(TR);
+    try
+      Check(Doc.Str('tool_use_id') = 't1',
+        'the tool_result pairs back to the same id');
+      Check((Doc.Find('is_error') <> nil) and
+            (Doc.Find('is_error').Kind = jkBool),
+        'and is_error is a boolean, always present');
+    finally
+      Doc.Free;
+    end;
+
+    Deltas := '';
+    for I := 0 to SdkCountOf('assistant_delta') - 1 do
+    begin
+      Doc := JsonParse(SdkNthOf('assistant_delta', I));
+      try
+        if Doc.Find('delta').Str('type') = 'text' then
+          Deltas := Deltas + Doc.Find('delta').Str('text');
+      finally
+        Doc.Free;
+      end;
+    end;
+    Check(Deltas = 'done',
+      'the text deltas concatenate to the reply: "' + Deltas + '"');
+
+    Doc := JsonParse(SdkNthOf('result', 0));
+    try
+      Check(Doc.Str('subtype') = 'success', 'the result says success');
+      Check(Doc.Str('result') = A.LastAssistantText,
+        'and carries the final assistant text');
+    finally
+      Doc.Free;
+    end;
+  finally
+    A.Free;
+    uSdk.SdkSink := nil;
+    uSdk.SdkSource := nil;
+  end;
+end;
+
+{ A turn reports what that turn spent, not what the session has spent. }
+procedure TestSdkPerTurnUsage;
+var
+  A: TAgent;
+  Err: string;
+  Doc: TJson;
+begin
+  ResetScript;
+  ResetSdk;
+  uTools.RootDir := SessionDir;
+
+  SetLength(Replies, 2);
+  Replies[0] := TextReply('one');
+  Replies[1] := TextReply('two');
+  Drive('{"type":"user","message":{"role":"user","content":"first"}}');
+  Drive('{"type":"user","message":{"role":"user","content":"second"}}');
+
+  uSdk.SdkSink := @CollectLine;
+  uSdk.SdkSource := @DriverLine;
+  A := MakeAgent;
+  try
+    uSdk.SdkRun(A, SdkOptions(sfStreamJson, True), '', Err);
+    Check(SdkCountOf('result') = 2, 'two turns produce two result lines');
+
+    Doc := JsonParse(SdkNthOf('result', 0));
+    try
+      Check(Doc.Find('usage').Num('input_tokens') = 10,
+        'turn one reports its own input tokens');
+      Check(Doc.Find('total_usage').Num('input_tokens') = 10,
+        'and the running total is the same after one turn');
+      Check(Doc.Num('num_turns') = 1, 'num_turns is 1');
+      Check(Doc.Num('duration_ms') >= 0, 'duration_ms is present and sane');
+      Check(Doc.Find('total_cost_usd') = nil,
+        'no total_cost_usd is invented: there is no price table to build one from');
+    finally
+      Doc.Free;
+    end;
+
+    Doc := JsonParse(SdkNthOf('result', 1));
+    try
+      Check(Doc.Find('usage').Num('input_tokens') = 10,
+        'turn two reports turn two alone, not the running sum');
+      Check(Doc.Find('total_usage').Num('input_tokens') = 20,
+        'while total_usage carries both turns');
+      Check(Doc.Num('num_turns') = 2, 'num_turns has advanced');
+      Check(Doc.Find('total_cost_usd') = nil,
+        'and still no total_cost_usd on the second result');
+    finally
+      Doc.Free;
+    end;
+  finally
+    A.Free;
+    uSdk.SdkSink := nil;
+    uSdk.SdkSource := nil;
+  end;
+end;
+
+{ Several turns over one stdin stream, in both content shapes a driver may
+  have to hand. }
+procedure TestSdkStreamInputMultiTurn;
+var
+  A: TAgent;
+  Err: string;
+  Code: Integer;
+begin
+  ResetScript;
+  ResetSdk;
+  uTools.RootDir := SessionDir;
+
+  SetLength(Replies, 2);
+  Replies[0] := TextReply('alpha');
+  Replies[1] := TextReply('beta');
+  Drive('{"type":"user","message":{"role":"user","content":"first question"}}');
+  Drive('{"type":"user","message":{"role":"user","content":' +
+        '[{"type":"text","text":"second question"}]}}');
+
+  uSdk.SdkSink := @CollectLine;
+  uSdk.SdkSource := @DriverLine;
+  A := MakeAgent;
+  try
+    Code := uSdk.SdkRun(A, SdkOptions(sfStreamJson, True), '', Err);
+    Check(Code = 0, 'a two-message driver session exits 0');
+    Check(SdkCountOf('system') = 1,
+      'the init line is emitted once for the whole run, not once per message');
+    Check(SdkCountOf('user') = 2, 'both driver messages were echoed');
+    Check(SdkCountOf('result') = 2,
+      'and each one got its own result, including the block-array form');
+    Check(CallCount = 2, 'two requests went out');
+    Check((Pos('first question', Requests[1]) > 0) and
+          (Pos('second question', Requests[1]) > 0),
+      'the second request carries both turns, so the transcript survived');
+  finally
+    A.Free;
+    uSdk.SdkSink := nil;
+    uSdk.SdkSource := nil;
+  end;
+end;
+
+{ One write_file turn answered by the given permission response.  Returns the
+  tool_result's is_error; SawResult says whether one was emitted at all. }
+function RunOnePermission(const Response: string; SendResponse: Boolean;
+  out SawResult: Boolean; out ReqLine: string): Boolean;
+var
+  A: TAgent;
+  Err: string;
+  Doc: TJson;
+begin
+  Result := False;
+  SawResult := False;
+  ReqLine := '';
+  ResetScript;
+  ResetSdk;
+  SetLength(Replies, 2);
+  Replies[0] := ToolReply('w1', 'write_file',
+    '{"path":"perm.txt","content":"second version\nwith two lines\n"}');
+  Replies[1] := TextReply('ok');
+  if SendResponse then Drive(Response);
+
+  uSdk.SdkSink := @CollectLine;
+  uSdk.SdkSource := @DriverLine;
+  A := MakeAgent;
+  try
+    uSdk.SdkRun(A, SdkOptions(sfStreamJson, True), 'write it', Err);
+    ReqLine := SdkNthOf('permission_request', 0);
+    SawResult := SdkCountOf('tool_result') = 1;
+    Doc := JsonParse(SdkNthOf('tool_result', 0));
+    if Doc <> nil then
+    try
+      Result := Doc.Bool('is_error');
+    finally
+      Doc.Free;
+    end;
+  finally
+    A.Free;
+    uSdk.SdkSink := nil;
+    uSdk.SdkSource := nil;
+  end;
+end;
+
+{ The driver as permission authority.  Every ambiguity has to deny, and every
+  denial still has to produce a tool_result or the transcript is illegal. }
+procedure TestSdkPermissionDelegation;
+var
+  SavedEdits, IsErr, Saw: Boolean;
+  Req: string;
+  Doc: TJson;
+begin
+  SavedEdits := uTools.AllowAllEdits;
+  uTools.AllowAllEdits := False;
+  uTools.RootDir := SessionDir;
+  WriteSessionFile('perm.txt', 'first version');
+  try
+    IsErr := RunOnePermission('{"type":"permission_response","id":"perm_1",' +
+      '"behavior":"allow"}', True, Saw, Req);
+    Check(Saw, 'an allowed write still emits its tool_result');
+    Check(not IsErr, 'and the result is not an error');
+    Check(Req <> '', 'a permission_request was emitted');
+    Doc := JsonParse(Req);
+    try
+      Check(Doc.Str('id') <> '', 'carrying a non-empty id');
+      Check(Doc.Str('tool_name') = 'write_file', 'and the tool name');
+      Check(Pos(#10, Req) = 0,
+        'and the multi-line diff preview is escaped, so it stays one line');
+      Check(Pos(#10, Doc.Str('detail')) > 0,
+        'while the detail decodes back to the several lines a user would read');
+    finally
+      Doc.Free;
+    end;
+
+    { The write above went through, so put the file back for the refusals. }
+    WriteSessionFile('perm.txt', 'first version');
+    IsErr := RunOnePermission('{"type":"permission_response","id":"perm_1",' +
+      '"behavior":"deny"}', True, Saw, Req);
+    Check(Saw and IsErr, 'a refusal still produces a tool_result, marked error');
+
+    IsErr := RunOnePermission('{"type":"permission_response","id":"nope",' +
+      '"behavior":"allow"}', True, Saw, Req);
+    Check(Saw and IsErr, 'an answer to a different id denies');
+
+    IsErr := RunOnePermission('{"type":"permission_response","id":"perm_1",' +
+      '"behavior":"maybe"}', True, Saw, Req);
+    Check(Saw and IsErr, 'an unrecognised behavior denies');
+
+    IsErr := RunOnePermission('{"type":"notice","text":"hi"}', True, Saw, Req);
+    Check(Saw and IsErr, 'a message that is not a permission_response denies');
+
+    IsErr := RunOnePermission('', False, Saw, Req);
+    Check(Saw and IsErr, 'and end of stream denies');
+  finally
+    uTools.AllowAllEdits := SavedEdits;
+  end;
+end;
+
+{ --output-format json: one line for the whole run, and nothing else. }
+procedure TestSdkJsonSingleLine;
+var
+  A: TAgent;
+  Err: string;
+  Code: Integer;
+  Doc: TJson;
+begin
+  ResetScript;
+  ResetSdk;
+  uTools.RootDir := SessionDir;
+  SetLength(Replies, 1);
+  Replies[0] := TextReply('the whole answer');
+
+  uSdk.SdkSink := @CollectLine;
+  A := MakeAgent;
+  try
+    Code := uSdk.SdkRun(A, SdkOptions(sfJson, False), 'ask', Err);
+    Check(Code = 0, 'a clean json run exits 0');
+    Check(Length(SdkLines) = 1,
+      Format('json mode emits exactly one line (%d): %s',
+        [Length(SdkLines), SdkTypes]));
+    Check(SdkCountOf('assistant_delta') = 0,
+      'no deltas: json mode installs no text hooks at all');
+    Check(SdkCountOf('system') = 0, 'and no init line');
+    Doc := JsonParse(SdkNthOf('result', 0));
+    try
+      Check(Doc.Str('subtype') = 'success', 'the one line is a success result');
+      Check(Doc.Str('result') = 'the whole answer',
+        'carrying the reply text');
+    finally
+      Doc.Free;
+    end;
+  finally
+    A.Free;
+    uSdk.SdkSink := nil;
+  end;
+
+  { And a run the transport refuses outright. }
+  ResetScript;
+  ResetSdk;
+  SetLength(Replies, 1);
+  Replies[0] := TextReply('never sent');
+  FailAfter := 0;
+  FailUntil := 99;
+  FailStatus := 400;
+  FailBody := '{"type":"error","error":{"type":"invalid_request_error",' +
+              '"message":"nope"}}';
+
+  uSdk.SdkSink := @CollectLine;
+  A := MakeAgent;
+  try
+    Code := uSdk.SdkRun(A, SdkOptions(sfJson, False), 'ask', Err);
+    Check(Code = 1, 'a failed run exits 1, so a caller can tell');
+    Check(Length(SdkLines) = 1, 'and still emits exactly one line');
+    Doc := JsonParse(SdkNthOf('result', 0));
+    try
+      Check(Doc.Str('subtype') = 'error', 'reporting subtype error');
+      Check(Doc.Bool('is_error'), 'with is_error true');
+      Check(Trim(Doc.Str('error')) <> '', 'and a non-empty error field');
+    finally
+      Doc.Free;
+    end;
+  finally
+    A.Free;
+    uSdk.SdkSink := nil;
+  end;
+end;
+
+{ What a driver on the other end of a pipe can actually send.  The loop must
+  survive every one of these and must never mistake one for a prompt. }
+procedure TestSdkDriverInputHostile;
+var
+  A: TAgent;
+  Err, Big: string;
+  Code: Integer;
+begin
+  ResetScript;
+  ResetSdk;
+  uTools.RootDir := SessionDir;
+  SetLength(Replies, 2);
+  Replies[0] := TextReply('answered the big one');
+  Replies[1] := TextReply('answered the good one');
+
+  Big := StringOfChar('q', 300000);
+  Drive('');
+  Drive('   ');
+  Drive('[1,2,3]');
+  Drive('{}');
+  Drive('{"type":"banana"}');
+  Drive('{oops');
+  Drive('{"type":"user","message":{"role":"user","content":' +
+        JsonQuote(Big) + '}}');
+  Drive('{"type":"user","message":{"role":"user","content":"finally"}}');
+
+  uSdk.SdkSink := @CollectLine;
+  uSdk.SdkSource := @DriverLine;
+  A := MakeAgent;
+  try
+    Code := uSdk.SdkRun(A, SdkOptions(sfStreamJson, True), '', Err);
+    Check(Code = 0, 'a stream of hostile lines does not fail the run');
+    Check(SdkCountOf('error') = 6,
+      Format('each of the six bad lines produced one error line (%d)',
+        [SdkCountOf('error')]));
+    { The point of the count: a malformed line that got treated as prompt text
+      would show up here as a third request. }
+    Check(CallCount = 2,
+      Format('and only the two real user messages became requests (%d)',
+        [CallCount]));
+    Check(SdkCountOf('result') = 2, 'so there are two results');
+    Check(Pos(Copy(Big, 1, 200), Requests[0]) > 0,
+      'the 300 KB message went through whole');
+    Check(Pos('finally', Requests[1]) > 0,
+      'and the good message after the bad ones was still processed');
+  finally
+    A.Free;
+    uSdk.SdkSink := nil;
+    uSdk.SdkSource := nil;
+  end;
+end;
+
 begin
   { Every request in this suite goes to the stand-in rather than the network. }
   SetEnvironmentVariable('USERPROFILE',
@@ -2278,6 +2822,12 @@ begin
   TestMcpTurn;
   TestHookBlocksToolCall;
   TestStopHookContinuation;
+  TestSdkStreamProtocol;
+  TestSdkPerTurnUsage;
+  TestSdkStreamInputMultiTurn;
+  TestSdkPermissionDelegation;
+  TestSdkJsonSingleLine;
+  TestSdkDriverInputHostile;
 
   WriteLn;
   if Fails = 0 then
