@@ -2553,6 +2553,93 @@ begin
   end;
 end;
 
+{ A user who does not know they are in accept-edits is the failure this
+  feature exists to prevent, so the indicator has to be right in every state
+  and not merely in the interesting ones.  Returning the plain word whenever
+  the mode is not plan is exactly the bug the brief forbids. }
+procedure TestModeIsVisible;
+var
+  SE, SB, SF, SM, SP, SY: Boolean;
+begin
+  SE := uTools.AllowAllEdits;  SB := uTools.AllowAllBash;
+  SF := uTools.AllowAllFetch;  SM := uTools.AllowAllMcp;
+  SP := uTools.PlanMode;       SY := uTools.BypassMode;
+  try
+    uTools.SetPermMode(uTools.pmodeAsk);
+    uTools.ClearBashPrefixes;
+    uTools.ClearTrust;
+    Check(uTools.PermModeIndicator = 'ask',
+      'the plain state reads ask: ' + uTools.PermModeIndicator);
+    Check(uTools.PermModeBanner = '',
+      'and the banner has nothing to say');
+
+    uTools.SetPermMode(uTools.pmodeAcceptEdits);
+    Check(uTools.PermModeIndicator = 'accept-edits',
+      'accept-edits is named: ' + uTools.PermModeIndicator);
+
+    uTools.SetPermMode(uTools.pmodeBypass);
+    Check(uTools.PermModeIndicator = 'bypass', 'and bypass');
+
+    uTools.SetPermMode(uTools.pmodePlan);
+    Check(uTools.PermModeIndicator = 'plan',
+      'and plan wins over bypass, as it does in the predicate: ' +
+      uTools.PermModeIndicator);
+
+    { The suffix, and what it is for: a class grant the mode word cannot
+      cover.  Without it the prompt would read "ask" while bash never asks. }
+    uTools.SetPermMode(uTools.pmodeAsk);
+    uTools.AllowAllBash := True;
+    Check(uTools.PermModeIndicator = 'ask+',
+      'a live bash grant marks the word as understating it: ' +
+      uTools.PermModeIndicator);
+    Check(Pos('bash', uTools.PermGrantSummary) > 0,
+      'and the summary names it: ' + uTools.PermGrantSummary);
+    Check(Pos('/mode ask', uTools.PermModeBanner) > 0,
+      'and the banner says how to get out: ' + uTools.PermModeBanner);
+  finally
+    uTools.ClearBashPrefixes;
+    uTools.ClearTrust;
+    uTools.PlanMode := SP;       uTools.BypassMode := SY;
+    uTools.AllowAllEdits := SE;  uTools.AllowAllBash := SB;
+    uTools.AllowAllFetch := SF;  uTools.AllowAllMcp := SM;
+  end;
+end;
+
+{ The state that has always existed and has never been on screen: a previous
+  session's "always" answer loading as accept-edits before the user has typed
+  anything at all.  Suppressing the banner for a grant that came from disk
+  rather than from a command is precisely the invisible case. }
+procedure TestLoadedGrantIsAnnounced;
+var
+  Path: string;
+  SE, SB, SF, SM, SP, SY: Boolean;
+begin
+  SE := uTools.AllowAllEdits;  SB := uTools.AllowAllBash;
+  SF := uTools.AllowAllFetch;  SM := uTools.AllowAllMcp;
+  SP := uTools.PlanMode;       SY := uTools.BypassMode;
+  Path := IncludeTrailingPathDelimiter(TmpRoot) + 'loaded-approvals.json';
+  try
+    uTools.SetPermMode(uTools.pmodeAsk);
+    uTools.ClearBashPrefixes;
+    uTools.ClearTrust;
+    WriteFileText(Path, '{"allow_edits":true}');
+    uTools.LoadPermissions(Path);
+    Check(uTools.CurrentPermMode = uTools.pmodeAcceptEdits,
+      'a loaded grant IS a mode, and the program now says so');
+    Check(Pos('accept-edits', uTools.PermModeBanner) > 0,
+      'the banner names it: ' + uTools.PermModeBanner);
+    Check(Pos('/mode ask', uTools.PermModeBanner) > 0,
+      'and the way out of it');
+  finally
+    SysUtils.DeleteFile(Path);
+    uTools.ClearBashPrefixes;
+    uTools.ClearTrust;
+    uTools.PlanMode := SP;       uTools.BypassMode := SY;
+    uTools.AllowAllEdits := SE;  uTools.AllowAllBash := SB;
+    uTools.AllowAllFetch := SF;  uTools.AllowAllMcp := SM;
+  end;
+end;
+
 begin
   TmpRoot := IncludeTrailingPathDelimiter(GetTempDir) + 'pasclaude-ux';
   Cleanup(TmpRoot);
@@ -2583,6 +2670,8 @@ begin
     TestHooksPanel;
     TestPluginState;
     TestSystemPromptLift;
+    TestModeIsVisible;
+    TestLoadedGrantIsAnnounced;
   finally
     { Before the cleanup, not after: a live child holding a spool handle under
       TmpRoot would make the recursive delete fail. }

@@ -1387,6 +1387,166 @@ begin
   ClearTrust;
 end;
 
+{ ---------------------------------------------------- permission modes -- }
+
+{ SetPermMode is the only writer of the mode state, so what it writes is the
+  whole of what a reader can conclude.  Every assertion here names a way the
+  mode word could come to disagree with the gate. }
+procedure TestPermModes;
+var
+  SE, SB, SF, SM, SP, SY: Boolean;
+begin
+  SE := uTools.AllowAllEdits;  SB := uTools.AllowAllBash;
+  SF := uTools.AllowAllFetch;  SM := uTools.AllowAllMcp;
+  SP := uTools.PlanMode;       SY := uTools.BypassMode;
+  try
+    uTools.SetPermMode(uTools.pmodeAsk);
+    ClearBashPrefixes;
+    Check(uTools.CurrentPermMode = uTools.pmodeAsk, 'ask is the plain state');
+
+    uTools.SetPermMode(uTools.pmodeAcceptEdits);
+    Check(uTools.AllowAllEdits, 'accept-edits IS the AllowAllEdits flag');
+    Check(uTools.CurrentPermMode = uTools.pmodeAcceptEdits,
+      'and the mode word reports it');
+
+    { From the plain state, so what bypass leaves behind is what bypass wrote
+      and not what accept-edits left. }
+    uTools.SetPermMode(uTools.pmodeAsk);
+    uTools.SetPermMode(uTools.pmodeBypass);
+    Check(uTools.BypassMode, 'bypass sets its own flag');
+    Check(uTools.CurrentPermMode = uTools.pmodeBypass, 'and reports bypass');
+    { The point of the change: bypass writes nothing that SavePermissions
+      would ever see, so "yolo never persists" is a property of the variable
+      rather than of the host remembering to skip a save. }
+    Check((not uTools.AllowAllEdits) and (not uTools.AllowAllBash) and
+      (not uTools.AllowAllFetch) and (not uTools.AllowAllMcp),
+      'and leaves every persisted-shaped flag alone');
+
+    uTools.SetPermMode(uTools.pmodePlan);
+    Check(uTools.PlanMode, 'plan sets the boundary');
+    Check(uTools.CurrentPermMode = uTools.pmodePlan,
+      'and plan beats bypass in the word, as it does in the predicate');
+
+    { The off switch, and the reason it is broader than its name: a mode line
+      reading "ask" while bash never asks would be worse than a revocation
+      the user did not quite ask for. }
+    AllowBashPrefix('git status');
+    uTools.AllowAllBash := True;
+    uTools.AllowAllFetch := True;
+    uTools.AllowAllMcp := True;
+    uTools.SetPermMode(uTools.pmodeAsk);
+    Check((not uTools.PlanMode) and (not uTools.BypassMode),
+      'ask clears both mode flags');
+    Check((not uTools.AllowAllEdits) and (not uTools.AllowAllBash) and
+      (not uTools.AllowAllFetch) and (not uTools.AllowAllMcp),
+      'and all four class blankets');
+    { Named grants survive: each one said what it covered. }
+    Check(BashPrefixAllowed('git log'),
+      'but not the bash program table, which named its program');
+
+    Check(uTools.PermModeName(uTools.pmodePlan) = 'plan', 'the plan name');
+    Check(uTools.PermModeName(uTools.pmodeAsk) = 'ask', 'the ask name');
+    Check(uTools.PermModeName(uTools.pmodeAcceptEdits) = 'accept-edits',
+      'the accept-edits name');
+    Check(uTools.PermModeName(uTools.pmodeBypass) = 'bypass',
+      'the bypass name');
+
+    Check(uTools.PermGrantSummary <> '',
+      'a stored bash program is a standing grant no mode word names');
+    ClearBashPrefixes;
+    Check(uTools.PermGrantSummary = '',
+      'and with nothing standing the summary is empty');
+  finally
+    ClearBashPrefixes;
+    uTools.PlanMode := SP;       uTools.BypassMode := SY;
+    uTools.AllowAllEdits := SE;  uTools.AllowAllBash := SB;
+    uTools.AllowAllFetch := SF;  uTools.AllowAllMcp := SM;
+  end;
+end;
+
+{ Bypass is aimed at exactly the two places a nil Ask lives - print mode and a
+  subagent - so the line has to sit above the nil check, not below it. }
+procedure TestBypassGate;
+var
+  SE, SB, SF, SM, SY: Boolean;
+begin
+  SE := uTools.AllowAllEdits;  SB := uTools.AllowAllBash;
+  SF := uTools.AllowAllFetch;  SM := uTools.AllowAllMcp;
+  SY := uTools.BypassMode;
+  try
+    uTools.AllowAllEdits := False;  uTools.AllowAllBash := False;
+    uTools.AllowAllFetch := False;  uTools.AllowAllMcp := False;
+    ClearBashPrefixes;
+    ClearTrust;
+
+    uTools.BypassMode := False;
+    Check(not Permit('write_file', 'd', nil), 'without bypass a write denies');
+    Check(not Permit('fetch', 'd', nil), 'and a fetch');
+    Check(not Permit('mcp__srv__t', 'd', nil), 'and an MCP call');
+    Check(not PermitBash('del x', 'd', nil), 'and a shell command');
+
+    uTools.BypassMode := True;
+    Check(Permit('write_file', 'd', nil), 'bypass approves a write with a nil Ask');
+    Check(Permit('fetch', 'd', nil), 'and a fetch');
+    Check(Permit('mcp__srv__t', 'd', nil), 'and an MCP call');
+    Check(PermitBash('del x', 'd', nil), 'and a shell command, chained or not');
+  finally
+    uTools.BypassMode := SY;
+    uTools.AllowAllEdits := SE;  uTools.AllowAllBash := SB;
+    uTools.AllowAllFetch := SF;  uTools.AllowAllMcp := SM;
+  end;
+end;
+
+{ The plan allowlist and the print-mode rule are both pure functions, which is
+  the whole reason they are public: neither needs a process to pin. }
+procedure TestPlanToolListAndPrintRule;
+var
+  M: uTools.TPermMode;
+begin
+  Check(uTools.IsPlanTool('read_file'), 'plan mode keeps read_file');
+  Check(uTools.IsPlanTool('list_dir'), 'and list_dir');
+  Check(uTools.IsPlanTool('search'), 'and search');
+  Check(uTools.IsPlanTool('todo_write'), 'and todo_write');
+  Check(uTools.IsPlanTool('skill'), 'and skill');
+  Check(uTools.IsPlanTool('task'), 'and task');
+  Check(uTools.IsPlanTool('bash_output'), 'and bash_output');
+  Check(uTools.IsPlanTool('fetch'), 'and fetch');
+  Check(not uTools.IsPlanTool('write_file'), 'and refuses write_file');
+  Check(not uTools.IsPlanTool('edit_file'), 'and edit_file');
+  Check(not uTools.IsPlanTool('notebook_edit'), 'and notebook_edit');
+  Check(not uTools.IsPlanTool('bash'), 'and bash, whole');
+  Check(not uTools.IsPlanTool('kill_bash'), 'and kill_bash');
+  { The allowlist's whole purpose: a name nobody has written yet. }
+  Check(not uTools.IsPlanTool('mcp__srv__create_issue'),
+    'and an MCP tool nobody vetted');
+  Check(not uTools.IsPlanTool('future_tool'),
+    'and a tool that does not exist yet');
+  { The two boundaries compose as an intersection only if this holds. }
+  Check(uTools.IsSubagentTool('read_file') and uTools.IsPlanTool('read_file'),
+    'the plan list is a superset of the subagent list');
+
+  Check(uTools.PermModeReachableUnderPrint(uTools.pmodeAsk, False),
+    'ask is reachable under -p');
+  Check(uTools.PermModeReachableUnderPrint(uTools.pmodePlan, False),
+    'and plan, which is stricter than the default');
+  Check(not uTools.PermModeReachableUnderPrint(uTools.pmodeAcceptEdits, False),
+    'accept-edits is not, with nobody to accept');
+  Check(uTools.PermModeReachableUnderPrint(uTools.pmodeAcceptEdits, True),
+    'but is with a driver on stdin');
+  Check(uTools.PermModeReachableUnderPrint(uTools.pmodeBypass, False),
+    'and bypass is, which is what the long flag buys');
+
+  Check(uTools.PermModeParse('ask', M) and (M = uTools.pmodeAsk),
+    'ask parses');
+  Check(uTools.PermModeParse('plan', M) and (M = uTools.pmodePlan),
+    'plan parses');
+  Check(uTools.PermModeParse('accept-edits', M) and
+    (M = uTools.pmodeAcceptEdits), 'accept-edits parses');
+  { The dangerous mode keeps its dangerous spelling. }
+  Check(not uTools.PermModeParse('bypass', M), 'bypass does not parse');
+  Check(not uTools.PermModeParse('yolo', M), 'nor yolo');
+end;
+
 { ------------------------------------------------------ the fourth class -- }
 
 procedure TestMcpPermissionClass;
@@ -2664,6 +2824,9 @@ begin
   TestPluginPrecedence;
   TestDenyRuleParsing;
   TestPermissionPersistence;
+  TestPermModes;
+  TestBypassGate;
+  TestPlanToolListAndPrintRule;
   TestToolRegistry;
   TestMcpApprovals;
   TestMcpPermissionClass;

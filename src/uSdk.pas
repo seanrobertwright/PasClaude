@@ -50,7 +50,16 @@ type
     Format: TSdkFormat;
     StreamInput: Boolean;
     SessionId: string;
-    PermissionMode: string;   { 'deny' or 'ask' }
+    { The mode NAME as reported to the driver in the init event, and nothing
+      else.  It used to be a behaviour switch keyed on a display string, which
+      became a latent bug the moment the vocabulary grew past two words: a
+      mode the driver should see reported ('plan') would have silently
+      disarmed the permission channel.  '' means "ask uTools what it is". }
+    PermissionMode: string;
+    { Whether a permission request should be put to the driver.  Separate from
+      the name above so reporting a mode and answering a prompt are two
+      decisions, taken by whoever knows each. }
+    AskViaDriver: Boolean;
   end;
 
 var
@@ -474,7 +483,14 @@ begin
     Root.AddStr('session_id', Opts.SessionId);
     Root.AddStr('cwd', Safe(uTools.RootDir));
     Root.AddStr('model', Safe(AModel));
-    Root.AddStr('permission_mode', Opts.PermissionMode);
+    { A caller that says nothing gets the truth rather than a blank: a driver
+      that cannot see the mode cannot explain a refusal to whoever is reading
+      its log. }
+    if Opts.PermissionMode <> '' then
+      Root.AddStr('permission_mode', Opts.PermissionMode)
+    else
+      Root.AddStr('permission_mode',
+        uTools.PermModeName(uTools.CurrentPermMode));
 
     { Walked out of the live schema rather than listed here, so a tool that
       MCP or skills contributed appears without this encoder knowing it
@@ -873,7 +889,7 @@ begin
   { Delegation is only offered when there is a driver on stdin to delegate
     to.  Everything else runs the print-mode rule unchanged: nobody to ask
     means every gated tool refuses, in band, with a normal tool_result. }
-  if Opts.StreamInput and (Opts.PermissionMode = 'ask') then
+  if Opts.StreamInput and Opts.AskViaDriver then
     A.Ask := @AskThroughDriver
   else
     A.Ask := nil;

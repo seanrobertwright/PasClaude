@@ -1711,6 +1711,321 @@ begin
   DenyFixtureReset;
 end;
 
+{ ------------------------------------------------------ permission modes -- }
+
+procedure ModeFixtureReset;
+begin
+  DenyFixtureReset;
+  uTools.PlanMode := False;
+  uTools.BypassMode := False;
+end;
+
+{ Plan mode is a boundary, not a permission level, and the whole claim rests
+  on it running in RunTool rather than in the gate.  Every state below is one
+  that would win if the check had been put inside Permit. }
+procedure TestPlanModeBeatsEverything;
+var
+  J: TJson;
+  Out_: string;
+  IsErr: Boolean;
+  Target: string;
+
+  procedure Refused(const Tool: string; Input: TJson);
+  begin
+    Out_ := uTools.RunTool(Tool, Input, @SayAlways, IsErr);
+    Input.Free;
+    Check(IsErr and (Pos('plan mode', Out_) > 0),
+      'plan mode refuses ' + Tool + ': ' + Out_);
+  end;
+
+begin
+  ModeFixtureReset;
+  Target := IncludeTrailingPathDelimiter(SessionDir) + 'planned.txt';
+  if FileExists(Target) then SysUtils.DeleteFile(Target);
+
+  { Every override at once, and the most permissive Ask there is. }
+  uTools.PlanMode := True;
+  uTools.BypassMode := True;
+  uTools.AllowAllEdits := True;
+  uTools.AllowAllBash := True;
+  uTools.AllowAllMcp := True;
+  uTools.AllowBashPrefix('echo hi');
+
+  J := TJson.NewObj;
+  J.AddStr('path', 'planned.txt');
+  J.AddStr('content', 'x');
+  Refused('write_file', J);
+  Check(not FileExists(Target), 'and nothing reached the disk');
+
+  J := TJson.NewObj;
+  J.AddStr('path', 'planned.txt');
+  J.AddStr('old_text', 'a');
+  J.AddStr('new_text', 'b');
+  Refused('edit_file', J);
+
+  J := TJson.NewObj;
+  J.AddStr('path', 'planned.ipynb');
+  J.AddStr('cell_id', '1');
+  J.AddStr('source', 'x');
+  Refused('notebook_edit', J);
+
+  J := TJson.NewObj;
+  J.AddStr('command', 'echo hi');
+  Refused('bash', J);
+
+  J := TJson.NewObj;
+  J.AddStr('id', '1');
+  Refused('kill_bash', J);
+
+  J := TJson.NewObj;
+  Refused('mcp__srv__anything', J);
+
+  { The mode word, and the fact that plan beats bypass in it too. }
+  Check(uTools.CurrentPermMode = uTools.pmodePlan,
+    'and the session still calls itself plan, not bypass');
+  ModeFixtureReset;
+end;
+
+{ The hook fire is below the boundary, which is what stops a repository's
+  hooks.json from being able to unlock plan mode.  The marker file is the
+  proof: a hook that never ran cannot have been consulted. }
+procedure TestPlanModeBeatsHookAllow;
+var
+  Notes, Out_, Marker: string;
+  J: TJson;
+  IsErr: Boolean;
+begin
+  ModeFixtureReset;
+  Marker := IncludeTrailingPathDelimiter(SessionDir) + 'planhook.txt';
+  if FileExists(Marker) then SysUtils.DeleteFile(Marker);
+  WriteHooks('{"hooks":{"PreToolUse":[{"command":' +
+    '"echo ran > \"' + StringReplace(Marker, '\', '\\', [rfReplaceAll]) +
+    '\" & echo {\"decision\":\"allow\"}"}]}}');
+  uHooks.LoadHooks(True, Notes);
+  Check(uHooks.HooksEnabled, 'the allowing hook is loaded');
+
+  { Positive control, so a hook that simply never worked cannot pass this. }
+  J := TJson.NewObj;
+  J.AddStr('command', 'echo hello');
+  Out_ := uTools.RunTool('bash', J, nil, IsErr);
+  J.Free;
+  Check(FileExists(Marker), 'and it runs for an ordinary call');
+
+  SysUtils.DeleteFile(Marker);
+  uTools.PlanMode := True;
+  J := TJson.NewObj;
+  J.AddStr('command', 'echo hello');
+  Out_ := uTools.RunTool('bash', J, nil, IsErr);
+  J.Free;
+  Check(IsErr and (Pos('plan mode', Out_) > 0),
+    'a hook''s allow cannot lift the plan boundary: ' + Out_);
+  Check(not FileExists(Marker),
+    'and the refused call never reached the hook at all');
+  Check(not uTools.TakeHookAllow,
+    'so nothing was left pending for the next call');
+
+  uHooks.ClearHooks;
+  WriteHooks('{}');
+  ModeFixtureReset;
+end;
+
+{ An allowlist, so a name nobody has written yet is refused by default.  A
+  denylist of the three mutating built-ins would pass every one of the last
+  two assertions. }
+procedure TestPlanModeIsAnAllowlist;
+var
+  J: TJson;
+  Out_: string;
+  IsErr: Boolean;
+begin
+  ModeFixtureReset;
+  WriteFileText(IncludeTrailingPathDelimiter(SessionDir) + 'plain.txt', 'here');
+  uTools.PlanMode := True;
+
+  J := TJson.NewObj;
+  J.AddStr('path', 'plain.txt');
+  Out_ := uTools.RunTool('read_file', J, @SayYes, IsErr);
+  J.Free;
+  Check((not IsErr) and (Pos('here', Out_) > 0),
+    'read_file still works while planning');
+
+  J := TJson.NewObj;
+  J.AddStr('path', '.');
+  Out_ := uTools.RunTool('list_dir', J, @SayYes, IsErr);
+  J.Free;
+  Check(not IsErr, 'and list_dir');
+
+  J := TJson.NewObj;
+  J.AddStr('pattern', 'here');
+  Out_ := uTools.RunTool('search', J, @SayYes, IsErr);
+  J.Free;
+  Check(not IsErr, 'and search');
+
+  J := TJson.NewObj;
+  J.Add('todos', TJson.NewArr);
+  Out_ := uTools.RunTool('todo_write', J, @SayYes, IsErr);
+  J.Free;
+  Check(not IsErr, 'and todo_write, which is how a plan gets written down');
+
+  J := TJson.NewObj;
+  J.AddStr('id', 'nope');
+  Out_ := uTools.RunTool('bash_output', J, @SayYes, IsErr);
+  J.Free;
+  Check(Pos('plan mode', Out_) = 0,
+    'and bash_output reaches its own tool, whatever it then says');
+
+  J := TJson.NewObj;
+  Out_ := uTools.RunTool('future_tool', J, @SayYes, IsErr);
+  J.Free;
+  Check(IsErr and (Pos('plan mode', Out_) > 0),
+    'a tool nobody has written yet is refused by default: ' + Out_);
+
+  J := TJson.NewObj;
+  Out_ := uTools.RunTool('mcp__srv__create_issue', J, @SayYes, IsErr);
+  J.Free;
+  Check(IsErr and (Pos('plan mode', Out_) > 0),
+    'and a third-party verb that sounds harmless');
+
+  ModeFixtureReset;
+  uTools.ClearTodos;
+end;
+
+{ A mode says what is being done right now.  A file that quietly meant "and
+  every future session" would be a wider grant than the word the user typed -
+  and the same file has to keep working as the off switch for accept-edits,
+  which is the only thing in the feature that does survive a restart. }
+procedure TestNoModePersists;
+var
+  Path, Text: string;
+  Root: TJson;
+  L: TStringList;
+begin
+  ModeFixtureReset;
+  Path := IncludeTrailingPathDelimiter(SessionDir) + 'modes.json';
+  uTools.PlanMode := True;
+  uTools.BypassMode := True;
+  uTools.AllowAllEdits := True;
+  uTools.SavePermissions(Path);
+
+  Text := '';
+  L := TStringList.Create;
+  try
+    L.LoadFromFile(Path);
+    Text := L.Text;
+  finally
+    L.Free;
+  end;
+  Root := JsonParse(Text);
+  Check(Root <> nil, 'the approvals file parses');
+  if Root <> nil then
+  try
+    Check(Root.Find('plan') = nil, 'and holds no plan key');
+    Check(Root.Find('bypass') = nil, 'nor a bypass key');
+    Check(Root.Find('mode') = nil, 'nor a mode key');
+    Check(Root.Find('yolo') = nil, 'nor a yolo key');
+    Check(Root.Find('allow_edits') <> nil,
+      'while the grant behind accept-edits is written');
+  finally
+    Root.Free;
+  end;
+
+  uTools.PlanMode := False;
+  uTools.BypassMode := False;
+  uTools.AllowAllEdits := False;
+  uTools.LoadPermissions(Path);
+  Check(not uTools.PlanMode, 'loading it enters no mode');
+  Check(not uTools.BypassMode, 'nor bypass');
+  Check(uTools.AllowAllEdits,
+    'but the edits grant does come back, as it always has');
+
+  { The off switch.  It works only because the load widens from a TRUE key
+    and has nothing that widens from a false one, so a false written here is
+    durable rather than silent. }
+  uTools.SetPermMode(uTools.pmodeAsk);
+  uTools.SavePermissions(Path);
+  uTools.LoadPermissions(Path);
+  Check(not uTools.AllowAllEdits, '/mode ask survives a restart');
+  Check(uTools.CurrentPermMode = uTools.pmodeAsk, 'and the word with it');
+
+  SysUtils.DeleteFile(Path);
+  ModeFixtureReset;
+end;
+
+{ The gate never reads the project directory for a mode, and the store it does
+  read lives where a clone cannot write.  Both halves, because either alone
+  would pass if the other were broken. }
+procedure TestNoModeFromProject;
+var
+  Local, Profile, Base, InTree: string;
+begin
+  Local := SysUtils.GetEnvironmentVariable('LOCALAPPDATA');
+  Profile := SysUtils.GetEnvironmentVariable('USERPROFILE');
+  Base := ExcludeTrailingPathDelimiter(SessionDir) + '-appdata';
+  ForceDirectories(Base);
+  try
+    SetEnvironmentVariable('LOCALAPPDATA', PChar(Base));
+    ModeFixtureReset;
+    ForceDirectories(IncludeTrailingPathDelimiter(SessionDir) + StateDirName);
+    InTree := IncludeTrailingPathDelimiter(SessionDir) + StateDirName +
+      PathDelim + 'permissions.json';
+    WriteFileText(InTree,
+      '{"allow_edits":true,"allow_bash":true,"bypass":true,"mode":"bypass"}');
+    WriteFileText(IncludeTrailingPathDelimiter(SessionDir) + 'mode.json',
+      '{"mode":"bypass"}');
+
+    Check(Pos(UpperCase(IncludeTrailingPathDelimiter(
+      ExpandFileName(SessionDir))), UpperCase(ApprovalsPath)) = 0,
+      'the approvals file is not inside the project: ' + ApprovalsPath);
+    uTools.LoadPermissions(ApprovalsPath);
+    Check(not uTools.AllowAllEdits,
+      'a permissions.json committed to the repository grants no edits');
+    Check(not uTools.AllowAllBash, 'nor bash');
+    Check(not uTools.BypassMode, 'and enters no mode');
+    Check(not uTools.PlanMode, 'in either direction');
+    Check(uTools.CurrentPermMode = uTools.pmodeAsk,
+      'the session is still in ask mode');
+    SysUtils.DeleteFile(InTree);
+    SysUtils.DeleteFile(IncludeTrailingPathDelimiter(SessionDir) + 'mode.json');
+  finally
+    SetEnvironmentVariable('LOCALAPPDATA', PChar(Local));
+    SetEnvironmentVariable('USERPROFILE', PChar(Profile));
+    ModeFixtureReset;
+  end;
+end;
+
+{ The cross-cutting property of this whole round, restated against the mode
+  half: a deny rule the user can be talked out of is decoration.  Bypass is
+  the strongest override the program has, and it is below the deny lines in
+  every one of the three places a decision is taken. }
+procedure TestDenyBeatsEveryMode;
+var
+  J: TJson;
+  Out_: string;
+  IsErr: Boolean;
+begin
+  ModeFixtureReset;
+  uTools.SetPermMode(uTools.pmodeBypass);
+  uTools.AllowAllEdits := True;
+  uTools.AddDenyRule('tool:write_file', 'test');
+
+  J := TJson.NewObj;
+  J.AddStr('path', 'denied-mode.txt');
+  J.AddStr('content', 'x');
+  Out_ := uTools.RunTool('write_file', J, @SayAlways, IsErr);
+  J.Free;
+  Check(IsErr and (Pos('refused by deny rule', Out_) > 0),
+    'bypass does not lift a deny rule: ' + Out_);
+  Check(not FileExists(IncludeTrailingPathDelimiter(SessionDir) +
+    'denied-mode.txt'), 'and nothing was written');
+  Check(not uTools.Permit('write_file', 'detail', @SayAlways),
+    'and the gate refuses it too, with bypass set');
+  { An "always" cannot clear a rule either: the widening path never runs. }
+  Check(AskedCount = 0, 'and nobody was asked, so nobody could say always');
+  Check(uTools.DenyRuleCount = 1, 'the rule is still in force afterwards');
+
+  ModeFixtureReset;
+end;
+
 { The discovery cache is a file in the project directory, so a repository can
   ship one whose entries match its own .mcp.json - no server has to run for
   its contents to be believed.  Loading those for a server the user refused
@@ -2252,6 +2567,12 @@ begin
   TestDenyRulesNotFromProject;
   TestDenyBadRuleIsNotSilent;
   TestDenyBashSegments;
+  TestPlanModeBeatsEverything;
+  TestPlanModeBeatsHookAllow;
+  TestPlanModeIsAnAllowlist;
+  TestNoModePersists;
+  TestNoModeFromProject;
+  TestDenyBeatsEveryMode;
   TestMcpConfig;
   TestMcpSchemaTrust;
   TestMcpHostileServer;

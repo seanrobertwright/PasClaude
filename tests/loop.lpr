@@ -626,6 +626,98 @@ begin
   end;
 end;
 
+{ Plan mode is told to the model twice: once as a paragraph in the system
+  prompt, so it does not spend a turn walking into the boundary, and once as
+  the refusal when it does anyway.  Both halves are here, plus the shape of
+  the block, which is the thing that has to stay right or every plan-mode turn
+  re-reads the whole cached prefix. }
+procedure TestPlanModeReachesTheModel;
+var
+  A: TAgent;
+  Err: string;
+  Doc, Sys, Msg, C: TJson;
+  Found, I: Integer;
+begin
+  ResetScript;
+  uTools.RootDir := SessionDir;
+  uTools.ClearDenyRules;
+  { Every override on, so a refusal below can only be the boundary. }
+  uTools.AllowAllEdits := True;
+  uTools.BypassMode := True;
+  uTools.PlanMode := True;
+
+  SetLength(Replies, 2);
+  Replies[0] := ToolReply('t1', 'write_file',
+    '{"path":"planned.txt","content":"x"}');
+  Replies[1] := TextReply('Here is what I would do.');
+
+  A := MakeAgent;
+  try
+    A.Send('go', Err);
+    Check(CallCount = 2, 'the turn continues after the plan boundary refuses');
+    Check(not FileExists(IncludeTrailingPathDelimiter(SessionDir) +
+      'planned.txt'), 'and nothing was written');
+
+    Doc := JsonParse(Requests[0]);
+    try
+      Sys := Doc.Find('system');
+      Check(Sys.Count = 2, 'plan mode adds a second system block');
+      { Assert on the LAST block: under an OAuth key the identity block goes
+        first and every index shifts. }
+      Check(Sys.Item(0).Find('cache_control') <> nil,
+        'the first still carries the cache breakpoint');
+      Check(Sys.Item(Sys.Count - 1).Find('cache_control') = nil,
+        'and the mode note deliberately does not, so a toggle is cheap');
+      Check(Pos('plan mode', Sys.Item(Sys.Count - 1).Str('text')) > 0,
+        'and it says so in words the model can act on');
+    finally
+      Doc.Free;
+    end;
+
+    Doc := JsonParse(Requests[1]);
+    try
+      Msg := Doc.Find('messages').Item(2).Find('content');
+      Found := 0;
+      for I := 0 to Msg.Count - 1 do
+        if Msg.Item(I).Str('tool_use_id') = 't1' then Inc(Found);
+      Check(Found = 1, Format('exactly one tool_result for the tool_use (%d)',
+        [Found]));
+      C := Msg.Item(0);
+      Check(C.Bool('is_error'), 'marked as an error result');
+      Check(Pos('plan mode', C.Str('content')) > 0,
+        'and the refusal names the mode: ' + C.Str('content'));
+    finally
+      Doc.Free;
+    end;
+    Check(Prose = 'Here is what I would do.',
+      'and the conversation reaches a normal reply');
+  finally
+    A.Free;
+  end;
+
+  { The other direction, which is the assertion that keeps every existing
+    request-body test honest: with the mode off the body is what it was. }
+  uTools.PlanMode := False;
+  uTools.BypassMode := False;
+  ResetScript;
+  SetLength(Replies, 1);
+  Replies[0] := TextReply('hello');
+  A := MakeAgent;
+  try
+    A.Send('hi', Err);
+    Doc := JsonParse(Requests[0]);
+    try
+      Check(Doc.Find('system').Count = 1,
+        'and out of plan mode there is no second block at all');
+    finally
+      Doc.Free;
+    end;
+  finally
+    A.Free;
+  end;
+  uTools.AllowAllEdits := True;
+end;
+
 { Print mode has no human, so it must never be the most permissive mode.  The
   ordering that guarantees it is that the host calls LoadDenyRules before the
   print-mode halt and LoadPermissions after; this pins the half of it that
@@ -2527,6 +2619,9 @@ begin
   Result.SessionId := 'sess-test';
   if Stream then Result.PermissionMode := 'ask'
   else Result.PermissionMode := 'deny';
+  { The name and the channel are two decisions now.  A driver on stdin is a
+    permission answerer, so it is armed exactly when there is one. }
+  Result.AskViaDriver := Stream;
 end;
 
 { One turn with a tool in it, seen entirely through the wire. }
@@ -2954,6 +3049,7 @@ begin
   TestMidLoopFailure;
   TestDeniedToolContinues;
   TestDenyProducesToolResult;
+  TestPlanModeReachesTheModel;
   TestPrintModeInheritsNoGrants;
   TestConversationPersists;
   TestParallelToolCalls;

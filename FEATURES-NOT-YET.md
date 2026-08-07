@@ -234,8 +234,35 @@ text preserves what was missing at the time. Unchecked items remain open.
   had accumulated
   approvals in an in-repo `.pasclaude\permissions.json` is simply re-asked,
   with no notice explaining why.*
-- [ ] **Permission modes** — no plan mode, no accept-edits mode, no
-  `--dangerously-skip-permissions` flag (`/yolo` is per-session only).
+- [x] ~~**Permission modes** — no plan mode, no accept-edits mode, no
+  `--dangerously-skip-permissions` flag (`/yolo` is per-session only).~~
+  *Built: four modes, shown as one word — `ask`, `plan`, `accept-edits`,
+  `bypass` — behind two pieces of state rather than one ladder, because plan
+  has to beat bypass. Plan mode is a boundary enforced in `RunTool` beside the
+  subagent read-only list, above the `PreToolUse` fire and far above the gate,
+  so bypass, a class allow-all, a stored bash prefix, a hook's `allow` and a
+  nil `Ask` are all structurally unable to lift it; what it permits is an
+  allowlist (`read_file`, `list_dir`, `search`, `todo_write`, `skill`, `task`,
+  `bash_output`, `fetch`), so a third-party MCP verb or a tool added next year
+  is refused without anyone deciding to refuse it. The model learns the mode
+  both ways: a paragraph in an uncached trailing system block, and a refusal
+  naming the mode. Accept-edits IS the existing `AllowAllEdits` flag given a
+  name, an indicator and — for the first time — an off switch, `/mode ask`,
+  which survives a restart because the approvals file only ever widens from a
+  true key. `--permission-mode ask|plan|accept-edits`,
+  `--dangerously-skip-permissions`, `/mode`, `/plan` and `/yolo` are the only
+  ways in; the prompt string carries the mode on every keystroke and the
+  banner announces a grant loaded from disk, which had been invisible since
+  approvals began persisting. Narrower than Claude Code in four ways: there is
+  no `exit_plan_mode` tool at all, because a tool that lets the model leave
+  plan mode is a tool that lets it grant itself write access, so leaving is
+  always a keystroke and never auto-approves the plan's edits; plan mode stops
+  the model, not the machine — a `SessionStart` or `UserPromptSubmit` hook is
+  the user's own command and still runs; no mode is persisted or resumed, so a
+  session resumed with `--resume` comes back in `ask`; and `/mode ask` revokes
+  the bash, fetch and MCP class blankets as well as edits, which is broader
+  than the name suggests and is printed, but leaves the named per-program and
+  per-server grants alone.*
 - [ ] **Sandboxed bash** — commands run directly through `cmd.exe /C`,
   unsandboxed (compound commands are re-prompted, but not isolated).
 - [ ] **Additional working directories** — one session root, fixed at

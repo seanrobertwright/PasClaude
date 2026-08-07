@@ -200,10 +200,10 @@ end;
 { ------------------------------------------------------------- completion -- }
 
 const
-  SlashCommands: array[0..23] of string = (
+  SlashCommands: array[0..25] of string = (
     '/help', '/clear', '/compact', '/deny', '/diff', '/hooks', '/jobs', '/mcp',
-    '/memory', '/init', '/rewind', '/sessions', '/skills', '/plugins',
-    '/think', '/web',
+    '/memory', '/init', '/mode', '/plan', '/rewind', '/sessions', '/skills',
+    '/plugins', '/think', '/web',
     '/resume', '/save', '/cwd', '/model', '/yolo', '/cost', '/exit', '/quit');
 
 { Candidates for the token being completed: slash commands when the token
@@ -345,6 +345,105 @@ end;
 
 { ------------------------------------------------------------------ shell -- }
 
+{ ------------------------------------------------------- permission modes -- }
+
+{ The prompt is the only place the mode is guaranteed to be seen, because it
+  is redrawn on every keystroke and a banner scrolls away.  A user who does
+  not know they are in accept-edits is the failure this whole feature exists
+  to prevent, so the word goes where it cannot be missed.
+
+  The '+' is a pointer to /mode, not information: no four-character suffix can
+  render every combination of class grants, and one that tried would be read
+  as complete.  It says "the word understates this". }
+function ModePrompt: string;
+begin
+  Result := uTools.PermModeIndicator;
+  { Plain ask with nothing standing keeps the prompt the program has always
+    had: an indicator that is always on stops being an indicator. }
+  if Result = 'ask' then Result := '> ' else Result := Result + '> ';
+end;
+
+function Choice(B: Boolean; const Yes, No: string): string;
+begin
+  if B then Result := Yes else Result := No;
+end;
+
+procedure ShowMode(const Arg: string);
+var
+  M: uTools.TPermMode;
+  Grants: string;
+begin
+  if Arg <> '' then
+  begin
+    if LowerCase(Arg) = 'bypass' then
+    begin
+      EmitCLn(clYellow, '  bypass is spelled /yolo, and it means it');
+      Exit;
+    end;
+    if not uTools.PermModeParse(Arg, M) then
+    begin
+      EmitCLn(clRed, '  unknown mode: ' + Arg);
+      EmitCLn(clGrey, '  ask, plan or accept-edits (/yolo for bypass)');
+      Exit;
+    end;
+    uTools.SetPermMode(M);
+    if M = uTools.pmodePlan then
+      EmitCLn(clCyan, '  plan mode: the model may read and investigate; ' +
+        'nothing may change until you leave with /mode ask')
+    else
+      EmitCLn(clYellow, '  mode: ' + uTools.PermModeName(M));
+    if M = uTools.pmodeAsk then
+      EmitCLn(clGrey, '  every write, shell command and fetch will be asked ' +
+        'about again');
+    Exit;
+  end;
+
+  EmitCLn(clBright, 'Permission mode');
+  EmitCLn(clGrey, '  mode:         ' +
+    uTools.PermModeName(uTools.CurrentPermMode));
+  if uTools.PlanMode then
+    EmitCLn(clGrey, '  plan mode:    on - every changing tool is refused ' +
+      'before the gate is reached')
+  else
+    EmitCLn(clGrey, '  plan mode:    off');
+  EmitLn;
+  EmitCLn(clGrey, '  file edits:   ' +
+    Choice(uTools.AllowAllEdits, 'approved', 'asked about'));
+  EmitCLn(clGrey, '  shell:        ' +
+    Choice(uTools.AllowAllBash, 'approved', 'asked about'));
+  EmitCLn(clGrey, '  fetch:        ' +
+    Choice(uTools.AllowAllFetch, 'approved', 'asked about'));
+  EmitCLn(clGrey, '  mcp tools:    ' +
+    Choice(uTools.AllowAllMcp, 'approved', 'asked about'));
+  Grants := uTools.PermGrantSummary;
+  if Grants <> '' then
+    EmitCLn(clGrey, '  standing:     ' + Grants);
+  EmitLn;
+  if YoloSession then
+    EmitCLn(clGrey, '  nothing from this session will be saved to the ' +
+      'approvals file')
+  else
+    EmitCLn(clGrey, '  approvals given this session are saved to ' +
+      uTools.ApprovalsPath);
+  EmitLn;
+  { Said out loud because the promise would otherwise be oversold.  Plan mode
+    is a boundary on the MODEL's tool calls; a SessionStart or UserPromptSubmit
+    hook is a command the user configured themselves and runs regardless. }
+  EmitCLn(clGrey, '  Plan mode stops the model, not the machine: your own');
+  EmitCLn(clGrey, '  hooks still run.  Deny rules beat every mode, always.');
+  EmitCLn(clGrey, '  /mode ask | plan | accept-edits   (/yolo for bypass)');
+end;
+
+{ Split from ShowMode only so /plan can reach the same code with no argument
+  parsing of its own. }
+procedure SetMode(const Cmd, Arg: string);
+begin
+  if (Cmd = '/plan') and (Arg = '') then
+    ShowMode('plan')
+  else
+    ShowMode(Arg);
+end;
+
 procedure ShowHelp;
 begin
   EmitCLn(clBright, 'Commands');
@@ -369,7 +468,9 @@ begin
   EmitCLn(clGrey,   '  /cwd           show the session root');
   EmitCLn(clGrey,   '  /model [name]  pick a model from a list, or set one by name');
   EmitCLn(clGrey,   '  /deny          rules nothing can override; add <rule>, remove <n>');
-  EmitCLn(clGrey,   '  /yolo          approve every tool for this session');
+  EmitCLn(clGrey,   '  /mode [name]   ask | plan | accept-edits; no argument shows the state');
+  EmitCLn(clGrey,   '  /plan          shorthand for /mode plan: read and investigate only');
+  EmitCLn(clGrey,   '  /yolo          approve every tool for this session (bypass)');
   EmitCLn(clGrey,   '  /cost          tokens used so far');
   EmitCLn(clGrey,   '  /exit          quit (Ctrl+C also works)');
   EmitLn;
@@ -1323,6 +1424,11 @@ begin
   { Only when there are any: a user in a stricter state than they believe is a
     smaller problem than one in a looser state, but a refusal nobody can
     explain is still a bug report. }
+  { The mode, whenever it is not the plain one - including the case that has
+    existed all along and was invisible, a previous session's "always" loading
+    as accept-edits before anything has been typed. }
+  if uTools.PermModeBanner <> '' then
+    EmitCLn(clYellow, '  ' + uTools.PermModeBanner);
   if uTools.DenyRulesInForce then
     EmitCLn(clGrey, Format('  %d deny rules in force (/deny)',
       [uTools.DenyRuleCount]));
@@ -1573,24 +1679,26 @@ begin
     ShowMcp(Arg)
   else if Cmd = '/deny' then
     ShowDeny(Arg)
+  else if (Cmd = '/mode') or (Cmd = '/plan') then
+    SetMode(Cmd, Arg)
   else if Cmd = '/yolo' then
   begin
-    uTools.AllowAllEdits := True;
-    uTools.AllowAllBash := True;
-    uTools.AllowAllFetch := True;
-    { The per-call MCP class only.  /yolo deliberately does not grant a server
-      permission to be spawned: that question was answered before this session
-      knew what .mcp.json contained, and "stop asking me about these tools" is
-      not the same sentence as "run whatever programs a cloned repository
-      names".  For the same reason it does not trust hooks.json: that question
-      is about running a repository's commands, not about the tools the model
-      was declared. }
-    uTools.AllowAllMcp := True;
+    { One line where there were four flags.  /yolo deliberately does not grant
+      a server permission to be spawned: that question was answered before
+      this session knew what .mcp.json contained, and "stop asking me about
+      these tools" is not the same sentence as "run whatever programs a cloned
+      repository names".  For the same reason it does not trust hooks.json:
+      that question is about running a repository's commands, not about the
+      tools the model was declared.  Bypass reaches neither, because it is one
+      line inside Permit and neither of those goes through Permit. }
+    uTools.SetPermMode(uTools.pmodeBypass);
     YoloSession := True;
     { Deliberately not persisted: /yolo is "I trust this session", and a
       standing file that quietly means "and every future one" is a wider
       grant than the word implied.  The per-answer approvals do persist,
-      because each named the thing it covered. }
+      because each named the thing it covered.  Twice over now - bypass sets
+      no persisted-shaped flag at all, so the save-suppression below is a
+      second line of defence rather than the whole of it. }
     EmitCLn(clYellow, '  every tool is now approved for this session');
     { Said out loud, because "every" would otherwise be read as every.  A deny
       rule is checked above all four of the flags just set, and above the
@@ -1682,9 +1790,39 @@ var
   SdkOpts: uSdk.TSdkOptions;
   SdkCode: Integer;
   SkipNext: Boolean = False;
+  { The mode asked for on the command line, held rather than applied: it has
+    to beat a grant loaded from the approvals file, and that file is read much
+    later.  ModeGiven distinguishes "the user asked for ask" from "nobody
+    said", which are different answers once allow_edits is on disk. }
+  ModeWanted: uTools.TPermMode = uTools.pmodeAsk;
+  ModeGiven: Boolean = False;
+  { Recorded separately from ModeWanted, which only one of them can win, so
+    the two can be seen to contradict each other whichever order they arrive
+    in. }
+  PlanFlag: Boolean = False;
+  BypassFlag: Boolean = False;
   StopActive: Boolean = False;
   Again: Boolean = False;
   TurnOk: Boolean = False;
+
+{ Applied twice, and idempotently, on purpose.  Once before the print-mode
+  halt, because a -p run never reaches the second call and a flag it was given
+  has to mean something; once after LoadPermissions, because that call only
+  ever widens and would otherwise turn "--permission-mode ask" back into
+  accept-edits using a grant from a previous session.  An explicit flag beats
+  a loaded one - the user typed it this time. }
+procedure ApplyStartupMode;
+begin
+  if not ModeGiven then Exit;
+  uTools.SetPermMode(ModeWanted);
+  if ModeWanted = uTools.pmodeBypass then
+    { Sticky for the whole run: the shutdown save is skipped wholesale,
+      because a session that approved everything cannot tell its blanket
+      grants from the ones the user answered one at a time.  Bypass itself
+      now sets no persisted flag, so this is the second line of defence
+      rather than the only one. }
+    YoloSession := True;
+end;
 
 begin
   TermInit;
@@ -1726,6 +1864,34 @@ begin
           SkipNext := True;
         end;
       end
+      else if Arg = '--permission-mode' then
+      begin
+        if ArgI >= ParamCount then
+          FailStart('--permission-mode needs a value: ask, plan or accept-edits',
+            '', 2);
+        if not uTools.PermModeParse(ParamStr(ArgI + 1), ModeWanted) then
+        begin
+          { Named explicitly, because a user who typed 'bypass' knows what
+            they wanted and the only thing worth telling them is how it is
+            spelled here.  It is not an alias: the long form is the whole
+            defence against the mode arriving in a script by accident. }
+          if LowerCase(ParamStr(ArgI + 1)) = 'bypass' then
+            FailStart('bypass is spelled --dangerously-skip-permissions',
+              'and it means it: nothing is asked about at all', 2)
+          else
+            FailStart('unknown permission mode: ' + ParamStr(ArgI + 1),
+              'ask, plan or accept-edits', 2);
+        end;
+        ModeGiven := True;
+        PlanFlag := PlanFlag or (ModeWanted = uTools.pmodePlan);
+        SkipNext := True;
+      end
+      else if Arg = '--dangerously-skip-permissions' then
+      begin
+        ModeWanted := uTools.pmodeBypass;
+        ModeGiven := True;
+        BypassFlag := True;
+      end
       else if Arg = '--output-format' then
       begin
         if ArgI >= ParamCount then
@@ -1756,6 +1922,19 @@ begin
         EmitCLn(clGrey, '  --web     let the model search the web (off by default)');
         EmitCLn(clGrey, '  -p        answer one prompt and exit (reads stdin when piped)');
         EmitCLn(clGrey, '            (-p never loads hooks: nobody is there to approve them)');
+        EmitCLn(clGrey, '  --permission-mode ask|plan|accept-edits');
+        EmitCLn(clGrey, '            ask (the default) prompts for every write, edit and command;');
+        EmitCLn(clGrey, '            plan lets the model only read and investigate, and refuses');
+        EmitCLn(clGrey, '            everything else until you leave it with /mode;');
+        EmitCLn(clGrey, '            accept-edits stops asking about file writes (but not about');
+        EmitCLn(clGrey, '            shell commands or fetch), and needs somebody to be there,');
+        EmitCLn(clGrey, '            so under -p it needs --input-format stream-json.');
+        EmitCLn(clGrey, '            Plan mode stops the MODEL, not the machine: your own');
+        EmitCLn(clGrey, '            hooks still run.');
+        EmitCLn(clGrey, '  --dangerously-skip-permissions');
+        EmitCLn(clGrey, '            approve everything, asking nothing, for this run only.');
+        EmitCLn(clGrey, '            Nothing is persisted.  Deny rules, the session root and');
+        EmitCLn(clGrey, '            the subagent read-only list still apply; nothing else does.');
         EmitCLn(clGrey, '  --output-format text|json|stream-json   (needs -p)');
         EmitCLn(clGrey, '  --input-format  text|stream-json        (needs -p and stream-json out)');
         EmitCLn(clGrey, '            json/stream-json put one JSON object per line on stdout,');
@@ -1787,6 +1966,22 @@ begin
     if StreamInput and (OutFormat <> uSdk.sfStreamJson) then
       FailStart('--input-format stream-json needs --output-format stream-json',
         'a driver that sends messages has to be able to read the answers', 2);
+    { A mode that cannot work under -p is a startup error rather than a quiet
+      downgrade: a script that asked to stop being prompted and was silently
+      given the prompting mode would fail later, in the middle of the work,
+      with a refusal that looks like a bug. }
+    if PrintMode and not uTools.PermModeReachableUnderPrint(ModeWanted,
+      PrintMode and StreamInput) then
+      FailStart('--permission-mode ' + uTools.PermModeName(ModeWanted) +
+        ' needs somebody to accept: -p has nobody',
+        'attach a driver with --input-format stream-json, or say' +
+        ' --dangerously-skip-permissions and mean it', 2);
+    { Contradictory rather than ordered.  Either precedence would be a guess
+      about which flag the user meant, and both guesses are dangerous: one
+      silently plans nothing, the other silently approves everything. }
+    if PlanFlag and BypassFlag then
+      FailStart('--permission-mode plan and --dangerously-skip-permissions '
+        + 'contradict each other', 'pick one', 2);
     if Dir <> '' then
     begin
       if not DirectoryExists(Dir) then
@@ -1815,6 +2010,18 @@ begin
       read here unprompted too - so this is only the plugin half. }
     uTools.LoadPluginState(PluginStatePath);
     uTools.RefreshSkills;
+
+    { Beside the deny rules and for the mirror-image reason: a mode from argv
+      is the human speaking about this run, and -p halts below without ever
+      reaching the second application.  It is applied again after
+      LoadPermissions so a loaded grant cannot undo it. }
+    ApplyStartupMode;
+    if PrintMode and (uTools.CurrentPermMode = uTools.pmodeBypass) then
+      { On stderr, so a driver reading stdout for JSON is undisturbed and a
+        log of the run still records that nothing was asked. }
+      WriteLn(StdErr, 'pasclaude: --dangerously-skip-permissions: every tool ' +
+        'is approved without asking. Deny rules and the session root still ' +
+        'apply; nothing else does.');
 
     ApiKey := GetEnvironmentVariable('ANTHROPIC_API_KEY');
     UsingSubscription := False;
@@ -1925,7 +2132,14 @@ begin
           SdkOpts.Format := OutFormat;
           SdkOpts.StreamInput := True;
           SdkOpts.SessionId := uSdk.SdkNewSessionId;
-          SdkOpts.PermissionMode := 'ask';
+          { The reported name and the answering channel, decided separately.
+            A driver is a permission answerer and nothing more, so it is armed
+            only in the two modes where a question can arise: plan refuses
+            before the gate, and bypass answers itself. }
+          SdkOpts.PermissionMode :=
+            uTools.PermModeName(uTools.CurrentPermMode);
+          SdkOpts.AskViaDriver :=
+            uTools.CurrentPermMode in [uTools.pmodeAsk, uTools.pmodeAcceptEdits];
           SdkCode := uSdk.SdkRun(Agent, SdkOpts, PrintPrompt, Err);
           TermDone;
           Halt(SdkCode);
@@ -1959,8 +2173,16 @@ begin
           SdkOpts.Format := OutFormat;
           SdkOpts.StreamInput := False;
           SdkOpts.SessionId := uSdk.SdkNewSessionId;
-          { No driver, so nobody can be asked and SdkRun leaves Ask nil. }
-          SdkOpts.PermissionMode := 'deny';
+          { No driver, so nobody can be asked and SdkRun leaves Ask nil.  The
+            reported name is still the truth about the session: a bypass run
+            asks nobody because it needs nobody, which is a different fact
+            from having nobody to ask. }
+          SdkOpts.AskViaDriver := False;
+          if uTools.CurrentPermMode = uTools.pmodeAsk then
+            SdkOpts.PermissionMode := 'deny'
+          else
+            SdkOpts.PermissionMode :=
+              uTools.PermModeName(uTools.CurrentPermMode);
           SdkCode := uSdk.SdkRun(Agent, SdkOpts, PrintPrompt, Err);
           TermDone;
           Halt(SdkCode);
@@ -1995,6 +2217,10 @@ begin
       { Standing approvals survive restarts.  Print mode skips this: a
         scripted run must not inherit interactive grants, nor write any. }
       LoadPermissions(PermissionsPath);
+      { Second application: LoadPermissions widens, so without this a flag
+        saying "ask me" would be quietly overruled by a grant the user made
+        weeks ago and has since forgotten. }
+      ApplyStartupMode;
 
       { After LoadPermissions, so an approval already given suppresses the
         prompt, and after the print-mode Halt above, which is what makes a
@@ -2075,7 +2301,7 @@ begin
       end;
 
       repeat
-        if not ReadLineEdit('> ', Line) then Break;
+        if not ReadLineEdit(ModePrompt, Line) then Break;
         Line := Trim(Line);
         if Line = '' then Continue;
         { Written now rather than at exit, for the same reason the session
@@ -2234,6 +2460,18 @@ begin
             end;
           end;
         until not Again;
+        { A plan is prose, so there is nothing an approval could be bound to
+          and nothing is auto-approved on the way out - an approval that
+          claims to cover "the plan" and actually covers everything is a lie
+          with a friendly label.  What the user gets instead is the reminder
+          that the two ways out are one command each. }
+        if TurnOk and uTools.PlanMode then
+        begin
+          NeedNewLine;
+          EmitCLn(clGrey, '  (plan mode: nothing was changed.  /mode ' +
+            'accept-edits to do the work without prompts, or /mode ask to ' +
+            'be asked about each step)');
+        end;
         { Saved after every turn rather than at exit, because the session
           worth keeping is usually the one that ended in a crash or a closed
           window.  A failure to save is reported once and does not interrupt

@@ -1058,8 +1058,12 @@ begin
       CC.AddStr('type', 'ephemeral');
       SysBlock.Add('cache_control', CC);
       SysArr.Push(SysBlock);
-      { Whatever is true of this session rather than of the program: deny
-        rules, and later the permission mode and the extra roots.  It goes
+      { Whatever is true of this session rather than of the program: plan
+        mode, deny rules, and later the extra roots.  Read from uTools here
+        rather than set by the host, because a host that forgot to wire it
+        would produce exactly the failure plan mode exists to prevent - a
+        model told nothing, discovering the boundary by walking into it after
+        doing half the work.  It goes
         AFTER the marked block and carries no marker of its own, so a session
         that turns one of these on does not invalidate the cached prefix -
         and with everything at its default uTools.SessionNote is '', no second

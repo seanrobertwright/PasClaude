@@ -1,9 +1,22 @@
 { uTools - the tools the model is allowed to call, and the permission gate.
 
   Every tool that changes the machine (write, edit, bash) asks the user first,
-  unless the session has been put in accept-all mode.  Reads are free.  Paths
-  are resolved against the session root and refused when they escape it, so a
-  confused model cannot walk into C:\Windows by accident. }
+  unless a standing approval covers it or the session has been put in
+  accept-edits or bypass mode.  Reads are free.  Paths are resolved against
+  the session root and refused when they escape it, so a confused model cannot
+  walk into C:\Windows by accident.
+
+  Two boundaries sit ABOVE the gate rather than inside it, in RunTool, where
+  no answer and no standing grant is consulted: the subagent read-only list,
+  and plan mode.  A boundary refuses; only the gate can allow.  Everything
+  the gate can conclude is narrowed further by the deny rules, which no mode
+  and no answer can lift.
+
+  A mode comes from exactly three places - a keystroke, this process's command
+  line, or the user's own earlier "always" in the out-of-tree approvals file.
+  The gate never reads the project directory for any of it: a repository that
+  could ship the file answering its own permission questions is the hole the
+  whole design exists to close. }
 unit uTools;
 
 {$mode objfpc}{$H+}
@@ -15,6 +28,19 @@ uses SysUtils, uJson, uDiff;
 type
   { Answer to a permission prompt. }
   TPermission = (pmAsk, pmAllowOnce, pmAllowAlways, pmDeny);
+
+  { What the session is doing about permission, as one word for the user.
+    The prefix is pmode rather than pm because pm is TPermission's, and two
+    enumerations sharing a prefix in one unit is how a value ends up in the
+    wrong case arm with no diagnostic at all.
+
+    This is a DISPLAY type, not the state: there is no mode variable.  Plan is
+    a boundary and bypass is a gate setting, so collapsing them onto one scale
+    would have to claim one is stronger than the other, and plan must beat
+    bypass - "let me look around first" has to be available inside a yolo
+    session.  CurrentPermMode derives the word from the state that already
+    exists; SetPermMode is the only writer. }
+  TPermMode = (pmodePlan, pmodeAsk, pmodeAcceptEdits, pmodeBypass);
 
   { Supplied by the host so this unit does not depend on the console. }
   TAskProc = function(const Title, Detail: string): TPermission;
@@ -91,6 +117,25 @@ var
     command line instead, which is the same reasoning that makes an "always"
     for bash approve a program rather than a command line. }
   AllowAllMcp: Boolean = False;
+  { The two mode variables.  Both are session-scoped and neither is ever
+    written to or read from a file, by design: a mode is a statement about
+    what is being done right now, and a standing file meaning "and every
+    future session" is a wider grant than the word implied.  Neither can be
+    set from the project directory - not by a hook, a skill, a plugin, an
+    MCP server, .mcp.json or CLAUDE.md - because the only writer is
+    SetPermMode and its only callers are the host's slash commands and its
+    command-line parser.
+
+    PlanMode is enforced in RunTool, beside the subagent read-only boundary
+    and far above the gate, so it beats BypassMode, a class allow-all, a
+    persisted bash prefix and a PreToolUse hook's allow without any of them
+    needing to know it exists. }
+  PlanMode: Boolean = False;
+  { BypassMode is one line at the top of Permit and PermitBash.  It sets none
+    of the four flags above, which is what makes "yolo never persists" a
+    property of the variable rather than of the host remembering to skip a
+    save. }
+  BypassMode: Boolean = False;
   { Filled in by uAgent's initialization.  Nil means this build cannot run a
     subagent at all: the task tool is then not advertised and, if the model
     names it anyway, it reports a plain error.  Deny-by-default applied to a
@@ -238,6 +283,54 @@ function Permit(const Name, Detail: string; Ask: TAskProc): Boolean;
   two of them together are the whole answer to "can this be overridden", and
   a test that only went through RunTool could not tell which line refused. }
 function PermitBash(const Cmd, Detail: string; Ask: TAskProc): Boolean;
+
+{ ---- permission modes ----
+  Three sources may change a mode and there are no others: a keystroke at the
+  REPL prompt, an argument on this process's command line, and the
+  allow_edits key in the out-of-tree approvals file, which is written only by
+  the user's own earlier "always" answers.  Nothing in or under the project
+  directory is one of them.  There is deliberately no exit_plan_mode tool: a
+  tool that lets the model leave plan mode is a tool that lets the model grant
+  itself write access. }
+
+{ The only writer of PlanMode and BypassMode.  pmodeAsk is the off switch the
+  program has never had - it clears all four class blankets so the word "ask"
+  on screen means you will be asked. }
+procedure SetPermMode(M: TPermMode);
+{ Derived, never stored.  Plan beats bypass beats accept-edits beats ask. }
+function CurrentPermMode: TPermMode;
+function PermModeName(M: TPermMode): string;
+{ Parses a --permission-mode or /mode argument.  Rejects 'bypass': the
+  dangerous mode keeps its dangerous spelling and has one, on the command
+  line and at the prompt alike. }
+function PermModeParse(const S: string; out M: TPermMode): Boolean;
+{ The plan-mode paragraph for the system prompt, '' in every other mode.
+  SessionNote is what actually reaches the request; this is separate so the
+  text can be asserted on without reconstructing the whole note. }
+function PermModeNote: string;
+{ The plan-mode allowlist: what the model may still call while planning. }
+function IsPlanTool(const Name: string): Boolean;
+{ The tool_result a refused call gets, so the model learns the mode by being
+  told as well as by walking into it. }
+function PlanRefusal(const Name: string): string;
+{ Whether M can be entered by a -p run, given whether a stream-json driver is
+  attached.  A pure function so the rule is testable without a process. }
+function PermModeReachableUnderPrint(M: TPermMode; HasDriver: Boolean): Boolean;
+{ The standing grants no mode word names - the bash, fetch and MCP class
+  flags, the approved bash programs and the trusted MCP servers.  '' when
+  there are none, which is what lets the host show a mode line only when
+  there is something to say. }
+function PermGrantSummary: string;
+{ The mode as one word for the input prompt, with a '+' when PermGrantSummary
+  has something the word does not cover.  Text, not console - the host adds
+  the '> ' - and here rather than there because "does the user know what mode
+  they are in" is the failure this feature exists to prevent, and a host-only
+  string is one no suite can assert on. }
+function PermModeIndicator: string;
+{ The banner line, or '' when there is nothing worth saying.  Non-empty for a
+  grant loaded from the approvals file as well as for one typed this session:
+  the loaded case is the state that has always existed and never been shown. }
+function PermModeBanner: string;
 
 { A one-line description used in the transcript and in permission prompts. }
 function DescribeTool(const Name: string; Input: TJson): string;
@@ -1351,11 +1444,14 @@ end;
 
 function SessionNote: string;
 begin
-  Result := '';
-  { The plan-mode paragraph and the additional-working-directories block are
-    the other two contributions, in that order above this one.  The patterns
-    are deliberately absent: the model needs to know a refusal is policy, or
-    it burns turns retrying, and it does not need a list of what to try. }
+  { The plan paragraph goes first, and the additional-working-directories
+    block between it and the deny sentence.  Order is fixed so a session with
+    two of them on reads the same way every turn. }
+  Result := PermModeNote;
+  { The patterns are deliberately absent: the model needs to know a refusal is
+    policy, or it burns turns retrying, and it does not need a list of what to
+    try.  The permission mode below plan is absent for the same class of
+    reason - a model told it is in bypass has been told nothing it can use. }
   if DenyRulesInForce then
     Result := Result +
       'Some tools and paths are refused by deny rules; a refusal names the ' +
@@ -3849,6 +3945,36 @@ begin
   Result := (Name = 'read_file') or (Name = 'list_dir') or (Name = 'search');
 end;
 
+{ The plan-mode allowlist, in the same shape and for the same reason: a
+  reviewer verifies "nothing here changes anything" by reading one line.
+
+  An allowlist rather than a list of the mutating tools, because the tool set
+  is open - mcp__* names are arbitrary third-party verbs and the dynamic tool
+  source registry means new ones arrive at runtime.  A denylist would let an
+  MCP tool called create_issue straight through the moment somebody
+  configured the server; this refuses it without anybody having to think
+  about it, and refuses next year's tool by default too.
+
+  bash is refused whole.  Nothing here can tell "git status" from "del /s",
+  and a plan mode that ran shell commands it guessed were harmless would be
+  making exactly the judgement it exists to defer to the user.
+
+  fetch stays on the list because investigation needs it, and it changes
+  nothing locally - but it is an https request, so it is an observable
+  external side effect.  It still goes through Permit, so plan mode can never
+  make anything more permissive than the mode underneath it; anyone
+  uncomfortable with the exfiltration channel deletes one name here and loses
+  nothing structural.
+
+  A strict superset of IsSubagentTool, so the two boundaries compose as an
+  intersection: a subagent in plan mode has exactly the subagent's three. }
+function IsPlanTool(const Name: string): Boolean;
+begin
+  Result := IsSubagentTool(Name) or (Name = 'todo_write') or
+    (Name = 'skill') or (Name = 'task') or (Name = 'bash_output') or
+    (Name = 'fetch');
+end;
+
 function AgentsDir: string;
 begin
   Result := IncludeTrailingPathDelimiter(NormalizeRoot) + StateDirName +
@@ -4120,7 +4246,16 @@ end;
   file can mean.
 
   AllowAllMcp is deliberately absent: it is set only by /yolo, and /yolo is
-  never saved at all.
+  never saved at all.  PlanMode and BypassMode are absent for the same
+  reason and for a stronger one - a mode says what is being done right now,
+  and a file that quietly meant "and every future session" would be a wider
+  grant than the word the user typed.
+
+  allow_edits is now also what "/mode ask" writes false, and that works
+  precisely because of the only-widen rule above: the load can turn the flag
+  on from a true key but has nothing that turns it on from a false or absent
+  one, so a false written here is a durable off switch rather than a silence.
+  This is why SavePermissions must keep writing the flag's actual value.
 
   One more key, "deny":["bash:rm",...], and it is the first with the opposite
   polarity - it can only narrow.  It is read by LoadDenyRules, not here, and
@@ -4728,6 +4863,184 @@ begin
   Result := True;
 end;
 
+{ ---------------------------------------------------- permission modes -- }
+
+{ Accept-edits IS AllowAllEdits.  Not a new variable beside it: that flag
+  already means "the edits class is pre-approved", already persists and
+  already has the pmAllowAlways widening path, and around sixty places set it
+  directly to suppress prompts.  What it lacked was a name, an off switch and
+  an indicator, and those three things are the whole of this feature.  A
+  parallel mode boolean would create a state where the mode says ask and the
+  flag says allow, with no way for the user to tell which one the gate
+  believed. }
+procedure SetPermMode(M: TPermMode);
+begin
+  case M of
+    { Everything else untouched, so leaving plan mode returns the session to
+      the gate state it had rather than to a state the mode invented. }
+    pmodePlan: PlanMode := True;
+    pmodeAsk:
+      begin
+        PlanMode := False;
+        BypassMode := False;
+        { "Ask" on screen has to mean you will be asked, so the four class
+          blankets go.  Deliberately NOT the bash prefix table or the trust
+          store: those are narrow grants that each named the thing they
+          covered - a program, a server - and revoking them is not what the
+          user asked for.  /mode reports their counts instead. }
+        AllowAllEdits := False;
+        AllowAllBash := False;
+        AllowAllFetch := False;
+        AllowAllMcp := False;
+      end;
+    pmodeAcceptEdits:
+      begin
+        PlanMode := False;
+        BypassMode := False;
+        AllowAllBash := False;
+        AllowAllFetch := False;
+        AllowAllMcp := False;
+        AllowAllEdits := True;
+      end;
+    pmodeBypass:
+      begin
+        { Plan is cleared because bypass is a deliberate answer to "stop
+          asking", and a session that stayed in plan would refuse everything
+          while claiming to approve everything. }
+        PlanMode := False;
+        { Note what this does NOT do: it sets none of the four
+          persisted-shaped flags.  Bypass therefore touches zero persisted
+          state, and "yolo never persists" stops depending on the host
+          remembering to skip the save at shutdown - that suppression stays,
+          as a second line. }
+        BypassMode := True;
+      end;
+  end;
+end;
+
+function CurrentPermMode: TPermMode;
+begin
+  { Plan first: it is a boundary and it beats bypass. }
+  if PlanMode then Result := pmodePlan
+  else if BypassMode then Result := pmodeBypass
+  else if AllowAllEdits then Result := pmodeAcceptEdits
+  else Result := pmodeAsk;
+end;
+
+function PermModeName(M: TPermMode): string;
+begin
+  case M of
+    pmodePlan: Result := 'plan';
+    pmodeAcceptEdits: Result := 'accept-edits';
+    pmodeBypass: Result := 'bypass';
+  else
+    Result := 'ask';
+  end;
+end;
+
+function PermModeParse(const S: string; out M: TPermMode): Boolean;
+var
+  N: string;
+begin
+  M := pmodeAsk;
+  N := LowerCase(Trim(S));
+  Result := True;
+  if N = 'ask' then M := pmodeAsk
+  else if N = 'plan' then M := pmodePlan
+  else if N = 'accept-edits' then M := pmodeAcceptEdits
+  { 'bypass' and 'yolo' are refused here rather than accepted quietly.  The
+    mode is reachable, but only by typing --dangerously-skip-permissions or
+    /yolo: a mild spelling for the dangerous mode is how it gets into a
+    script somebody skim-read. }
+  else Result := False;
+end;
+
+function PermModeNote: string;
+begin
+  Result := '';
+  if not PlanMode then Exit;
+  Result :=
+    'This session is in plan mode. Investigate as much as you like: '#10 +
+    'read_file, list_dir, search, fetch, task and bash_output all work, '#10 +
+    'and todo_write is there for your own notes. Every call that would '#10 +
+    'change anything is refused while plan mode is on - write_file, '#10 +
+    'edit_file, notebook_edit, bash, kill_bash, and every tool an MCP '#10 +
+    'server contributed. Do not retry a refused call and do not ask to be '#10 +
+    'let out mid-turn: only the user can leave plan mode. End your turn by '#10 +
+    'saying what you would do and why, and stop there.'#10;
+end;
+
+function PlanRefusal(const Name: string): string;
+begin
+  { One ASCII sentence naming the mode, the reason and the way out, because a
+    refusal the model cannot act on costs a turn of retries. }
+  Result := 'plan mode: nothing may change yet. Say what you would do and ' +
+    'stop; only the user leaves plan mode (/mode). Refused: ' + Name;
+end;
+
+function PermModeReachableUnderPrint(M: TPermMode; HasDriver: Boolean): Boolean;
+begin
+  case M of
+    { The default, and it denies everything gated: -p leaves Ask nil. }
+    pmodeAsk: Result := True;
+    { Strictly stricter than the default. }
+    pmodePlan: Result := True;
+    { "Stop asking me" presupposes a me.  With a stream-json driver on stdin
+      there is one; without, the honest spelling of "no human, do it anyway"
+      is the dangerous flag, and silently downgrading to ask would leave a
+      script believing it had asked for something it did not get. }
+    pmodeAcceptEdits: Result := HasDriver;
+    { Reachable, and the single largest weakening in this round: it is the
+      only thing here a CI system can use.  It costs the literal string
+      --dangerously-skip-permissions and a warning on stderr. }
+    pmodeBypass: Result := True;
+  else
+    Result := False;
+  end;
+end;
+
+function PermGrantSummary: string;
+var
+  I, Progs, Trust: Integer;
+begin
+  { Everything a mode word does not cover.  AllowAllEdits is absent on
+    purpose: it IS the accept-edits word, so naming it here would make the
+    prompt read "accept-edits+" forever and the suffix would stop meaning
+    anything. }
+  Result := '';
+  if AllowAllBash then Result := Result + ', bash';
+  if AllowAllFetch then Result := Result + ', fetch';
+  if AllowAllMcp then Result := Result + ', mcp tools';
+  Progs := Length(BashPrefixes);
+  if Progs > 0 then
+    Result := Result + Format(', %d approved bash program(s)', [Progs]);
+  Trust := 0;
+  for I := 0 to High(Trusted) do
+    if Copy(Trusted[I].Key, 1, 9) = 'mcp-call:' then Inc(Trust);
+  if Trust > 0 then
+    Result := Result + Format(', %d trusted mcp server(s)', [Trust]);
+  if Result <> '' then Delete(Result, 1, 2);
+end;
+
+function PermModeIndicator: string;
+begin
+  Result := PermModeName(CurrentPermMode);
+  { A pointer to /mode, not information: no suffix can render every
+    combination of standing grants, and one that tried would be read as
+    complete.  It says only "the word understates this". }
+  if PermGrantSummary <> '' then Result := Result + '+';
+end;
+
+function PermModeBanner: string;
+begin
+  Result := '';
+  if (CurrentPermMode = pmodeAsk) and (PermGrantSummary = '') then Exit;
+  Result := 'mode: ' + PermModeName(CurrentPermMode);
+  if PermGrantSummary <> '' then
+    Result := Result + ' (also standing: ' + PermGrantSummary + ')';
+  Result := Result + '  -  /mode ask to be asked again';
+end;
+
 function Permit(const Name, Detail: string; Ask: TAskProc): Boolean;
 var
   IsBash, IsFetch, IsMcp: Boolean;
@@ -4744,6 +5057,15 @@ begin
   IsBash := Name = 'bash';
   IsFetch := Name = 'fetch';
   IsMcp := Copy(Name, 1, Length(McpNamePrefix)) = McpNamePrefix;
+
+  { The one line in this function that is not about a class, which is why it
+    is not down among them.  Set only by /yolo or by
+    --dangerously-skip-permissions, and BELOW the deny line above, which is
+    the cheapest available proof that no mode reaches around a deny rule: the
+    two decisions are not even in the same paragraph.  Plan mode is not
+    checked here at all - it was enforced in RunTool before this function was
+    reached, which is exactly why it beats this line. }
+  if BypassMode then Exit(True);
 
   if IsBash and AllowAllBash then Exit(True);
   if IsFetch and AllowAllFetch then Exit(True);
@@ -4805,6 +5127,10 @@ begin
     what makes a deny rule beat both /yolo and a persisted "always". }
   if DenyToolReason('bash') <> '' then Exit(False);
   if DenyBashReason(Cmd) <> '' then Exit(False);
+
+  { Below the deny pair and above everything else, commented with the same
+    line in Permit. }
+  if BypassMode then Exit(True);
 
   if AllowAllBash then Exit(True);
   if BashPrefixAllowed(Cmd) then Exit(True);
@@ -4907,8 +5233,12 @@ var
 begin
   Detail := DescribeTool(Name, Input);
   { The diff is only built when someone is actually going to be asked, since
-    reading and diffing the file is pure waste under /yolo. }
-  if Assigned(Ask) and not (AllowAllEdits or ((Name = 'bash') and AllowAllBash)) then
+    reading and diffing the file is pure waste under /yolo.  Bypass needs its
+    own term now that it no longer sets AllowAllEdits: without it, the mode
+    whose whole point is not asking would be the one paying for a diff nobody
+    will read. }
+  if Assigned(Ask) and not BypassMode and
+     not (AllowAllEdits or ((Name = 'bash') and AllowAllBash)) then
   begin
     Preview := ChangePreview(Name, Input);
     if Preview <> '' then
@@ -6485,8 +6815,29 @@ begin
     Exit(Reason);
   end;
 
-  { R4.  Plan mode goes here, above the subagent boundary and above the hook
-    fire, and is owned by the permission-modes work rather than by this one. }
+  { R4.  Plan mode, and it is a boundary rather than a gate setting - which is
+    why it is here, in a different function from Permit, running before Permit
+    is reached at all.  The subagent block below carries the argument already:
+    the permission gate is no backstop, because Permit short-circuits on
+    BypassMode and AllowAllEdits and PermitBash on a persisted "always".  A
+    check inside Permit would sit below those short-circuits and /yolo would
+    win; here, bypass, a class allow-all, a stored bash prefix, a hook allow
+    and a nil Ask are all structurally unreachable, and none of them had to be
+    taught that plan mode exists.
+
+    Above the hook fire for the reason written at R5: a repository's hook must
+    never be offered the chance to allow what a boundary refused.  Above the
+    subagent boundary only because "plan mode" is the more useful of two
+    refusals to read.
+
+    The refusal is a plain string with IsError, so the transcript still gets
+    exactly one tool_result for the tool_use and the model is told the mode as
+    well as being shown it in the system prompt. }
+  if PlanMode and not IsPlanTool(Name) then
+  begin
+    IsError := True;
+    Exit(PlanRefusal(Name));
+  end;
 
   { R5.  This, not the schema, is where read-only is true.  The schema is advice
     to the model and nothing stops it naming a tool it was never offered; and
