@@ -54,6 +54,7 @@ type
       plain input plus both cache columns.  This is the real size of the
       context, where TranscriptBytes is only a proxy for it. }
     FLastPromptTokens: Int64;
+    FThinkingBudget: Integer;
 
     function BuildBody: string;
     { One request/response exchange.  Returns the blocks the model produced. }
@@ -130,6 +131,10 @@ type
     function CacheReadTokens: Int64;
     function TurnCount: Integer;
     property Model: string read FModel write FModel;
+    { Extended thinking budget in tokens; 0 disables it.  When set the
+      request carries a thinking block allowance and max_tokens grows to
+      leave room for the visible reply on top of the reasoning. }
+    property ThinkingBudget: Integer read FThinkingBudget write FThinkingBudget;
 
     { Test seam.  Feeds raw response bytes through the same decoder the live
       stream uses, so the SSE handling can be exercised without a network.
@@ -749,8 +754,21 @@ begin
   Root := TJson.NewObj;
   try
     Root.AddStr('model', FModel);
-    Root.AddNum('max_tokens', FMaxTokens);
+    { Thinking spends from the same max_tokens pot as the reply, so the
+      ceiling rises with the budget or a long think would starve the
+      answer that follows it. }
+    if FThinkingBudget > 0 then
+      Root.AddNum('max_tokens', FMaxTokens + FThinkingBudget)
+    else
+      Root.AddNum('max_tokens', FMaxTokens);
     Root.AddBool('stream', True);
+    if FThinkingBudget > 0 then
+    begin
+      CC := TJson.NewObj;
+      CC.AddStr('type', 'enabled');
+      CC.AddNum('budget_tokens', FThinkingBudget);
+      Root.Add('thinking', CC);
+    end;
     { The system prompt travels as a content block so it can carry a
       cache_control marker.  The cache covers the request prefix up to the
       marker - tools come before system in that prefix - so this one

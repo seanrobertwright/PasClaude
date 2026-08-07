@@ -23,6 +23,9 @@ const
     proxy; this is the measured thing the context window actually fills
     with, and 150k leaves headroom under a 200k window for the reply. }
   CompactTokens = 150000;
+  { The /think default: enough for real multi-step reasoning, small enough
+    that a casual "on" does not silently multiply the bill. }
+  DefaultThinkBudget = 8192;
 
 var
   Agent: TAgent;
@@ -164,9 +167,9 @@ end;
 { ------------------------------------------------------------- completion -- }
 
 const
-  SlashCommands: array[0..9] of string = (
-    '/help', '/clear', '/compact', '/resume', '/save', '/cwd', '/model',
-    '/yolo', '/cost', '/exit');
+  SlashCommands: array[0..11] of string = (
+    '/help', '/clear', '/compact', '/diff', '/think', '/resume', '/save',
+    '/cwd', '/model', '/yolo', '/cost', '/exit');
 
 { Candidates for the token being completed: slash commands when the token
   opens the line with a slash, file and directory names under the session
@@ -398,6 +401,8 @@ begin
   EmitCLn(clGrey,   '  /clear         forget the conversation, here and on disk');
   EmitCLn(clGrey,   '  /compact       drop the oldest turns, keep the recent ones');
   EmitCLn(clGrey,   '  /compact full  replace the transcript with a model-written summary');
+  EmitCLn(clGrey,   '  /diff          list the files this session has changed');
+  EmitCLn(clGrey,   '  /think [n]     extended thinking: on, off, or a token budget');
   EmitCLn(clGrey,   '  /resume        reload the saved conversation');
   EmitCLn(clGrey,   '  /save          write the conversation now');
   EmitCLn(clGrey,   '  /cwd           show the session root');
@@ -407,6 +412,50 @@ begin
   EmitCLn(clGrey,   '  /exit          quit (Ctrl+C also works)');
   EmitLn;
   EmitCLn(clGrey,   '  Esc during a reply stops it.');
+end;
+
+{ Where the prompt history lives, beside the session. }
+function HistoryPath: string;
+begin
+  Result := IncludeTrailingPathDelimiter(uTools.RootDir) + SessionDir +
+    PathDelim + 'history.txt';
+end;
+
+{ What this session changed.  git diff --stat is the richer answer when
+  there is a repository - it also sees compiler output and hand edits - so
+  the session's own list leads and the stat follows when available. }
+procedure ShowDiff;
+var
+  Changed: TStringArray;
+  I, Code: Integer;
+  Stat: string;
+  L: TStringList;
+begin
+  Changed := uTools.ChangedFiles;
+  if Length(Changed) = 0 then
+    EmitCLn(clGrey, '  no files written or edited this session')
+  else
+  begin
+    EmitCLn(clBright, Format('  %d file(s) changed by this session:',
+      [Length(Changed)]));
+    for I := 0 to High(Changed) do
+      EmitCLn(clGrey, '    ' + Changed[I]);
+  end;
+
+  Stat := uTools.RunShellQuiet('git diff --stat HEAD', Code);
+  if (Code = 0) and (Trim(Stat) <> '') then
+  begin
+    EmitCLn(clBright, '  git diff --stat HEAD:');
+    L := TStringList.Create;
+    try
+      L.Text := Stat;
+      for I := 0 to L.Count - 1 do
+        if Trim(L[I]) <> '' then
+          EmitCLn(clGrey, '    ' + L[I]);
+    finally
+      L.Free;
+    end;
+  end;
 end;
 
 procedure ShowBanner;
@@ -451,6 +500,7 @@ begin
   else if Cmd = '/clear' then
   begin
     Agent.Reset;
+    uTools.ClearChangedFiles;
     { The saved copy has to go too.  Otherwise "cleared" means only "cleared
       until you resume", and a user who cleared something they did not want
       kept would find it again on the next run. }
@@ -499,6 +549,40 @@ begin
   end
   else if Cmd = '/cwd' then
     EmitCLn(clGrey, '  ' + uTools.RootDir)
+  else if Cmd = '/diff' then
+  begin
+    { Approvals happen one edit at a time; this is the aggregated answer.
+      When the directory is a git repository the real diff stat is the
+      better source - it sees hand edits too - so it is preferred and the
+      session's own list is the fallback. }
+    ShowDiff;
+  end
+  else if Cmd = '/think' then
+  begin
+    if (Arg = '') or (Arg = 'on') then
+      Agent.ThinkingBudget := DefaultThinkBudget
+    else if Arg = 'off' then
+      Agent.ThinkingBudget := 0
+    else
+    begin
+      Agent.ThinkingBudget := StrToIntDef(Arg, -1);
+      if Agent.ThinkingBudget < 0 then
+      begin
+        Agent.ThinkingBudget := 0;
+        EmitCLn(clRed, '  /think takes on, off, or a token count');
+        Exit;
+      end;
+      { The API floor is 1024; below it the request is rejected, and a
+        rejected request is a worse answer than a rounded-up budget. }
+      if (Agent.ThinkingBudget > 0) and (Agent.ThinkingBudget < 1024) then
+        Agent.ThinkingBudget := 1024;
+    end;
+    if Agent.ThinkingBudget > 0 then
+      EmitCLn(clGrey, Format('  extended thinking on, %d token budget',
+        [Agent.ThinkingBudget]))
+    else
+      EmitCLn(clGrey, '  extended thinking off');
+  end
   else if Cmd = '/save' then
   begin
     if Agent.SaveSession(SessionPath(uTools.RootDir), Err) then
@@ -632,6 +716,10 @@ begin
       if Resume then
         Resumed := Agent.LoadSession(SessionPath(uTools.RootDir), ResumeErr);
 
+      { Up-arrow reaching last week's build command is the whole point of
+        history; in-memory only, it died with the window. }
+      HistoryLoad(HistoryPath);
+
       ShowBanner;
 
       if Resume then
@@ -663,6 +751,12 @@ begin
         if not ReadLineEdit('> ', Line) then Break;
         Line := Trim(Line);
         if Line = '' then Continue;
+        { Written now rather than at exit, for the same reason the session
+          is: the run worth remembering is the one that ended in a crash or
+          a closed window.  ForceDirectories because the first prompt can
+          come before the first save creates .pasclaude. }
+        ForceDirectories(ExtractFilePath(HistoryPath));
+        HistorySave(HistoryPath);
 
         if not HandleCommand(Line, Handled) then Break;
         if Handled then Continue;
@@ -687,8 +781,37 @@ begin
           the byte count (a proxy, available before the first request) and
           the token count the API actually reported, which is the measured
           truth and catches token-dense transcripts the byte guess misses. }
-        if (Agent.TranscriptBytes > CompactKeepBytes) or
-           (Agent.ContextTokens > CompactTokens) then
+        if Agent.ContextTokens > CompactTokens then
+        begin
+          { The token trigger fires at a measured size, which is also the
+            point where the old turns are worth a request to keep: the
+            summary preserves their substance where the byte trim forgets
+            it.  A failed summary falls back to the trim - a session that
+            cannot summarize must still not outgrow the window. }
+          EmitCLn(clGrey, '  (context is large; summarizing older turns)');
+          AtLineStart := True;
+          MdReset;
+          if Agent.CompactWithSummary(Err) then
+          begin
+            MdFinish;
+            AtLineStart := True;
+            NeedNewLine;
+            EmitCLn(clGrey, Format('  (compacted to a summary, %d bytes)',
+              [Agent.TranscriptBytes]));
+          end
+          else
+          begin
+            MdFinish;
+            AtLineStart := True;
+            NeedNewLine;
+            EmitCLn(clYellow, '  (could not summarize: ' + Err + ')');
+            Dropped := Agent.Compact(CompactKeepBytes);
+            if Dropped > 0 then
+              EmitCLn(clGrey, Format('  (compacted: dropped %d older messages)',
+                [Dropped]));
+          end;
+        end
+        else if Agent.TranscriptBytes > CompactKeepBytes then
         begin
           Dropped := Agent.Compact(CompactKeepBytes);
           if Dropped > 0 then

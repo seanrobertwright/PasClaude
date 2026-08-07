@@ -55,6 +55,8 @@ contents are appended to the system prompt as binding instructions.
 | `/clear` | forget the conversation, here and on disk |
 | `/compact` | drop the oldest turns, keep the recent ones |
 | `/compact full` | replace the transcript with a model-written summary |
+| `/diff` | list the files this session has changed |
+| `/think [n]` | extended thinking: on, off, or a token budget |
 | `/resume` | reload the saved conversation |
 | `/save` | write the conversation now |
 | `/cwd` | show the session root |
@@ -81,6 +83,27 @@ giving up, not by an unkillable hour-long sleep.
 At the prompt, the arrow keys move the caret and walk the command history,
 `Home`/`End` (or `Ctrl+A`/`Ctrl+E`) jump to either end, and `Ctrl+U` clears
 the line.
+
+History persists in `.pasclaude\history.txt`, so Up-arrow reaches last
+week's build command in a fresh window. One command per line, multi-line
+prompts stored with backslash escapes (`\n`, `\\`), capped at 200 entries,
+written after every accepted line for the same reason the session is - the
+run worth remembering is the one that ended in a closed window. A missing
+or unreadable file is simply an empty history, never an error.
+
+`/think` enables extended thinking. The request carries a
+`thinking: {type: enabled, budget_tokens}` block, and `max_tokens` grows by
+the budget so a long think does not starve the visible reply that follows
+it. Budgets under the API's floor of 1024 are rounded up rather than
+rejected; a bare `/think` uses 8192. The reasoning streams in grey as it
+always has - the decoder handled thinking blocks and signatures from the
+start, there was just no way to ask for them.
+
+`/diff` answers "what changed?" in aggregate, since approvals happen one
+edit at a time: the files this session's `write_file`/`edit_file` actually
+touched (denied and failed calls are not recorded), followed by
+`git diff --stat HEAD` when the directory is a repository - which also sees
+hand edits the session list cannot.
 
 `Tab` completes: slash commands at the start of the line, file and directory
 names anywhere else, resolved against the session root. Several matches extend
@@ -115,9 +138,11 @@ removed - is refused.
 
 Bytes are a proxy for the thing that actually fills the window, so a second
 trigger reads the measured truth: the prompt token count the API reported for
-the last request (`/cost` shows it as `context:`). Past 150k tokens the trim
-runs even when the byte count looks fine, which catches token-dense
-transcripts the byte guess misses.
+the last request (`/cost` shows it as `context:`). Past 150k tokens the
+compaction is the summarizing kind - the measured trigger fires at a size
+where the old turns are worth one request to keep - and falls back to the
+plain trim if the summary request fails, because a session that cannot
+summarize must still not outgrow the window.
 
 `/compact full` is the expensive kind: it asks the model to summarize the
 conversation - what was asked, what was done, exact paths, decisions and
@@ -191,8 +216,17 @@ the first's conversation on its very first save.
 | `bash` | yes | `cmd.exe /C`, output merged, 120 s timeout |
 | `fetch` | yes | HTTPS GET, capped at 200 KB, own "always" class |
 
-At each prompt you can answer `y` (once), `a` (always, for that class of tool)
-or `n`. Read-only tools never ask.
+At each prompt you can answer `y` (once), `a` (always) or `n`. Read-only
+tools never ask. For the edit tools and fetch, "always" covers the tool
+class. For bash it covers the *program*: answering `a` to `git status`
+approves future `git` commands, not `del /s` - quietly extending one
+approval to every future command is how trust gets spent. The prefix is the
+first token, lowercased, stripped of path and `.exe`, so `git` and
+`C:\Tools\git.exe` match. A compound command (`&`, `|`, `;`, redirects,
+`%var%`, `^`) has no prefix and is asked about every time, because cmd.exe
+runs everything after the separator regardless of what the first program
+was. "Always" for one degrades to this-once. `/yolo` still approves
+everything.
 
 `fetch` reaches the outside world, so it asks - and its "always" answer is
 its own class, separate from the edit tools, because approving edits forever
@@ -389,6 +423,15 @@ refused?" test. Making `fetch` skip its permission gate fails 1, and zeroing
 the prompt-token capture fails 1. The Ctrl+C handler is driven directly by
 the test with synthetic events, since a suite cannot press the key.
 
+The follow-on round: dropping the separator check from `BashPrefix` fails 6
+assertions (chained commands riding an approved prefix is exactly the hole
+the check closes), allowing any simple command through the bash gate fails
+1, and saving history without its escapes fails 4 - a multi-line prompt
+splits into several entries, which the round-trip assertions catch. The
+first draft of the quote handling failed its own test: stripping quotes
+before splitting on spaces broke `"C:\Program Files\Git\git.exe"` at the
+space inside the path, so quoted names now run to the closing quote.
+
 A third defect turned up the same way as the first two - by using the program
 rather than reading it. `/clear` printed "conversation cleared" and left the
 saved copy untouched, so `--resume` brought the whole thing back. For anything
@@ -477,6 +520,13 @@ transcript's *shape*; that is why the structural rules are enforced in
 | `pasclaude.lpr` | REPL, slash commands, rendering |
 
 Details worth knowing if you touch this code:
+
+* **Colour goes out as ANSI escapes when the console accepts VT
+  processing,** and through `SetConsoleTextAttribute` when it does not (an
+  old conhost). `TermInit` asks for
+  `ENABLE_VIRTUAL_TERMINAL_PROCESSING` and remembers the answer; on the VT
+  path a coloured span is one write instead of three round trips. The mode
+  is restored at exit because the flag is process-wide on shared consoles.
 
 * **The tool loop is the whole point.** `TAgent.Send` posts the transcript,
   and if the reply contains `tool_use` blocks it runs them, appends the

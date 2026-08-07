@@ -244,12 +244,118 @@ begin
   end;
 end;
 
+{ The bash prefix rules.  "Always" for a command approves its program; a
+  chained command has no prefix and is asked about every time. }
+procedure TestBashPrefixes;
+var
+  J: TJson;
+  Out_: string;
+  IsErr: Boolean;
+begin
+  ClearBashPrefixes;
+  uTools.AllowAllBash := False;
+
+  Check(BashPrefix('git status') = 'git', 'the prefix is the program name');
+  Check(BashPrefix('  git   log --oneline') = 'git', 'leading space is trimmed');
+  Check(BashPrefix('GIT LOG') = 'git', 'the prefix is case-folded');
+  Check(BashPrefix('C:\Tools\git.exe log') = 'git',
+    'a full path reduces to the program');
+  Check(BashPrefix('"C:\Program Files\Git\git.exe"') = 'git',
+    'quotes are stripped');
+  Check(BashPrefix('git status && del /q *') = '',
+    'a chained command has no prefix');
+  Check(BashPrefix('type x | find "y"') = '', 'a pipe poisons the prefix');
+  Check(BashPrefix('echo %PATH%') = '', 'an env expansion poisons the prefix');
+  Check(BashPrefix('build > out.txt') = '', 'a redirect poisons the prefix');
+  Check(BashPrefix('') = '', 'an empty command has no prefix');
+
+  Check(not BashPrefixAllowed('git status'), 'nothing is approved to start');
+  AllowBashPrefix('git status');
+  Check(BashPrefixAllowed('git log'), 'approving git status approves git log');
+  Check(BashPrefixAllowed('GIT PUSH'), 'case does not matter');
+  Check(not BashPrefixAllowed('del /q x'), 'del was never approved');
+  Check(not BashPrefixAllowed('git status && del /q *'),
+    'a chained command never rides an approved prefix');
+
+  { Through the real tool: an approved prefix runs without a prompt (Ask is
+    nil here, so any prompt would deny). }
+  AllowBashPrefix('echo hi');
+  J := TJson.NewObj;
+  J.AddStr('command', 'echo prefix-approved');
+  Out_ := Run('bash', J, IsErr);
+  Check((not IsErr) and (Pos('prefix-approved', Out_) > 0),
+    'an approved prefix runs without asking');
+
+  J := TJson.NewObj;
+  J.AddStr('command', 'dir');
+  Out_ := Run('bash', J, IsErr);
+  Check(IsErr and (Pos('denied', Out_) > 0),
+    'an unapproved program still asks (and a nil ask denies)');
+
+  J := TJson.NewObj;
+  J.AddStr('command', 'echo x && echo y');
+  Out_ := Run('bash', J, IsErr);
+  Check(IsErr and (Pos('denied', Out_) > 0),
+    'a chained command is asked about even when its first program is approved');
+
+  ClearBashPrefixes;
+  Check(not BashPrefixAllowed('git log'), 'clearing forgets the approvals');
+end;
+
+{ The changed-files log behind /diff. }
+procedure TestChangedFiles;
+var
+  J: TJson;
+  IsErr: Boolean;
+  C: TStringArray;
+begin
+  ClearChangedFiles;
+  uTools.AllowAllEdits := True;
+
+  Check(Length(uTools.ChangedFiles) = 0, 'the list starts empty');
+
+  J := TJson.NewObj;
+  J.AddStr('path', 'diffed.txt');
+  J.AddStr('content', 'one');
+  Run('write_file', J, IsErr);
+
+  J := TJson.NewObj;
+  J.AddStr('path', 'diffed.txt');
+  J.AddStr('old_text', 'one');
+  J.AddStr('new_text', 'two');
+  Run('edit_file', J, IsErr);
+
+  C := uTools.ChangedFiles;
+  Check(Length(C) = 1, 'a write and an edit of one file count once');
+  Check((Length(C) = 1) and (C[0] = 'diffed.txt'), 'by its relative path');
+
+  { A read is not a change. }
+  J := TJson.NewObj;
+  J.AddStr('path', 'diffed.txt');
+  Run('read_file', J, IsErr);
+  Check(Length(uTools.ChangedFiles) = 1, 'reading adds nothing');
+
+  { A denied write is not a change either. }
+  uTools.AllowAllEdits := False;
+  J := TJson.NewObj;
+  J.AddStr('path', 'never.txt');
+  J.AddStr('content', 'x');
+  Run('write_file', J, IsErr);
+  Check(Length(uTools.ChangedFiles) = 1, 'a denied write is not recorded');
+  uTools.AllowAllEdits := True;
+
+  ClearChangedFiles;
+  Check(Length(uTools.ChangedFiles) = 0, 'clearing empties the list');
+end;
+
 var
   Schema: TJson;
 begin
   TestJson;
   TestTools;
   TestFetch;
+  TestBashPrefixes;
+  TestChangedFiles;
   Schema := ToolsSchema;
   try
     Check(Pos('"input_schema"', Schema.ToJson) > 0, 'the schema serialises');

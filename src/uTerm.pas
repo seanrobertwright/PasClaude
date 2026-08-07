@@ -19,6 +19,16 @@ type
 procedure TermInit;
 procedure TermDone;
 
+{ True when the console accepted virtual-terminal processing, in which case
+  colour goes out as ANSI escapes instead of attribute calls.  Exposed for
+  the tests and for anyone wondering which path their terminal is on. }
+function TermVtActive: Boolean;
+
+{ The escape sequence for a colour, '' when VT is off.  Pure, so the mapping
+  is testable without a console. }
+function VtSeq(C: TColor): string;
+function VtReset: string;
+
 procedure Emit(const S: string);                      { no newline }
 procedure EmitLn(const S: string = '');
 procedure EmitC(C: TColor; const S: string);
@@ -108,10 +118,22 @@ procedure HistoryAdd(const S: string);
 procedure HistoryClear;
 { Test seam: how many commands are remembered. }
 function HistoryCount: Integer;
+{ Loads history from Path, replacing what is in memory.  A missing or
+  unreadable file is simply an empty history, never an error: history is a
+  convenience, and a session must not fail over it. }
+procedure HistoryLoad(const Path: string);
+{ Writes the history to Path, newest last, capped at HistoryMax entries.
+  Failures are swallowed for the same reason. }
+procedure HistorySave(const Path: string);
+
+const
+  { Entries kept on disk.  Enough that Up-arrow reaches last week's build
+    command, few enough that the file stays trivial. }
+  HistoryMax = 200;
 
 implementation
 
-uses Windows;
+uses Windows, Classes;
 
 var
   HOut: HANDLE = 0;
@@ -122,6 +144,44 @@ var
   { Written from the console control thread, read from the main one; a
     Boolean write is atomic on every target this builds for. }
   CtrlCFlag: Boolean = False;
+  VtActive: Boolean = False;
+  SavedOutMode: DWORD = 0;
+
+const
+  ENABLE_VIRTUAL_TERMINAL_PROCESSING = $0004;
+
+function TermVtActive: Boolean;
+begin
+  Result := VtActive;
+end;
+
+{ The 8 bright ANSI foregrounds cover the palette exactly; clWhite is the
+  one non-intense entry.  Escape sequences render italic-capable, truecolor
+  terminals correctly where legacy attributes flatten them. }
+function VtSeq(C: TColor): string;
+begin
+  if not VtActive then Exit('');
+  case C of
+    clGrey:    Result := #27'[90m';
+    clWhite:   Result := #27'[37m';
+    clBright:  Result := #27'[97m';
+    clCyan:    Result := #27'[96m';
+    clGreen:   Result := #27'[92m';
+    clYellow:  Result := #27'[93m';
+    clRed:     Result := #27'[91m';
+    clMagenta: Result := #27'[95m';
+    clBlue:    Result := #27'[94m';
+  else
+    Result := '';
+  end;
+end;
+
+function VtReset: string;
+begin
+  if VtActive then Result := #27'[0m' else Result := '';
+end;
+
+procedure RawWrite(const S: string); forward;
 
 function HandleConsoleBreak(CtrlType: LongWord): LongBool; stdcall;
 begin
@@ -173,11 +233,24 @@ begin
   SetConsoleOutputCP(CP_UTF8);
   SetConsoleCP(CP_UTF8);
   SetConsoleCtrlHandler(@HandleConsoleBreak, True);
+  { Ask for VT processing; a console that refuses (an old conhost) simply
+    leaves the attribute path in use.  The mode is restored at exit because
+    the flag is process-wide on shared consoles. }
+  VtActive := False;
+  if (HOut <> 0) and GetConsoleMode(HOut, SavedOutMode) then
+    if SetConsoleMode(HOut, SavedOutMode or ENABLE_VIRTUAL_TERMINAL_PROCESSING) then
+      VtActive := True;
 end;
 
 procedure TermDone;
 begin
   SetConsoleCtrlHandler(@HandleConsoleBreak, False);
+  if VtActive and (HOut <> 0) then
+  begin
+    RawWrite(VtReset);
+    SetConsoleMode(HOut, SavedOutMode);
+    VtActive := False;
+  end;
   if HOut <> 0 then
     SetConsoleTextAttribute(HOut, SavedAttr);
   if SavedCP <> 0 then SetConsoleOutputCP(SavedCP);
@@ -226,9 +299,16 @@ end;
 
 procedure EmitC(C: TColor; const S: string);
 begin
-  if HOut <> 0 then SetConsoleTextAttribute(HOut, Attr(C));
-  RawWrite(S);
-  if HOut <> 0 then SetConsoleTextAttribute(HOut, SavedAttr);
+  if VtActive then
+    { One write instead of three round trips; on a VT console the colour
+      travels inside the text. }
+    RawWrite(VtSeq(C) + S + VtReset)
+  else
+  begin
+    if HOut <> 0 then SetConsoleTextAttribute(HOut, Attr(C));
+    RawWrite(S);
+    if HOut <> 0 then SetConsoleTextAttribute(HOut, SavedAttr);
+  end;
 end;
 
 procedure EmitCLn(C: TColor; const S: string);
@@ -399,6 +479,106 @@ end;
 function HistoryCount: Integer;
 begin
   Result := Length(History);
+end;
+
+{ One command per line.  A multi-line prompt (pasted block, Ctrl+Enter) is
+  stored with backslash escapes - \\ for a backslash, \n for a newline -
+  because the file format is line-oriented and a bare newline would split
+  one command into several. }
+
+function HistEscape(const S: string): string;
+var
+  I: Integer;
+begin
+  Result := '';
+  for I := 1 to Length(S) do
+    case S[I] of
+      '\': Result := Result + '\\';
+      #10: Result := Result + '\n';
+      #13: ;   { CR never re-enters; the editor stores bare newlines }
+    else
+      Result := Result + S[I];
+    end;
+end;
+
+function HistUnescape(const S: string): string;
+var
+  I: Integer;
+begin
+  Result := '';
+  I := 1;
+  while I <= Length(S) do
+  begin
+    if (S[I] = '\') and (I < Length(S)) then
+    begin
+      case S[I + 1] of
+        '\': Result := Result + '\';
+        'n': Result := Result + #10;
+      else
+        { An escape this build does not know passes through untouched,
+          which errs on the side of showing the user their own text. }
+        Result := Result + Copy(S, I, 2);
+      end;
+      Inc(I, 2);
+    end
+    else
+    begin
+      Result := Result + S[I];
+      Inc(I);
+    end;
+  end;
+end;
+
+procedure HistoryLoad(const Path: string);
+var
+  L: TStringList;
+  I, N: Integer;
+  S: string;
+begin
+  SetLength(History, 0);
+  if not FileExists(Path) then Exit;
+  L := TStringList.Create;
+  try
+    try
+      L.LoadFromFile(Path);
+    except
+      Exit;
+    end;
+    N := 0;
+    for I := 0 to L.Count - 1 do
+    begin
+      S := HistUnescape(L[I]);
+      if Trim(S) = '' then Continue;
+      SetLength(History, N + 1);
+      History[N] := S;
+      Inc(N);
+    end;
+  finally
+    L.Free;
+  end;
+end;
+
+procedure HistorySave(const Path: string);
+var
+  L: TStringList;
+  I, First: Integer;
+begin
+  L := TStringList.Create;
+  try
+    First := 0;
+    if Length(History) > HistoryMax then
+      First := Length(History) - HistoryMax;
+    for I := First to High(History) do
+      L.Add(HistEscape(History[I]));
+    try
+      L.SaveToFile(Path);
+    except
+      { A read-only directory or a full disk is not worth a message: the
+        session works identically without persistent history. }
+    end;
+  finally
+    L.Free;
+  end;
 end;
 
 procedure EditInit(out E: TEditState);

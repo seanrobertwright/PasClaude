@@ -1182,6 +1182,56 @@ begin
   end;
 end;
 
+{ The thinking budget's effect on the request: a thinking block with the
+  budget, and max_tokens raised so the reply is not starved by the think. }
+procedure TestThinkingBudgetInRequest;
+var
+  A: TAgent;
+  Doc, Th: TJson;
+  BaseMax, RaisedMax: Integer;
+begin
+  ResetScript;
+  uTools.RootDir := SessionDir;
+  A := MakeAgent;
+  try
+    A.AppendUserText('q');
+
+    Doc := JsonParse(A.RequestBody);
+    try
+      Check(Doc.Find('thinking') = nil, 'no thinking block by default');
+      BaseMax := Round(Doc.Num('max_tokens'));
+    finally
+      Doc.Free;
+    end;
+
+    A.ThinkingBudget := 2048;
+    Doc := JsonParse(A.RequestBody);
+    try
+      Th := Doc.Find('thinking');
+      Check(Th <> nil, 'the thinking block is present when a budget is set');
+      Check((Th <> nil) and (Th.Str('type') = 'enabled'), 'typed enabled');
+      Check((Th <> nil) and (Round(Th.Num('budget_tokens')) = 2048),
+        'with the budget');
+      RaisedMax := Round(Doc.Num('max_tokens'));
+      Check(RaisedMax = BaseMax + 2048,
+        Format('max_tokens grows by the budget: %d -> %d', [BaseMax, RaisedMax]));
+    finally
+      Doc.Free;
+    end;
+
+    A.ThinkingBudget := 0;
+    Doc := JsonParse(A.RequestBody);
+    try
+      Check(Doc.Find('thinking') = nil, 'turning it off removes the block');
+      Check(Round(Doc.Num('max_tokens')) = BaseMax, 'and max_tokens falls back');
+    finally
+      Doc.Free;
+    end;
+  finally
+    A.Free;
+  end;
+end;
+
 begin
   { Every request in this suite goes to the stand-in rather than the network. }
   uHttp.HttpTransport := @FakePost;
@@ -1209,6 +1259,7 @@ begin
   TestCompactWithSummaryEmptyRestores;
   TestToolUseStreamingHooks;
   TestContextTokens;
+  TestThinkingBudgetInRequest;
 
   WriteLn;
   if Fails = 0 then

@@ -10,7 +10,7 @@ unit uTools;
 
 interface
 
-uses uJson, uDiff;
+uses SysUtils, uJson, uDiff;
 
 type
   { Answer to a permission prompt. }
@@ -75,9 +75,28 @@ function IsIgnored(const RelPath: string; IsDir: Boolean): Boolean;
   without the permission gate - the host is not the model. }
 function RunShellQuiet(const Cmd: string; out ExitCode: Integer): string;
 
+{ The leading program name of a shell command - the part an "always" answer
+  reasonably covers.  Exposed for the tests. }
+function BashPrefix(const Cmd: string): string;
+{ True when Cmd's prefix was approved with "always" earlier this session. }
+function BashPrefixAllowed(const Cmd: string): Boolean;
+{ Records Cmd's prefix as approved.  Exposed for the tests. }
+procedure AllowBashPrefix(const Cmd: string);
+{ Test seam: forget every approved prefix. }
+procedure ClearBashPrefixes;
+
+{ Files the write and edit tools actually touched this session, relative to
+  the root, oldest first, without duplicates.  Approvals happen one edit at
+  a time; this is the aggregated answer to "what changed?". }
+function ChangedFiles: TStringArray;
+{ Records a touched file.  RunTool calls it on success; exposed for tests. }
+procedure NoteChangedFile(const RelPath: string);
+{ Test seam and /clear: forget the list. }
+procedure ClearChangedFiles;
+
 implementation
 
-uses SysUtils, Classes, Process, Windows, uHttp;
+uses Classes, Process, Windows, uHttp;
 
 const
   MaxReadBytes = 400 * 1024;   { keeps a stray huge file out of the context }
@@ -743,6 +762,109 @@ begin
     Result := OemToUtf8(Result);
 end;
 
+{ ---------------------------------------------------------- bash prefixes -- }
+
+var
+  BashPrefixes: array of string;
+
+{ The first token, lowercased, stripped of a path and an .exe suffix - so
+  "git status" and "C:\Program Files\Git\git.exe log" share the prefix
+  "git".  An "always" answer covers the program, not the arguments: the
+  user who approved "git status" forever meant git, not status.
+
+  Compound commands are deliberately not split: "git status && del *" has
+  the prefix "git" only as its first program, and cmd.exe runs the rest
+  regardless, so the whole line must carry the strictest reading.  The &,
+  |, ; separators therefore poison the prefix - such a command never
+  matches a stored prefix and is always asked about. }
+function BashPrefix(const Cmd: string): string;
+var
+  S: string;
+  I: Integer;
+begin
+  Result := '';
+  S := Trim(Cmd);
+  if S = '' then Exit;
+  { A chained command is asked about every time; see above. }
+  for I := 1 to Length(S) do
+    if S[I] in ['&', '|', ';', '<', '>', '%', '^'] then Exit;
+  { A quoted program name runs to the closing quote, spaces included;
+    otherwise the first space ends it. }
+  if S[1] = '"' then
+  begin
+    I := Pos('"', S, 2);
+    if I = 0 then Exit;   { an unclosed quote is not worth guessing about }
+    S := Copy(S, 2, I - 2);
+  end
+  else
+  begin
+    I := Pos(' ', S);
+    if I > 0 then S := Copy(S, 1, I - 1);
+  end;
+  S := ExtractFileName(S);
+  if LowerCase(ExtractFileExt(S)) = '.exe' then
+    S := ChangeFileExt(S, '');
+  Result := LowerCase(S);
+end;
+
+function BashPrefixAllowed(const Cmd: string): Boolean;
+var
+  P: string;
+  I: Integer;
+begin
+  Result := False;
+  P := BashPrefix(Cmd);
+  if P = '' then Exit;
+  for I := 0 to High(BashPrefixes) do
+    if BashPrefixes[I] = P then Exit(True);
+end;
+
+procedure AllowBashPrefix(const Cmd: string);
+var
+  P: string;
+begin
+  P := BashPrefix(Cmd);
+  if P = '' then Exit;
+  if BashPrefixAllowed(Cmd) then Exit;
+  SetLength(BashPrefixes, Length(BashPrefixes) + 1);
+  BashPrefixes[High(BashPrefixes)] := P;
+end;
+
+procedure ClearBashPrefixes;
+begin
+  SetLength(BashPrefixes, 0);
+end;
+
+{ ---------------------------------------------------------- changed files -- }
+
+var
+  ChangedList: array of string;
+
+function ChangedFiles: TStringArray;
+var
+  I: Integer;
+begin
+  SetLength(Result, Length(ChangedList));
+  for I := 0 to High(ChangedList) do
+    Result[I] := ChangedList[I];
+end;
+
+procedure NoteChangedFile(const RelPath: string);
+var
+  I: Integer;
+begin
+  if RelPath = '' then Exit;
+  for I := 0 to High(ChangedList) do
+    if CompareText(ChangedList[I], RelPath) = 0 then Exit;
+  SetLength(ChangedList, Length(ChangedList) + 1);
+  ChangedList[High(ChangedList)] := RelPath;
+end;
+
+procedure ClearChangedFiles;
+begin
+  SetLength(ChangedList, 0);
+end;
+
 { ------------------------------------------------------------------ schema -- }
 
 function StrProp(const Desc: string): TJson;
@@ -974,6 +1096,37 @@ begin
   end;
 end;
 
+{ The bash gate.  "Always" for a shell command approves its program, not
+  every future command: the user who said always to "git status" meant git,
+  and quietly extending that to "del /s" is how trust gets spent.  /yolo
+  still approves everything through AllowAllBash. }
+function PermitBash(const Cmd, Detail: string; Ask: TAskProc): Boolean;
+var
+  A: TPermission;
+  P: string;
+begin
+  if AllowAllBash then Exit(True);
+  if BashPrefixAllowed(Cmd) then Exit(True);
+  if Ask = nil then Exit(False);
+
+  P := BashPrefix(Cmd);
+  A := Ask('bash', Detail);
+  case A of
+    pmAllowOnce: Result := True;
+    pmAllowAlways:
+      begin
+        { A chained command has no prefix; "always" for one degrades to
+          this-once, since there is nothing safe to remember it by -
+          silently widening to all commands would spend trust the user
+          never gave. }
+        if P <> '' then AllowBashPrefix(Cmd);
+        Result := True;
+      end;
+  else
+    Result := False;
+  end;
+end;
+
 { Builds the diff a change would produce.  Reads the file as it stands now,
   so the preview reflects what is really on disk rather than what the model
   believed was there. }
@@ -1095,6 +1248,7 @@ begin
       IsError := True;
       Exit('cannot write: ' + Err);
     end;
+    NoteChangedFile(Rel(Full));
     Result := Format('wrote %s (%d bytes)',
       [Rel(Full), Length(Input.Str('content'))]);
   end
@@ -1134,6 +1288,7 @@ begin
       IsError := True;
       Exit('cannot write: ' + Err);
     end;
+    NoteChangedFile(Rel(Full));
     Result := 'edited ' + Rel(Full);
   end
 
@@ -1165,7 +1320,7 @@ begin
       IsError := True;
       Exit('command is required');
     end;
-    if not Permit(Name, DescribeTool(Name, Input), Ask) then
+    if not PermitBash(Cmd, DescribeTool(Name, Input), Ask) then
     begin
       IsError := True;
       Exit('the user denied this command');

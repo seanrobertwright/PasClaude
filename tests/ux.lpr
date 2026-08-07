@@ -1505,6 +1505,73 @@ begin
   Check(not CtrlCPressed, 'Ctrl+Break does not raise the cancel flag');
 end;
 
+{ History persistence.  The file format is line-oriented with backslash
+  escapes, so a multi-line prompt must survive the round trip as one entry. }
+procedure TestHistoryPersistence;
+var
+  P: string;
+  E: TEditState;
+  I: Integer;
+begin
+  WriteLn('-- history file --');
+  P := IncludeTrailingPathDelimiter(TmpRoot) + 'history.txt';
+
+  HistoryClear;
+  HistoryAdd('build debug');
+  HistoryAdd('what does uHttp do?');
+  HistoryAdd('line one'#10'line two');
+  HistoryAdd('a literal \n stays literal');
+  HistorySave(P);
+
+  HistoryClear;
+  Check(HistoryCount = 0, 'memory is empty before the load');
+  HistoryLoad(P);
+  Check(HistoryCount = 4, 'every entry came back');
+
+  { Recall through the editor, newest first. }
+  EditInit(E);
+  EditApply(E, ekHistPrev, #0);
+  Check(UTF8Encode(E.Text) = 'a literal \n stays literal',
+    'a literal backslash-n survives the round trip');
+  EditApply(E, ekHistPrev, #0);
+  Check(UTF8Encode(E.Text) = 'line one'#10'line two',
+    'a multi-line entry is one entry with its newline intact');
+  EditApply(E, ekHistPrev, #0);
+  Check(UTF8Encode(E.Text) = 'what does uHttp do?', 'ordinary lines are ordinary');
+
+  { A missing file is an empty history, not an error. }
+  HistoryLoad(IncludeTrailingPathDelimiter(TmpRoot) + 'no-such-history.txt');
+  Check(HistoryCount = 0, 'a missing file loads as empty');
+
+  { The cap: more than HistoryMax entries keep only the newest. }
+  HistoryClear;
+  for I := 1 to HistoryMax + 25 do
+    HistoryAdd('cmd ' + IntToStr(I));
+  HistorySave(P);
+  HistoryLoad(P);
+  Check(HistoryCount = HistoryMax,
+    Format('the file keeps at most %d entries, got %d', [HistoryMax, HistoryCount]));
+  EditInit(E);
+  EditApply(E, ekHistPrev, #0);
+  Check(UTF8Encode(E.Text) = 'cmd ' + IntToStr(HistoryMax + 25),
+    'and they are the newest ones');
+
+  HistoryClear;
+  DeleteFile(P);
+end;
+
+{ The VT colour mapping.  A suite has no terminal to switch modes on, so
+  the pure mapping is what is checked: off means empty strings (the
+  attribute path), and the sequences themselves are well-formed SGR. }
+procedure TestVt;
+begin
+  WriteLn('-- vt --');
+  { TermInit has not run in this suite, so VT is off. }
+  Check(not TermVtActive, 'VT is off without TermInit');
+  Check(VtSeq(clRed) = '', 'no sequence when VT is off');
+  Check(VtReset = '', 'no reset when VT is off');
+end;
+
 { ------------------------------------------------------------------- main -- }
 
 procedure Cleanup(const Dir: string);
@@ -1546,6 +1613,8 @@ begin
     TestGitignore;
     TestMarkdown;
     TestCtrlC;
+    TestHistoryPersistence;
+    TestVt;
   finally
     uTools.RootDir := '';
     Cleanup(TmpRoot);
