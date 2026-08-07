@@ -459,6 +459,25 @@ procedure ClearSnapshots;
 { Test seam: how many snapshots are held. }
 function SnapshotCount: Integer;
 
+{ Where the standing approvals for the current RootDir live, and deliberately
+  NOT inside it.  The file answers "may this project's code run", so a copy of
+  it that the project itself supplies answers its own question: a clone
+  carrying .pasclaude\permissions.json alongside .pasclaude\hooks.json would
+  pre-approve its own hooks and its own MCP servers and execute before the
+  banner, with nobody asked anything.  Nothing distinguishes a file this
+  program wrote from one git checked out, so the fix is a home the repository
+  cannot write: %LOCALAPPDATA%\pasclaude\approvals\<leaf>-<hash>.json, keyed
+  by the full root path so two projects never share approvals.
+
+  '' when neither LOCALAPPDATA nor USERPROFILE is set.  Load and Save both
+  treat that as "approve nothing, persist nothing", which is the right
+  degradation: a session with no memory of past yeses asks again, where a
+  fallback into the project directory would restore the hole.
+
+  There is no migration of an existing in-project file.  Importing one would
+  be importing exactly the bytes this function exists to distrust. }
+function ApprovalsPath: string;
+
 { Loads standing approvals from Path: the tool-class "always" answers and
   the approved bash programs, so an "a" gives once survives restarts.  A
   missing or unreadable file simply approves nothing. }
@@ -468,7 +487,7 @@ procedure LoadPermissions(const Path: string);
 procedure SavePermissions(const Path: string);
 
 { ---- the trust store ----
-  One object in permissions.json, key = what was approved, value = a
+  One object in the approvals file, key = what was approved, value = a
   fingerprint of exactly what it was approved as.  A boolean would say "this
   project's config is trusted" forever; a fingerprint says "these bytes are",
   and the moment they change the question is asked again.  Same idea as an
@@ -575,12 +594,15 @@ function McpExpandVars(const S: string): string;
 
 { ---- approvals ---- }
 
-{ 8 hex digits over the expanded command line, its arguments and the sorted
-  names of its environment overrides.  Sorted keys, because the order two
-  variables appear in a JSON object says nothing about what will run; the
-  arguments are not sorted, because their order is exactly what runs. }
+{ 16 hex digits over the expanded command line, its arguments and its sorted
+  NAME=VALUE environment overrides.  Values as well as names, because a value
+  chooses the program as surely as an argument does - NODE_OPTIONS can preload
+  a module - and an approval that did not cover them would carry over to a
+  different program.  Sorted pairs, because the order two variables appear in
+  a JSON object says nothing about what will run; the arguments are not
+  sorted, because their order is exactly what runs. }
 function McpCommandHash(const Cmd: string;
-  const Args, EnvKeys: array of string): string;
+  const Args, EnvPairs: array of string): string;
 { True when this MCP tool's server has a standing per-call approval whose
   fingerprint still matches its current command line. }
 function McpCallApproved(const ToolName: string): Boolean;
@@ -2022,6 +2044,52 @@ end;
 
 { --------------------------------------------------------- the trust store -- }
 
+{ FNV-1a, used for the two fingerprints in this unit.  Declared here rather
+  than beside its MCP caller because the approvals path below needs it too and
+  the ladder inside a unit is textual. }
+function Fnv1a(const S: string; Seed: QWord): QWord;
+var
+  I: Integer;
+begin
+  Result := Seed;
+  for I := 1 to Length(S) do
+  begin
+    Result := Result xor QWord(Byte(S[I]));
+    Result := Result * QWord($100000001B3);
+  end;
+end;
+
+function ApprovalsPath: string;
+var
+  Home, Root, Leaf: string;
+  I: Integer;
+begin
+  Result := '';
+  { SysUtils. qualified deliberately: the Windows unit's raw API of the same
+    name is in scope here and shadows it. }
+  Home := Trim(SysUtils.GetEnvironmentVariable('LOCALAPPDATA'));
+  if Home = '' then
+    Home := Trim(SysUtils.GetEnvironmentVariable('USERPROFILE'));
+  if Home = '' then Exit;
+  Root := NormalizeRoot;
+  { The leaf is decoration - it is what makes the directory readable by a human
+    deleting an entry - so anything that is not plainly a filename character is
+    dropped rather than escaped.  The hash of the whole path, case-folded
+    because Windows paths are, is what actually distinguishes two roots. }
+  Leaf := '';
+  for I := 1 to Length(ExtractFileName(Root)) do
+    if ExtractFileName(Root)[I] in ['a'..'z', 'A'..'Z', '0'..'9', '-', '_'] then
+    begin
+      Leaf := Leaf + ExtractFileName(Root)[I];
+      if Length(Leaf) >= 32 then Break;
+    end;
+  if Leaf = '' then Leaf := 'root';
+  Result := IncludeTrailingPathDelimiter(Home) + 'pasclaude' + PathDelim +
+    'approvals' + PathDelim + Leaf + '-' +
+    LowerCase(IntToHex(Fnv1a(UpperCase(Root), QWord($CBF29CE484222325)), 16)) +
+    '.json';
+end;
+
 type
   TTrustEntry = record
     Key, Fingerprint: string;
@@ -3328,8 +3396,11 @@ end;
 { ------------------------------------------------- permission persistence -- }
 
 { The file is JSON: {"allow_edits":bool,"allow_bash":bool,"allow_fetch":bool,
-  "bash_programs":["git","build",...],"trusted":{"mcp:github":"3f9a1c04"}}.
-  Deliberately not the transcript format and deliberately tiny - it is
+  "bash_programs":["git","build",...],"trusted":{"mcp:github":"3f9a1c04..."}}.
+  Path is ApprovalsPath, which is outside the project: every key here answers
+  "what may this project do", so a copy the project itself supplies would be
+  the project answering for the user.  Deliberately not the transcript format
+  and deliberately tiny - it is
   user-editable state, and someone deleting a line from it must be able to
   predict what that does.  Deleting a "trusted" entry means being asked about
   that program again, which is the most useful thing a line in a permissions
@@ -3403,7 +3474,13 @@ begin
   finally
     Root.Free;
   end;
+  { '' is ApprovalsPath with no home directory to put the file in.  Approving
+    nothing and remembering nothing is the correct answer there; inventing a
+    location inside the project would put the trust store back where a clone
+    could write it. }
+  if Path = '' then Exit;
   try
+    ForceDirectories(ExtractFileDir(Path));
     F := TFileStream.Create(Path, fmCreate);
     try
       if Text <> '' then F.WriteBuffer(Text[1], Length(Text));
@@ -4399,20 +4476,8 @@ end;
 
 { ---- approvals ---- }
 
-function Fnv1a(const S: string; Seed: QWord): QWord;
-var
-  I: Integer;
-begin
-  Result := Seed;
-  for I := 1 to Length(S) do
-  begin
-    Result := Result xor QWord(Byte(S[I]));
-    Result := Result * QWord($100000001B3);
-  end;
-end;
-
 function McpCommandHash(const Cmd: string;
-  const Args, EnvKeys: array of string): string;
+  const Args, EnvPairs: array of string): string;
 var
   H: QWord;
   L: TStringList;
@@ -4426,12 +4491,17 @@ begin
     H := Fnv1a(#0, H);
   end;
   H := Fnv1a(#0, H);
-  { Sorted, because the order two variables happen to appear in a JSON object
-    says nothing about what will run.  The arguments above are deliberately
-    not sorted, because their order is exactly what will run. }
+  { NAME=VALUE, not NAME.  The names alone were a fingerprint of the shape of
+    the environment rather than of the program: NODE_OPTIONS is one key whether
+    its value raises a heap limit or preloads a module, so an "always" given to
+    the first silently covered the second, and /mcp showed the same command
+    line either way because EnvPairs are not part of Command.  Sorted, because
+    the order two variables happen to appear in a JSON object says nothing
+    about what will run.  The arguments above are deliberately not sorted,
+    because their order is exactly what will run. }
   L := TStringList.Create;
   try
-    for I := Low(EnvKeys) to High(EnvKeys) do L.Add(EnvKeys[I]);
+    for I := Low(EnvPairs) to High(EnvPairs) do L.Add(EnvPairs[I]);
     L.Sort;
     for I := 0 to L.Count - 1 do
     begin
@@ -4441,7 +4511,10 @@ begin
   finally
     L.Free;
   end;
-  Result := LowerCase(IntToHex(LongWord(H xor (H shr 32)), 8));
+  { The full 64 bits.  Folding to 32 halved the work of finding a second
+    config matching a fingerprint the user has already approved, and the
+    fingerprint is only ever compared, never typed. }
+  Result := LowerCase(IntToHex(H, 16));
 end;
 
 { The server a composed tool name belongs to, found by matching the name we
@@ -4514,7 +4587,7 @@ var
   Text, Name, Cmd, PErr: string;
   Root, Servers, S, A, E: TJson;
   I, J: Integer;
-  Args, EnvKeys: array of string;
+  Args: array of string;
   Rec: TMcpServerRec;
 begin
   Err := '';
@@ -4628,13 +4701,10 @@ begin
           Args[High(Args)] := McpExpandVars(A.Item(J).AsString);
         end;
 
-      SetLength(EnvKeys, 0);
       E := S.Find('env');
       if (E <> nil) and (E.Kind = jkObj) then
         for J := 0 to E.Count - 1 do
         begin
-          SetLength(EnvKeys, Length(EnvKeys) + 1);
-          EnvKeys[High(EnvKeys)] := E.Key(J);
           SetLength(Rec.EnvPairs, Length(Rec.EnvPairs) + 1);
           Rec.EnvPairs[High(Rec.EnvPairs)] :=
             E.Key(J) + '=' + McpExpandVars(E.Item(J).AsString);
@@ -4643,7 +4713,10 @@ begin
       Rec.Command := QuoteArg(Cmd);
       for J := 0 to High(Args) do
         Rec.Command := Rec.Command + ' ' + QuoteArg(Args[J]);
-      Rec.Hash := McpCommandHash(Cmd, Args, EnvKeys);
+      { The same expanded pairs McpSpawn will put in the child's environment,
+        not their names: the fingerprint has to cover everything that decides
+        what runs, and Rec.Command shows none of this. }
+      Rec.Hash := McpCommandHash(Cmd, Args, Rec.EnvPairs);
 
       SetLength(McpServers, Length(McpServers) + 1);
       McpServers[High(McpServers)] := Rec;
@@ -4685,6 +4758,13 @@ begin
     for I := 0 to High(McpServers) do
     begin
       if McpServers[I].Hash = '' then Continue;
+      { Approval first, and not merely as an optimisation.  The cache is a
+        file in the project directory, so a repository can ship one whose
+        entries match its own .mcp.json; loading those for a server the user
+        refused would put attacker-written tool names and descriptions into
+        every request through McpDeclare.  Execution stays blocked either way,
+        but a "no" has to remove the tools as well as the process. }
+      if not McpServers[I].Approved then Continue;
       Arr := Root.Find(McpServers[I].Name + '@' + McpServers[I].Hash);
       if (Arr = nil) or (Arr.Kind <> jkArr) then Continue;
       SetLength(McpServers[I].Tools, 0);
@@ -4962,6 +5042,13 @@ begin
   Used := 0;
   Dropped := 0;
   for I := 0 to High(McpServers) do
+  begin
+    { A server the user refused declares nothing.  Tools can reach the table
+      from the on-disk cache as well as from a live tools/list, so the check
+      belongs here too and not only at the load: a declaration is text from the
+      project that the model reads and acts on, which is most of the harm of
+      running the server and none of the consent. }
+    if not McpServers[I].Approved then Continue;
     for J := 0 to High(McpServers[I].Tools) do
     begin
       { The budget is global and consumed in server order.  Per server it
@@ -4978,6 +5065,7 @@ begin
       Inc(Used, Length(McpServers[I].Tools[J].Decl));
       Result.Push(D);
     end;
+  end;
   McpBudgetDropped := Dropped;
 end;
 

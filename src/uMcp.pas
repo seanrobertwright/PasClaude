@@ -19,6 +19,15 @@
   across four call sites, and it is the reason the deadline is checked in the
   same loop that does the reading instead of around it.
 
+  Writing needs the same treatment and for a while did not get it.  A request
+  is small and stdin's buffer sounded big, so a byte ceiling was allowed to
+  stand in for a deadline - but CreatePipe's default buffer is about 4 KB,
+  which one model-supplied argument clears, and a server that stops draining
+  its stdin then blocks us inside WriteFile where no deadline, no Esc and no
+  tool_result can reach.  So the write end is opened PIPE_NOWAIT and
+  ConnSendRaw runs the same loop shape as McpAwait.  A ceiling is not a
+  deadline; only a deadline is.
+
   Polling on the caller's thread, rather than a reader thread or overlapped
   I/O, is a deliberate choice.  This program has exactly one thread and no
   thread safety anywhere: every piece of mutable state above here is an
@@ -55,11 +64,9 @@ const
   McpCallMs      = 60000;
 
   { A request bigger than this is refused locally, without touching the pipe.
-    WriteFile is the one wait here that no deadline covers: a server that has
-    stopped draining its stdin blocks us inside the kernel.  Keeping a single
-    request under a few pipe-buffer fills is not a proof, but it turns "any
-    large argument object can wedge the session" into "a server that reads
-    nothing at all can", which is a server that is already broken. }
+    Not a hang guard - ConnSendRaw's deadline is that - just a cap on how
+    much of a hung server's buffer one request may be waiting on, and a limit
+    on what a runaway argument object can ask the wire to carry. }
   McpMaxRequestBytes = 262144;
 
   { A line longer than this kills the connection.  A server streaming an
@@ -119,6 +126,18 @@ var
     deadline-only: the guarantee is the deadline, this only lets Ctrl+C cut a
     sixty-second call short. }
   McpShouldCancel: function: Boolean = nil;
+
+  { How long a request may take to get into the server's stdin before the
+    connection is declared wedged.  Separate from the answer deadlines above
+    because it measures a different failure - a server that is not reading -
+    and a server too busy to drain 256 KB in ten seconds is not going to
+    answer either.
+
+    A variable rather than a constant so a test can wind it down: the only
+    way to reach this path is a real child process that genuinely never reads
+    its stdin, and the alternative to a seam is ten seconds of wall clock in
+    every suite run.  Nothing in the shipped program assigns it. }
+  McpSendMs: Integer = 10000;
 
 { True when a stand-in wire is installed.  A test asserts this is False before
   it installs one, so a wire left behind by an earlier test cannot silently
@@ -329,15 +348,44 @@ begin
   end;
 end;
 
-function ConnSendRaw(C: Integer; const Data: string): Boolean;
+{ The write half of the same guarantee McpAwait gives the read half, and it
+  has to be here rather than in a byte ceiling above it: the pipe's buffer is
+  the system default, about 4 KB, so "keep a request under a few buffer fills"
+  never bounded anything - one model-supplied argument of a few kilobytes is
+  already past it.  A server that stops draining its stdin would block us
+  inside WriteFile with no deadline, no Esc and no tool_result, which is the
+  exact hang this unit exists to make impossible.
+
+  The write handle is put in PIPE_NOWAIT at spawn, so WriteFile takes what
+  fits and returns immediately; the loop below supplies the deadline, the
+  liveness check and the cancel poll, in the same order and with the same
+  Sleep(5) as McpAwait.  A short write is progress, a zero write is a full
+  buffer, and neither is an error until the deadline says so. }
+function ConnSendRaw(C: Integer; const Data: string; DeadlineMs: Integer): Boolean;
 var
   Wrote: DWORD;
+  Sent, Chunk: Integer;
+  Deadline: QWord;
 begin
   if not Valid(C) then Exit(False);
   if Conns[C].OnWire then Exit(McpWire.Send(Conns[C].Wire, Data));
-  Wrote := 0;
-  Result := WriteFile(Conns[C].hIn, PChar(Data)^, Length(Data), Wrote, nil)
-    and (Integer(Wrote) = Length(Data));
+  if Data = '' then Exit(True);
+  Sent := 0;
+  Deadline := GetTickCount64 + QWord(DeadlineMs);
+  repeat
+    Wrote := 0;
+    Chunk := Length(Data) - Sent;
+    if not WriteFile(Conns[C].hIn, Data[Sent + 1], Chunk, Wrote, nil) then
+      Exit(False);
+    Inc(Sent, Integer(Wrote));
+    if Sent >= Length(Data) then Exit(True);
+    { Nothing moved.  A dead child never drains again, so do not spend the
+      whole deadline discovering it. }
+    if not ProcAlive(Conns[C].Proc) then Exit(False);
+    if Assigned(McpShouldCancel) and McpShouldCancel() then Exit(False);
+    Sleep(5);
+  until GetTickCount64 > Deadline;
+  Result := False;
 end;
 
 { One message per line, and the line may not contain an embedded newline -
@@ -345,7 +393,8 @@ end;
   and escapes control characters, so a newline inside a string value can never
   break a message in half; ToJsonPretty would, which is why this must not be
   "tidied up" into the readable form. }
-function ConnSendMsg(C: Integer; Msg: TJson; out Err: string): Boolean;
+function ConnSendMsg(C: Integer; Msg: TJson; DeadlineMs: Integer;
+  out Err: string): Boolean;
 var
   S: string;
 begin
@@ -357,8 +406,11 @@ begin
       [Length(S), McpMaxRequestBytes]);
     Exit(False);
   end;
-  Result := ConnSendRaw(C, S + #10);
-  if not Result then Err := 'the server closed its input';
+  Result := ConnSendRaw(C, S + #10, DeadlineMs);
+  { One message for both endings on purpose: from here a server that closed
+    its stdin and one that stopped reading it are the same fact - the request
+    did not land - and the connection is finished either way. }
+  if not Result then Err := 'the server stopped reading its input';
 end;
 
 function NewRequest(C: Integer; const Method: string; Params: TJson;
@@ -412,6 +464,7 @@ var
   PI: PROCESS_INFORMATION;
   Info: TJobExtendedLimits;
   hInR, hInW, hOutR, hOutW, hErr, hJob: THandle;
+  Mode: DWORD;
   CmdLine, EnvBlock, Dir: string;
   EnvPtr, DirPtr: PChar;
 begin
@@ -464,6 +517,14 @@ begin
     the back door. }
   SetHandleInformation(hInW, HANDLE_FLAG_INHERIT, 0);
   SetHandleInformation(hOutR, HANDLE_FLAG_INHERIT, 0);
+  { Our end of the child's stdin, non-blocking, so ConnSendRaw's deadline is
+    reachable at all.  Only this handle: the child keeps the blocking read end
+    it expects, and our read end is already governed by PeekNamedPipe.  Not
+    fatal if it fails - an old pipe implementation that refuses the mode leaves
+    a blocking write, which is what shipped before and is still better than
+    refusing to start the server. }
+  Mode := PIPE_NOWAIT;
+  SetNamedPipeHandleState(hInW, @Mode, nil, nil);
 
   if ErrLogPath <> '' then
     hErr := CreateFile(PChar(ErrLogPath), GENERIC_WRITE,
@@ -641,7 +702,7 @@ begin
     E.AddNum('code', -32601);
     E.AddStr('message', 'pasclaude implements no client methods');
     M.Add('error', E);
-    ConnSendMsg(C, M, Ignored);
+    ConnSendMsg(C, M, McpSendMs, Ignored);
   finally
     M.Free;
   end;
@@ -776,7 +837,7 @@ begin
 
   Req := NewRequest(C, 'initialize', Params, Id);
   try
-    if not ConnSendMsg(C, Req, Err) then Exit;
+    if not ConnSendMsg(C, Req, McpSendMs, Err) then Exit;
   finally
     Req.Free;
   end;
@@ -814,7 +875,7 @@ begin
   try
     Req.AddStr('jsonrpc', '2.0');
     Req.AddStr('method', 'notifications/initialized');
-    if not ConnSendMsg(C, Req, Err) then Exit;
+    if not ConnSendMsg(C, Req, McpSendMs, Err) then Exit;
   finally
     Req.Free;
   end;
@@ -843,7 +904,7 @@ begin
       end;
       Req := NewRequest(C, 'tools/list', Params, Id);
       try
-        if not ConnSendMsg(C, Req, Err) then Exit;
+        if not ConnSendMsg(C, Req, McpSendMs, Err) then Exit;
       finally
         Req.Free;
       end;
@@ -969,7 +1030,7 @@ begin
 
   Req := NewRequest(C, 'tools/call', Params, Id);
   try
-    if not ConnSendMsg(C, Req, Err) then Exit;
+    if not ConnSendMsg(C, Req, McpSendMs, Err) then Exit;
   finally
     Req.Free;
   end;

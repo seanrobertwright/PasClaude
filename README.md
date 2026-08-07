@@ -311,9 +311,15 @@ runs everything after the separator regardless of what the first program
 was. "Always" for one degrades to this-once. `/yolo` still approves
 everything.
 
-"Always" answers persist in `.pasclaude\permissions.json` - the tool-class
-grants and the approved bash programs - so a restart does not re-ask what
-was already answered. The file only ever widens what is approved, never
+"Always" answers persist in
+`%LOCALAPPDATA%\pasclaude\approvals\<project>-<hash>.json` - the tool-class
+grants, the approved bash programs and the trusted fingerprints - so a
+restart does not re-ask what was already answered. It lives outside the
+project on purpose: the file records what you let this project do, and a
+repository that could ship its own copy would be answering its own
+question - pre-approving its own hooks and its own MCP servers before you
+saw a prompt. One file per project directory, keyed by its full path.
+The file only ever widens what is approved, never
 narrows a live grant, and it is deliberately tiny and hand-editable:
 deleting a line must do the predictable thing. `/yolo` is the exception:
 its blanket flags are "I trust this session", not "and every future one",

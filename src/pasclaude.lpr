@@ -398,11 +398,14 @@ begin
     PathDelim + 'history.txt';
 end;
 
-{ Standing approvals, beside the session and the history. }
+{ Standing approvals - and pointedly NOT beside the session and the history.
+  Everything else under <root>\.pasclaude describes the project; this one
+  records what the user let the project do, and a project that can supply its
+  own answer to that has not been asked anything.  uTools.ApprovalsPath puts
+  it under %LOCALAPPDATA%, keyed by the root path. }
 function PermissionsPath: string;
 begin
-  Result := IncludeTrailingPathDelimiter(uTools.RootDir) + SessionDir +
-    PathDelim + 'permissions.json';
+  Result := uTools.ApprovalsPath;
 end;
 
 { Which plugins are enabled - a different question from what is approved, and
@@ -1583,7 +1586,15 @@ begin
       else if (Arg = '-p') or (Arg = '--print') then
       begin
         PrintMode := True;
-        if ArgI < ParamCount then
+        { A leading '-' means the next token is another flag, not this one's
+          value.  Taking it unconditionally made every flag after -p unusable
+          in the order --help showed: "-p --output-format json" sent
+          '--output-format' to the model as the question and then died on
+          'json' as a directory name, and "-p --web" quietly asked the model
+          about the string '--web' with the web never enabled.  A prompt that
+          genuinely starts with a dash is what -- style quoting is for, and is
+          worth far less than flags that work in the documented order. }
+        if (ArgI < ParamCount) and (Copy(ParamStr(ArgI + 1), 1, 1) <> '-') then
         begin
           PrintPrompt := ParamStr(ArgI + 1);
           SkipNext := True;
@@ -1625,8 +1636,8 @@ begin
         EmitCLn(clGrey, '            for driving pasclaude from another program.  Without');
         EmitCLn(clGrey, '            --input-format stream-json there is nobody to approve');
         EmitCLn(clGrey, '            anything, so every write, edit and shell command is refused.');
-        EmitCLn(clGrey, '            Note -p takes the next argument as its prompt, so put the');
-        EmitCLn(clGrey, '            format flags before it or give -p a prompt of its own.');
+        EmitCLn(clGrey, '            -p takes the next argument as its prompt unless that starts');
+        EmitCLn(clGrey, '            with "-", so the flags may go on either side of it.');
         { Halt skips the finally block, so the console has to be put back
           here or the caller's codepage stays switched to UTF-8. }
         TermDone;

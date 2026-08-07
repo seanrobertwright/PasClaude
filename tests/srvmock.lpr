@@ -13,6 +13,11 @@
   One binary covers every case, selected by argument:
     (none)     two tools; tools/call answers 'pong'
     --hang     answers initialize, then never answers anything again
+    --deaf     answers initialize, then stops reading stdin for good.  Not
+               the same failure as --hang: --hang drains every line before
+               choosing not to answer, so the write side never fills up.
+               This one wedges our WriteFile instead of our ReadFile, which
+               is the half no deadline used to cover.
     --die      exits 3 immediately after answering initialize
     --junk     writes non-JSON lines before every response
     --pages    tools/list paginated over three nextCursor pages
@@ -29,7 +34,7 @@ program srvmock;
 uses SysUtils;
 
 var
-  Hang, Die, Junk, Pages, Big, Chatty, Crlf: Boolean;
+  Hang, Die, Deaf, Junk, Pages, Big, Chatty, Crlf: Boolean;
   SlowMs: Integer = 0;
   Page: Integer = 0;
 
@@ -141,13 +146,14 @@ var
   I: Integer;
   Line, Method, Id: string;
 begin
-  Hang := False; Die := False; Junk := False; Pages := False;
+  Hang := False; Die := False; Deaf := False; Junk := False; Pages := False;
   Big := False; Chatty := False; Crlf := False;
   I := 1;
   while I <= ParamCount do
   begin
     if ParamStr(I) = '--hang' then Hang := True
     else if ParamStr(I) = '--die' then Die := True
+    else if ParamStr(I) = '--deaf' then Deaf := True
     else if ParamStr(I) = '--junk' then Junk := True
     else if ParamStr(I) = '--pages' then Pages := True
     else if ParamStr(I) = '--big' then Big := True
@@ -179,6 +185,9 @@ begin
         '"protocolVersion":"2025-06-18","capabilities":{"tools":{}},' +
         '"serverInfo":{"name":"srv","version":"1.0"}}}');
       if Die then Halt(3);
+      { Still here, still holding both pipes, and never reading again.  The
+        client's stdin buffer fills and its WriteFile has nowhere to go. }
+      while Deaf do Sleep(1000);
     end
     else if Method = 'notifications/initialized' then
       { no reply, by the spec }

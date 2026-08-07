@@ -1316,7 +1316,7 @@ begin
   SetLength(A2, 0);
 
   H1 := McpCommandHash('npx', A1, A2);
-  Check(Length(H1) = 8, 'a command hash is eight hex digits: ' + H1);
+  Check(Length(H1) = 16, 'a command hash is sixteen hex digits: ' + H1);
   A1[1] := 'server-gitlab';
   H2 := McpCommandHash('npx', A1, A2);
   Check(H1 <> H2, 'changing an argument changes the hash');
@@ -1324,14 +1324,27 @@ begin
   Check(H2 <> H3, 'changing the command changes the hash');
 
   SetLength(A2, 2);
-  A2[0] := 'TOKEN';
-  A2[1] := 'HOST';
+  A2[0] := 'TOKEN=abc';
+  A2[1] := 'HOST=example.com';
   H3 := McpCommandHash('npx', A1, A2);
-  Check(H3 <> H2, 'adding an environment key changes the hash');
-  A2[0] := 'HOST';
-  A2[1] := 'TOKEN';
+  Check(H3 <> H2, 'adding an environment override changes the hash');
+  A2[0] := 'HOST=example.com';
+  A2[1] := 'TOKEN=abc';
   H4 := McpCommandHash('npx', A1, A2);
   Check(H3 = H4, 'but the order two variables were written in does not');
+
+  { The regression: the fingerprint used to cover the variable NAMES only, so
+    NODE_OPTIONS=--max-old-space-size=512 and NODE_OPTIONS=--require ./evil.js
+    were one program to it - an "always" for the first silently covered the
+    second, and /mcp showed the same command line because the environment is
+    not part of it. }
+  SetLength(A2, 1);
+  A2[0] := 'NODE_OPTIONS=--max-old-space-size=512';
+  H3 := McpCommandHash('node', A1, A2);
+  A2[0] := 'NODE_OPTIONS=--require ./payload.js';
+  H4 := McpCommandHash('node', A1, A2);
+  Check(H3 <> H4, 'changing what a variable says changes the hash');
+  SetLength(A2, 0);
 
   { Expansion happens before hashing, so what the fingerprint covers is the
     command line that will actually run. }
