@@ -200,9 +200,10 @@ end;
 { ------------------------------------------------------------- completion -- }
 
 const
-  SlashCommands: array[0..19] of string = (
+  SlashCommands: array[0..21] of string = (
     '/help', '/clear', '/compact', '/diff', '/hooks', '/jobs', '/mcp',
-    '/memory', '/init', '/rewind', '/sessions', '/think', '/web',
+    '/memory', '/init', '/rewind', '/sessions', '/skills', '/plugins',
+    '/think', '/web',
     '/resume', '/save', '/cwd', '/model', '/yolo', '/cost', '/exit');
 
 { Candidates for the token being completed: slash commands when the token
@@ -393,6 +394,8 @@ begin
     'which unit owns something, where a setting is used - hand it to task ' +
     'and work from its answer, so this conversation is not filled with the ' +
     'intermediate files.' + #10 +
+    '- Named skills may be available through the skill tool; check its list ' +
+    'before improvising a procedure this project has already written down.' + #10 +
     '- Shell commands run through cmd.exe, so use Windows syntax.' + #10 +
     '- After changing code, build or test it if there is an obvious way to ' +
     'do so, and fix what you broke.' + #10 +
@@ -531,6 +534,8 @@ begin
   EmitCLn(clGrey,   '  /memory        show the project memory (CLAUDE.md)');
   EmitCLn(clGrey,   '  /init          have the model write a CLAUDE.md for this project');
   EmitCLn(clGrey,   '  /rewind        undo turns: conversation and edited files');
+  EmitCLn(clGrey,   '  /skills        skills this project offers; also rescans for new ones');
+  EmitCLn(clGrey,   '  /plugins       installed plugins; /plugins enable|disable <name>');
   EmitCLn(clGrey,   '  /think [n]     extended thinking: on, off, or a token budget');
   EmitCLn(clGrey,   '  /web [on|off]  let the model search the web (off by default)');
   EmitCLn(clGrey,   '  /resume        reload the saved conversation');
@@ -543,7 +548,10 @@ begin
   EmitLn;
   EmitCLn(clGrey,   '  Esc during a reply stops it.');
   EmitCLn(clGrey,   '  A file in .pasclaude\commands\ is a slash command; one in');
-  EmitCLn(clGrey,   '  .pasclaude\agents\ is a subagent type the task tool can ask for.');
+  EmitCLn(clGrey,   '  .pasclaude\agents\ is a subagent type the task tool can ask for;');
+  EmitCLn(clGrey,   '  .pasclaude\skills\<name>\SKILL.md is a skill the model can read.');
+  EmitCLn(clGrey,   '  A directory in .pasclaude\plugins\ can carry all three, once you');
+  EmitCLn(clGrey,   '  enable it by name. A skill added mid-session appears after /skills.');
 end;
 
 { Hook failures, matcher budgets and load-time notes.  Yellow, because none of
@@ -567,6 +575,16 @@ function PermissionsPath: string;
 begin
   Result := IncludeTrailingPathDelimiter(uTools.RootDir) + SessionDir +
     PathDelim + 'permissions.json';
+end;
+
+{ Which plugins are enabled - a different question from what is approved, and
+  deliberately a different file.  permissions.json only ever widens on load,
+  which would make a disable that did not survive a restart; this one is read
+  as written, in both directions. }
+function PluginStatePath: string;
+begin
+  Result := IncludeTrailingPathDelimiter(uTools.RootDir) + SessionDir +
+    PathDelim + uTools.PluginStateName;
 end;
 
 { The first-contact question for .pasclaude\hooks.json.  Nothing on disk is
@@ -921,6 +939,122 @@ end;
 { /hooks, /hooks off.  Reports the file, whether it is running, and what the
   user actually approved, because "hooks are configured" and "hooks are on"
   are different states and only this can tell them apart. }
+{ /skills, which doubles as the rescan: the catalogue is cached, so a skill
+  dropped in mid-session is invisible until something invalidates it, and the
+  command a user reaches for to find out whether their skill is there is the
+  natural place to do it.  A skill whose SKILL.md failed to parse is listed
+  with its reason and line number rather than omitted - omitted is exactly the
+  state in which nobody can find out why it never triggers. }
+procedure ShowSkills;
+var
+  C: uTools.TSkillInfoArray;
+  I: Integer;
+  Src: string;
+begin
+  uTools.RefreshSkills;
+  C := uTools.SkillCatalogue;
+  if Length(C) = 0 then
+  begin
+    EmitCLn(clGrey, '  no skills (put one in ' + SessionDir + PathDelim +
+      uTools.SkillsDirName + PathDelim + '<name>' + PathDelim + 'SKILL.md)');
+    Exit;
+  end;
+  for I := 0 to High(C) do
+  begin
+    case C[I].Source of
+      uTools.ssProject: Src := 'project';
+      uTools.ssPlugin:  Src := 'plugin ' + C[I].Plugin;
+    else
+      Src := 'user';
+    end;
+    if C[I].Err <> '' then
+    begin
+      EmitCLn(clYellow, Format('  %-16s %-14s %s',
+        [C[I].Name, Src, C[I].Err]));
+      Continue;
+    end;
+    EmitCLn(clBright, Format('  %-16s %s', [C[I].Name, Src]));
+    EmitCLn(clGrey,   '    ' + C[I].Description);
+  end;
+end;
+
+{ /plugins, /plugins enable <name>, /plugins disable <name>.  Consent here is
+  a typed name and not a y/a/n prompt on purpose: a launch-time prompt is
+  answered by muscle memory before anything has been read, whereas typing the
+  plugin's name means the user went and looked at it. }
+procedure ShowPlugins(const Arg: string);
+var
+  P: uTools.TPluginInfoArray;
+  I, Sp: Integer;
+  Verb, Name, Err, State: string;
+begin
+  Sp := Pos(' ', Arg);
+  if Sp = 0 then
+  begin
+    Verb := LowerCase(Trim(Arg));
+    Name := '';
+  end
+  else
+  begin
+    Verb := LowerCase(Trim(Copy(Arg, 1, Sp - 1)));
+    Name := Trim(Copy(Arg, Sp + 1, MaxInt));
+  end;
+
+  if (Verb = 'enable') or (Verb = 'disable') then
+  begin
+    if not uTools.SetPluginEnabled(Name, Verb = 'enable', Err) then
+    begin
+      EmitCLn(clYellow, '  ' + Err);
+      Exit;
+    end;
+    uTools.SavePluginState(PluginStatePath);
+    uTools.RefreshSkills;
+    if Verb = 'enable' then
+      EmitCLn(clGreen, '  ' + Name + ' enabled: its commands, agents and ' +
+        'skills are live')
+    else
+      EmitCLn(clGrey, '  ' + Name + ' disabled');
+    Exit;
+  end;
+  if Verb <> '' then
+  begin
+    EmitCLn(clYellow, '  /plugins, /plugins enable <name>, /plugins disable <name>');
+    Exit;
+  end;
+
+  P := uTools.InstalledPlugins;
+  if Length(P) = 0 then
+  begin
+    EmitCLn(clGrey, '  no plugins (a plugin is a directory in ' + SessionDir +
+      PathDelim + uTools.PluginsDirName + ')');
+    Exit;
+  end;
+  for I := 0 to High(P) do
+  begin
+    if P[I].Enabled then State := 'enabled' else State := 'disabled';
+    if P[I].Enabled then
+      EmitCLn(clGreen, Format('  %-16s %-9s %d commands, %d agents, %d skills',
+        [P[I].Name, State, P[I].Commands, P[I].Agents, P[I].Skills]))
+    else
+      EmitCLn(clBright, Format('  %-16s %-9s %d commands, %d agents, %d skills',
+        [P[I].Name, State, P[I].Commands, P[I].Agents, P[I].Skills]));
+    if P[I].Description <> '' then
+      EmitCLn(clGrey, '    ' + P[I].Description);
+    if P[I].Err <> '' then
+      EmitCLn(clYellow, '    ' + P[I].Err);
+    { Named, never obeyed.  Enabling a plugin activates its commands, agents
+      and skills and nothing else; a manifest asking for a hook or a server
+      is reported so the user knows what they are not getting. }
+    if P[I].Ignored <> '' then
+      EmitCLn(clGrey, '    ignored: ' + P[I].Ignored +
+        ' - this build does not run plugin hooks or servers');
+  end;
+  { Marked here rather than at startup: the notice exists to be read, and
+    consuming it before the user had a chance makes it a flicker. }
+  uTools.MarkPluginsSeen;
+  uTools.SavePluginState(PluginStatePath);
+end;
+
 procedure ShowHooks(const Arg: string);
 var
   Sum: string;
@@ -1285,6 +1419,9 @@ begin
       that survived it would be a process the user has no name for and no
       way to stop short of Task Manager. }
     uTools.ClearJobs;
+    { A cleared conversation is about to be told what skills exist all over
+      again, so it may as well be told the truth about the disk. }
+    uTools.RefreshSkills;
     { MCP connections deliberately survive /clear, as the rewind snapshots and
       the approved bash programs do: a running server is a capability this
       session has, not something the conversation said. }
@@ -1477,6 +1614,10 @@ begin
     else
       PickModel;
   end
+  else if Cmd = '/skills' then
+    ShowSkills
+  else if Cmd = '/plugins' then
+    ShowPlugins(Arg)
   else if Cmd = '/hooks' then
     ShowHooks(Arg)
   else if Cmd = '/mcp' then
@@ -1550,9 +1691,11 @@ begin
   for I := 1 to Length(Name) do
     if Name[I] in ['\', '/', ':', '.'] then Exit;
 
-  Path := IncludeTrailingPathDelimiter(uTools.RootDir) + SessionDir +
-    PathDelim + 'commands' + PathDelim + Name + '.md';
-  if not FileExists(Path) then Exit;
+  { Through the resolver, so an enabled plugin's commands answer to /name too.
+    The filter above stays: it is one line, it is the same rule, and defence
+    in depth costs nothing here. }
+  Path := uTools.ResolveCommandFile(Name);
+  if Path = '' then Exit;
 
   L := TStringList.Create;
   try
@@ -1571,6 +1714,9 @@ end;
 var
   ApiKey, ModelName, Line, Err, Dir, SaveErr, Arg, ResumeErr: string;
   MentionNotes: string;
+  SkillNames: string;
+  SkillList: uTools.TSkillInfoArray;
+  NewPlugins: TStringArray;
   Handled: Boolean;
   Dropped: Integer;
   Resume: Boolean = False;
@@ -1645,6 +1791,13 @@ begin
     end;
     uTools.RootDir := GetCurrentDir;
     uTools.LoadIgnoreRules;
+    { Beside LoadIgnoreRules and therefore BEFORE the print-mode halt below,
+      on purpose: a scripted run honours an enablement the user already made
+      but, having no console, can never create one.  Skills need no enabling
+      at all - they are text of the same trust class as CLAUDE.md, which is
+      read here unprompted too - so this is only the plugin half. }
+    uTools.LoadPluginState(PluginStatePath);
+    uTools.RefreshSkills;
 
     ApiKey := GetEnvironmentVariable('ANTHROPIC_API_KEY');
     UsingSubscription := False;
@@ -1808,6 +1961,45 @@ begin
       if McpErr <> '' then EmitCLn(clYellow, '  ' + McpErr);
 
       ShowBanner;
+
+      { The honest disclosure for the half of this feature that asks nothing:
+        text out of the repository is now in the model's catalogue, and here
+        is the command that shows what it says. }
+      SkillList := uTools.SkillCatalogue;
+      if Length(SkillList) > 0 then
+      begin
+        SkillNames := '';
+        for ArgI := 0 to High(SkillList) do
+        begin
+          if ArgI >= 6 then
+          begin
+            SkillNames := SkillNames + ', ...';
+            Break;
+          end;
+          if SkillNames <> '' then SkillNames := SkillNames + ', ';
+          SkillNames := SkillNames + SkillList[ArgI].Name;
+        end;
+        EmitCLn(clGrey, Format('  skills: %d available (%s) - /skills to read them',
+          [Length(SkillList), SkillNames]));
+      end;
+      { Repeated every launch until /plugins is run, which is the point: a
+        bundle somebody else wrote is sitting in this directory disabled, and
+        the notice stops when the user has looked, not when they have
+        enabled. }
+      NewPlugins := uTools.UnseenPlugins;
+      if Length(NewPlugins) > 0 then
+      begin
+        SkillNames := '';
+        for ArgI := 0 to High(NewPlugins) do
+        begin
+          if SkillNames <> '' then SkillNames := SkillNames + ', ';
+          SkillNames := SkillNames + NewPlugins[ArgI];
+        end;
+        EmitCLn(clGrey, Format('  plugins: %d new (%s) - disabled. read %s%s%s,' +
+          ' then /plugins enable <name>',
+          [Length(NewPlugins), SkillNames, SessionDir, PathDelim,
+           uTools.PluginsDirName]));
+      end;
 
       if Resume then
       begin

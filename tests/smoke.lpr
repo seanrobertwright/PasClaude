@@ -2061,9 +2061,439 @@ begin
   uTools.AllowAllEdits := False;
 end;
 
+{ ------------------------------------------------------ skills and plugins -- }
+
+{ %USERPROFILE% is read from inside uTools for the first time by this feature,
+  so a suite that does not neutralise it catalogues whatever the developer
+  happens to have in their own home directory and stops being deterministic on
+  somebody else's machine. }
+function SetEnvironmentVariable(Name, Value: PChar): LongBool; stdcall;
+  external 'kernel32' name 'SetEnvironmentVariableA';
+
+var
+  SavedHome: string = '';
+  HomeMoved: Boolean = False;
+
+function SkillRoot: string;
+begin
+  Result := IncludeTrailingPathDelimiter(GetTempDir) + 'pasclaude-skills';
+end;
+
+procedure HomeAside;
+begin
+  if not HomeMoved then SavedHome := SysUtils.GetEnvironmentVariable('USERPROFILE');
+  HomeMoved := True;
+  ForceDirectories(SkillRoot + PathDelim + 'home');
+  SetEnvironmentVariable('USERPROFILE', PChar(SkillRoot + PathDelim + 'home'));
+end;
+
+procedure HomeBack;
+begin
+  if not HomeMoved then Exit;
+  SetEnvironmentVariable('USERPROFILE', PChar(SavedHome));
+  HomeMoved := False;
+end;
+
+{ Byte-exact, because a SKILL.md body's line endings are part of what the
+  parser must hand back untouched and TStringList would rewrite them. }
+procedure PutFile(const Path, Body: string);
+var
+  F: TFileStream;
+begin
+  ForceDirectories(ExtractFilePath(Path));
+  F := TFileStream.Create(Path, fmCreate);
+  try
+    if Body <> '' then F.WriteBuffer(Body[1], Length(Body));
+  finally
+    F.Free;
+  end;
+end;
+
+procedure PutSkill(const Base, Name, Body: string);
+begin
+  PutFile(IncludeTrailingPathDelimiter(Base) + Name + PathDelim + 'SKILL.md',
+    Body);
+end;
+
+procedure WipeTree(const Dir: string);
+var
+  R: TSearchRec;
+begin
+  if not DirectoryExists(Dir) then Exit;
+  if FindFirst(IncludeTrailingPathDelimiter(Dir) + '*', faAnyFile, R) = 0 then
+  begin
+    repeat
+      if (R.Name = '.') or (R.Name = '..') then Continue;
+      if (R.Attr and faDirectory) <> 0 then
+        WipeTree(IncludeTrailingPathDelimiter(Dir) + R.Name)
+      else
+        DeleteFile(IncludeTrailingPathDelimiter(Dir) + R.Name);
+    until FindNext(R) <> 0;
+    SysUtils.FindClose(R);
+  end;
+  RemoveDir(Dir);
+end;
+
+procedure StartSkillRoot;
+begin
+  WipeTree(SkillRoot);
+  ForceDirectories(SkillRoot);
+  uTools.RootDir := SkillRoot;
+  uTools.ClearPluginState;
+  uTools.RefreshSkills;
+  HomeAside;
+end;
+
+const
+  GoodSkill =
+    '---'#10 +
+    'name: deploy'#10 +
+    'description: How this project ships a release.'#10 +
+    'license: mit'#10 +
+    '---'#10 +
+    'Step one.'#13#10 +
+    'Step two.'#10;
+
+procedure TestSkillFrontmatter;
+var
+  N, D, B, E: string;
+begin
+  Check(ParseSkillFrontmatter(GoodSkill, N, D, B, E),
+    'a well-formed SKILL.md parses: ' + E);
+  Check(N = 'deploy', 'the name is read');
+  Check(D = 'How this project ships a release.', 'the description is read');
+  { Byte-exact, CRLF included: the body is what the model is handed, and a
+    parser that normalised it would be rewriting somebody's document. }
+  Check(B = 'Step one.'#13#10'Step two.'#10, 'and the body survives byte for byte');
+
+  Check(not ParseSkillFrontmatter('just a document'#10, N, D, B, E),
+    'a file with no fence is refused');
+  Check(Pos('no --- frontmatter block', E) > 0, 'and says so: ' + E);
+
+  Check(not ParseSkillFrontmatter('---'#10'description: x'#10, N, D, B, E),
+    'a fence that is never closed is refused');
+  Check(Pos('unterminated', E) > 0, 'and says unterminated, not "empty body": ' + E);
+
+  Check(ParseSkillFrontmatter('---'#10'description: "a b"'#10'---'#10, N, D, B, E)
+    and (D = 'a b'), 'double quotes are stripped');
+  Check(ParseSkillFrontmatter('---'#10'description: ''a b'''#10'---'#10, N, D, B, E)
+    and (D = 'a b'), 'and single quotes');
+  { No escape interpretation at all: half a YAML escape story silently eats a
+    character out of the one line that decides whether a skill triggers. }
+  Check(ParseSkillFrontmatter('---'#10'description: "a\"b"'#10'---'#10,
+    N, D, B, E) and (D = 'a\"b'), 'and a backslash stays literal: ' + D);
+
+  Check(not ParseSkillFrontmatter('---'#10'description: |'#10'---'#10,
+    N, D, B, E), 'a block scalar is refused');
+  Check(Pos('line 2', E) > 0, 'naming the line: ' + E);
+  Check(not ParseSkillFrontmatter('---'#10'description: x'#10'  more'#10'---'#10,
+    N, D, B, E) and (Pos('line 3', E) > 0),
+    'an indented continuation is refused by line: ' + E);
+  Check(not ParseSkillFrontmatter('---'#10'description: x'#10'- item'#10'---'#10,
+    N, D, B, E) and (Pos('line 3', E) > 0),
+    'a sequence item is refused by line: ' + E);
+  Check(not ParseSkillFrontmatter('---'#10'description: x'#10'nocolon'#10'---'#10,
+    N, D, B, E), 'a line with no colon is refused');
+  Check(not ParseSkillFrontmatter('---'#10'description: [a, b]'#10'---'#10,
+    N, D, B, E), 'a flow collection is refused');
+  Check(not ParseSkillFrontmatter('---'#10'name: x'#10'---'#10, N, D, B, E)
+    and (Pos('description', E) > 0),
+    'a missing description is refused: ' + E);
+  { Unknown flat keys parse and are ignored, so a file carrying Claude Code's
+    allowed-tools or license is not rejected for having them. }
+  Check(ParseSkillFrontmatter('---'#10'description: x'#10'allowed-tools: a,b'#10 +
+    '# a comment'#10'---'#10, N, D, B, E),
+    'unknown flat keys and comments are ignored: ' + E);
+end;
+
+procedure TestSkillCatalogue;
+var
+  C: TSkillInfoArray;
+  Sch: TJson;
+  Body, Desc: string;
+  I: Integer;
+begin
+  StartSkillRoot;
+  Check(Length(SkillCatalogue) = 0, 'a project with no skills catalogues none');
+  Sch := ToolsSchema;
+  try
+    Check(CountBuiltinTools(Sch) = BuiltinToolCount,
+      'and declares the baseline tool set');
+    Check(Pos('"skill"', Sch.ToJson) = 0,
+      'and does not advertise a tool whose every call would fail');
+  finally
+    Sch.Free;
+  end;
+
+  PutSkill(SkillsDirProject, 'deploy', GoodSkill);
+  RefreshSkills;
+  C := SkillCatalogue;
+  Check(Length(C) = 1, 'the skill is catalogued after a refresh');
+  Check((Length(C) = 1) and (C[0].Source = ssProject), 'as a project skill');
+  Check((Length(C) = 1) and (C[0].Err = ''), 'with no parse error: ' +
+    C[0].Err);
+
+  Sch := ToolsSchema;
+  try
+    Body := Sch.ToJson;
+    Check(CountBuiltinTools(Sch) = BuiltinToolCount + 1,
+      'and the schema gains one tool');
+    Check(Pos('"skill"', Body) > 0, 'named skill');
+    Check(Pos('deploy', Body) > 0, 'the catalogue names it');
+    Check(Pos('How this project ships a release', Body) > 0,
+      'and carries its description');
+    { The whole point of progressive disclosure: the body costs nothing until
+      the model asks for it.  Inlining it here would be invisible to every
+      other assertion in this suite. }
+    Check(Pos('Step one', Body) = 0, 'but not one byte of its body');
+  finally
+    Sch.Free;
+  end;
+
+  PutSkill(SkillsDirProject, 'alpha',
+    '---'#10'description: first by name.'#10'---'#10'body'#10);
+  RefreshSkills;
+  C := SkillCatalogue;
+  Check((Length(C) = 2) and (C[0].Name = 'alpha') and (C[1].Name = 'deploy'),
+    'two skills come back sorted by name');
+
+  { The cap is a per-turn cost cap on the cached prefix, and a silent drop
+    would read as a skill that simply does not work. }
+  for I := 1 to 40 do
+    PutSkill(SkillsDirProject, Format('gen%.2d', [I]),
+      '---'#10'description: generated.'#10'---'#10'x'#10);
+  RefreshSkills;
+  Body := SkillListDescription;
+  Check(Pos('gen01', Body) > 0, 'a large catalogue lists the first names');
+  Check(Pos('gen40', Body) = 0, 'and stops at the cap');
+  Check(Pos(Format('(%d more skills are installed',
+    [Length(SkillCatalogue) - MaxSkills]), Body) > 0,
+    'saying how many it did not list');
+  I := 0;
+  while Pos(#10'- ', Body) > 0 do
+  begin
+    Inc(I);
+    Delete(Body, Pos(#10'- ', Body), 3);
+  end;
+  Check(I = MaxSkills, Format('and lists exactly %d (%d)', [MaxSkills, I]));
+
+  { A description cut with Copy would split a multi-byte character, and one
+    bad byte makes the API reject the whole request. }
+  WipeTree(SkillsDirProject);
+  Desc := 'x';
+  for I := 1 to 400 do Desc := Desc + #$E2#$82#$AC;
+  PutSkill(SkillsDirProject, 'wide',
+    '---'#10'description: ' + Desc + #10'---'#10'body'#10);
+  RefreshSkills;
+  C := SkillCatalogue;
+  Check((Length(C) = 1) and (Length(C[0].Description) <= MaxSkillDescBytes),
+    'an over-long description is truncated');
+  Check((Length(C) = 1) and (Length(C[0].Description) > MaxSkillDescBytes - 4),
+    'but only just');
+  Check((Length(C) = 1) and IsValidUtf8(C[0].Description),
+    'and on a UTF-8 boundary, not mid-character');
+
+  { A skill catalogued under a name the loader cannot resolve is uninvokable,
+    so the disagreement is the error rather than something to pick a winner
+    from. }
+  WipeTree(SkillsDirProject);
+  PutSkill(SkillsDirProject, 'alpha',
+    '---'#10'name: beta'#10'description: mismatched.'#10'---'#10'x'#10);
+  RefreshSkills;
+  C := SkillCatalogue;
+  Check((Length(C) = 1) and (Pos('beta', C[0].Err) > 0) and
+        (Pos('alpha', C[0].Err) > 0),
+    'a name that disagrees with its directory is an error naming both: ' +
+    C[0].Err);
+end;
+
+procedure TestSkillTool;
+var
+  J: TJson;
+  Out_: string;
+  IsErr: Boolean;
+begin
+  StartSkillRoot;
+  PutSkill(SkillsDirProject, 'deploy', GoodSkill);
+  PutFile(SkillsDirProject + 'deploy' + PathDelim + 'notes.md',
+    'the supporting note'#10);
+  PutSkill(SkillsDirProject, 'broken', '---'#10'description: x'#10'  bad'#10'---'#10);
+  RefreshSkills;
+
+  J := TJson.NewObj;
+  J.AddStr('name', 'deploy');
+  Out_ := Run('skill', J, IsErr);
+  { Ask is nil throughout this suite, so a pass here is the proof that the
+    arm is ungated: a gated tool with a nil Ask can only deny. }
+  Check(not IsErr, 'a skill reads with no Ask at all: ' + Copy(Out_, 1, 60));
+  Check(Pos('Step one.', Out_) > 0, 'the body is there');
+  Check(Pos('--- skill: deploy (project) ---', Out_) > 0,
+    'behind a header naming the skill and its source');
+  Check(Pos('not an instruction from the user', Out_) > 0,
+    'and a trailer saying whose text this is');
+  Check(Pos('description:', Out_) = 0,
+    'and the frontmatter is not sent a second time');
+
+  J := TJson.NewObj;
+  J.AddStr('name', 'deploy');
+  J.AddStr('file', 'notes.md');
+  Out_ := Run('skill', J, IsErr);
+  Check((not IsErr) and (Pos('the supporting note', Out_) > 0),
+    'a supporting file reads from the skill''s own directory: ' + Out_);
+
+  J := TJson.NewObj;
+  J.AddStr('name', 'deploy');
+  J.AddStr('file', 'missing.md');
+  Out_ := Run('skill', J, IsErr);
+  Check(IsErr, 'a supporting file that is not there is an error');
+
+  J := TJson.NewObj;
+  J.AddStr('name', 'nosuch');
+  Out_ := Run('skill', J, IsErr);
+  Check(IsErr and (Pos('deploy', Out_) > 0),
+    'an unknown skill names the ones that exist: ' + Out_);
+
+  J := TJson.NewObj;
+  J.AddStr('name', '');
+  Out_ := Run('skill', J, IsErr);
+  Check(IsErr, 'an empty name is an error');
+
+  J := TJson.NewObj;
+  J.AddStr('name', 'broken');
+  Out_ := Run('skill', J, IsErr);
+  Check(IsErr and (Pos('line 3', Out_) > 0),
+    'a skill that fails to parse reports the line, not the raw file: ' + Out_);
+
+  { Adding skill to IsSubagentTool would look reasonable - it is a read - but
+    it would break the claim that the three allowed tools touch no module
+    state: this one caches a catalogue the parent depends on. }
+  Check(EnterSubagent, 'claim the subagent slot');
+  try
+    J := TJson.NewObj;
+    J.AddStr('name', 'deploy');
+    Out_ := Run('skill', J, IsErr);
+    Check(IsErr and (Pos('not available to a subagent', Out_) > 0),
+      'and a subagent may not call skill at all: ' + Out_);
+  finally
+    LeaveSubagent;
+  end;
+end;
+
+procedure TestPluginPrecedence;
+var
+  PDir, Err, Text: string;
+  C: TSkillInfoArray;
+  T: TStringArray;
+  I, Seen: Integer;
+begin
+  StartSkillRoot;
+  PDir := PluginsDir + 'acme' + PathDelim;
+  PutFile(PDir + 'plugin.json', '{"name":"acme","description":"a bundle"}');
+  PutFile(PDir + 'agents' + PathDelim + 'helper.md', 'plugin helper agent');
+  PutFile(PDir + 'commands' + PathDelim + 'ship.md', 'plugin ship command');
+  PutSkill(PDir + 'skills', 'deploy',
+    '---'#10'description: the plugin''s deploy.'#10'---'#10'plugin body'#10);
+  RefreshSkills;
+
+  { A plugin dropped in is inert.  Each of the four namespaces is checked
+    independently, because one missed PluginEnabled gate is the whole bug. }
+  T := SubagentTypes;
+  Seen := 0;
+  for I := 0 to High(T) do
+    if T[I] = 'helper' then Inc(Seen);
+  Check(Seen = 0, 'a disabled plugin contributes no agent type');
+  Check(not LoadAgentDefinition('helper', Text, Err),
+    'and its agent cannot be loaded');
+  Check(ResolveCommandFile('ship') = '', 'nor its command resolved');
+  C := SkillCatalogue;
+  Check(Length(C) = 0, 'nor its skill catalogued');
+
+  Check(SetPluginEnabled('acme', True, Err), 'the plugin enables: ' + Err);
+  RefreshSkills;
+  T := SubagentTypes;
+  Seen := 0;
+  for I := 0 to High(T) do
+    if T[I] = 'helper' then Inc(Seen);
+  Check(Seen = 1, 'now its agent type is offered exactly once');
+  Check(LoadAgentDefinition('helper', Text, Err) and
+        (Pos('plugin helper', Text) > 0), 'and loads: ' + Err);
+  Check(ResolveCommandFile('ship') <> '', 'and its command resolves');
+  C := SkillCatalogue;
+  Check((Length(C) = 1) and (C[0].Source = ssPlugin) and (C[0].Plugin = 'acme'),
+    'and its skill is catalogued as the plugin''s');
+
+  { Nearer wins.  Reversed, a cloned repository's plugin would silently
+    replace a definition the user wrote for themselves. }
+  PutFile(IncludeTrailingPathDelimiter(RootDir) + '.pasclaude' + PathDelim +
+    'agents' + PathDelim + 'helper.md', 'the project''s own helper');
+  PutSkill(SkillsDirProject, 'deploy',
+    '---'#10'description: the project''s deploy.'#10'---'#10'project body'#10);
+  PutFile(IncludeTrailingPathDelimiter(RootDir) + '.pasclaude' + PathDelim +
+    'commands' + PathDelim + 'ship.md', 'the project''s own ship');
+  RefreshSkills;
+
+  Check(LoadAgentDefinition('helper', Text, Err) and
+        (Pos('project''s own helper', Text) > 0),
+    'the project''s agent wins over the plugin''s: ' + Text);
+  T := SubagentTypes;
+  Seen := 0;
+  for I := 0 to High(T) do
+    if CompareText(T[I], 'helper') = 0 then Inc(Seen);
+  Check(Seen = 1, 'and helper is still listed exactly once');
+  Check(Pos('.pasclaude' + PathDelim + 'commands', ResolveCommandFile('ship')) > 0,
+    'the project''s command wins: ' + ResolveCommandFile('ship'));
+  C := SkillCatalogue;
+  Check((Length(C) = 1) and (C[0].Source = ssProject),
+    'and the project''s skill shadows the plugin''s');
+
+  { A user-level skill is furthest away, so a plugin's shadows it. }
+  PutSkill(SkillsDirUser, 'deploy',
+    '---'#10'description: the user''s deploy.'#10'---'#10'user body'#10);
+  PutSkill(SkillsDirUser, 'mine',
+    '---'#10'description: only the user has this.'#10'---'#10'user body'#10);
+  WipeTree(SkillsDirProject);
+  RefreshSkills;
+  C := SkillCatalogue;
+  Check(Length(C) = 2, 'a user skill is catalogued when nothing nearer claims it');
+  for I := 0 to High(C) do
+  begin
+    if C[I].Name = 'deploy' then
+      Check(C[I].Source = ssPlugin, 'and a plugin skill shadows the user''s');
+    if C[I].Name = 'mine' then
+      Check(C[I].Source = ssUser, 'while an unshadowed one is the user''s');
+  end;
+
+  { With the project's own copy gone, only the plugin could answer - so this
+    is the disable and nothing else. }
+  DeleteFile(IncludeTrailingPathDelimiter(RootDir) + '.pasclaude' + PathDelim +
+    'commands' + PathDelim + 'ship.md');
+  Check(ResolveCommandFile('ship') <> '',
+    'the plugin still answers for ship while enabled');
+  Check(SetPluginEnabled('acme', False, Err), 'the plugin disables again');
+  RefreshSkills;
+  Check(ResolveCommandFile('ship') = '', 'and its command stops resolving');
+
+  Check(not SetPluginEnabled('nosuch', True, Err), 'an unknown plugin is refused');
+  Check(Pos('acme', Err) > 0, 'naming the ones installed: ' + Err);
+  Check(not SetPluginEnabled('..\evil', True, Err),
+    'and a traversal name never reaches the disk: ' + Err);
+
+  { Leave the suite as it found it: a live skills root would put a thirteenth
+    tool in every schema assertion after this one. }
+  uTools.ClearSkills;
+  uTools.ClearPluginState;
+  HomeBack;
+  WipeTree(SkillRoot);
+  uTools.RootDir := IncludeTrailingPathDelimiter(GetTempDir) + 'pasclaude-test';
+end;
+
 var
   Schema: TJson;
 begin
+  { Before the first schema assertion, not just before the skill tests:
+    every CountBuiltinTools check in this suite would be one out on a machine
+    whose real home directory happens to hold a skill. }
+  HomeAside;
   TestJson;
   TestRegexEngine;
   TestTools;
@@ -2074,6 +2504,10 @@ begin
   TestListModels;
   TestTodos;
   TestSubagentGate;
+  TestSkillFrontmatter;
+  TestSkillCatalogue;
+  TestSkillTool;
+  TestPluginPrecedence;
   TestPermissionPersistence;
   TestToolRegistry;
   TestMcpApprovals;
@@ -2101,6 +2535,7 @@ begin
   finally
     Schema.Free;
   end;
+  HomeBack;
   WriteLn;
   if Fails = 0 then
     WriteLn('all tests passed')

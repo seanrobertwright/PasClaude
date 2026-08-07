@@ -953,6 +953,145 @@ begin
   Check(SubagentDepth = 0, 'and no failed call left the depth raised');
 end;
 
+{ ----------------------------------------------------------------- skills -- }
+
+{ Beside TestAgentDefinitions and for the same reason: this is the second
+  loader in the program that opens a file under the state directory without
+  SafePath, and its whole guard is a character filter on a bare name. }
+
+{ %USERPROFILE% is read from inside uTools by the skills scan, so a suite that
+  does not neutralise it catalogues whatever the developer has at home. }
+function SetEnvironmentVariable(Name, Value: PChar): LongBool; stdcall;
+  external 'kernel32' name 'SetEnvironmentVariableA';
+
+procedure TestSkillsHostile;
+var
+  SkillsBase, Decoy, Out_, Home, Text: string;
+  IsErr: Boolean;
+  J: TJson;
+  I: Integer;
+
+  procedure RefusesName(const Name, What: string);
+  var
+    K: TJson;
+    O: string;
+    E: Boolean;
+  begin
+    K := TJson.NewObj;
+    K.AddStr('name', Name);
+    O := RunTool('skill', K, E);
+    Check(E, What + ': ' + Copy(O, 1, 60));
+    Check(Pos('DECOYSECRET', O) = 0, '  and read nothing outside the tree');
+  end;
+
+  procedure RefusesFile(const FileName, What: string);
+  var
+    K: TJson;
+    O: string;
+    E: Boolean;
+  begin
+    K := TJson.NewObj;
+    K.AddStr('name', 'good');
+    K.AddStr('file', FileName);
+    O := RunTool('skill', K, E);
+    Check(E, What + ': ' + Copy(O, 1, 60));
+    Check(Pos('DECOYSECRET', O) = 0, '  and read nothing outside the tree');
+  end;
+
+begin
+  Home := SysUtils.GetEnvironmentVariable('USERPROFILE');
+  SetEnvironmentVariable('USERPROFILE',
+    PChar(IncludeTrailingPathDelimiter(SessionDir) + 'nohome'));
+  uTools.RootDir := SessionDir;
+  SkillsBase := IncludeTrailingPathDelimiter(SessionDir) + StateDirName +
+    PathDelim + 'skills' + PathDelim;
+  ForceDirectories(SkillsBase + 'good');
+
+  { Placed where a traversal would land, so a filter that leaks shows up as
+    the decoy's own text in a tool result rather than as a silent pass. }
+  Decoy := IncludeTrailingPathDelimiter(SessionDir) + StateDirName +
+    PathDelim + 'DECOY.md';
+  WriteFileText(Decoy, 'DECOYSECRET should never reach the model');
+  WriteFileText(IncludeTrailingPathDelimiter(SessionDir) + 'DECOY.md',
+    'DECOYSECRET should never reach the model');
+  WriteFileText(SkillsBase + 'good' + PathDelim + 'SKILL.md',
+    '---'#10'description: a good skill.'#10'---'#10'the body'#10);
+  ForceDirectories(SkillsBase + 'good' + PathDelim + 'sub');
+  WriteFileText(SkillsBase + 'good' + PathDelim + 'sub' + PathDelim + 'x.md',
+    'DECOYSECRET in a subdirectory');
+  WriteFileText(SkillsBase + 'good' + PathDelim + '.hidden', 'DECOYSECRET');
+  uTools.RefreshSkills;
+
+  RefusesName('..', 'the parent directory is refused');
+  RefusesName('..\..\windows', 'a relative escape is refused');
+  RefusesName('a/b', 'a forward slash is refused');
+  RefusesName('a\b', 'a backslash is refused');
+  RefusesName('C:\x', 'a drive letter is refused');
+  RefusesName('a.b', 'a dot is refused, so the extension cannot be steered');
+  RefusesName('good'#0'\..\DECOY', 'a NUL-bearing name is refused');
+  RefusesName('good'#10'x', 'a newline-bearing name is refused');
+
+  { The file filter is a different rule - a supporting file keeps its
+    extension - so it is checked independently. }
+  RefusesFile('..\SKILL.md', 'a traversal file is refused');
+  RefusesFile('..\..\DECOY.md', 'and a deeper one');
+  RefusesFile('sub\x.md', 'a subdirectory is not addressable');
+  RefusesFile('.hidden', 'a dotfile is refused');
+  RefusesFile('a..b', 'and any .. at all');
+
+  { A body in the console codepage is repaired rather than refused: it is
+    still a document, and one bad byte in the request loses the whole
+    conversation. }
+  WriteFileText(SkillsBase + 'good' + PathDelim + 'SKILL.md',
+    '---'#10'description: a good skill.'#10'---'#10 +
+    StringOfChar(#$FF, 40) + ' body' + #10);
+  uTools.RefreshSkills;
+  J := TJson.NewObj;
+  J.AddStr('name', 'good');
+  Out_ := RunTool('skill', J, IsErr);
+  Check(not IsErr, 'a skill with hostile bytes still loads: ' + Copy(Out_, 1, 60));
+  Check(IsValidUtf8(Out_), 'and comes back as valid UTF-8');
+
+  { Bigger than the model should ever be handed, in a file bigger than the
+    reader will look at. }
+  Text := '---'#10'description: a good skill.'#10'---'#10;
+  for I := 1 to 40 do Text := Text + StringOfChar('z', 10000) + #10;
+  WriteFileText(SkillsBase + 'good' + PathDelim + 'SKILL.md', Text);
+  uTools.RefreshSkills;
+  J := TJson.NewObj;
+  J.AddStr('name', 'good');
+  Out_ := RunTool('skill', J, IsErr);
+  Check(not IsErr, 'a 400 KB skill loads: ' + Copy(Out_, 1, 60));
+  Check(Length(Out_) <= 31 * 1024,
+    Format('and is clipped to the tool output bound (%d bytes)', [Length(Out_)]));
+
+  Text := '---'#10'description: a good skill.'#10'---'#10;
+  for I := 1 to 200 do Text := Text + StringOfChar('z', 10000) + #10;
+  WriteFileText(SkillsBase + 'good' + PathDelim + 'SKILL.md', Text);
+  uTools.RefreshSkills;
+  J := TJson.NewObj;
+  J.AddStr('name', 'good');
+  Out_ := RunTool('skill', J, IsErr);
+  Check(Length(Out_) <= 31 * 1024,
+    Format('a 2 MB SKILL.md is read only as far as the cap (%d bytes)',
+      [Length(Out_)]));
+
+  { A supporting file that is not text is a mistake in the skill, not a binary
+    the model asked to see: refused, not hex-dumped. }
+  WriteFileText(SkillsBase + 'good' + PathDelim + 'blob.bin',
+    StringOfChar(#$FF, 200) + #0 + StringOfChar(#$FE, 200));
+  J := TJson.NewObj;
+  J.AddStr('name', 'good');
+  J.AddStr('file', 'blob.bin');
+  Out_ := RunTool('skill', J, IsErr);
+  Check(IsErr and (Pos('UTF-8', Out_) > 0),
+    'a binary supporting file is refused, not dumped: ' + Copy(Out_, 1, 60));
+
+  uTools.ClearSkills;
+  uTools.ClearPluginState;
+  SetEnvironmentVariable('USERPROFILE', PChar(Home));
+end;
+
 { ------------------------------------------------------------------ hooks -- }
 
 procedure WriteHooks(const Body: string);
@@ -1499,6 +1638,7 @@ begin
   TestBackgroundJobsHostile;
   TestHostileSearchResult;
   TestAgentDefinitions;
+  TestSkillsHostile;
   TestHooksHostileConfig;
   TestHooksHostileBehaviour;
   TestMcpConfig;

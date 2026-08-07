@@ -199,6 +199,12 @@ begin
   ToolArgs := '';
 end;
 
+{ The skills scan reads %USERPROFILE% from inside uTools, and this suite
+  counts declared tools: a developer with a skill in their own home directory
+  would make every one of those counts one too high. }
+function SetEnvironmentVariable(Name, Value: PChar): LongBool; stdcall;
+  external 'kernel32' name 'SetEnvironmentVariableA';
+
 function SessionDir: string;
 begin
   Result := IncludeTrailingPathDelimiter(GetTempDir) + 'pasclaude-loop';
@@ -1332,6 +1338,11 @@ begin
       Check(Web = 0, 'web search is not declared by default');
       Check(Local = uTools.BuiltinToolCount,
         Format('the local tools are all declared (%d)', [Local]));
+      { The count above holds only because this suite's root has no skills
+        directory, and a count that is right by luck is a count that breaks
+        somewhere unrelated.  Anchored by name, the reason is visible. }
+      Check(Pos('"skill"', Doc.ToJson) = 0,
+        'and no skill tool is declared in a project that has no skills');
     finally
       Doc.Free;
     end;
@@ -2035,13 +2046,28 @@ begin
       A.Free;
     end;
 
-    { (d) neither the declaration nor the call is available to a subagent. }
+    { (d) neither the declaration nor the call is available to a subagent -
+      and neither is a skill, which is why one is planted first: without it
+      the three-tool assertion below would be true for the wrong reason. }
+    ForceDirectories(IncludeTrailingPathDelimiter(SessionDir) + StateDirName +
+      PathDelim + 'skills' + PathDelim + 'deploy');
+    WriteSessionFile(StateDirName + PathDelim + 'skills' + PathDelim +
+      'deploy' + PathDelim + 'SKILL.md',
+      '---'#10'description: how this project ships.'#10'---'#10'the body'#10);
+    uTools.RefreshSkills;
     Check(uTools.EnterSubagent, 'claim the subagent slot');
     try
       Tools := uTools.ToolsSchema;
       try
         Body := Tools.ToJson;
         Check(Pos('mcp__', Body) = 0, 'a subagent is told about no MCP tool');
+        { The skill declaration sits below the same Exit, so a project with
+          skills still offers a subagent exactly three tools.  Moving it above
+          that cut would hand a subagent a reader that reaches files SafePath
+          refuses. }
+        Check(Tools.Count = 3,
+          Format('and still exactly three tools (%d)', [Tools.Count]));
+        Check(Pos('"skill"', Body) = 0, 'and never the skill tool');
       finally
         Tools.Free;
       end;
@@ -2062,6 +2088,12 @@ begin
       deleted. }
     uTools.ClearMcpServers;
     uTools.ClearTrust;
+    { The planted skill would otherwise be a thirteenth declaration in every
+      later assertion about the size of the tool list. }
+    SysUtils.DeleteFile(IncludeTrailingPathDelimiter(SessionDir) +
+      StateDirName + PathDelim + 'skills' + PathDelim + 'deploy' + PathDelim +
+      'SKILL.md');
+    uTools.ClearSkills;
     uTools.AllowAllMcp := SavedMcp;
     uTools.AllowAllEdits := SavedEdits;
   end;
@@ -2205,6 +2237,8 @@ end;
 
 begin
   { Every request in this suite goes to the stand-in rather than the network. }
+  SetEnvironmentVariable('USERPROFILE',
+    PChar(IncludeTrailingPathDelimiter(SessionDir) + 'nohome'));
   uHttp.HttpTransport := @FakePost;
   { The backoff is real time; the tests only care that it happens. }
   uAgent.RetryBaseMs := 1;

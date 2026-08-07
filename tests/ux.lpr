@@ -2269,6 +2269,104 @@ begin
   end;
 end;
 
+{ ---------------------------------------------------------- plugin state -- }
+
+{ The one piece of state in the program whose file narrows as well as widens.
+  permissions.json sits in the same directory and only ever widens, so the two
+  are tested against each other here: a disable that did not survive a restart
+  would be a consent bug the user could never diagnose. }
+procedure TestPluginState;
+var
+  Path, Err: string;
+  P: uTools.TPluginInfoArray;
+  U: TStringArray;
+begin
+  Path := IncludeTrailingPathDelimiter(TmpRoot) + '.pasclaude' + PathDelim +
+    'plugins.json';
+  DeleteFile(Path);
+  uTools.ClearPluginState;
+
+  WriteFileText(IncludeTrailingPathDelimiter(TmpRoot) + '.pasclaude' +
+    PathDelim + 'plugins' + PathDelim + 'acme' + PathDelim + 'plugin.json',
+    '{"name":"acme","description":"a bundle","hooks":{"PreToolUse":"x"}}');
+  WriteFileText(IncludeTrailingPathDelimiter(TmpRoot) + '.pasclaude' +
+    PathDelim + 'plugins' + PathDelim + 'acme' + PathDelim + 'commands' +
+    PathDelim + 'ship.md', 'ship it');
+
+  uTools.LoadPluginState(Path);
+  Check(not uTools.PluginEnabled('acme'),
+    'a plugin nobody enabled is inert, missing file and all');
+
+  P := uTools.InstalledPlugins;
+  Check(Length(P) = 1, 'but it is listed as installed');
+  Check((Length(P) = 1) and (P[0].Commands = 1), 'with its component counts');
+  { Named, never obeyed.  A manifest asking for a hook is reported so the user
+    knows what they are not getting, and nothing is executed. }
+  Check((Length(P) = 1) and (Pos('hooks', P[0].Ignored) > 0),
+    'and a manifest key this build does not act on is reported: ' +
+    P[0].Ignored);
+
+  U := uTools.UnseenPlugins;
+  Check((Length(U) = 1) and (U[0] = 'acme'),
+    'a plugin the user has not looked at yet is unseen');
+
+  Check(uTools.SetPluginEnabled('acme', True, Err), 'it enables: ' + Err);
+  uTools.SavePluginState(Path);
+  uTools.ClearPluginState;
+  Check(not uTools.PluginEnabled('acme'), 'the wipe took the enablement');
+  uTools.LoadPluginState(Path);
+  Check(uTools.PluginEnabled('acme'), 'and it came back off disk');
+  Check(Length(uTools.UnseenPlugins) = 1,
+    'while enabling is not the same as having looked');
+
+  uTools.MarkPluginsSeen;
+  uTools.SavePluginState(Path);
+  Check(Length(uTools.UnseenPlugins) = 0, 'running /plugins marks it seen');
+  uTools.ClearPluginState;
+  uTools.LoadPluginState(Path);
+  Check(Length(uTools.UnseenPlugins) = 0, 'and that survives a restart too');
+
+  { The half that permissions.json cannot do.  Copying its only-widen rule in
+    here would make /plugins disable appear to work and silently re-enable on
+    the next launch. }
+  Check(uTools.SetPluginEnabled('acme', False, Err), 'it disables: ' + Err);
+  uTools.SavePluginState(Path);
+  uTools.ClearPluginState;
+  uTools.LoadPluginState(Path);
+  Check(not uTools.PluginEnabled('acme'),
+    'a disable survives the round trip: this file narrows as well as widens');
+
+  { Every malformed shape leaves everything off rather than crashing - and
+    each of these takes a different early exit out of the parse, all of which
+    must still free the parsed document. }
+  uTools.SetPluginEnabled('acme', True, Err);
+  WriteFileText(Path, '{"enabled":"acme"}');
+  uTools.LoadPluginState(Path);
+  Check(not uTools.PluginEnabled('acme'),
+    'a string where an array belongs enables nothing');
+
+  uTools.SetPluginEnabled('acme', True, Err);
+  WriteFileText(Path, '{"enabled":["acme"');
+  uTools.LoadPluginState(Path);
+  Check(not uTools.PluginEnabled('acme'), 'nor does a truncated file');
+
+  uTools.SetPluginEnabled('acme', True, Err);
+  WriteFileText(Path, '["acme"]');
+  uTools.LoadPluginState(Path);
+  Check(not uTools.PluginEnabled('acme'), 'nor a non-object root');
+
+  { A name that could name a path never becomes one, even coming back off
+    disk: this file is input like any other. }
+  WriteFileText(Path, '{"enabled":["..\\evil","acme"]}');
+  uTools.LoadPluginState(Path);
+  Check(uTools.PluginEnabled('acme'), 'a legal name beside a hostile one loads');
+  Check(uTools.ResolveCommandFile('..\evil') = '',
+    'and the hostile one resolves to nothing at all');
+
+  uTools.ClearPluginState;
+  DeleteFile(Path);
+end;
+
 procedure Cleanup(const Dir: string);
 var
   R: TSearchRec;
@@ -2316,6 +2414,7 @@ begin
     TestJobList;
     TestMcpPanel;
     TestHooksPanel;
+    TestPluginState;
   finally
     { Before the cleanup, not after: a live child holding a spool handle under
       TmpRoot would make the recursive delete fail. }
@@ -2323,6 +2422,10 @@ begin
     { And the MCP connections, for exactly the same reason: a live server
       holding its stderr spool under TmpRoot blocks the delete. }
     uTools.ClearMcpServers;
+    { And the skills cache and plugin enablement, so nothing this suite
+      put on disk outlives it in module state. }
+    uTools.ClearSkills;
+    uTools.ClearPluginState;
     uTools.RootDir := '';
     Cleanup(TmpRoot);
   end;
