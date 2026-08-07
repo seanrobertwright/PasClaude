@@ -96,6 +96,18 @@ function JsonParse(const Text: string): TJson; overload;
 { Escapes S as a JSON string literal, quotes included. }
 function JsonQuote(const S: string): string;
 
+{ The longest prefix of S that is at most MaxBytes long and does not end in
+  the middle of a UTF-8 character - and, when S itself ends mid-character,
+  without that stump either.  Every cap in this program is a byte count, and
+  a byte cut through a multi-byte sequence produces text the API rejects
+  whole: one truncated 'e' loses the entire turn, not just the value it was
+  in.  The rule lives at the bottom of the ladder because both the notebook
+  summariser and the tool layer need it and the ladder forbids the lower one
+  from reaching up for it.  Bytes that were not valid UTF-8 to begin with are
+  passed through unchanged; deciding what to do about those belongs to the
+  caller that knows whether they are OEM output or a binary file. }
+function Utf8Cut(const S: string; MaxBytes: Integer): string;
+
 implementation
 
 uses SysUtils;
@@ -366,6 +378,34 @@ begin
     end;
   end;
   Result := Result + '"';
+end;
+
+function Utf8Cut(const S: string; MaxBytes: Integer): string;
+var
+  N, K, Need: Integer;
+  B: Byte;
+begin
+  N := Length(S);
+  if MaxBytes < N then N := MaxBytes;
+  if N < 0 then N := 0;
+  { Walk back over the continuation bytes at the cut to the byte that starts
+    the last character, then keep that character only if the whole of it is
+    inside the cut.  A run of continuation bytes with no lead byte in front
+    of it is already malformed, so there is nothing to preserve and the cut
+    stands where it fell. }
+  K := N;
+  while (K > 0) and ((Byte(S[K]) and $C0) = $80) do Dec(K);
+  if K > 0 then
+  begin
+    B := Byte(S[K]);
+    if B < $80 then Need := 1
+    else if (B and $E0) = $C0 then Need := 2
+    else if (B and $F0) = $E0 then Need := 3
+    else if (B and $F8) = $F0 then Need := 4
+    else Need := 1;                      { $F8..$FF: not UTF-8, leave it be }
+    if K + Need - 1 > N then N := K - 1;
+  end;
+  Result := Copy(S, 1, N);
 end;
 
 { FloatToStr would honour the locale's decimal separator, which JSON does not

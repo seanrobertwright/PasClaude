@@ -703,6 +703,55 @@ begin
   else
     Check(False, 'a loud job starts: ' + Err);
 
+  { The job listing is an answer to the model - bash_output with no job id
+    returns it - and the command in it came out of the model's own JSON, so
+    it can be UTF-8.  The column is 60 bytes wide, so a command longer than
+    that is cut at byte 57: with the cut inside the accented character the
+    listing, and every request carrying it, is invalid. }
+  uTools.ClearJobs;
+  if StartBackgroundJob('echo ' + StringOfChar('a', 51) + #$C3#$A9 +
+       StringOfChar('b', 20), Id, Err) then
+  begin
+    WaitBackgroundJob(Id, 5000);
+    Check(IsValidUtf8(BackgroundJobList),
+      'a long non-ASCII command survives the listing column');
+    J := TJson.NewObj;
+    Out_ := RunTool('bash_output', J, IsErr);
+    Check(IsValidUtf8(Out_), 'and bash_output with no id returns valid UTF-8');
+  end
+  else
+    Check(False, 'a long non-ASCII command starts: ' + Err);
+
+  { A running job whose output has no newline in it at all.  Holding a
+    partial line back is right - it stops a character being split across two
+    polls - but once the read comes back full the line is longer than a poll
+    and will never end, so holding it back means the offset never advances
+    and every later poll returns the same nothing.  A minified asset or a
+    one-line build report does exactly this. }
+  uTools.ClearJobs;
+  WriteFileText(IncludeTrailingPathDelimiter(SessionDir) + 'oneline.txt',
+    StringOfChar('x', 30000));
+  if StartBackgroundJob('type oneline.txt & ping -n 30 127.0.0.1 > nul',
+       Id, Err) then
+  begin
+    First := '';
+    for I := 1 to 20 do
+    begin
+      Sleep(250);
+      First := PollBackgroundJob(Id, IsErr);
+      if Pos(StringOfChar('x', 100), First) > 0 then Break;
+    end;
+    Check(Pos(StringOfChar('x', 100), First) > 0,
+      'a running job with one enormous line still hands over what it has');
+    Check(IsValidUtf8(First), 'and the cut leaves valid UTF-8');
+    Second := PollBackgroundJob(Id, IsErr);
+    Check(Second <> First, 'and the next poll is not the same nothing again');
+    KillBackgroundJob(Id);
+    WaitBackgroundJob(Id, 5000);
+  end
+  else
+    Check(False, 'a one-line job starts: ' + Err);
+
   { The table is capped.  Without the cap a model in a loop fills the machine
     with detached shells. }
   uTools.ClearJobs;

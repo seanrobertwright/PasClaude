@@ -164,8 +164,12 @@ begin
   finally
     L.Free;
   end;
+  { Utf8Cut, not Copy: the cap is a byte count and an output is as likely to
+    be a pandas repr full of em dashes as it is to be ASCII.  A sequence cut
+    in half here reaches the model through read_file and the API rejects the
+    request whole - the truncation would cost the turn, not the output. }
   if Length(Result) > MaxOutputChars then
-    Result := Copy(Result, 1, MaxOutputChars) +
+    Result := Utf8Cut(Result, MaxOutputChars) +
       Format('... [%d chars total]', [Length(S)]);
 end;
 

@@ -1585,6 +1585,22 @@ begin
   Check(Length(View) < 4096, 'the whole view stays small: ' +
     IntToStr(Length(View)) + ' bytes');
 
+  { The per-output cap is a byte count, and an output is as likely to be a
+    pandas repr with an em dash or a traceback with a curly quote as it is to
+    be ASCII.  Here the 2000th byte is the lead byte of an accented
+    character: cut there with Copy and the view - which read_file hands
+    straight to the model - is not valid UTF-8, and the API rejects the whole
+    request rather than the one output that was too long. }
+  Big := '{"cells":[{"cell_type":"code","execution_count":1,"metadata":{},' +
+    '"outputs":[{"output_type":"stream","name":"stdout","text":"' +
+    StringOfChar('a', 1999) + #$C3#$A9 + StringOfChar('b', 50) + '"}],' +
+    '"source":["print(s)"]}],"metadata":{},"nbformat":4,"nbformat_minor":5}';
+  Check(IsValidUtf8(Big), 'the boundary fixture is itself valid UTF-8');
+  Check(NotebookView(Big, View, Err),
+    'the view renders an output that is cut mid-character: ' + Err);
+  Check(IsValidUtf8(View), 'and the cut view is still valid UTF-8');
+  Check(Pos('chars total', View) > 0, 'the output really was cut');
+
   { The permission prompt.  Without a ChangePreview arm the user is asked to
     approve a bare tool name, and without a DescribeTool arm the title is the
     word "notebook_edit" - neither of which any other assertion notices. }

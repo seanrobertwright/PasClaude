@@ -480,7 +480,11 @@ begin
   if Length(S) <= MaxOutBytes then
     Result := S
   else
-    Result := Copy(S, 1, MaxOutBytes) +
+    { The cap is the last thing every tool result passes through, so it is
+      also the last chance to split a character in one - and this result is
+      on its way into a JSON request body that a single half-character makes
+      unacceptable. }
+    Result := Utf8Cut(S, MaxOutBytes) +
       Format(#10'... [truncated, %d bytes total]', [Length(S)]);
 end;
 
@@ -1366,8 +1370,20 @@ begin
   if Alive then
   begin
     P := LastDelimiter(#10, Result);
-    if P = 0 then Exit('');   { no complete line yet; keep it for next time }
-    SetLength(Result, P);
+    if P > 0 then
+      SetLength(Result, P)
+    { No newline in the whole buffer.  Holding it back is right while there
+      is room for the line to finish, but once the read came back full the
+      line is longer than a poll and waiting for its end means waiting
+      forever: the offset would never advance and every later poll would
+      return this same nothing.  A minified asset or a single-line build
+      report does exactly that, so a full buffer is handed over cut at the
+      last complete character instead - which is the only part of the
+      line-boundary rule that was ever about correctness. }
+    else if More then
+      Result := Utf8Cut(Result, Length(Result))
+    else
+      Exit('');               { no complete line yet; keep it for next time }
   end;
   Inc(J.Offset, Length(Result));
   if not IsValidUtf8(Result) then
@@ -1458,7 +1474,11 @@ begin
     Pending := SpoolSize(Jobs[I].Spool) - Jobs[I].Offset;
     if Pending < 0 then Pending := 0;
     C := Jobs[I].Cmd;
-    if Length(C) > 60 then C := Copy(C, 1, 57) + '...';
+    { The command came out of the model's JSON, so it can be UTF-8, and this
+      listing goes back to the model as the answer to a bash_output with no
+      job id - a byte cut through a character here invalidates the whole
+      request body, not just the column it widened. }
+    if Length(C) > 60 then C := Utf8Cut(C, 57) + '...';
     Result := Result + Format('%s  %s  %ds  %d bytes unread  %s'#10,
       [Jobs[I].Id, State, (GetTickCount64 - Jobs[I].Started) div 1000,
        Pending, C]);
