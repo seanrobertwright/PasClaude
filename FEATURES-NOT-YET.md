@@ -60,15 +60,24 @@ text preserves what was missing at the time. Unchecked items remain open.
 
 ## Sessions and memory
 
-- [ ] **Checkpointing / rewind** — no Esc-Esc rewind, no `/rewind`, no
-  restoring code + conversation to an earlier point.
-- [ ] **Session picker** — one session per directory (the previous one is
+- [x] ~~**Checkpointing / rewind** — no Esc-Esc rewind, no `/rewind`, no
+  restoring code + conversation to an earlier point.~~
+  *Built: `/rewind` lists your turns and restores both the transcript and
+  the files edited since the picked one, including deleting files created
+  that turn. Shell commands are named as not-undoable; files over 400 KB
+  are not snapshotted. (Esc-Esc as a shortcut remains missing.)*
+- [x] ~~**Session picker** — one session per directory (the previous one is
   moved to `session.prev.json`, not offered); no list of past sessions, no
-  naming, no `--continue` vs `--resume` distinction.
+  naming.~~
+  *Built: `/save <name>` keeps a named copy, `/sessions` lists everything
+  saved (live, safety copy, named) with dates and sizes and resumes the
+  pick. (`--continue` vs `--resume` as CLI flags remains missing.)*
 - [x] ~~**Memory** — no `/memory`, no `#` shortcut to append to CLAUDE.md,
   no user-level `~/.claude/CLAUDE.md`, no `@import` in CLAUDE.md.~~
-  *Built: `# note` appends to the project memory file, `/memory` shows it.
-  Still missing: user-level `~/.claude/CLAUDE.md` and `@import`.*
+  *Built: `# note` appends to the project memory file, `/memory` shows it,
+  `%USERPROFILE%\.pasclaude\CLAUDE.md` is user-level memory loaded before
+  the project's (nearer wins), and `@import <path>` / bare `@path` lines in
+  instruction files inline the referenced file, one level deep.*
 - [x] ~~**/init** — cannot generate a CLAUDE.md for a new project.~~
   *Built: `/init` has the model explore the project and write a starter
   CLAUDE.md through the ordinary write approval.*
@@ -121,6 +130,13 @@ text preserves what was missing at the time. Unchecked items remain open.
 - **Memory** — `# note` appends to the project memory file under a Notes
   heading; `/memory` shows it. (User-level `~/.claude/CLAUDE.md` and
   `@import` remain missing.)
+- **User-level memory and @import** — `%USERPROFILE%\.pasclaude\CLAUDE.md`
+  loads before the project files (nearer wins), and `@import <path>` lines
+  in instruction files inline the referenced file, one level deep.
+- **Checkpointing / rewind** — `/rewind` restores the conversation and the
+  edited files to the moment before a picked turn.
+- **Session picker** — `/save <name>` makes named copies and `/sessions`
+  lists and resumes them.
 - **/init** — the model explores the project and writes a starter
   CLAUDE.md through the ordinary write approval.
 - **Non-interactive mode** — `pasclaude -p "question"` answers once and

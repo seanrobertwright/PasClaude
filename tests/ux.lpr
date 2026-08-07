@@ -1572,6 +1572,142 @@ begin
   Check(VtReset = '', 'no reset when VT is off');
 end;
 
+{ The rewind machinery: TruncateMessages on the transcript, and the file
+  snapshots the write/edit tools take.  Driven through the real RunTool so
+  the snapshot happens exactly where a real edit triggers it. }
+procedure TestRewind;
+var
+  A: TAgent;
+  J: TJson;
+  Out_, Notes, P: string;
+  IsErr: Boolean;
+  L: TStringList;
+  N: Integer;
+begin
+  WriteLn('-- rewind --');
+  uTools.AllowAllEdits := True;
+  uTools.ClearSnapshots;
+
+  { TruncateMessages: the conversation half. }
+  A := TAgent.Create('k', 'm', 'sys');
+  try
+    A.AppendUserText('one');
+    A.AppendUserText('two');
+    A.AppendUserText('three');
+    A.TruncateMessages(1);
+    Check(A.MessageCount = 1, 'truncate keeps the requested prefix');
+    Check(Pos('one', A.Transcript) > 0, 'and it is the oldest message');
+    Check(Pos('three', A.Transcript) = 0, 'the newer ones are gone');
+    A.TruncateMessages(5);
+    Check(A.MessageCount = 1, 'truncating to more than exists is a no-op');
+    A.TruncateMessages(-3);
+    Check(A.MessageCount = 0, 'a negative count clamps to empty');
+  finally
+    A.Free;
+  end;
+
+  { Snapshots: edit an existing file across two turns, then rewind. }
+  P := IncludeTrailingPathDelimiter(TmpRoot) + 'rw.txt';
+  L := TStringList.Create;
+  try
+    L.Text := 'original';
+    L.SaveToFile(P);
+  finally
+    L.Free;
+  end;
+
+  uTools.BeginTurn(1);
+  J := TJson.NewObj;
+  J.AddStr('path', 'rw.txt');
+  J.AddStr('old_text', 'original');
+  J.AddStr('new_text', 'after turn 1');
+  Out_ := uTools.RunTool('edit_file', J, nil, IsErr);
+  J.Free;
+  Check(not IsErr, 'the turn-1 edit applies: ' + Out_);
+
+  uTools.BeginTurn(2);
+  J := TJson.NewObj;
+  J.AddStr('path', 'rw.txt');
+  J.AddStr('old_text', 'after turn 1');
+  J.AddStr('new_text', 'after turn 2');
+  Out_ := uTools.RunTool('edit_file', J, nil, IsErr);
+  J.Free;
+  Check(not IsErr, 'the turn-2 edit applies: ' + Out_);
+  { A file created in turn 2 must be deleted by the rewind. }
+  J := TJson.NewObj;
+  J.AddStr('path', 'made-in-2.txt');
+  J.AddStr('content', 'new');
+  uTools.RunTool('write_file', J, nil, IsErr);
+  J.Free;
+  Check(SnapshotCount = 3, 'each first-touch per turn took one snapshot');
+
+  { Rewind to the start of turn 2: rw.txt back to its turn-1 result, the
+    created file gone, turn 1's snapshot still held for a deeper rewind. }
+  N := uTools.RestoreFilesSince(2, Notes);
+  Check(N = 2, 'two files were put back');
+  L := TStringList.Create;
+  try
+    L.LoadFromFile(P);
+    Check(Trim(L.Text) = 'after turn 1', 'the edit landed back at the turn-2 start');
+  finally
+    L.Free;
+  end;
+  Check(not FileExists(IncludeTrailingPathDelimiter(TmpRoot) + 'made-in-2.txt'),
+    'a file created that turn is removed');
+  Check(SnapshotCount = 1, 'turn 1''s snapshot survives for a deeper rewind');
+
+  { And the deeper rewind reaches the original. }
+  N := uTools.RestoreFilesSince(1, Notes);
+  Check(N = 1, 'the deeper rewind restores one file');
+  L := TStringList.Create;
+  try
+    L.LoadFromFile(P);
+    Check(Trim(L.Text) = 'original', 'all the way back to the original');
+  finally
+    L.Free;
+  end;
+  Check(SnapshotCount = 0, 'nothing left to rewind');
+
+  { The ordering case: one file touched in two turns, both at or after the
+    rewind point.  The restore must land on the older state - write order
+    inside RestoreFilesSince is what decides it, so this is the assertion
+    that pins the direction of that loop. }
+  L := TStringList.Create;
+  try
+    L.Text := 'v0';
+    L.SaveToFile(P);
+  finally
+    L.Free;
+  end;
+  uTools.BeginTurn(5);
+  J := TJson.NewObj;
+  J.AddStr('path', 'rw.txt');
+  J.AddStr('old_text', 'v0');
+  J.AddStr('new_text', 'v5');
+  uTools.RunTool('edit_file', J, nil, IsErr);
+  J.Free;
+  uTools.BeginTurn(6);
+  J := TJson.NewObj;
+  J.AddStr('path', 'rw.txt');
+  J.AddStr('old_text', 'v5');
+  J.AddStr('new_text', 'v6');
+  uTools.RunTool('edit_file', J, nil, IsErr);
+  J.Free;
+  N := uTools.RestoreFilesSince(5, Notes);
+  Check(N = 2, 'both turn snapshots were applied');
+  L := TStringList.Create;
+  try
+    L.LoadFromFile(P);
+    Check(Trim(L.Text) = 'v0',
+      'a file snapshotted in two rewound turns lands on the older state');
+  finally
+    L.Free;
+  end;
+
+  uTools.ClearSnapshots;
+  DeleteFile(P);
+end;
+
 { ------------------------------------------------------------------- main -- }
 
 procedure Cleanup(const Dir: string);
@@ -1615,6 +1751,7 @@ begin
     TestCtrlC;
     TestHistoryPersistence;
     TestVt;
+    TestRewind;
   finally
     uTools.RootDir := '';
     Cleanup(TmpRoot);

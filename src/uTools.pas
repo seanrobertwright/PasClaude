@@ -101,6 +101,22 @@ function CurrentTodos: TStringArray;
 { Test seam and /clear. }
 procedure ClearTodos;
 
+{ ---- file snapshots, the disk half of /rewind ----
+  Before a write or edit changes a file, its prior state is captured against
+  the current turn number.  Rewinding to turn N restores every touched file
+  to the oldest snapshot at or after N - the state it had when N began. }
+
+{ Marks the turn now starting; snapshots taken from here belong to it. }
+procedure BeginTurn(TurnNo: Integer);
+{ Restores every file touched at or after TurnNo and forgets those
+  snapshots.  Notes lists what was restored or why something could not be.
+  Returns the number of files put back. }
+function RestoreFilesSince(TurnNo: Integer; out Notes: string): Integer;
+{ Test seam and /clear. }
+procedure ClearSnapshots;
+{ Test seam: how many snapshots are held. }
+function SnapshotCount: Integer;
+
 { Loads standing approvals from Path: the tool-class "always" answers and
   the approved bash programs, so an "a" gives once survives restarts.  A
   missing or unreadable file simply approves nothing. }
@@ -899,6 +915,125 @@ begin
   SetLength(TodoList, 0);
 end;
 
+{ -------------------------------------------------------------- snapshots -- }
+
+type
+  TSnapshot = record
+    Turn: Integer;
+    Full: string;        { absolute path }
+    Existed: Boolean;    { False: the file was created, restore = delete }
+    Text: string;        { prior contents when Existed }
+  end;
+
+var
+  Snapshots: array of TSnapshot;
+  CurrentTurn: Integer = 0;
+
+procedure BeginTurn(TurnNo: Integer);
+begin
+  CurrentTurn := TurnNo;
+end;
+
+procedure ClearSnapshots;
+begin
+  SetLength(Snapshots, 0);
+end;
+
+function SnapshotCount: Integer;
+begin
+  Result := Length(Snapshots);
+end;
+
+{ Captures Full's state before its first change this turn.  Later changes in
+  the same turn keep the first snapshot: rewinding lands at the turn start,
+  not midway through it.  Snapshot bytes live in memory; a 400 KB cap keeps
+  a huge generated file from bloating the process, at the cost of that file
+  not being rewindable - noted at restore time. }
+procedure SnapshotFile(const Full: string);
+var
+  I: Integer;
+  S: TSnapshot;
+  F: TFileStream;
+begin
+  { One snapshot per file per turn.  Earlier turns keep theirs: a file
+    touched in turn 2 and again in turn 5 must be restorable to either. }
+  for I := 0 to High(Snapshots) do
+    if (Snapshots[I].Turn = CurrentTurn) and
+       (CompareText(Snapshots[I].Full, Full) = 0) then Exit;
+
+  S.Turn := CurrentTurn;
+  S.Full := Full;
+  S.Existed := FileExists(Full);
+  S.Text := '';
+  if S.Existed then
+  begin
+    try
+      F := TFileStream.Create(Full, fmOpenRead or fmShareDenyNone);
+      try
+        if F.Size > MaxReadBytes then Exit;   { too big to hold; not rewindable }
+        SetLength(S.Text, F.Size);
+        if F.Size > 0 then F.ReadBuffer(S.Text[1], F.Size);
+      finally
+        F.Free;
+      end;
+    except
+      Exit;   { unreadable now means unrestorable later; skip }
+    end;
+  end;
+  SetLength(Snapshots, Length(Snapshots) + 1);
+  Snapshots[High(Snapshots)] := S;
+end;
+
+function RestoreFilesSince(TurnNo: Integer; out Notes: string): Integer;
+var
+  I, Kept: Integer;
+  Err: string;
+begin
+  Result := 0;
+  Notes := '';
+  { Newest first, so when a file has snapshots in several turns at or after
+    TurnNo, the oldest one writes last and wins - the state the file had
+    when TurnNo began. }
+  for I := High(Snapshots) downto 0 do
+  begin
+    if Snapshots[I].Turn < TurnNo then Continue;
+    if Snapshots[I].Existed then
+    begin
+      if SaveFileText(Snapshots[I].Full, Snapshots[I].Text, Err) then
+      begin
+        Inc(Result);
+        Notes := Notes + 'restored ' + Rel(Snapshots[I].Full) + #10;
+      end
+      else
+        Notes := Notes + 'could not restore ' + Rel(Snapshots[I].Full) +
+          ': ' + Err + #10;
+    end
+    else
+    begin
+      if not FileExists(Snapshots[I].Full) or
+         SysUtils.DeleteFile(Snapshots[I].Full) then
+      begin
+        Inc(Result);
+        Notes := Notes + 'removed ' + Rel(Snapshots[I].Full) +
+          ' (created that turn)'#10;
+      end
+      else
+        Notes := Notes + 'could not remove ' + Rel(Snapshots[I].Full) + #10;
+    end;
+  end;
+
+  { Forget what was restored; earlier turns keep their snapshots so a
+    second, deeper rewind still works. }
+  Kept := 0;
+  for I := 0 to High(Snapshots) do
+    if Snapshots[I].Turn < TurnNo then
+    begin
+      Snapshots[Kept] := Snapshots[I];
+      Inc(Kept);
+    end;
+  SetLength(Snapshots, Kept);
+end;
+
 { ------------------------------------------------- permission persistence -- }
 
 { The file is JSON: {"allow_edits":bool,"allow_bash":bool,"allow_fetch":bool,
@@ -1374,6 +1509,7 @@ begin
       IsError := True;
       Exit('the user denied this write');
     end;
+    SnapshotFile(Full);
     if not SaveFileText(Full, Input.Str('content'), Err) then
     begin
       IsError := True;
@@ -1414,6 +1550,7 @@ begin
       IsError := True;
       Exit('the user denied this edit');
     end;
+    SnapshotFile(Full);
     if not SaveFileText(Full, Text, Err) then
     begin
       IsError := True;

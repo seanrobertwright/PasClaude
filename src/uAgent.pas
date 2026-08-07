@@ -119,6 +119,9 @@ type
     { Drops a trailing user message that never got an answer.  Returns True if
       one was removed. }
     function TrimUnansweredQuestion: Boolean;
+    { Drops every message past Count, for /rewind.  The caller recorded the
+      count before the turn it wants to return to. }
+    procedure TruncateMessages(Count: Integer);
     { Unwinds a turn that stopped with tool results the model never saw, back
       to a state the next question can legally follow. }
     procedure UnwindUnsentTail;
@@ -555,6 +558,13 @@ end;
 function TAgent.MessageCount: Integer;
 begin
   Result := FMessages.Count;
+end;
+
+procedure TAgent.TruncateMessages(Count: Integer);
+begin
+  if Count < 0 then Count := 0;
+  while FMessages.Count > Count do
+    FMessages.Drop(FMessages.Count - 1);
 end;
 
 function TAgent.ContextTokens: Int64;

@@ -30,6 +30,12 @@ const
 var
   Agent: TAgent;
   AtLineStart: Boolean = True;
+  { One checkpoint per user turn: the transcript length before it ran and
+    the question that started it.  /rewind picks one and puts both the
+    conversation and the files back. }
+  CheckTurns: array of Integer;      { turn number, for the file snapshots }
+  CheckCounts: array of Integer;     { MessageCount before the turn }
+  CheckPrompts: array of string;     { first line of the question, for the list }
   { What the banner says about how the session authenticates; '' for a
     plain API key, which is the unremarkable case. }
   BannerAuth: string = '';
@@ -193,8 +199,9 @@ end;
 { ------------------------------------------------------------- completion -- }
 
 const
-  SlashCommands: array[0..13] of string = (
-    '/help', '/clear', '/compact', '/diff', '/memory', '/init', '/think',
+  SlashCommands: array[0..15] of string = (
+    '/help', '/clear', '/compact', '/diff', '/memory', '/init', '/rewind',
+    '/sessions', '/think',
     '/resume', '/save', '/cwd', '/model', '/yolo', '/cost', '/exit');
 
 { Candidates for the token being completed: slash commands when the token
@@ -388,8 +395,90 @@ begin
     'related changes rather than asking many times for trivia.';
 end;
 
+{ Expands @import lines in an instruction file: a line that is exactly
+  "@import <path>" (or Claude Code's bare "@path" form alone on a line) is
+  replaced by that file's contents.  One level only - an import cannot
+  import - because a cycle must terminate and one level covers the real
+  use: a shared conventions file included from CLAUDE.md.  The path faces
+  the session-root guard; anything it refuses stays as literal text. }
+function ExpandImports(const Text: string): string;
+var
+  L, F: TStringList;
+  I: Integer;
+  Line, Ref, Full, Err, Sub: string;
+begin
+  L := TStringList.Create;
+  try
+    L.Text := Text;
+    Result := '';
+    for I := 0 to L.Count - 1 do
+    begin
+      Line := Trim(L[I]);
+      Ref := '';
+      if Copy(Line, 1, 8) = '@import ' then
+        Ref := Trim(Copy(Line, 9, MaxInt))
+      else if (Length(Line) > 1) and (Line[1] = '@') and
+              (Pos(' ', Line) = 0) then
+        { The bare "@path" form, alone on its line. }
+        Ref := Copy(Line, 2, MaxInt);
+
+      if (Ref <> '') and uTools.ResolveInRoot(Ref, Full, Err) and
+         FileExists(Full) then
+      begin
+        Sub := '';
+        F := TStringList.Create;
+        try
+          try
+            F.LoadFromFile(Full);
+            Sub := F.Text;
+          except
+            Sub := '';
+          end;
+        finally
+          F.Free;
+        end;
+        if (Sub <> '') and uTools.IsValidUtf8(Sub) then
+        begin
+          Result := Result + '--- imported: ' + Ref + ' ---'#10 + Sub + #10;
+          Continue;
+        end;
+      end;
+      Result := Result + L[I] + #10;
+    end;
+  finally
+    L.Free;
+  end;
+end;
+
+{ The user-level memory: %USERPROFILE%\.pasclaude\CLAUDE.md, instructions
+  that follow the user across projects.  It loads before the project's own
+  files so a project can override it - nearer wins, as in Claude Code. }
+function UserContext: string;
+var
+  Path: string;
+  L: TStringList;
+begin
+  Result := '';
+  Path := IncludeTrailingPathDelimiter(GetEnvironmentVariable('USERPROFILE')) +
+    '.pasclaude' + PathDelim + 'CLAUDE.md';
+  if not FileExists(Path) then Exit;
+  L := TStringList.Create;
+  try
+    try
+      L.LoadFromFile(Path);
+      Result := #10#10 + '--- user memory (~\.pasclaude\CLAUDE.md) ---' + #10 +
+        L.Text;
+    except
+      { Unreadable user memory is not worth failing the session over. }
+    end;
+  finally
+    L.Free;
+  end;
+end;
+
 { Project instructions, if the repository ships any.  This is how a project
-  tells the agent about its own conventions. }
+  tells the agent about its own conventions.  The user-level memory loads
+  first so the project's own files can override it - nearer wins. }
 function ProjectContext: string;
 var
   Names: array[0..2] of string = ('AGENTS.md', 'CLAUDE.md', '.pasclaude.md');
@@ -397,7 +486,7 @@ var
   Path: string;
   L: TStringList;
 begin
-  Result := '';
+  Result := UserContext;
   for I := 0 to High(Names) do
   begin
     Path := IncludeTrailingPathDelimiter(uTools.RootDir) + Names[I];
@@ -406,7 +495,8 @@ begin
     try
       try
         L.LoadFromFile(Path);
-        Result := Result + #10#10 + '--- ' + Names[I] + ' ---' + #10 + L.Text;
+        Result := Result + #10#10 + '--- ' + Names[I] + ' ---' + #10 +
+          ExpandImports(L.Text);
       except
         { An unreadable context file is not worth failing the session over. }
       end;
@@ -430,6 +520,7 @@ begin
   EmitCLn(clGrey,   '  /diff          list the files this session has changed');
   EmitCLn(clGrey,   '  /memory        show the project memory (CLAUDE.md)');
   EmitCLn(clGrey,   '  /init          have the model write a CLAUDE.md for this project');
+  EmitCLn(clGrey,   '  /rewind        undo turns: conversation and edited files');
   EmitCLn(clGrey,   '  /think [n]     extended thinking: on, off, or a token budget');
   EmitCLn(clGrey,   '  /resume        reload the saved conversation');
   EmitCLn(clGrey,   '  /save          write the conversation now');
@@ -769,6 +860,166 @@ begin
   EmitCLn(clGrey, '  model set to ' + Agent.Model);
 end;
 
+procedure RecordCheckpoint(const Prompt: string);
+var
+  N: Integer;
+  Line: string;
+  P: Integer;
+begin
+  N := Length(CheckTurns);
+  SetLength(CheckTurns, N + 1);
+  SetLength(CheckCounts, N + 1);
+  SetLength(CheckPrompts, N + 1);
+  CheckTurns[N] := Agent.TurnCount + 1;      { the turn about to run }
+  CheckCounts[N] := Agent.MessageCount;
+  Line := Prompt;
+  P := Pos(#10, Line);
+  if P > 0 then SetLength(Line, P - 1);
+  if Length(Line) > 60 then Line := Copy(Line, 1, 57) + '...';
+  CheckPrompts[N] := Line;
+  uTools.BeginTurn(CheckTurns[N]);
+end;
+
+{ Checkpoint message counts are positions in the transcript, so anything
+  that renumbers it - compaction, /clear, a resume - makes them lies.  The
+  file snapshots go too: a rewind that restored files against a transcript
+  that no longer matches would be half an undo, which is worse than none. }
+procedure DropCheckpoints;
+begin
+  SetLength(CheckTurns, 0);
+  SetLength(CheckCounts, 0);
+  SetLength(CheckPrompts, 0);
+  uTools.ClearSnapshots;
+end;
+
+{ Every saved conversation in .pasclaude: the live one, the safety copy,
+  and any named saves (/save <name> writes <name>.session.json).  Each
+  shows its date and size; a number resumes it.  Resuming a named session
+  does not touch the live file until the next autosave, which is the same
+  rule /resume has always had. }
+procedure PickSession;
+var
+  R: TSearchRec;
+  Dir, Line, Err: string;
+  Names: array of string;
+  Sizes: array of Int64;
+  Stamps: array of TDateTime;
+  N, I, Pick: Integer;
+
+  procedure Add(const FileName: string; Size: Int64; Stamp: TDateTime);
+  begin
+    SetLength(Names, N + 1);
+    SetLength(Sizes, N + 1);
+    SetLength(Stamps, N + 1);
+    Names[N] := FileName;
+    Sizes[N] := Size;
+    Stamps[N] := Stamp;
+    Inc(N);
+  end;
+
+begin
+  Dir := IncludeTrailingPathDelimiter(uTools.RootDir) + SessionDir + PathDelim;
+  Names := nil;
+  N := 0;
+  if FindFirst(Dir + '*.json', faAnyFile, R) = 0 then
+  begin
+    repeat
+      { Sessions only: the permissions file also lives here. }
+      if (R.Name = 'session.json') or (R.Name = 'session.prev.json') or
+         (Pos('.session.json', R.Name) > 0) then
+        Add(R.Name, R.Size, FileDateToDateTime(R.Time));
+    until FindNext(R) <> 0;
+    SysUtils.FindClose(R);
+  end;
+  if N = 0 then
+  begin
+    EmitCLn(clGrey, '  no saved sessions in ' + SessionDir);
+    Exit;
+  end;
+
+  EmitCLn(clBright, '  saved sessions:');
+  for I := 0 to N - 1 do
+    EmitCLn(clGrey, Format('  %2d  %-32s %s  %d KB', [I + 1, Names[I],
+      FormatDateTime('yyyy-mm-dd hh:nn', Stamps[I]),
+      (Sizes[I] + 1023) div 1024]));
+  EmitC(clYellow, '  pick a number to resume, or Enter to cancel > ');
+  if not ReadLineEdit('', Line) then Exit;
+  Line := Trim(Line);
+  if Line = '' then
+  begin
+    EmitCLn(clGrey, '  cancelled');
+    Exit;
+  end;
+  Pick := StrToIntDef(Line, 0);
+  if (Pick < 1) or (Pick > N) then
+  begin
+    EmitCLn(clRed, '  not a listed number: ' + Line);
+    Exit;
+  end;
+  if Agent.LoadSession(Dir + Names[Pick - 1], Err) then
+  begin
+    DropCheckpoints;
+    EmitCLn(clGrey, Format('  resumed %s: %d messages (%d turns)',
+      [Names[Pick - 1], Agent.MessageCount, Agent.TurnCount]));
+  end
+  else
+    EmitCLn(clRed, '  could not resume: ' + Err);
+end;
+
+{ /rewind: list the turns, pick one, and both the conversation and the
+  files return to the moment before it ran.  The files come back from the
+  snapshots the write and edit tools took; the conversation is truncated to
+  its recorded length.  What cannot come back is deliberately named: shell
+  commands are not undoable, and a file too large to snapshot stays as it
+  is. }
+procedure DoRewind;
+var
+  I, Pick, Restored: Integer;
+  Line, Notes, Err: string;
+begin
+  if Length(CheckTurns) = 0 then
+  begin
+    EmitCLn(clGrey, '  nothing to rewind to yet');
+    Exit;
+  end;
+  EmitCLn(clBright, '  rewind to the moment before:');
+  for I := 0 to High(CheckTurns) do
+    EmitCLn(clGrey, Format('  %2d  %s', [I + 1, CheckPrompts[I]]));
+  EmitC(clYellow, '  pick a number, or Enter to cancel > ');
+  if not ReadLineEdit('', Line) then Exit;
+  Line := Trim(Line);
+  if Line = '' then
+  begin
+    EmitCLn(clGrey, '  cancelled');
+    Exit;
+  end;
+  Pick := StrToIntDef(Line, 0);
+  if (Pick < 1) or (Pick > Length(CheckTurns)) then
+  begin
+    EmitCLn(clRed, '  not a listed number: ' + Line);
+    Exit;
+  end;
+
+  Agent.TruncateMessages(CheckCounts[Pick - 1]);
+  Restored := uTools.RestoreFilesSince(CheckTurns[Pick - 1], Notes);
+  if Notes <> '' then
+    EmitC(clGrey, '  ' + StringReplace(Trim(Notes), #10, #10'  ',
+      [rfReplaceAll]) + #10);
+  EmitCLn(clGrey, Format('  rewound: %d messages in the transcript, %d files restored',
+    [Agent.MessageCount, Restored]));
+  EmitCLn(clYellow, '  shell commands are not undone, and files over 400 KB were not snapshotted');
+
+  { The checkpoints past the target are gone with the turns they marked. }
+  SetLength(CheckTurns, Pick - 1);
+  SetLength(CheckCounts, Pick - 1);
+  SetLength(CheckPrompts, Pick - 1);
+
+  { The saved session must match, or a crash right now resurrects what was
+    just rewound. }
+  if not Agent.SaveSession(SessionPath(uTools.RootDir), Err) then
+    EmitCLn(clYellow, '  (the rewound session could not be saved: ' + Err + ')');
+end;
+
 procedure ShowBanner;
 begin
   EmitCLn(clCyan, Format('pasclaude %s', [Version]));
@@ -834,6 +1085,7 @@ begin
       MdReset;
       if Agent.CompactWithSummary(Err) then
       begin
+        DropCheckpoints;
         MdFinish;
         AtLineStart := True;
         NeedNewLine;
@@ -854,6 +1106,7 @@ begin
     else
     begin
       Dropped := Agent.Compact(CompactKeepBytes);
+      if Dropped > 0 then DropCheckpoints;
       if Dropped = 0 then
         EmitCLn(clGrey, Format('  nothing to compact (%d messages, %d bytes)',
           [Agent.MessageCount, Agent.TranscriptBytes]))
@@ -874,6 +1127,10 @@ begin
   end
   else if Cmd = '/memory' then
     ShowMemory
+  else if Cmd = '/rewind' then
+    DoRewind
+  else if Cmd = '/sessions' then
+    PickSession
   else if Cmd = '/init' then
   begin
     if FileExists(MemoryPath) then
@@ -930,7 +1187,25 @@ begin
   end
   else if Cmd = '/save' then
   begin
-    if Agent.SaveSession(SessionPath(uTools.RootDir), Err) then
+    { /save <name> makes a named copy the autosave never overwrites, which
+      is what turns one-session-per-directory into a collection: name the
+      current state, keep going, and /sessions offers it later. }
+    if Arg <> '' then
+    begin
+      for Sp := 1 to Length(Arg) do
+        if Arg[Sp] in ['\', '/', ':', '.', '"', '*', '?', '<', '>', '|'] then
+        begin
+          EmitCLn(clRed, '  a session name cannot contain path characters');
+          Exit;
+        end;
+      if Agent.SaveSession(IncludeTrailingPathDelimiter(uTools.RootDir) +
+        SessionDir + PathDelim + Arg + '.session.json', Err) then
+        EmitCLn(clGrey, Format('  saved %d messages as %s',
+          [Agent.MessageCount, Arg]))
+      else
+        EmitCLn(clRed, '  could not save: ' + Err);
+    end
+    else if Agent.SaveSession(SessionPath(uTools.RootDir), Err) then
       EmitCLn(clGrey, Format('  saved %d messages', [Agent.MessageCount]))
     else
       EmitCLn(clRed, '  could not save: ' + Err);
@@ -938,8 +1213,11 @@ begin
   else if Cmd = '/resume' then
   begin
     if Agent.LoadSession(SessionPath(uTools.RootDir), Err) then
+    begin
+      DropCheckpoints;
       EmitCLn(clGrey, Format('  resumed %d messages (%d turns)',
-        [Agent.MessageCount, Agent.TurnCount]))
+        [Agent.MessageCount, Agent.TurnCount]));
+    end
     else
       EmitCLn(clRed, '  could not resume: ' + Err);
   end
@@ -1297,6 +1575,7 @@ begin
           MdReset;
           if Agent.CompactWithSummary(Err) then
           begin
+            DropCheckpoints;
             MdFinish;
             AtLineStart := True;
             NeedNewLine;
@@ -1311,17 +1590,25 @@ begin
             EmitCLn(clYellow, '  (could not summarize: ' + Err + ')');
             Dropped := Agent.Compact(CompactKeepBytes);
             if Dropped > 0 then
+            begin
+              DropCheckpoints;
               EmitCLn(clGrey, Format('  (compacted: dropped %d older messages)',
                 [Dropped]));
+            end;
           end;
         end
         else if Agent.TranscriptBytes > CompactKeepBytes then
         begin
           Dropped := Agent.Compact(CompactKeepBytes);
           if Dropped > 0 then
+          begin
+            DropCheckpoints;
             EmitCLn(clGrey, Format('  (compacted: dropped %d older messages)',
               [Dropped]));
+          end;
         end;
+        { The moment before the turn runs is what /rewind returns to. }
+        RecordCheckpoint(Line);
         if not Agent.Send(Line, Err) then
         begin
           NeedNewLine;

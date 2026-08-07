@@ -69,9 +69,11 @@ contents are appended to the system prompt as binding instructions.
 | `/diff` | list the files this session has changed |
 | `/memory` | show the project memory (CLAUDE.md) |
 | `/init` | have the model write a CLAUDE.md for this project |
+| `/rewind` | undo turns: conversation and edited files |
+| `/sessions` | list saved sessions and resume one |
 | `/think [n]` | extended thinking: on, off, or a token budget |
 | `/resume` | reload the saved conversation |
-| `/save` | write the conversation now |
+| `/save [name]` | write the conversation now; a name makes a keepable copy |
 | `/cwd` | show the session root |
 | `/model [name]` | pick a model from a live list, or set one by name |
 | `/yolo` | approve every tool for the rest of the session |
@@ -84,6 +86,29 @@ question: `# prefer edit_file here` appends to CLAUDE.md (or AGENTS.md /
 and the next session starts knowing it. `/memory` shows the file; `/init`
 has the model explore the project and write a starter CLAUDE.md, through
 the ordinary write approval.
+
+Memory has a user level too: `%USERPROFILE%\.pasclaude\CLAUDE.md` follows
+you across projects and loads before the project's own files, so a project
+can override it - nearer wins. Inside any instruction file, a line that is
+`@import <path>` (or a bare `@path` alone on its line) is replaced by that
+file's contents, one level deep: enough for a shared conventions file,
+no room for a cycle. The imported path faces the same session-root guard
+as everything else; a refused path stays as literal text.
+
+`/rewind` undoes turns. Before each of your prompts runs, the transcript
+length is checkpointed, and before any `write_file`/`edit_file` touches a
+file its prior state is snapshotted in memory (up to 400 KB per file).
+Rewinding lists your turns, and picking one puts both the conversation and
+the files back to the moment before it - including deleting files that
+turn created. What cannot come back is named rather than glossed: shell
+commands are not undone, and oversized files are not snapshotted.
+Compaction, `/clear`, and resuming a session drop the checkpoints, because
+their message positions no longer describe the transcript.
+
+`/save <name>` keeps a named copy (`<name>.session.json`) the autosave
+never overwrites, and `/sessions` lists everything saved in the directory -
+the live session, the safety copy, and the named ones, with dates and
+sizes - and resumes whichever you pick.
 
 A slash command nobody built in is looked up in `.pasclaude\commands\`:
 `/shout loud words` reads `commands\shout.md` and sends its contents as the
