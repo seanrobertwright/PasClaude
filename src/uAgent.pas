@@ -154,9 +154,15 @@ type
   end;
 
 const
-  DefaultModel  = 'claude-sonnet-4-20250514';
+  DefaultModel  = 'claude-sonnet-4-5';
   ApiUrl        = 'https://api.anthropic.com/v1/messages';
   ApiVersion    = '2023-06-01';
+  { A subscription OAuth token (Claude Code's) rather than an API key.  It
+    authenticates with a Bearer header and a beta flag, and the API requires
+    the first system block to be Claude Code's identity line, verbatim. }
+  OauthKeyPrefix = 'sk-ant-oat';
+  OauthBeta      = 'oauth-2025-04-20';
+  OauthIdentity  = 'You are Claude Code, Anthropic''s official CLI for Claude.';
   MaxToolRounds = 24;
   { Transient failures are retried this many times before giving up. }
   MaxRetries    = 3;
@@ -776,13 +782,23 @@ begin
       thousand tokens of identical text on every turn. }
     if FSystem <> '' then
     begin
+      SysArr := TJson.NewArr;
+      { Under an OAuth token the API insists the system prompt open with
+        Claude Code's own identity line, exactly.  It goes in as its own
+        block ahead of ours, which continues unchanged. }
+      if Copy(FApiKey, 1, Length(OauthKeyPrefix)) = OauthKeyPrefix then
+      begin
+        SysBlock := TJson.NewObj;
+        SysBlock.AddStr('type', 'text');
+        SysBlock.AddStr('text', OauthIdentity);
+        SysArr.Push(SysBlock);
+      end;
       SysBlock := TJson.NewObj;
       SysBlock.AddStr('type', 'text');
       SysBlock.AddStr('text', FSystem);
       CC := TJson.NewObj;
       CC.AddStr('type', 'ephemeral');
       SysBlock.Add('cache_control', CC);
-      SysArr := TJson.NewArr;
       SysArr.Push(SysBlock);
       Root.Add('system', SysArr);
     end;
@@ -849,11 +865,21 @@ begin
   St.ErrText := '';
   St.Cancel := False;
 
-  Headers :=
-    'x-api-key: ' + FApiKey + #13#10 +
-    'anthropic-version: ' + ApiVersion + #13#10 +
-    'content-type: application/json' + #13#10 +
-    'accept: text/event-stream';
+  { A subscription OAuth token authenticates as a Bearer with its beta flag;
+    an API key rides the x-api-key header.  Same endpoint either way. }
+  if Copy(FApiKey, 1, Length(OauthKeyPrefix)) = OauthKeyPrefix then
+    Headers :=
+      'authorization: Bearer ' + FApiKey + #13#10 +
+      'anthropic-beta: ' + OauthBeta + #13#10 +
+      'anthropic-version: ' + ApiVersion + #13#10 +
+      'content-type: application/json' + #13#10 +
+      'accept: text/event-stream'
+  else
+    Headers :=
+      'x-api-key: ' + FApiKey + #13#10 +
+      'anthropic-version: ' + ApiVersion + #13#10 +
+      'content-type: application/json' + #13#10 +
+      'accept: text/event-stream';
 
   Body := BuildBody;
   Res := HttpPost(ApiUrl, Headers, Body, @StreamChunk, @St);

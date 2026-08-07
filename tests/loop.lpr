@@ -20,6 +20,7 @@ var
   { The scripted exchange. }
   Replies: array of string;   { response body per request, in order }
   Requests: array of string;  { what the agent actually sent }
+  ReqHeaders: array of string; { headers per request, in order }
   CallCount: Integer = 0;
   FailAfter: Integer = -1;    { when >= 0, the transport errors from this call }
   FailUntil: Integer = 0;     { ... up to and including this call number }
@@ -94,6 +95,8 @@ begin
 
   SetLength(Requests, Length(Requests) + 1);
   Requests[High(Requests)] := Body;
+  SetLength(ReqHeaders, Length(ReqHeaders) + 1);
+  ReqHeaders[High(ReqHeaders)] := Headers;
   Inc(CallCount);
 
   if (FailAfter >= 0) and (CallCount > FailAfter) and (CallCount <= FailUntil) then
@@ -181,6 +184,7 @@ procedure ResetScript;
 begin
   Replies := nil;
   Requests := nil;
+  ReqHeaders := nil;
   CallCount := 0;
   FailAfter := -1;
   FailUntil := 0;
@@ -1232,6 +1236,75 @@ begin
   end;
 end;
 
+{ A subscription OAuth token changes how a request authenticates and what
+  its system prompt opens with; everything else must stay identical. }
+procedure TestOauthRequestShape;
+var
+  A: TAgent;
+  Err: string;
+  Doc, Sys: TJson;
+begin
+  ResetScript;
+  uTools.RootDir := SessionDir;
+  SetLength(Replies, 1);
+  Replies[0] := TextReply('hi');
+
+  A := TAgent.Create('sk-ant-oat01-fake-token', 'm', 'sys prompt');
+  A.OnText := @CapText;
+  try
+    A.Send('hello', Err);
+    Check(Pos('authorization: Bearer sk-ant-oat01-fake-token',
+      ReqHeaders[0]) > 0, 'an OAuth token rides the Bearer header');
+    Check(Pos('x-api-key', ReqHeaders[0]) = 0,
+      'and not the x-api-key header');
+    Check(Pos('anthropic-beta: oauth', ReqHeaders[0]) > 0,
+      'with the oauth beta flag');
+
+    Doc := JsonParse(Requests[0]);
+    try
+      Sys := Doc.Find('system');
+      Check((Sys <> nil) and (Sys.Count = 2),
+        'the system prompt has two blocks under OAuth');
+      Check((Sys <> nil) and (Sys.Count = 2) and
+        (Pos('Claude Code', Sys.Item(0).Str('text')) > 0),
+        'the first is the identity line the API requires');
+      Check((Sys <> nil) and (Sys.Count = 2) and
+        (Sys.Item(1).Str('text') = 'sys prompt'),
+        'ours follows unchanged');
+      Check((Sys <> nil) and (Sys.Count = 2) and
+        (Sys.Item(1).Find('cache_control') <> nil),
+        'and still carries the cache breakpoint');
+    finally
+      Doc.Free;
+    end;
+  finally
+    A.Free;
+  end;
+
+  { An ordinary key is untouched by any of this. }
+  ResetScript;
+  SetLength(Replies, 1);
+  Replies[0] := TextReply('hi');
+  A := MakeAgent;
+  try
+    A.Send('hello', Err);
+    Check(Pos('x-api-key: k', ReqHeaders[0]) > 0,
+      'an API key still rides x-api-key');
+    Check(Pos('authorization', ReqHeaders[0]) = 0,
+      'with no Bearer header');
+    Doc := JsonParse(Requests[0]);
+    try
+      Sys := Doc.Find('system');
+      Check((Sys <> nil) and (Sys.Count = 1),
+        'and a single system block, as before');
+    finally
+      Doc.Free;
+    end;
+  finally
+    A.Free;
+  end;
+end;
+
 begin
   { Every request in this suite goes to the stand-in rather than the network. }
   uHttp.HttpTransport := @FakePost;
@@ -1260,6 +1333,7 @@ begin
   TestToolUseStreamingHooks;
   TestContextTokens;
   TestThinkingBudgetInRequest;
+  TestOauthRequestShape;
 
   WriteLn;
   if Fails = 0 then

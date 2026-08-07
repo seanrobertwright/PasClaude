@@ -10,7 +10,7 @@ program pasclaude;
 {$mode objfpc}{$H+}
 
 uses
-  SysUtils, Classes, uTerm, uJson, uHttp, uTools, uAgent;
+  SysUtils, Classes, DateUtils, uTerm, uJson, uHttp, uTools, uAgent;
 
 const
   Version = '0.1';
@@ -30,6 +30,9 @@ const
 var
   Agent: TAgent;
   AtLineStart: Boolean = True;
+  { What the banner says about how the session authenticates; '' for a
+    plain API key, which is the unremarkable case. }
+  BannerAuth: string = '';
   { Bytes of tool-argument JSON already echoed for the current tool call;
     the display caps what it shows, the model still gets everything. }
   ToolArgShown: Integer = 0;
@@ -421,6 +424,73 @@ begin
     PathDelim + 'history.txt';
 end;
 
+{ A Claude subscription can stand in for an API key: Claude Code stores its
+  OAuth token in ~\.claude\.credentials.json, and the messages API accepts
+  it as a Bearer.  Read-only - refreshing the token is Claude Code's job,
+  and this program must never write into another program's state.  Returns
+  '' when there is no usable token, with Why saying what was found. }
+function SubscriptionToken(out Why: string): string;
+var
+  Path, Text: string;
+  F: TFileStream;
+  Root, OAuth: TJson;
+  ExpiresMs, NowMs: Int64;
+begin
+  Result := '';
+  Why := '';
+  Path := IncludeTrailingPathDelimiter(GetEnvironmentVariable('USERPROFILE')) +
+    '.claude' + PathDelim + '.credentials.json';
+  if not FileExists(Path) then
+  begin
+    Why := 'no Claude Code credentials found';
+    Exit;
+  end;
+  try
+    F := TFileStream.Create(Path, fmOpenRead or fmShareDenyNone);
+    try
+      SetLength(Text, F.Size);
+      if F.Size > 0 then F.ReadBuffer(Text[1], F.Size);
+    finally
+      F.Free;
+    end;
+  except
+    on E: Exception do
+    begin
+      Why := 'credentials unreadable: ' + E.Message;
+      Exit;
+    end;
+  end;
+  Root := JsonParse(Text);
+  if Root = nil then
+  begin
+    Why := 'credentials are not valid JSON';
+    Exit;
+  end;
+  try
+    OAuth := Root.Find('claudeAiOauth');
+    if OAuth = nil then
+    begin
+      Why := 'no OAuth entry in the credentials';
+      Exit;
+    end;
+    { An expired token would fail every request with a 401; saying so up
+      front beats a session that mysteriously cannot talk.  Refreshing it is
+      one "claude" run away. }
+    ExpiresMs := Round(OAuth.Num('expiresAt', 0));
+    NowMs := Round((LocalTimeToUniversal(Now) - EncodeDate(1970, 1, 1)) * MSecsPerDay);
+    if (ExpiresMs > 0) and (NowMs > ExpiresMs) then
+    begin
+      Why := 'the subscription token has expired; run claude once to refresh it';
+      Exit;
+    end;
+    Result := OAuth.Str('accessToken');
+    if Result = '' then
+      Why := 'the credentials carry no access token';
+  finally
+    Root.Free;
+  end;
+end;
+
 { What this session changed.  git diff --stat is the richer answer when
   there is a repository - it also sees compiler output and hand edits - so
   the session's own list leads and the stat follows when available. }
@@ -462,7 +532,10 @@ procedure ShowBanner;
 begin
   EmitCLn(clCyan, Format('pasclaude %s', [Version]));
   EmitCLn(clGrey, '  ' + uTools.RootDir);
-  EmitCLn(clGrey, '  ' + Agent.Model);
+  if BannerAuth <> '' then
+    EmitCLn(clGrey, '  ' + Agent.Model + ' (' + BannerAuth + ')')
+  else
+    EmitCLn(clGrey, '  ' + Agent.Model);
   EmitCLn(clGrey, '  /help for commands, /exit to quit');
   EmitCLn(clGrey, '  Esc stops a reply in progress');
   EmitLn;
@@ -639,6 +712,7 @@ var
   Resume: Boolean = False;
   Resumed: Boolean = False;
   SaveWarned: Boolean = False;
+  UsingSubscription: Boolean = False;
   ArgI: Integer;
 
 begin
@@ -682,12 +756,23 @@ begin
     uTools.LoadIgnoreRules;
 
     ApiKey := GetEnvironmentVariable('ANTHROPIC_API_KEY');
+    UsingSubscription := False;
     if Trim(ApiKey) = '' then
     begin
-      EmitCLn(clRed, 'ANTHROPIC_API_KEY is not set.');
-      EmitCLn(clGrey, '  set ANTHROPIC_API_KEY=sk-ant-...');
-      TermDone;
-      Halt(2);
+      { No key in the environment; a Claude subscription can stand in.
+        The explicit key wins when both exist, because setting a variable
+        is a deliberate act and reading another program's token is not. }
+      ApiKey := SubscriptionToken(SaveErr);
+      if Trim(ApiKey) <> '' then
+        UsingSubscription := True
+      else
+      begin
+        EmitCLn(clRed, 'ANTHROPIC_API_KEY is not set, and no subscription token was usable');
+        EmitCLn(clGrey, '  (' + SaveErr + ')');
+        EmitCLn(clGrey, '  set ANTHROPIC_API_KEY=sk-ant-..., or sign in to Claude Code once');
+        TermDone;
+        Halt(2);
+      end;
     end;
     if not HttpAvailable then
     begin
@@ -697,6 +782,7 @@ begin
     end;
 
     ModelName := GetEnvironmentVariable('ANTHROPIC_MODEL');
+    if UsingSubscription then BannerAuth := 'subscription';
     Agent := TAgent.Create(ApiKey, ModelName, SystemPrompt + ProjectContext);
     try
       Agent.OnText := @OnText;

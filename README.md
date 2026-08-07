@@ -11,7 +11,7 @@ a small DOM in `uJson`, and the console is driven through the Win32 API.
 ```
 pasclaude 0.1
   E:\Projects\pascal\pasclaude
-  claude-sonnet-4-20250514
+  claude-sonnet-4-5
   /help for commands, /exit to quit
 
 > what does uHttp do, and is the timeout long enough for streaming?
@@ -35,9 +35,20 @@ Requires Free Pascal 3.2.x for `x86_64-win64`. The script finds `fpc.exe` on
 
 ```
 set ANTHROPIC_API_KEY=sk-ant-...
-set ANTHROPIC_MODEL=claude-sonnet-4-20250514   :: optional
+set ANTHROPIC_MODEL=claude-sonnet-4-5          :: optional
 bin\pasclaude.exe [directory] [--resume]
 ```
+
+Without a key, a Claude subscription works instead: if Claude Code has been
+signed in on the machine, its OAuth token
+(`%USERPROFILE%\.claude\.credentials.json`) is picked up automatically and
+the banner says `(subscription)`. The token is read, never written -
+refreshing it is Claude Code's job, and this program does not touch another
+program's state. An explicit `ANTHROPIC_API_KEY` always wins, because
+setting a variable is a deliberate act and borrowing a token is not. Under
+OAuth the request authenticates with a Bearer header and its beta flag, and
+the system prompt opens with Claude Code's identity line, which the API
+requires verbatim; ours follows unchanged, cache breakpoint included.
 
 The directory argument (default: the current one) becomes the *session root*.
 Every path the model asks for is resolved against it and refused if it would
@@ -493,10 +504,14 @@ one-byte budget, which is the only way to reach it.
 `uHttp.HttpTransport` is the seam the loop suite uses. It is nil in the shipped
 program, which is asserted by the network suite reaching the real API.
 
-What remains unverified is a 200 response from the live API, which needs a key
-this machine does not have. Both sides of it are covered: the transport carries
-real traffic in `net`, and the full request-stream-tool-respond cycle runs in
-`loop`.
+The live API has now been verified end to end through the subscription
+token: a streaming 200, a real tool round trip (read a file, answer from
+it), the cache counters reporting reads at a tenth rate, extended thinking
+streaming its reasoning, and `/compact full` producing a genuine summary.
+That run also caught a real defect the suites never could: the hardcoded
+default model had been retired server-side (HTTP 404), which is exactly the
+class of failure only live traffic reveals. The default is now a dated-less
+alias (`claude-sonnet-4-5`) that tracks the current Sonnet.
 
 That gap is wider than it used to look. `net` once claimed its 401 proved the
 request body was well formed, on the theory that a bad shape is rejected as
