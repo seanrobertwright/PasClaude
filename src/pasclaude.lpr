@@ -386,6 +386,8 @@ begin
     '- Investigate before you act: read the relevant files rather than ' +
     'guessing at their contents.' + #10 +
     '- Prefer edit_file over write_file when changing an existing file.' + #10 +
+    '- Jupyter notebooks (.ipynb) read back as numbered cells; change them ' +
+    'with notebook_edit, not edit_file.' + #10 +
     '- Shell commands run through cmd.exe, so use Windows syntax.' + #10 +
     '- After changing code, build or test it if there is an obvious way to ' +
     'do so, and fix what you broke.' + #10 +

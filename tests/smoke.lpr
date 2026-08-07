@@ -24,7 +24,7 @@ end;
 procedure TestJson;
 var
   J, K: TJson;
-  Err: string;
+  Err, Nb, Want: string;
 begin
   J := JsonParse('{"a":1,"b":[true,null,"x\ny"],"c":{"d":-2.5e1}}', Err);
   Check(J <> nil, 'parses a nested document');
@@ -58,6 +58,74 @@ begin
   J := JsonParse('"\ud83d\ude00"', Err);
   Check((J <> nil) and (Length(J.AsString) = 4), 'joins a surrogate pair into UTF-8');
   J.Free;
+
+  { SetAt replaces a value where it stands.  Implementing it as Drop-then-Add
+    would move the key to the end, which is why the position is asserted as
+    well as the value; the discarded child must also be freed, and -gh is what
+    checks that. }
+  J := JsonParse('{"a":1,"b":2,"c":3}', Err);
+  try
+    J.SetAt(J.IndexOf('b'), TJson.NewStr('z'));
+    Check(J.Str('b') = 'z', 'SetAt replaces a value');
+    Check(J.Key(1) = 'b', 'SetAt leaves the key where it was');
+    Check(J.ToJson = '{"a":1,"b":"z","c":3}', 'and the field order with it');
+  finally
+    J.Free;
+  end;
+
+  J := JsonParse('["a","b","c"]', Err);
+  try
+    J.InsertAt(1, TJson.NewStr('x'));
+    Check((J.Count = 4) and (J.Item(0).AsString = 'a') and
+          (J.Item(1).AsString = 'x') and (J.Item(2).AsString = 'b'),
+      'InsertAt shifts the element it inserts before');
+    J.InsertAt(99, TJson.NewStr('tail'));
+    Check(J.Item(J.Count - 1).AsString = 'tail', 'an index past the end appends');
+    J.InsertAt(0, TJson.NewStr('head'));
+    Check(J.Item(0).AsString = 'head', 'and index 0 prepends');
+  finally
+    J.Free;
+  end;
+
+  { The exact bytes matter, not merely the shape: this is what Python's
+    json.dumps(indent=1, sort_keys=True, separators=(',', ': ')) emits, which
+    is what nbformat writes.  Any drift - two-space indent, ':' without the
+    space, empty containers expanded - turns every future notebook write into
+    a whole-file git diff, and only a character-for-character assertion sees
+    it happen. }
+  Nb := '{"cells":[{"cell_type":"code","execution_count":null,"id":"a1",' +
+        '"metadata":{},"outputs":[],"source":["print(1)\n"]}],' +
+        '"metadata":{},"nbformat":4,"nbformat_minor":5}';
+  Want :=
+    '{'#10 +
+    ' "cells": ['#10 +
+    '  {'#10 +
+    '   "cell_type": "code",'#10 +
+    '   "execution_count": null,'#10 +
+    '   "id": "a1",'#10 +
+    '   "metadata": {},'#10 +
+    '   "outputs": [],'#10 +
+    '   "source": ['#10 +
+    '    "print(1)\n"'#10 +
+    '   ]'#10 +
+    '  }'#10 +
+    ' ],'#10 +
+    ' "metadata": {},'#10 +
+    ' "nbformat": 4,'#10 +
+    ' "nbformat_minor": 5'#10 +
+    '}';
+  J := JsonParse(Nb, Err);
+  try
+    Check(J.ToJsonPretty(True) = Want,
+      'ToJsonPretty matches nbformat''s layout byte for byte');
+    { Legible is not enough: the output has to still be JSON carrying the same
+      values, or a pretty writer that eats a separator ships unnoticed. }
+    K := JsonParse(J.ToJsonPretty(True), Err);
+    Check((K <> nil) and (K.ToJson = J.ToJson), 'the pretty form reparses equal');
+    K.Free;
+  finally
+    J.Free;
+  end;
 end;
 
 function Run(const Name: string; Input: TJson; out IsErr: Boolean): string;
@@ -199,9 +267,11 @@ end;
 
 procedure TestTools;
 var
-  Dir, Out_: string;
+  Dir, Out_, Nb, Before: string;
   IsErr: Boolean;
-  J, Sch: TJson;
+  I: Integer;
+  J, Sch, Tool, Req: TJson;
+  L: TStringList;
 begin
   Dir := IncludeTrailingPathDelimiter(GetTempDir) + 'pasclaude-test';
   ForceDirectories(Dir);
@@ -326,6 +396,46 @@ begin
   Out_ := Run('write_file', J, IsErr);
   Check(IsErr and (Pos('denied', Out_) > 0), 'writes are denied without approval');
 
+  { Same story for a notebook: the gate is the one edit_file uses, so a nil
+    Ask must refuse and the file must be exactly as it was.  An arm that
+    writes first and asks afterwards passes every other assertion here. }
+  Nb := IncludeTrailingPathDelimiter(Dir) + 'n.ipynb';
+  Before := '{"cells":[{"cell_type":"code","execution_count":null,' +
+            '"metadata":{},"outputs":[],"source":["x=1\n"]}],' +
+            '"metadata":{},"nbformat":4,"nbformat_minor":4}';
+  L := TStringList.Create;
+  try
+    L.Text := Before;
+    L.SaveToFile(Nb);
+  finally
+    L.Free;
+  end;
+  Before := '';
+  L := TStringList.Create;
+  try
+    L.LoadFromFile(Nb);
+    Before := L.Text;
+  finally
+    L.Free;
+  end;
+
+  J := TJson.NewObj;
+  J.AddStr('path', 'n.ipynb');
+  J.AddNum('cell', 0);
+  J.AddStr('edit_mode', 'replace');
+  J.AddStr('source', 'x=2');
+  Out_ := Run('notebook_edit', J, IsErr);
+  Check(IsErr and (Pos('denied', Out_) > 0),
+    'notebook edits are denied without approval: ' + Out_);
+  L := TStringList.Create;
+  try
+    L.LoadFromFile(Nb);
+    Check(L.Text = Before, 'and the notebook is untouched after a denial');
+  finally
+    L.Free;
+  end;
+  uTools.AllowAllEdits := True;
+
   J := TJson.NewObj;
   J.AddStr('path', 'x');
   Out_ := Run('no_such_tool', J, IsErr);
@@ -334,7 +444,24 @@ begin
   { The caller owns the schema, so it is freed here rather than leaked. }
   Sch := ToolsSchema;
   try
-    Check(Sch.Count = 8, 'the schema exposes eight tools');
+    Check(Sch.Count = 9, 'the schema exposes nine tools');
+    { A tool that exists in RunTool but not in the schema is one the model
+      never learns about, and no other test would notice. }
+    Tool := nil;
+    for I := 0 to Sch.Count - 1 do
+      if Sch.Item(I).Str('name') = 'notebook_edit' then Tool := Sch.Item(I);
+    Check(Tool <> nil, 'notebook_edit is declared to the model');
+    if Tool <> nil then
+    begin
+      Req := Tool.Find('input_schema').Find('required');
+      Check((Req.Count = 3) and (Req.Item(0).AsString = 'path') and
+            (Req.Item(1).AsString = 'cell') and
+            (Req.Item(2).AsString = 'edit_mode'),
+        'notebook_edit requires path, cell and edit_mode');
+      Check(Tool.Find('input_schema').Find('properties').Find('cell')
+              .Str('type') = 'integer',
+        'and declares cell as an integer, not a string');
+    end;
   finally
     Sch.Free;
   end;

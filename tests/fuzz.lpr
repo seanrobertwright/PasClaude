@@ -42,6 +42,18 @@ begin
   end;
 end;
 
+procedure WriteFileText(const Full, Text: string);
+var
+  F: TFileStream;
+begin
+  F := TFileStream.Create(Full, fmCreate);
+  try
+    if Text <> '' then F.WriteBuffer(Text[1], Length(Text));
+  finally
+    F.Free;
+  end;
+end;
+
 function RunTool(const Name: string; Input: TJson; out IsErr: Boolean): string;
 begin
   Result := uTools.RunTool(Name, Input, nil, IsErr);
@@ -464,6 +476,169 @@ begin
     'and the binary file is skipped rather than quoted');
 end;
 
+{ ----------------------------------------------------------- notebooks -- }
+
+{ A notebook is the one file the model reads through a parser, which makes it
+  the one file where a parse failure can turn into a write.  Everything here
+  asks the same question in a different way: when the document is not what the
+  code expected, does the user's file survive? }
+procedure TestNotebookHostileInput;
+var
+  J: TJson;
+  Out_, Path, Before, Big: string;
+  IsErr: Boolean;
+
+  { Every failing case must leave the file exactly as it was.  A branch that
+    writes a valid-but-empty document over a damaged notebook destroys the
+    only copy of what the user was trying to recover. }
+  procedure Unchanged(const What: string);
+  var
+    L: TStringList;
+  begin
+    L := TStringList.Create;
+    try
+      L.LoadFromFile(Path);
+      Check(L.Text = Before, What);
+    finally
+      L.Free;
+    end;
+  end;
+
+  procedure Snap;
+  var
+    L: TStringList;
+  begin
+    L := TStringList.Create;
+    try
+      L.LoadFromFile(Path);
+      Before := L.Text;
+    finally
+      L.Free;
+    end;
+  end;
+
+  function Edit(const Mode: string; Cell: Integer;
+    const Source: string; WithSource: Boolean = True): string;
+  begin
+    J := TJson.NewObj;
+    J.AddStr('path', 'hostile.ipynb');
+    J.AddNum('cell', Cell);
+    J.AddStr('edit_mode', Mode);
+    if WithSource then J.AddStr('source', Source);
+    Result := RunTool('notebook_edit', J, IsErr);
+  end;
+
+begin
+  uTools.RootDir := SessionDir;
+  uTools.AllowAllEdits := True;
+  Path := IncludeTrailingPathDelimiter(SessionDir) + 'hostile.ipynb';
+
+  { Truncated JSON.  read_file must still show the bytes - that file is what
+    the model has to repair - while notebook_edit must refuse it by name. }
+  WriteFileText(Path, '{"cells":[{"cell_type":"code","source":["x=1');
+  Snap;
+  J := TJson.NewObj;
+  J.AddStr('path', 'hostile.ipynb');
+  Out_ := RunTool('read_file', J, IsErr);
+  Check((not IsErr) and (Pos('x=1', Out_) > 0),
+    'read_file falls back to the raw text of a corrupt notebook');
+  Check(Pos('did not read as a notebook', Out_) > 0, 'and says why');
+  Out_ := Edit('replace', 0, 'x=2');
+  Check(IsErr and (Pos('not a valid notebook', Out_) > 0),
+    'notebook_edit refuses a corrupt notebook: ' + Out_);
+  Unchanged('and leaves the damaged file exactly as it was');
+
+  { The defect the whole feature exists to prevent: a megabyte of base64
+    reaching the context because something rendered the data bundle. }
+  Big := StringOfChar('Q', 1024 * 1024);
+  WriteFileText(Path,
+    '{"cells":[{"cell_type":"code","execution_count":1,"metadata":{},' +
+    '"outputs":[{"output_type":"display_data","data":{"image/png":"' + Big +
+    '"},"metadata":{}}],"source":["plot()"]}],"metadata":{},' +
+    '"nbformat":4,"nbformat_minor":5}');
+  J := TJson.NewObj;
+  J.AddStr('path', 'hostile.ipynb');
+  Out_ := RunTool('read_file', J, IsErr);
+  Check(Length(Out_) < 64 * 1024,
+    'a megabyte of output data does not reach the model: ' +
+    IntToStr(Length(Out_)) + ' bytes');
+  Check(Pos(StringOfChar('Q', 1000), Out_) = 0,
+    'and no run of the payload appears at all');
+  Check(IsValidUtf8(Out_), 'the notebook view is valid UTF-8');
+  Check(Pos('image/png', Out_) > 0, 'while the output is still named');
+
+  { Each of these must name the problem rather than guess at an intention:
+    a clamped index edits a cell the user never approved, an unknown mode
+    treated as replace edits one they did not ask about at all. }
+  WriteFileText(Path,
+    '{"cells":[{"cell_type":"code","source":["a"]},' +
+    '{"cell_type":"code","source":["b"]}],"metadata":{},' +
+    '"nbformat":4,"nbformat_minor":5}');
+  Snap;
+  Out_ := Edit('replace', 99, 'x');
+  Check(IsErr and (Pos('out of range', Out_) > 0) and (Pos('0..1', Out_) > 0),
+    'an out-of-range cell names the valid range: ' + Out_);
+  Unchanged('and changes nothing');
+  Out_ := Edit('frobnicate', 0, 'x');
+  Check(IsErr and (Pos('replace, insert or delete', Out_) > 0),
+    'an unknown edit_mode is refused: ' + Out_);
+  Unchanged('and changes nothing either');
+  Out_ := Edit('replace', 0, '', False);
+  Check(IsErr and (Pos('source is required', Out_) > 0),
+    'a replace with no source is refused: ' + Out_);
+  Unchanged('and still changes nothing');
+
+  { v3 kept its cells inside worksheets.  Accepting one and writing it back
+    as v4 would silently destroy the file's structure. }
+  WriteFileText(Path,
+    '{"worksheets":[{"cells":[]}],"metadata":{},"nbformat":3,' +
+    '"nbformat_minor":0}');
+  Snap;
+  Out_ := Edit('replace', 0, 'x');
+  Check(IsErr and (Pos('nbformat 3', Out_) > 0),
+    'an nbformat 3 notebook is refused by version: ' + Out_);
+  Unchanged('and is not rewritten as v4');
+
+  { The path guard, which a hand-copied branch is exactly one omitted line
+    away from skipping. }
+  J := TJson.NewObj;
+  J.AddStr('path', '..\escape.ipynb');
+  J.AddNum('cell', 0);
+  J.AddStr('edit_mode', 'insert');
+  J.AddStr('source', 'x');
+  Out_ := RunTool('notebook_edit', J, IsErr);
+  Check(IsErr and (Pos('escapes', Out_) > 0),
+    'notebook_edit cannot walk out of the session root: ' + Out_);
+  Check(not FileExists(ExtractFilePath(ExcludeTrailingPathDelimiter(SessionDir)) +
+    'escape.ipynb'), 'and no file appears outside it');
+
+  J := TJson.NewObj;
+  J.AddStr('path', '.pasclaude\x.ipynb');
+  J.AddNum('cell', 0);
+  J.AddStr('edit_mode', 'insert');
+  J.AddStr('source', 'x');
+  Out_ := RunTool('notebook_edit', J, IsErr);
+  Check(IsErr and (Pos('session state', Out_) > 0),
+    'nor into pasclaude''s own state directory: ' + Out_);
+  Check(not FileExists(IncludeTrailingPathDelimiter(SessionDir) +
+    '.pasclaude\x.ipynb'), 'and writes nothing there');
+
+  { Invalid UTF-8 in a .ipynb.  One bad byte in a tool result makes the API
+    reject the entire turn, so the failure would look nothing like a notebook
+    bug when it arrived. }
+  WriteRaw('hostile.ipynb', [$7B, $22, $63, $65, $6C, $6C, $73, $22, $3A,
+    $FF, $FE, $5D, $7D]);
+  Snap;
+  J := TJson.NewObj;
+  J.AddStr('path', 'hostile.ipynb');
+  Out_ := RunTool('read_file', J, IsErr);
+  Check(IsValidUtf8(Out_), 'read_file on a non-UTF-8 .ipynb returns valid UTF-8');
+  Out_ := Edit('replace', 0, 'x');
+  Check(IsErr and IsValidUtf8(Out_),
+    'and notebook_edit refuses it with a valid-UTF-8 message: ' + Out_);
+  Unchanged('leaving the bytes alone');
+end;
+
 begin
   TestBinaryFileDoesNotCorruptBody;
   TestNulByteIsEscaped;
@@ -473,6 +648,7 @@ begin
   TestToolOutputCannotForgeProtocol;
   TestShellOutputIsUtf8;
   TestHostileRegex;
+  TestNotebookHostileInput;
 
   WriteLn;
   if Fails = 0 then

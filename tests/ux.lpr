@@ -12,7 +12,7 @@ program ux;
 
 {$mode objfpc}{$H+}
 
-uses SysUtils, Classes, uJson, uDiff, uTools, uAgent, uTerm;
+uses SysUtils, Classes, uJson, uDiff, uTools, uAgent, uTerm, uNotebook;
 
 var
   Fails: Integer = 0;
@@ -1382,6 +1382,244 @@ begin
   uTools.AllowAllEdits := False;
 end;
 
+{ --------------------------------------------------------------- notebook -- }
+
+{ The two-cell fixture, written in the exact layout nbformat produces, so
+  "the writer is a fixed point" is a claim about real files rather than about
+  our own output fed back to us.  Png is the image payload, so the same
+  fixture serves the round-trip test with eight bytes and the output-summary
+  test with forty kilobytes. }
+function NotebookFixture(const Png: string; Minor: Integer): string;
+begin
+  Result :=
+    '{'#10 +
+    ' "cells": ['#10 +
+    '  {'#10 +
+    '   "cell_type": "code",'#10 +
+    '   "execution_count": 3,'#10;
+  if Minor >= 5 then
+    Result := Result + '   "id": "cell-zero",'#10;
+  Result := Result +
+    '   "metadata": {},'#10 +
+    '   "outputs": [],'#10 +
+    '   "source": ['#10 +
+    '    "x = 1\n",'#10 +
+    '    "print(x)"'#10 +
+    '   ]'#10 +
+    '  },'#10 +
+    '  {'#10 +
+    '   "cell_type": "code",'#10 +
+    '   "execution_count": 7,'#10;
+  if Minor >= 5 then
+    Result := Result + '   "id": "cell-one",'#10;
+  Result := Result +
+    '   "metadata": {},'#10 +
+    '   "outputs": ['#10 +
+    '    {'#10 +
+    '     "data": {'#10 +
+    '      "image/png": "' + Png + '",'#10 +
+    '      "text/plain": "<Figure size 640x480>"'#10 +
+    '     },'#10 +
+    '     "metadata": {},'#10 +
+    '     "output_type": "display_data"'#10 +
+    '    }'#10 +
+    '   ],'#10 +
+    '   "source": ['#10 +
+    '    "plot(x)"'#10 +
+    '   ]'#10 +
+    '  }'#10 +
+    ' ],'#10 +
+    ' "metadata": {'#10 +
+    '  "kernelspec": {'#10 +
+    '   "display_name": "Python 3",'#10 +
+    '   "language": "python",'#10 +
+    '   "name": "python3"'#10 +
+    '  }'#10 +
+    ' },'#10 +
+    ' "nbformat": 4,'#10 +
+    ' "nbformat_minor": ' + IntToStr(Minor) + #10 +
+    '}'#10;
+end;
+
+function NbEdit(const Path, Mode: string; Cell: Integer;
+  const Source, CellType: string; out IsErr: Boolean): string;
+var
+  Input: TJson;
+begin
+  Input := TJson.NewObj;
+  Input.AddStr('path', Path);
+  Input.AddNum('cell', Cell);
+  Input.AddStr('edit_mode', Mode);
+  if Mode <> 'delete' then Input.AddStr('source', Source);
+  if CellType <> '' then Input.AddStr('cell_type', CellType);
+  Result := uTools.RunTool('notebook_edit', Input, nil, IsErr);
+  Input.Free;
+end;
+
+procedure TestNotebook;
+var
+  Input, Doc, Cells, C: TJson;
+  IsErr: Boolean;
+  Path, Out_, View, Err, Before, Big, Preview: string;
+  Snaps: Integer;
+  Changed: TStringArray;
+  I: Integer;
+  Found: Boolean;
+begin
+  WriteLn('-- notebook --');
+  uTools.AllowAllEdits := True;
+  Path := IncludeTrailingPathDelimiter(TmpRoot) + 'nb.ipynb';
+
+  { The canonical form of a canonical file is itself.  A trailing newline
+    written twice or not at all, or CRLF instead of LF, all show up here -
+    and each of them would make a no-op edit dirty the file in git. }
+  Before := NotebookFixture('QUJDRA==', 5);
+  Check(NotebookCanonical(Before, Out_, Err) and (Out_ = Before),
+    'the writer is a fixed point on an nbformat-written file: ' + Err);
+
+  WriteFileText(Path, Before);
+  uTools.ClearChangedFiles;
+  uTools.ClearSnapshots;
+  uTools.BeginTurn(1);
+  Snaps := uTools.SnapshotCount;
+
+  Out_ := NbEdit('nb.ipynb', 'replace', 0, 'x = 2'#10'print(x + 1)', '', IsErr);
+  Check(not IsErr, 'notebook_edit replaces a cell source: ' + Out_);
+
+  { Everything the edit did not name has to survive verbatim.  A cell rebuilt
+    from the fields the code happens to know about loses ids and custom
+    metadata, and a replace that clears outputs destroys the user's plot -
+    each shows up below as one specific field that no longer matches. }
+  Doc := JsonParse(ReadFileText(Path), Err);
+  Check(Doc <> nil, 'the rewritten notebook still parses: ' + Err);
+  if Doc <> nil then
+  try
+    Cells := Doc.Find('cells');
+    Check(Doc.Num('nbformat', 0) = 4, 'nbformat survives');
+    Check(Doc.Num('nbformat_minor', 0) = 5, 'nbformat_minor survives');
+    Check(Doc.Find('metadata').Find('kernelspec').Str('name') = 'python3',
+      'the kernelspec survives');
+    Check(Cells.Count = 2, 'the cell count is unchanged');
+    C := Cells.Item(1);
+    Check(C.Str('id') = 'cell-one', 'the untouched cell keeps its id');
+    Check(C.Num('execution_count', 0) = 7,
+      'and its execution_count');
+    Check(C.Find('outputs').Item(0).Find('data').Str('image/png') = 'QUJDRA==',
+      'and its output data');
+    C := Cells.Item(0);
+    Check(C.Str('id') = 'cell-zero', 'the edited cell keeps its id too');
+    Check(C.Num('execution_count', 0) = 3,
+      'and its execution_count: a source change is not a re-run');
+    Check((C.Find('source').Count = 2) and
+          (C.Find('source').Item(0).AsString = 'x = 2'#10) and
+          (C.Find('source').Item(1).AsString = 'print(x + 1)'),
+      'and carries the new source as lines');
+  finally
+    Doc.Free;
+  end;
+
+  { The wiring that makes an edit visible to /diff and undoable by /rewind.
+    Neither changes the file, so nothing else here would catch their loss. }
+  Check(uTools.SnapshotCount = Snaps + 1, 'the edit took a snapshot');
+  Changed := uTools.ChangedFiles;
+  Found := False;
+  for I := 0 to High(Changed) do
+    if Changed[I] = 'nb.ipynb' then Found := True;
+  Check(Found, 'and the notebook is listed as changed');
+
+  { A replace with the source the cell already has must leave the bytes alone,
+    which is the same fixed-point claim, now through the whole tool path. }
+  Before := ReadFileText(Path);
+  Out_ := NbEdit('nb.ipynb', 'replace', 0, 'x = 2'#10'print(x + 1)', '', IsErr);
+  Check((not IsErr) and (ReadFileText(Path) = Before),
+    'a no-op replace leaves the file byte-identical');
+
+  { The view: cells legible, outputs named and measured, payload absent.
+    Forty kilobytes of base64 is what the whole feature exists to keep out of
+    the context, so the assertion is that no long run of it appears at all. }
+  Big := StringOfChar('A', 40000);
+  Check(NotebookView(NotebookFixture(Big, 5), View, Err),
+    'the view renders a notebook with a big output: ' + Err);
+  Check(Pos('== cell 1 (code', View) > 0, 'cells are numbered and typed');
+  Check(Pos('plot(x)', View) > 0, 'the source is shown verbatim');
+  Check(Pos('image/png', View) > 0, 'the output mime type is named');
+  Check(Pos(' KB)', View) > 0, 'with its size');
+  Check(Pos('<Figure size 640x480>', View) > 0, 'text/plain is shown');
+  Check(Pos(StringOfChar('A', 200), View) = 0,
+    'and no run of the payload reaches the view');
+  Check(Length(View) < 4096, 'the whole view stays small: ' +
+    IntToStr(Length(View)) + ' bytes');
+
+  { The permission prompt.  Without a ChangePreview arm the user is asked to
+    approve a bare tool name, and without a DescribeTool arm the title is the
+    word "notebook_edit" - neither of which any other assertion notices. }
+  Input := TJson.NewObj;
+  Input.AddStr('path', 'nb.ipynb');
+  Input.AddNum('cell', 0);
+  Input.AddStr('edit_mode', 'replace');
+  Input.AddStr('source', 'x = 99');
+  Preview := uTools.ChangePreview('notebook_edit', Input);
+  Out_ := uTools.DescribeTool('notebook_edit', Input);
+  Input.Free;
+  Check(Pos('- x = 2', Preview) > 0, 'the preview shows the old source removed');
+  Check(Pos('+ x = 99', Preview) > 0, 'and the new source added');
+  Check(Pos(StringOfChar('A', 200), Preview) = 0, 'and carries no payload');
+  Check((Pos('replace', Out_) > 0) and (Pos('cell 0', Out_) > 0),
+    'the prompt title names the mode and the cell: ' + Out_);
+
+  { Insert and delete.  The inserted cell must carry what the v4 schema makes
+    mandatory, an id only where the minor version allows one, and the pair of
+    operations must cancel exactly. }
+  Before := ReadFileText(Path);
+  Out_ := NbEdit('nb.ipynb', 'insert', 1, 'y = 2', 'code', IsErr);
+  Check(not IsErr, 'a cell can be inserted: ' + Out_);
+  Doc := JsonParse(ReadFileText(Path), Err);
+  if Doc <> nil then
+  try
+    Cells := Doc.Find('cells');
+    C := Cells.Item(1);
+    Check(Cells.Count = 3, 'the notebook gained a cell');
+    Check(C.Find('source').Item(0).AsString = 'y = 2',
+      'the new cell sits at the requested index carrying the given source');
+    Check((C.Find('metadata') <> nil) and (C.Find('metadata').Count = 0),
+      'with empty metadata');
+    Check((C.Find('outputs') <> nil) and (C.Find('outputs').Kind = jkArr) and
+          (C.Find('outputs').Count = 0), 'an empty outputs array');
+    Check((C.Find('execution_count') <> nil) and
+          (C.Find('execution_count').Kind = jkNull),
+      'and a null execution_count, both of which v4 requires');
+    Check((C.Str('id') <> '') and (C.Str('id') <> 'cell-zero') and
+          (C.Str('id') <> 'cell-one'),
+      'plus an id distinct from every existing one at nbformat_minor 5');
+  finally
+    Doc.Free;
+  end;
+  Out_ := NbEdit('nb.ipynb', 'delete', 1, '', '', IsErr);
+  Check((not IsErr) and (ReadFileText(Path) = Before),
+    'and deleting it returns the file to its exact previous bytes');
+
+  { 4.0 through 4.4 forbid the id field, so emitting one always is as wrong
+    as never emitting it. }
+  WriteFileText(Path, NotebookFixture('QUJDRA==', 4));
+  Out_ := NbEdit('nb.ipynb', 'insert', 0, 'z = 3', 'markdown', IsErr);
+  Check(not IsErr, 'insert works on a 4.4 notebook: ' + Out_);
+  Doc := JsonParse(ReadFileText(Path), Err);
+  if Doc <> nil then
+  try
+    C := Doc.Find('cells').Item(0);
+    Check(C.IndexOf('id') < 0, 'and adds no id where the schema forbids it');
+    Check(C.Str('cell_type') = 'markdown', 'honouring cell_type');
+    Check(C.IndexOf('outputs') < 0,
+      'a markdown cell gets no outputs array, which would be invalid');
+  finally
+    Doc.Free;
+  end;
+
+  uTools.ClearSnapshots;
+  uTools.ClearChangedFiles;
+  uTools.AllowAllEdits := False;
+end;
+
 { -------------------------------------------------------------- gitignore -- }
 
 procedure TestGitignore;
@@ -1814,6 +2052,7 @@ begin
     TestEditor;
     TestMentions;
     TestMultiEdit;
+    TestNotebook;
     TestGitignore;
     TestWalkDepth;
     TestMarkdown;

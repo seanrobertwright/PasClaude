@@ -57,11 +57,35 @@ type
     { Removes and frees the child at index I. }
     procedure Drop(I: Integer);
 
+    { Index of Name, or -1 when absent.  Exposed so a caller can replace a
+      value in place instead of rebuilding the object around it.  The parameter
+      is not called Key because the Key method above already owns that name in
+      this scope. }
+    function IndexOf(const Name: string): Integer;
+
+    { Replaces the child at I: the old one is freed, Value is owned from here.
+      The key at I is untouched, so an object keeps its field order - rewriting
+      a document must not reshuffle fields nobody asked about. }
+    procedure SetAt(I: Integer; Value: TJson);
+
+    { Inserts Value before index I, appending when I is past the end.  Takes
+      ownership.  Named InsertAt, not Insert, so it cannot shadow System.Insert
+      inside this unit's own methods. }
+    procedure InsertAt(I: Integer; Value: TJson);
+
     function AsString: string;                        { for jkStr/jkNum/jkBool }
     function AsNumber: Double;
     function AsBoolean: Boolean;
 
     function ToJson: string;
+
+    { Serialises with one space of indent per level and ": " after each key,
+      optionally with object keys in alphabetical order.  ToJson's compact form
+      is right for a request body; a file that git and a human will read wants
+      line structure, and Jupyter's own writer emits exactly this shape - so a
+      notebook we rewrite differs from the original only where we changed it. }
+    function ToJsonPretty(SortKeys: Boolean = False): string;
+
     property Kind: TJsonKind read FKind;
   end;
 
@@ -160,6 +184,16 @@ begin
   Result := nil;
 end;
 
+function TJson.IndexOf(const Name: string): Integer;
+var
+  I: Integer;
+begin
+  for I := 0 to High(FKeys) do
+    if FKeys[I] = Name then
+      Exit(I);
+  Result := -1;
+end;
+
 function TJson.Str(const Key: string; const Def: string): string;
 var
   V: TJson;
@@ -245,6 +279,41 @@ begin
   end;
   SetLength(FItems, Length(FItems) - 1);
   SetLength(FKeys, Length(FKeys) - 1);
+end;
+
+procedure TJson.SetAt(I: Integer; Value: TJson);
+begin
+  { Ownership passed at the call, so an out-of-range index frees Value rather
+    than dropping it on the floor: a silent no-op here would be an unfreed
+    block, and the suites build with -gh. }
+  if (I < 0) or (I > High(FItems)) then
+  begin
+    Value.Free;
+    Exit;
+  end;
+  if FItems[I] = Value then Exit;
+  FItems[I].Free;
+  FItems[I] := Value;
+end;
+
+procedure TJson.InsertAt(I: Integer; Value: TJson);
+var
+  J, N: Integer;
+begin
+  N := Length(FItems);
+  if I < 0 then I := 0;
+  if I > N then I := N;
+  SetLength(FItems, N + 1);
+  SetLength(FKeys, N + 1);
+  for J := N downto I + 1 do
+  begin
+    FItems[J] := FItems[J - 1];
+    FKeys[J] := FKeys[J - 1];
+  end;
+  FItems[I] := Value;
+  { An inserted element is an array element; objects grow through Add, which
+    is the only place a key is meaningful. }
+  FKeys[I] := '';
 end;
 
 function TJson.AsString: string;
@@ -343,6 +412,73 @@ begin
         Result := Result + '}';
       end;
   end;
+end;
+
+type
+  TIndexArray = array of Integer;
+
+{ The order the children of J should be written in, as an index permutation.
+  Sorting an object's keys is what makes two writers agree on a document:
+  Jupyter's own writer sorts, so a notebook we rewrite differs from the file
+  it came from only where the edit landed.  Insertion sort keeps it stable,
+  so duplicate keys - legal JSON, however unwise - keep their relative
+  order instead of shuffling on every save. }
+function KeyOrder(J: TJson; Sort: Boolean): TIndexArray;
+var
+  I, K, V: Integer;
+begin
+  SetLength(Result, J.Count);
+  for I := 0 to J.Count - 1 do
+    Result[I] := I;
+  if not (Sort and (J.Kind = jkObj)) then Exit;
+  for I := 1 to High(Result) do
+  begin
+    V := Result[I];
+    K := I - 1;
+    { CompareStr, not '>': the operator can be locale-aware, and the order has
+      to be byte order to agree with a writer that sorts by code point. }
+    while (K >= 0) and (CompareStr(J.Key(Result[K]), J.Key(V)) > 0) do
+    begin
+      Result[K + 1] := Result[K];
+      Dec(K);
+    end;
+    Result[K + 1] := V;
+  end;
+end;
+
+function EmitPretty(J: TJson; Depth: Integer; Sort: Boolean): string;
+var
+  I, Idx: Integer;
+  Pad, Inner: string;
+  Order: TIndexArray;
+begin
+  { Scalars have no layout of their own, so they are exactly what the compact
+    writer produces - which is also what keeps the two forms parse-identical. }
+  if not (J.Kind in [jkArr, jkObj]) then Exit(J.ToJson);
+  if J.Count = 0 then
+  begin
+    if J.Kind = jkArr then Exit('[]') else Exit('{}');
+  end;
+  Pad := StringOfChar(' ', Depth);
+  Inner := StringOfChar(' ', Depth + 1);
+  if J.Kind = jkArr then Result := '[' else Result := '{';
+  Order := KeyOrder(J, Sort);
+  for I := 0 to High(Order) do
+  begin
+    Idx := Order[I];
+    if I > 0 then Result := Result + ',';
+    Result := Result + #10 + Inner;
+    if J.Kind = jkObj then
+      Result := Result + JsonQuote(J.Key(Idx)) + ': ';
+    Result := Result + EmitPretty(J.Item(Idx), Depth + 1, Sort);
+  end;
+  Result := Result + #10 + Pad;
+  if J.Kind = jkArr then Result := Result + ']' else Result := Result + '}';
+end;
+
+function TJson.ToJsonPretty(SortKeys: Boolean): string;
+begin
+  Result := EmitPretty(Self, 0, SortKeys);
 end;
 
 { ---------------------------------------------------------------- parser -- }

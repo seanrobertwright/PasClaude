@@ -127,7 +127,7 @@ procedure SavePermissions(const Path: string);
 
 implementation
 
-uses Classes, Process, Windows, uHttp, uRegex;
+uses Classes, Process, Windows, uHttp, uRegex, uNotebook;
 
 const
   MaxReadBytes = 400 * 1024;   { keeps a stray huge file out of the context }
@@ -136,6 +136,13 @@ const
     ceiling at all a single list_dir on a node_modules-shaped tree would do
     unbounded work only for Clip to throw most of the answer away. }
   MaxWalkDepth = 12;
+  { A notebook is read whole or not at all.  The 400 KB cap would cut it
+    mid-JSON, which is the one truncation that costs everything: a partial
+    document does not parse, so the model gets a corrupt file rather than a
+    short one.  Eight megabytes is affordable precisely because the outputs
+    are summarised away - what reaches the model is the cells, not the
+    base64 that makes the file big. }
+  MaxNotebookBytes = 8 * 1024 * 1024;
   MaxOutBytes  = 30 * 1024;    { cap on any single tool result }
   { A fetched page larger than this is cut; the model gets the front, which
     is where documents put what they are about. }
@@ -503,7 +510,11 @@ begin
       Result := Result + '?';
 end;
 
-function LoadFileText(const Full: string; out Text: string; out Err: string): Boolean;
+{ The reading half of every file tool.  Limit is a parameter rather than a
+  constant because a notebook has to arrive whole to parse at all, while an
+  ordinary source file only has to arrive in a useful quantity. }
+function LoadFileLimited(const Full: string; Limit: Int64;
+  out Text: string; out Err: string): Boolean;
 var
   F: TFileStream;
   N: Int64;
@@ -521,15 +532,20 @@ begin
   end;
   try
     N := F.Size;
-    if N > MaxReadBytes then N := MaxReadBytes;
+    if N > Limit then N := Limit;
     SetLength(Text, N);
     if N > 0 then F.ReadBuffer(Text[1], N);
-    if F.Size > MaxReadBytes then
-      Err := Format('(file is %d bytes; first %d shown)', [F.Size, MaxReadBytes]);
+    if F.Size > Limit then
+      Err := Format('(file is %d bytes; first %d shown)', [F.Size, Limit]);
     Result := True;
   finally
     F.Free;
   end;
+end;
+
+function LoadFileText(const Full: string; out Text: string; out Err: string): Boolean;
+begin
+  Result := LoadFileLimited(Full, MaxReadBytes, Text, Err);
 end;
 
 function SaveFileText(const Full, Text: string; out Err: string): Boolean;
@@ -1229,7 +1245,9 @@ begin
   P := TJson.NewObj;
   P.Add('path', StrProp('File path, relative to the session root.'));
   Result.Push(MakeTool('read_file',
-    'Read a text file. Output is line-numbered so you can cite line numbers.',
+    'Read a text file. Output is line-numbered so you can cite line numbers. ' +
+    'A .ipynb file comes back instead as numbered notebook cells, with each ' +
+    'output summarised by type and size rather than dumped.',
     P, ['path']));
 
   P := TJson.NewObj;
@@ -1323,6 +1341,28 @@ begin
     'finishes, so the user can follow the plan. Send the whole list each ' +
     'time.',
     P, ['todos']));
+
+  P := TJson.NewObj;
+  P.Add('path', StrProp('Notebook path (.ipynb), relative to the session root.'));
+  P.Add('cell', TJson.NewObj);
+  with P.Find('cell') do
+  begin
+    AddStr('type', 'integer');
+    AddStr('description', 'The 0-based cell number read_file showed. For ' +
+      'insert, the index the new cell takes.');
+  end;
+  P.Add('edit_mode', StrProp('One of "replace", "insert" or "delete".'));
+  P.Add('source', StrProp('The cell''s new source, as plain text. Required ' +
+    'by replace and insert.'));
+  P.Add('cell_type', StrProp('"code", "markdown" or "raw" for insert. ' +
+    'Default "code".'));
+  Result.Push(MakeTool('notebook_edit',
+    'Replace, insert or delete one cell of a Jupyter notebook. Use this ' +
+    'rather than edit_file for .ipynb files: edit_file works on the file''s ' +
+    'JSON text, while this works on the cells read_file shows you. Outputs ' +
+    'and execution counts of the cell survive a replace. Requires user ' +
+    'approval, like any other file change.',
+    P, ['path', 'cell', 'edit_mode']));
 end;
 
 { --------------------------------------------------------------- execution -- }
@@ -1340,6 +1380,39 @@ begin
   if D >= MaxWalkDepth then Exit(MaxWalkDepth);
   { Written as a positive test so a NaN lands here rather than in Round. }
   if not (D > 1) then Exit(1);
+  Result := Round(D);
+end;
+
+{ The cell argument of notebook_edit, as an Integer that cannot raise.  Models
+  do send "2" for an integer field, so a string that parses is accepted; a
+  value too large to round is clamped to something NotebookApply will refuse
+  by name rather than crashing on the way in.  -1 means "not supplied", which
+  is out of range for every mode and so reports itself. }
+function CellIndex(Input: TJson): Integer;
+var
+  V: TJson;
+  D: Double;
+  N: Int64;
+begin
+  Result := -1;
+  if Input = nil then Exit;
+  V := Input.Find('cell');
+  if V = nil then Exit;
+  if V.Kind = jkStr then
+  begin
+    if TryStrToInt64(Trim(V.AsString), N) then
+    begin
+      if N > MaxInt then Exit(MaxInt);
+      if N < -MaxInt then Exit(-MaxInt);
+      Result := N;
+    end;
+    Exit;
+  end;
+  if V.Kind <> jkNum then Exit;
+  D := V.AsNumber;
+  if D >= MaxInt then Exit(MaxInt);
+  { Written as a positive test so a NaN lands here, not in Round. }
+  if not (D > -MaxInt) then Exit(-MaxInt);
   Result := Round(D);
 end;
 
@@ -1379,6 +1452,12 @@ begin
   end
   else if Name = 'fetch' then
     Result := 'fetch ' + Input.Str('url')
+  { Both the mode and the cell number, because they are the whole of what the
+    user is being asked to approve: "delete cell 3" and "replace cell 3" are
+    very different answers to the same prompt title. }
+  else if Name = 'notebook_edit' then
+    Result := Format('%s cell %d of %s',
+      [Input.Str('edit_mode', '?'), CellIndex(Input), Input.Str('path')])
   else if Name = 'todo_write' then
   begin
     if (Input.Find('todos') <> nil) then
@@ -1525,7 +1604,7 @@ end;
   believed was there. }
 function ChangePreview(const Name: string; Input: TJson): string;
 var
-  Full, Err, Text, Note, Updated: string;
+  Full, Err, Text, Note, Updated, OldView, NewView, Canon: string;
 begin
   Result := '';
   if Input = nil then Exit;
@@ -1562,6 +1641,32 @@ begin
     Updated := Text;
     if not ApplyEdits(Input, Updated, Rel(Full), Err) then Exit;
     Result := DiffSummary(Text, Updated, PreviewLines);
+  end
+
+  else if Name = 'notebook_edit' then
+  begin
+    if not SafePath(Input.Str('path'), Full, Err) then Exit;
+    if not FileExists(Full) then Exit;
+    if not LoadFileLimited(Full, MaxNotebookBytes, Text, Note) then Exit;
+    if not IsValidUtf8(Text) then Exit;
+    { The same NotebookApply the execution path runs, so preview and result
+      cannot diverge; an edit that would be refused previews as nothing, the
+      way a refused edit_file does. }
+    if not NotebookApply(Text, CellIndex(Input), Input.Str('edit_mode'),
+                         Input.Str('source'), Input.Str('cell_type'),
+                         Updated, Err) then Exit;
+    { The diff is over the cell view, not the file bytes: the user approves
+      the change in the same terms the model proposed it, and base64 output
+      data cannot reach the prompt by that route. }
+    if not NotebookView(Text, OldView, Err) then Exit;
+    if not NotebookView(Updated, NewView, Err) then Exit;
+    { What the cell diff cannot show is that the rest of the file is about to
+      be rewritten in Jupyter's layout.  That is a real, one-time cost to
+      someone's git history, so it is said out loud rather than discovered. }
+    if NotebookCanonical(Text, Canon, Err) and (Canon <> Text) then
+      Result := '(the file will be rewritten in Jupyter''s standard ' +
+        'formatting)'#10;
+    Result := Result + DiffSummary(OldView, NewView, PreviewLines);
   end;
 end;
 
@@ -1584,7 +1689,7 @@ end;
 function RunTool(const Name: string; Input: TJson; Ask: TAskProc;
   out IsError: Boolean): string;
 var
-  Full, Err, Text, Cmd, Note: string;
+  Full, Err, Text, Cmd, Note, Updated: string;
   Code: Integer;
 begin
   IsError := False;
@@ -1606,11 +1711,31 @@ begin
       IsError := True;
       Exit('no such file: ' + Rel(Full));
     end;
-    if not LoadFileText(Full, Text, Note) then
+    { A notebook is decoded into cells before anything else, because the model
+      reaches for read_file by reflex: a separate notebook_read tool would be
+      discovered only after four megabytes of base64 had already landed in the
+      context, and that is not a mistake anything can undo.  Anything that
+      fails here - too big, not UTF-8, not a v4 notebook - falls through to the
+      ordinary text path, so a damaged notebook is still visible and fixable. }
+    if IsNotebookPath(Full) then
+    begin
+      if LoadFileLimited(Full, MaxNotebookBytes, Text, Note) and (Note = '') and
+         IsValidUtf8(Text) and NotebookView(Text, Cmd, Err) then
+        Exit(Clip(Cmd));
+      Note := '(this .ipynb did not read as a notebook; showing the raw file)';
+    end
+    else
+      Note := '';
+    if not LoadFileText(Full, Text, Err) then
     begin
       IsError := True;
-      Exit('cannot read: ' + Note);
+      Exit('cannot read: ' + Err);
     end;
+    { Both notes can apply at once - a notebook too big to parse is also a
+      file too big to show whole - so the truncation note joins rather than
+      replaces the one explaining why the cells are missing. }
+    if Err <> '' then
+      if Note = '' then Note := Err else Note := Note + ' ' + Err;
     { A binary file is shown as hex rather than smuggled into the request as
       invalid UTF-8, which the API would refuse outright. }
     if not IsValidUtf8(Text) then
@@ -1805,6 +1930,79 @@ begin
       end;
     end;
     Result := Format('todo list updated (%d items)', [Length(TodoList)]);
+  end
+
+  { A separate tool rather than an extension of edit_file, because edit_file's
+    contract is substring replacement on the file's TEXT - and a notebook's
+    text is JSON.  Overloading it would make old_text mean something different
+    depending on the extension: the model, having read decoded cells, would
+    send print(x) while the file holds "print(x)\n" inside a JSON array.
+    Insert and delete of a cell have no expression in that schema at all.  A
+    model that reaches for edit_file here gets "old_text was not found", which
+    is a clean, self-correcting error. }
+  else if Name = 'notebook_edit' then
+  begin
+    if not SafePath(Input.Str('path'), Full, Err) then
+    begin
+      IsError := True;
+      Exit(Err);
+    end;
+    if not FileExists(Full) then
+    begin
+      IsError := True;
+      Exit('no such file: ' + Rel(Full));
+    end;
+    if not IsNotebookPath(Full) then
+    begin
+      IsError := True;
+      Exit('not a notebook: ' + Rel(Full) + ' - use edit_file for ordinary files');
+    end;
+    if not LoadFileLimited(Full, MaxNotebookBytes, Text, Note) then
+    begin
+      IsError := True;
+      Exit('cannot read: ' + Note);
+    end;
+    { A truncated read must never be written back: the result would be a
+      valid document that had silently lost everything past the cut. }
+    if Note <> '' then
+    begin
+      IsError := True;
+      Exit('notebook is too large to edit safely ' + Note);
+    end;
+    if not IsValidUtf8(Text) then
+    begin
+      IsError := True;
+      Exit(Rel(Full) + ' is not UTF-8 text and cannot be parsed as a notebook');
+    end;
+    if (Input.Str('edit_mode') <> 'delete') and (Input.Find('source') = nil) then
+    begin
+      IsError := True;
+      Exit('source is required for edit_mode ' + Input.Str('edit_mode', '(none)'));
+    end;
+    { Transformed before the user is asked, exactly as edit_file validates its
+      hunks first: a bad cell index or an unknown mode should never reach a
+      prompt. }
+    if not NotebookApply(Text, CellIndex(Input), Input.Str('edit_mode'),
+                         Input.Str('source'), Input.Str('cell_type'),
+                         Updated, Err) then
+    begin
+      IsError := True;
+      Exit(Err);
+    end;
+    if not PermitChange(Name, Input, Ask) then
+    begin
+      IsError := True;
+      Exit('the user denied this notebook edit');
+    end;
+    SnapshotFile(Full);
+    if not SaveFileText(Full, Updated, Err) then
+    begin
+      IsError := True;
+      Exit('cannot write: ' + Err);
+    end;
+    NoteChangedFile(Rel(Full));
+    Result := Format('%s cell %d of %s',
+      [Input.Str('edit_mode'), CellIndex(Input), Rel(Full)]);
   end
 
   else
