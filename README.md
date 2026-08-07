@@ -614,3 +614,7 @@ Details worth knowing if you touch this code:
   the model never saw, or a question nothing answered. Putting the cleanup in
   the caller only fixed the one path the caller could see; it lives inside
   `Send` so every exit passes through it.
+
+## License
+
+MIT.
