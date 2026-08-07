@@ -101,6 +101,46 @@ function CurrentTodos: TStringArray;
 { Test seam and /clear. }
 procedure ClearTodos;
 
+{ ---- background jobs, the detached half of bash ----
+  A background command's output goes to a spool file under the state
+  directory rather than a pipe.  An unread anonymous pipe fills and then
+  blocks the child forever, and by definition nothing is draining a
+  background command - that deadlock is not a risk here, it is the default
+  outcome.  A file cannot fill, so the child runs to completion whether or
+  not anybody ever polls it.
+
+  Each job also owns a Win32 job object with kill-on-close, so the whole
+  process tree dies with pasclaude even when pasclaude dies badly. }
+
+{ Starts Cmd detached and returns its job id.  False, with Err set, when the
+  table is full, the command is blank, or Windows refused to start it. }
+function StartBackgroundJob(const Cmd: string; out Id: string; out Err: string): Boolean;
+
+{ The output produced since the last poll, with a status line.  Found is
+  False when no such job exists, which the caller reports as an error: a
+  model that reads silence as "it produced nothing" waits forever. }
+function PollBackgroundJob(const Id: string; out Found: Boolean): string;
+
+{ Stops the job and everything it started.  False when the id is unknown.
+  The handles stay open so the final output can still be polled. }
+function KillBackgroundJob(const Id: string): Boolean;
+
+{ One line per job, for the model's bash_output with no id and for /jobs.
+  A process started on the user's behalf has to be visible to the user
+  without having to ask the model about it. }
+function BackgroundJobList: string;
+
+{ Test seam: how many jobs are held. }
+function BackgroundJobCount: Integer;
+
+{ Test seam: waits for a job to finish, bounded, so a suite can assert on a
+  finished job without sprinkling Sleep calls and hoping. }
+function WaitBackgroundJob(const Id: string; TimeoutMs: Integer): Boolean;
+
+{ Stops every job, closes its handles and deletes its spool.  Wired to
+  /clear, to exit, and to this unit's finalization. }
+procedure ClearJobs;
+
 { ---- file snapshots, the disk half of /rewind ----
   Before a write or edit changes a file, its prior state is captured against
   the current turn number.  Rewinding to turn N restores every touched file
@@ -885,6 +925,514 @@ begin
     Result := OemToUtf8(Result);
 end;
 
+{ -------------------------------------------------------- background bash -- }
+
+{ A second, entirely separate launch path.  RunShell above is left alone on
+  purpose: its drain loop is correct only while somebody is blocking on it,
+  and the whole point here is that nobody is.  The two share the permission
+  gate and the OEM conversion rule, and nothing else. }
+
+const
+  { Eight live jobs is far more than a session ever wants and still a number
+    a user can read off /jobs.  The cap exists so a model in a loop cannot
+    fill the machine with detached shells. }
+  MaxJobs = 8;
+  { Bytes handed back per poll.  Deliberately under MaxOutBytes so the status
+    line fits.  A chunk of solid high bytes can grow when it is converted out
+    of the OEM codepage, so the ceiling is not exact - but it is a ceiling,
+    and no byte is ever dropped, which is the property that matters: the
+    offset advances by what was returned, so what is not returned now comes
+    back next time rather than vanishing. }
+  MaxPollBytes = 24 * 1024;
+  { A runaway job writing to disk forever is the failure mode a spool file
+    has that a pipe does not.  Sixteen megabytes is generous for anything
+    worth reading and small enough to notice. }
+  MaxSpoolBytes = 16 * 1024 * 1024;
+  JobKillWaitMs = 2000;
+  JobsDirName = 'jobs';
+
+{ FPC 3.2.2's Windows unit does not declare the job-object API at all, so the
+  four entry points and the two records it needs are declared here.  These are
+  the documented kernel32 exports, nothing exotic; TJobExtendedLimits is 144
+  bytes on x64, which SetInformationJobObject validates on every call and a
+  probe confirmed before this was written. }
+const
+  JobObjectExtendedLimitInformation = 9;
+  JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = $2000;
+
+type
+  TJobBasicLimits = record
+    PerProcessUserTimeLimit: Int64;
+    PerJobUserTimeLimit: Int64;
+    LimitFlags: DWORD;
+    MinimumWorkingSetSize: SIZE_T;
+    MaximumWorkingSetSize: SIZE_T;
+    ActiveProcessLimit: DWORD;
+    Affinity: ULONG_PTR;
+    PriorityClass: DWORD;
+    SchedulingClass: DWORD;
+  end;
+
+  TJobIoCounters = record
+    ReadOperationCount, WriteOperationCount, OtherOperationCount: QWord;
+    ReadTransferCount, WriteTransferCount, OtherTransferCount: QWord;
+  end;
+
+  TJobExtendedLimits = record
+    BasicLimitInformation: TJobBasicLimits;
+    IoInfo: TJobIoCounters;
+    ProcessMemoryLimit: SIZE_T;
+    JobMemoryLimit: SIZE_T;
+    PeakProcessMemoryUsed: SIZE_T;
+    PeakJobMemoryUsed: SIZE_T;
+  end;
+
+function CreateJobObjectA(Attr: Pointer; Name: PAnsiChar): THandle; stdcall;
+  external 'kernel32' name 'CreateJobObjectA';
+function SetInformationJobObject(J: THandle; Cls: Integer; Info: Pointer;
+  Len: DWORD): BOOL; stdcall; external 'kernel32' name 'SetInformationJobObject';
+function AssignProcessToJobObject(J, P: THandle): BOOL; stdcall;
+  external 'kernel32' name 'AssignProcessToJobObject';
+function TerminateJobObject(J: THandle; Code: UINT): BOOL; stdcall;
+  external 'kernel32' name 'TerminateJobObject';
+
+type
+  TBackgroundJob = record
+    Id, Cmd, Spool, Note: string;
+    Proc, Job: THandle;
+    Offset: Int64;
+    Started: QWord;
+    Done, Reaped, Tree, Killed: Boolean;
+    ExitCode: Integer;
+  end;
+
+var
+  Jobs: array of TBackgroundJob;
+  JobSeq: Integer = 0;
+
+{ The spool directory.  This deliberately bypasses SafePath: the state
+  directory is exactly where that guard refuses to let the model go, and
+  that refusal is the property keeping the model from reading a half-written
+  spool behind its own back or forging one for a job it never started. }
+function JobsDir: string;
+begin
+  Result := IncludeTrailingPathDelimiter(NormalizeRoot) + StateDirName +
+    PathDelim + JobsDirName + PathDelim;
+  ForceDirectories(Result);
+end;
+
+{ The only route from an id to a path, which is what keeps a hostile id from
+  naming a file: an id that is not in the table is simply not a job. }
+function FindJob(const Id: string): Integer;
+var
+  I: Integer;
+begin
+  Result := -1;
+  if Id = '' then Exit;
+  for I := 0 to High(Jobs) do
+    if Jobs[I].Id = Id then Exit(I);
+end;
+
+function SpoolSize(const P: string): Int64;
+var
+  F: TFileStream;
+begin
+  Result := 0;
+  try
+    F := TFileStream.Create(P, fmOpenRead or fmShareDenyNone);
+    try
+      Result := F.Size;
+    finally
+      F.Free;
+    end;
+  except
+    Result := 0;
+  end;
+end;
+
+{ True while the process still runs.  The exit code is latched on the first
+  poll that sees it gone, because a handle stays signalled forever but the
+  code is only worth reading once. }
+function JobAlive(var J: TBackgroundJob): Boolean;
+var
+  C: DWORD;
+begin
+  Result := WaitForSingleObject(J.Proc, 0) <> WAIT_OBJECT_0;
+  if Result then Exit;
+  if not J.Done then
+  begin
+    C := 0;
+    if GetExitCodeProcess(J.Proc, C) then J.ExitCode := Integer(C);
+    J.Done := True;
+  end;
+end;
+
+{ Every handle this unit opened is closed here and every byte it wrote to
+  disk is removed here.  The -gh run and the user's process list are the two
+  things this has to leave clean, and they fail in opposite directions:
+  forgetting CloseHandle leaks quietly, forgetting the kill leaves a process
+  the user cannot name. }
+procedure FreeJob(var J: TBackgroundJob);
+begin
+  if J.Proc <> 0 then
+  begin
+    if WaitForSingleObject(J.Proc, 0) <> WAIT_OBJECT_0 then
+    begin
+      if J.Job <> 0 then
+        TerminateJobObject(J.Job, 1)
+      else
+        TerminateProcess(J.Proc, 1);
+      WaitForSingleObject(J.Proc, JobKillWaitMs);
+    end;
+    CloseHandle(J.Proc);
+    J.Proc := 0;
+  end;
+  if J.Job <> 0 then
+  begin
+    CloseHandle(J.Job);
+    J.Job := 0;
+  end;
+  if J.Spool <> '' then
+    SysUtils.DeleteFile(J.Spool);   { a spool nobody can poll is just litter }
+  J.Id := '';
+  J.Cmd := '';
+  J.Spool := '';
+  J.Note := '';
+end;
+
+{ Refreshes exit state, and stops anything that has written more than the
+  spool cap.  Purge additionally drops jobs whose output has been read to the
+  end after exiting - only StartBackgroundJob asks for that, because a poll
+  that quietly forgot the job it just reported on would leave the model
+  holding an id that had stopped existing between two sentences. }
+procedure SweepJobs(Purge: Boolean);
+var
+  I, N: Integer;
+begin
+  for I := 0 to High(Jobs) do
+  begin
+    if JobAlive(Jobs[I]) and (SpoolSize(Jobs[I].Spool) > MaxSpoolBytes) then
+    begin
+      if Jobs[I].Job <> 0 then
+        TerminateJobObject(Jobs[I].Job, 1)
+      else
+        TerminateProcess(Jobs[I].Proc, 1);
+      WaitForSingleObject(Jobs[I].Proc, JobKillWaitMs);
+      Jobs[I].Killed := True;
+      Jobs[I].Note := Format('[%s produced more than %d MB and was stopped]',
+        [Jobs[I].Id, MaxSpoolBytes div (1024 * 1024)]);
+      JobAlive(Jobs[I]);
+    end;
+  end;
+  if not Purge then Exit;
+  N := 0;
+  for I := 0 to High(Jobs) do
+    if Jobs[I].Reaped then
+      FreeJob(Jobs[I])
+    else
+    begin
+      if N <> I then Jobs[N] := Jobs[I];
+      Inc(N);
+    end;
+  SetLength(Jobs, N);
+end;
+
+function StartBackgroundJob(const Cmd: string; out Id: string; out Err: string): Boolean;
+var
+  Info: TJobExtendedLimits;
+  SA: SECURITY_ATTRIBUTES;
+  SI: STARTUPINFOA;
+  PI: PROCESS_INFORMATION;
+  hJob, hSpool, hNul: THandle;
+  CmdLine, Spool, ComSpec: string;
+  J: TBackgroundJob;
+begin
+  Result := False;
+  Id := '';
+  Err := '';
+  SweepJobs(True);
+  if Trim(Cmd) = '' then
+  begin
+    Err := 'command is required';
+    Exit;
+  end;
+  if Length(Jobs) >= MaxJobs then
+  begin
+    Err := Format('too many background jobs (%d running); read one with ' +
+      'bash_output or stop one with kill_bash', [Length(Jobs)]);
+    Exit;
+  end;
+
+  Inc(JobSeq);
+  Spool := JobsDir + 'bg' + IntToStr(JobSeq) + '.out';
+
+  hJob := CreateJobObjectA(nil, nil);
+  if hJob <> 0 then
+  begin
+    FillChar(Info, SizeOf(Info), 0);
+    Info.BasicLimitInformation.LimitFlags := JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if not SetInformationJobObject(hJob, JobObjectExtendedLimitInformation,
+             @Info, SizeOf(Info)) then
+    begin
+      CloseHandle(hJob);
+      hJob := 0;
+    end;
+  end;
+
+  { The child inherits a handle onto the spool and onto NUL.  NUL for stdin
+    matters as much as the spool does: a command that reads stdin gets an
+    instant EOF instead of waiting forever for a keyboard nobody is at. }
+  FillChar(SA, SizeOf(SA), 0);
+  SA.nLength := SizeOf(SA);
+  SA.bInheritHandle := True;
+  hSpool := CreateFile(PChar(Spool), GENERIC_WRITE,
+    FILE_SHARE_READ or FILE_SHARE_WRITE, @SA, CREATE_ALWAYS,
+    FILE_ATTRIBUTE_NORMAL, 0);
+  if hSpool = INVALID_HANDLE_VALUE then
+  begin
+    if hJob <> 0 then CloseHandle(hJob);
+    Err := 'could not open the output file: ' + SysErrorMessage(GetLastError);
+    Exit;
+  end;
+  hNul := CreateFile('NUL', GENERIC_READ, FILE_SHARE_READ or FILE_SHARE_WRITE,
+    @SA, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
+
+  ComSpec := SysUtils.GetEnvironmentVariable('ComSpec');
+  if ComSpec = '' then ComSpec := 'cmd.exe';
+  { Raw CreateProcess rather than TProcess, which cannot be told to hand a
+    file handle to its child.  The alternatives that keep TProcess both
+    change what the command MEANS - wrapping it in "( ... ) > spool 2>&1"
+    breaks on a bare ')', a generated .cmd file changes %% expansion - and a
+    background command that behaves differently from the same command in the
+    foreground is a trap nobody could explain afterwards.  The line reaching
+    cmd.exe here is character-identical to RunShell's. }
+  CmdLine := '"' + ComSpec + '" /C ' + Cmd;
+  { CreateProcessA may write into lpCommandLine, so it must not be sharing a
+    string with anybody. }
+  UniqueString(CmdLine);
+  FillChar(SI, SizeOf(SI), 0);
+  SI.cb := SizeOf(SI);
+  SI.dwFlags := STARTF_USESTDHANDLES;
+  SI.hStdInput := hNul;
+  SI.hStdOutput := hSpool;
+  SI.hStdError := hSpool;
+  FillChar(PI, SizeOf(PI), 0);
+
+  if not CreateProcess(nil, PChar(CmdLine), nil, nil, True, CREATE_NO_WINDOW,
+           nil, PChar(NormalizeRoot), SI, PI) then
+  begin
+    Err := 'could not start: ' + SysErrorMessage(GetLastError);
+    CloseHandle(hSpool);
+    if hNul <> INVALID_HANDLE_VALUE then CloseHandle(hNul);
+    if hJob <> 0 then CloseHandle(hJob);
+    SysUtils.DeleteFile(Spool);
+    Exit;
+  end;
+
+  { The child holds its own copies; a handle kept here is a handle leaked. }
+  CloseHandle(hSpool);
+  if hNul <> INVALID_HANDLE_VALUE then CloseHandle(hNul);
+  CloseHandle(PI.hThread);
+
+  FillChar(J, SizeOf(J), 0);
+  J.Id := 'bg' + IntToStr(JobSeq);
+  J.Cmd := Cmd;
+  J.Spool := Spool;
+  J.Proc := PI.hProcess;
+  J.Job := hJob;
+  J.Started := GetTickCount64;
+  J.ExitCode := -1;
+  { Assignment is after the spawn, so a grandchild started in the microseconds
+    before it escapes the job.  cmd.exe has to parse its command line first,
+    so the window is tiny - but it is real, and a stray that escapes survives
+    kill_bash.  When assignment fails outright the kill reaches cmd.exe only,
+    which the status line says out loud rather than pretending otherwise. }
+  J.Tree := (hJob <> 0) and AssignProcessToJobObject(hJob, PI.hProcess);
+  if (hJob <> 0) and not J.Tree then
+    J.Note := Format('[%s could not be put in a job object; stopping it may ' +
+      'leave programs it started running]', [J.Id]);
+
+  SetLength(Jobs, Length(Jobs) + 1);
+  Jobs[High(Jobs)] := J;
+  Id := J.Id;
+  Result := True;
+end;
+
+{ The shared reader behind poll and kill.  While the process is still running
+  the chunk is trimmed back to the last newline, so a poll never hands over
+  half a line - and with it never splits a multi-byte character across two
+  polls, which would leave both halves invalid with no way to rejoin them.
+  Once it has exited whatever remains is final and is taken whole.
+
+  The offset advances by exactly what is returned, before the OEM conversion
+  changes the length.  That is the invariant the model depends on: no byte
+  twice, no byte skipped. }
+function ReadJobChunk(var J: TBackgroundJob; Alive: Boolean;
+  out More: Boolean): string;
+var
+  F: TFileStream;
+  Buf: array of Byte;
+  N: LongInt;
+  P: Integer;
+begin
+  Result := '';
+  More := False;
+  if J.Spool = '' then Exit;
+  try
+    F := TFileStream.Create(J.Spool, fmOpenRead or fmShareDenyNone);
+    try
+      if J.Offset >= F.Size then Exit;
+      F.Position := J.Offset;
+      SetLength(Buf, MaxPollBytes);
+      N := F.Read(Buf[0], MaxPollBytes);
+      if N <= 0 then Exit;
+      More := N >= MaxPollBytes;
+      SetString(Result, PAnsiChar(@Buf[0]), N);
+    finally
+      F.Free;
+    end;
+  except
+    { A spool that cannot be opened is not worth an error: the status line
+      still tells the caller whether the job is alive. }
+    Result := '';
+    More := False;
+    Exit;
+  end;
+  if Alive then
+  begin
+    P := LastDelimiter(#10, Result);
+    if P = 0 then Exit('');   { no complete line yet; keep it for next time }
+    SetLength(Result, P);
+  end;
+  Inc(J.Offset, Length(Result));
+  if not IsValidUtf8(Result) then
+    Result := OemToUtf8(Result);
+end;
+
+function PollBackgroundJob(const Id: string; out Found: Boolean): string;
+var
+  I: Integer;
+  Alive, More: Boolean;
+  Chunk: string;
+  Age: QWord;
+begin
+  Result := '';
+  Found := False;
+  SweepJobs(False);
+  I := FindJob(Id);
+  if I < 0 then Exit;
+  Found := True;
+  { Check the exit state before reading, the same discipline RunShell's
+    post-exit drain follows: anything written between the read and the check
+    is not lost, it is simply the next poll's. }
+  Alive := JobAlive(Jobs[I]);
+  Chunk := ReadJobChunk(Jobs[I], Alive, More);
+  Age := (GetTickCount64 - Jobs[I].Started) div 1000;
+  if Jobs[I].Killed then
+    Result := Format('[%s killed]', [Jobs[I].Id])
+  else if Alive then
+    Result := Format('[%s running, %ds]', [Jobs[I].Id, Age])
+  else
+    Result := Format('[%s exited %d after %ds]',
+      [Jobs[I].Id, Jobs[I].ExitCode, Age]);
+  if Chunk <> '' then
+    Result := Result + #10 + Chunk
+  else
+    Result := Result + #10 + '(no new output)';
+  if More then
+    Result := Result + #10'[... more output pending; call bash_output again]';
+  if Jobs[I].Note <> '' then
+    Result := Result + #10 + Jobs[I].Note;
+  { Finished and fully read: the next launch may forget it. }
+  if (not Alive) and (not More) and (Jobs[I].Offset >= SpoolSize(Jobs[I].Spool)) then
+    Jobs[I].Reaped := True;
+end;
+
+function KillBackgroundJob(const Id: string): Boolean;
+var
+  I: Integer;
+  C: DWORD;
+begin
+  I := FindJob(Id);
+  Result := I >= 0;
+  if not Result then Exit;
+  if WaitForSingleObject(Jobs[I].Proc, 0) <> WAIT_OBJECT_0 then
+  begin
+    if Jobs[I].Job <> 0 then
+      TerminateJobObject(Jobs[I].Job, 1)
+    else
+      TerminateProcess(Jobs[I].Proc, 1);
+    WaitForSingleObject(Jobs[I].Proc, JobKillWaitMs);
+  end;
+  Jobs[I].Killed := True;
+  Jobs[I].Done := True;
+  Jobs[I].ExitCode := -1;
+  C := 0;
+  if GetExitCodeProcess(Jobs[I].Proc, C) and (C <> STILL_ACTIVE) then
+    Jobs[I].ExitCode := Integer(C);
+  { The handles stay open: the tail of the output is usually the interesting
+    part, and the entry goes away at the next launch or at /clear. }
+end;
+
+function BackgroundJobList: string;
+var
+  I: Integer;
+  State, C: string;
+  Pending: Int64;
+begin
+  Result := '';
+  SweepJobs(False);
+  for I := 0 to High(Jobs) do
+  begin
+    if Jobs[I].Killed then
+      State := 'killed'
+    else if JobAlive(Jobs[I]) then
+      State := 'running'
+    else
+      State := Format('exited %d', [Jobs[I].ExitCode]);
+    Pending := SpoolSize(Jobs[I].Spool) - Jobs[I].Offset;
+    if Pending < 0 then Pending := 0;
+    C := Jobs[I].Cmd;
+    if Length(C) > 60 then C := Copy(C, 1, 57) + '...';
+    Result := Result + Format('%s  %s  %ds  %d bytes unread  %s'#10,
+      [Jobs[I].Id, State, (GetTickCount64 - Jobs[I].Started) div 1000,
+       Pending, C]);
+  end;
+  if Result = '' then Result := 'no background jobs';
+end;
+
+function BackgroundJobCount: Integer;
+begin
+  Result := Length(Jobs);
+end;
+
+function WaitBackgroundJob(const Id: string; TimeoutMs: Integer): Boolean;
+var
+  I: Integer;
+  Deadline: QWord;
+begin
+  I := FindJob(Id);
+  if I < 0 then Exit(False);
+  Deadline := GetTickCount64 + QWord(TimeoutMs);
+  repeat
+    if not JobAlive(Jobs[I]) then Exit(True);
+    if GetTickCount64 >= Deadline then Exit(False);
+    WaitForSingleObject(Jobs[I].Proc, 50);
+  until False;
+end;
+
+procedure ClearJobs;
+var
+  I: Integer;
+begin
+  for I := 0 to High(Jobs) do
+    FreeJob(Jobs[I]);
+  SetLength(Jobs, 0);
+  { Ids restart, because nothing that could still name an old one survives a
+    clear: the transcript holding them has been thrown away too. }
+  JobSeq := 0;
+end;
+
 { ---------------------------------------------------------- bash prefixes -- }
 
 var
@@ -1313,10 +1861,33 @@ begin
 
   P := TJson.NewObj;
   P.Add('command', StrProp('Command line, run through cmd.exe /C.'));
+  P.Add('run_in_background', BoolProp('Start the command detached and return ' +
+    'a job id immediately instead of waiting. Use it for servers, watchers ' +
+    'and builds that outlive one tool call; poll with bash_output and stop ' +
+    'with kill_bash. Foreground commands time out after 120 s, background ' +
+    'ones do not.'));
   Result.Push(MakeTool('bash',
     'Run a shell command in the session root and return its output. ' +
-    'Use it to build, run tests, or inspect the system. Requires user approval.',
+    'Use it to build, run tests, or inspect the system. Set ' +
+    'run_in_background for anything that should keep running after this ' +
+    'call returns. Requires user approval.',
     P, ['command']));
+
+  P := TJson.NewObj;
+  P.Add('job_id', StrProp('The job id returned when the command was started. ' +
+    'Omit it to list every background job.'));
+  Result.Push(MakeTool('bash_output',
+    'Read the output a background command has produced since your last ' +
+    'read, plus whether it is still running and its exit code once it ' +
+    'finishes.',
+    P, []));
+
+  P := TJson.NewObj;
+  P.Add('job_id', StrProp('The job id to stop.'));
+  Result.Push(MakeTool('kill_bash',
+    'Stop a background command and everything it started, and return ' +
+    'whatever output it had not yet handed over.',
+    P, ['job_id']));
 
   P := TJson.NewObj;
   P.Add('url', StrProp('The https:// URL to fetch.'));
@@ -1449,7 +2020,21 @@ begin
     S := Input.Str('command');
     if Length(S) > 120 then S := Copy(S, 1, 117) + '...';
     Result := '$ ' + S;
+    { Said plainly in the prompt title, because "approve this command" and
+      "approve this command and let it outlive the answer" are different
+      questions and the user is only being asked once. }
+    if Input.Bool('run_in_background') then
+      Result := Result + '  [background]';
   end
+  else if Name = 'bash_output' then
+  begin
+    if Input.Str('job_id') = '' then
+      Result := 'list background jobs'
+    else
+      Result := 'read output of ' + Input.Str('job_id');
+  end
+  else if Name = 'kill_bash' then
+    Result := 'stop ' + Input.Str('job_id')
   else if Name = 'fetch' then
     Result := 'fetch ' + Input.Str('url')
   { Both the mode and the cell number, because they are the whole of what the
@@ -1691,6 +2276,7 @@ function RunTool(const Name: string; Input: TJson; Ask: TAskProc;
 var
   Full, Err, Text, Cmd, Note, Updated: string;
   Code: Integer;
+  Ok: Boolean;
 begin
   IsError := False;
   if Input = nil then
@@ -1857,6 +2443,21 @@ begin
       IsError := True;
       Exit('the user denied this command');
     end;
+    { The fork is below the gate, and must stay there.  Backgrounding is a
+      question about who waits, not about what runs: a detached "del /s"
+      deletes exactly as much as an attached one, so it faces exactly the
+      same approval and the same remembered per-program prefix. }
+    if Input.Bool('run_in_background') then
+    begin
+      if not StartBackgroundJob(Cmd, Note, Err) then
+      begin
+        IsError := True;
+        Exit(Err);
+      end;
+      Exit(Format('started background job %s: %s'#10 +
+        'read its output with bash_output(job_id="%s"), stop it with kill_bash.',
+        [Note, Cmd, Note]));
+    end;
     Text := RunShell(Cmd, NormalizeRoot, Code);
     { Console programs emit OEM-codepage bytes, not UTF-8, so anything
       non-ASCII has to be converted or the request body becomes invalid. }
@@ -2005,11 +2606,61 @@ begin
       [Input.Str('edit_mode'), CellIndex(Input), Rel(Full)]);
   end
 
+  { Neither of these is gated, and the reason is the same for both: they can
+    only observe or stop a process this session already got permission to
+    start.  A gate on reading output would hide what the user approved from
+    the model that has to react to it, and a gate on killing is a gate that
+    can only ever do harm - the answer "no, you may not stop it" is never the
+    one anybody wanted. }
+  else if Name = 'bash_output' then
+  begin
+    Cmd := Trim(Input.Str('job_id'));
+    if Cmd = '' then Exit(Clip(BackgroundJobList));
+    Text := PollBackgroundJob(Cmd, Ok);
+    if not Ok then
+    begin
+      IsError := True;
+      Exit('no such job: ' + Cmd);
+    end;
+    Result := Text;
+    { A finished job that failed reads as a failure, the same as foreground
+      bash - the model should not have to parse the status line to notice. }
+    Code := FindJob(Cmd);
+    IsError := (Code >= 0) and Jobs[Code].Done and (Jobs[Code].ExitCode <> 0);
+  end
+
+  else if Name = 'kill_bash' then
+  begin
+    Cmd := Trim(Input.Str('job_id'));
+    if Cmd = '' then
+    begin
+      IsError := True;
+      Exit('job_id is required');
+    end;
+    if not KillBackgroundJob(Cmd) then
+    begin
+      IsError := True;
+      Exit('no such job: ' + Cmd);
+    end;
+    { The final tail comes back in the same round trip: whatever the job
+      printed just before it died is usually the reason it was killed. }
+    Result := 'killed ' + Cmd + #10 + PollBackgroundJob(Cmd, Ok);
+  end
+
   else
   begin
     IsError := True;
     Result := 'unknown tool: ' + Name;
   end;
 end;
+
+finalization
+  { A background job outliving the process that started it is the one failure
+    mode worse than a leaked handle: the user is left with a program they did
+    not launch by hand and cannot name.  The host calls this in its shutdown
+    finally as well; this is the backstop for the paths that skip it.  The
+    paths that skip even finalization - a hard kill - are covered by the job
+    objects' kill-on-close, which Windows honours when it reclaims handles. }
+  ClearJobs;
 
 end.

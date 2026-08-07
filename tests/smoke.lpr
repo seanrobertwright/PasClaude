@@ -444,7 +444,7 @@ begin
   { The caller owns the schema, so it is freed here rather than leaked. }
   Sch := ToolsSchema;
   try
-    Check(Sch.Count = 9, 'the schema exposes nine tools');
+    Check(Sch.Count = 11, 'the schema exposes eleven tools');
     { A tool that exists in RunTool but not in the schema is one the model
       never learns about, and no other test would notice. }
     Tool := nil;
@@ -600,6 +600,104 @@ begin
 
   ClearBashPrefixes;
   Check(not BashPrefixAllowed('git log'), 'clearing forgets the approvals');
+end;
+
+{ Background bash.  The id-sensitive assertions go through the public job
+  API, because a job id is the one thing a tool result cannot be relied on to
+  spell for you; the gate assertions go through RunTool, because the gate is
+  the thing that must not be bypassable from there. }
+procedure TestBackgroundJobs;
+var
+  J: TJson;
+  Out_, Id, Err, Spool: string;
+  IsErr, Found: Boolean;
+begin
+  uTools.ClearJobs;
+  uTools.AllowAllBash := True;
+
+  { Through the tool, which is the only path the model has. }
+  J := TJson.NewObj;
+  J.AddStr('command', 'echo hello');
+  J.AddBool('run_in_background', True);
+  Out_ := Run('bash', J, IsErr);
+  Check(not IsErr, 'a background bash call succeeds');
+  Check(Pos('bg1', Out_) > 0, 'and returns the job id it started');
+  Check(uTools.BackgroundJobCount = 1, 'and the job is held');
+  Check(Pos('[exit code', Out_) = 0,
+    'and it returned immediately rather than running in the foreground');
+  uTools.ClearJobs;
+
+  { Directly, so the exit code and the offset can be asserted on. }
+  Check(StartBackgroundJob('echo hello', Id, Err), 'a job starts: ' + Err);
+  Check(Id = 'bg1', 'ids are predictable after a clear');
+  Check(WaitBackgroundJob(Id, 5000), 'and a quick job finishes');
+  Out_ := PollBackgroundJob(Id, Found);
+  Check(Found, 'polling finds it');
+  Check(Pos('hello', Out_) > 0, 'and hands over what it printed');
+  Check(Pos('exited 0', Out_) > 0, 'and reports the exit code once it is done');
+
+  { The offset is the whole contract: output is handed over once. }
+  Out_ := PollBackgroundJob(Id, Found);
+  Check(Pos('hello', Out_) = 0, 'a second poll does not repeat the output');
+  Check(Pos('(no new output)', Out_) > 0, 'and says so plainly');
+
+  { An id that names nothing must say so, not answer with silence: a model
+    reading silence as "it produced nothing" waits for a job that is not
+    there. }
+  PollBackgroundJob('bg999', Found);
+  Check(not Found, 'an unknown id is not found');
+  J := TJson.NewObj;
+  J.AddStr('job_id', 'bg999');
+  Out_ := Run('bash_output', J, IsErr);
+  Check(IsErr and (Pos('no such job', Out_) > 0),
+    'and the tool reports it as an error');
+
+  { A genuinely long job, so the kill has something to kill. }
+  uTools.ClearJobs;
+  Check(StartBackgroundJob('ping -n 30 127.0.0.1', Id, Err),
+    'a long job starts: ' + Err);
+  Check(not WaitBackgroundJob(Id, 300), 'and is still running a moment later');
+  Check(KillBackgroundJob(Id), 'killing it reports success');
+  Check(WaitBackgroundJob(Id, 5000), 'and it really stops');
+
+  { The gate, from the model's side.  This is the assertion that catches a
+    fork placed above PermitBash, which would make backgrounding a way to
+    run unapproved shell commands. }
+  uTools.ClearJobs;
+  uTools.AllowAllBash := False;
+  ClearBashPrefixes;
+  J := TJson.NewObj;
+  J.AddStr('command', 'ping -n 1 127.0.0.1');
+  J.AddBool('run_in_background', True);
+  Out_ := Run('bash', J, IsErr);
+  Check(IsErr and (Pos('denied', Out_) > 0),
+    'a background command faces the bash gate');
+  Check(uTools.BackgroundJobCount = 0, 'and a denied command starts nothing');
+
+  { The same per-program approval covers both: backgrounding is a question
+    about who waits, not about what runs. }
+  AllowBashPrefix('ping -n 1 127.0.0.1');
+  J := TJson.NewObj;
+  J.AddStr('command', 'ping -n 1 127.0.0.1');
+  J.AddBool('run_in_background', True);
+  Out_ := Run('bash', J, IsErr);
+  Check(not IsErr, 'a foreground prefix grant covers the background run');
+  Check(uTools.BackgroundJobCount = 1, 'and the job is really started');
+
+  { ClearJobs has to stop the child and take the spool with it, not just
+    forget the array. }
+  Spool := '';
+  if StartBackgroundJob('ping -n 30 127.0.0.1', Id, Err) then
+    Spool := IncludeTrailingPathDelimiter(uTools.RootDir) + '.pasclaude' +
+      PathDelim + 'jobs' + PathDelim + Id + '.out';
+  Check((Spool <> '') and FileExists(Spool), 'a job has a spool file on disk');
+  uTools.ClearJobs;
+  Check(uTools.BackgroundJobCount = 0, 'clearing forgets every job');
+  Check(not FileExists(Spool), 'and deletes its spool');
+
+  ClearBashPrefixes;
+  uTools.AllowAllBash := False;
+  uTools.ClearJobs;
 end;
 
 { The changed-files log behind /diff. }
@@ -857,6 +955,7 @@ begin
   TestTools;
   TestFetch;
   TestBashPrefixes;
+  TestBackgroundJobs;
   TestChangedFiles;
   TestListModels;
   TestTodos;
@@ -868,6 +967,13 @@ begin
       'and carries the new depth properties');
     Check(Pos('"case_sensitive"', Schema.ToJson) > 0,
       'and the search flags');
+    { A tool implemented in RunTool but missing from the schema is one the
+      model can never call, and nothing else would notice. }
+    Check(Pos('"bash_output"', Schema.ToJson) > 0,
+      'and bash_output is declared to the model');
+    Check(Pos('"kill_bash"', Schema.ToJson) > 0, 'and kill_bash');
+    Check(Pos('"run_in_background"', Schema.ToJson) > 0,
+      'and bash advertises run_in_background');
   finally
     Schema.Free;
   end;

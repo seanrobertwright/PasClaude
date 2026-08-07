@@ -2014,6 +2014,37 @@ begin
   DeleteFile(P);
 end;
 
+{ What /jobs shows.  A process started on the user's behalf by a model has to
+  be legible to the user without asking the model about it: which job, whether
+  it is alive, and what it is actually running. }
+procedure TestJobList;
+var
+  Id, Err, L: string;
+begin
+  uTools.ClearJobs;
+  Check(uTools.BackgroundJobList = 'no background jobs',
+    'an empty job list says so rather than showing nothing');
+
+  if not StartBackgroundJob('ping -n 30 127.0.0.1', Id, Err) then
+  begin
+    Check(False, 'a job starts for the listing: ' + Err);
+    Exit;
+  end;
+  L := uTools.BackgroundJobList;
+  Check(Pos(Id, L) > 0, 'the listing names the job');
+  Check(Pos('running', L) > 0, 'and says it is running');
+  Check(Pos('ping -n 30', L) > 0, 'and shows the command');
+
+  uTools.KillBackgroundJob(Id);
+  uTools.WaitBackgroundJob(Id, 5000);
+  L := uTools.BackgroundJobList;
+  Check(Pos('running', L) = 0, 'and stops calling a stopped job running');
+
+  uTools.ClearJobs;
+  Check(uTools.BackgroundJobList = 'no background jobs',
+    'and clearing empties it again');
+end;
+
 { ------------------------------------------------------------------- main -- }
 
 procedure Cleanup(const Dir: string);
@@ -2060,7 +2091,11 @@ begin
     TestHistoryPersistence;
     TestVt;
     TestRewind;
+    TestJobList;
   finally
+    { Before the cleanup, not after: a live child holding a spool handle under
+      TmpRoot would make the recursive delete fail. }
+    uTools.ClearJobs;
     uTools.RootDir := '';
     Cleanup(TmpRoot);
   end;

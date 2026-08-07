@@ -199,9 +199,9 @@ end;
 { ------------------------------------------------------------- completion -- }
 
 const
-  SlashCommands: array[0..15] of string = (
-    '/help', '/clear', '/compact', '/diff', '/memory', '/init', '/rewind',
-    '/sessions', '/think',
+  SlashCommands: array[0..16] of string = (
+    '/help', '/clear', '/compact', '/diff', '/jobs', '/memory', '/init',
+    '/rewind', '/sessions', '/think',
     '/resume', '/save', '/cwd', '/model', '/yolo', '/cost', '/exit');
 
 { Candidates for the token being completed: slash commands when the token
@@ -520,6 +520,7 @@ begin
   EmitCLn(clGrey,   '  /compact       drop the oldest turns, keep the recent ones');
   EmitCLn(clGrey,   '  /compact full  replace the transcript with a model-written summary');
   EmitCLn(clGrey,   '  /diff          list the files this session has changed');
+  EmitCLn(clGrey,   '  /jobs          background commands still running');
   EmitCLn(clGrey,   '  /memory        show the project memory (CLAUDE.md)');
   EmitCLn(clGrey,   '  /init          have the model write a CLAUDE.md for this project');
   EmitCLn(clGrey,   '  /rewind        undo turns: conversation and edited files');
@@ -815,6 +816,25 @@ begin
   end;
 end;
 
+{ Background commands were started on the user's behalf, by a model, without
+  the user necessarily reading the line that launched them.  They must be
+  visible without having to ask the model what it is running. }
+procedure ShowJobs;
+var
+  L: TStringList;
+  I: Integer;
+begin
+  L := TStringList.Create;
+  try
+    L.Text := uTools.BackgroundJobList;
+    for I := 0 to L.Count - 1 do
+      if Trim(L[I]) <> '' then
+        EmitCLn(clGrey, '  ' + L[I]);
+  finally
+    L.Free;
+  end;
+end;
+
 { A bare /model lists what the key can actually use and takes a number.
   Typing a model id from memory is guesswork about a namespace that changes
   under you - the retired-default 404 was exactly that - so the list comes
@@ -1081,6 +1101,10 @@ begin
     Agent.Reset;
     uTools.ClearChangedFiles;
     uTools.ClearTodos;
+    { The transcript that held the job ids is being thrown away, so a job
+      that survived it would be a process the user has no name for and no
+      way to stop short of Task Manager. }
+    uTools.ClearJobs;
     { The saved copy has to go too.  Otherwise "cleared" means only "cleared
       until you resume", and a user who cleared something they did not want
       kept would find it again on the next run. }
@@ -1139,6 +1163,8 @@ begin
       session's own list is the fallback. }
     ShowDiff;
   end
+  else if Cmd = '/jobs' then
+    ShowJobs
   else if Cmd = '/memory' then
     ShowMemory
   else if Cmd = '/rewind' then
@@ -1654,6 +1680,10 @@ begin
       Agent.Free;
     end;
   finally
+    { Before TermDone, so anything a dying child prints on its way out lands
+      while the console is still in a sane state.  uTools' finalization
+      repeats this as the backstop for the paths that skip a finally. }
+    uTools.ClearJobs;
     TermDone;
   end;
 end.

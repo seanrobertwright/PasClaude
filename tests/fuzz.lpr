@@ -639,6 +639,122 @@ begin
   Unchanged('leaving the bytes alone');
 end;
 
+{ Background bash, from the hostile side.  Everything here is a way the job
+  table or the spool could be turned into something other than "a process the
+  user approved". }
+procedure TestBackgroundJobsHostile;
+var
+  J: TJson;
+  Out_, First, Second, Id, Err: string;
+  IsErr: Boolean;
+  SavedCP: UINT;
+  I, Started: Integer;
+begin
+  uTools.RootDir := SessionDir;
+  uTools.AllowAllBash := True;
+  uTools.ClearJobs;
+
+  { A blank command backgrounded would spawn a bare cmd.exe and leave it in
+    the table with nothing to show for it. }
+  J := TJson.NewObj;
+  J.AddStr('command', '   ');
+  J.AddBool('run_in_background', True);
+  Out_ := RunTool('bash', J, IsErr);
+  Check(IsErr, 'a blank background command is refused');
+  Check(uTools.BackgroundJobCount = 0, 'and starts nothing');
+
+  { OEM bytes out of a background job.  The conversion lives in a different
+    reader from the foreground one, so it has to be pinned separately: one
+    stray high byte in a poll result makes the API reject the whole turn. }
+  SavedCP := GetConsoleOutputCP;
+  SetConsoleOutputCP(850);
+  try
+    uTools.ClearJobs;
+    if StartBackgroundJob('echo caf' + Chr($E9), Id, Err) then
+    begin
+      Check(WaitBackgroundJob(Id, 5000), 'an OEM-emitting job finishes');
+      Out_ := PollBackgroundJob(Id, IsErr);
+      Check(IsValidUtf8(Out_), 'polled output is valid UTF-8');
+      Check(Pos(#$C3#$A9, Out_) > 0,
+        'and the accented character is converted, not scrubbed');
+    end
+    else
+      Check(False, 'an OEM-emitting job starts: ' + Err);
+  finally
+    SetConsoleOutputCP(SavedCP);
+  end;
+
+  { More output than one poll may return.  The bound is on the READ, and the
+    offset advances by exactly what came back - so the rest arrives next
+    time.  Clipping the result instead would pass the first assertion and
+    lose those bytes forever, which the second assertion catches. }
+  uTools.ClearJobs;
+  if StartBackgroundJob('for /L %i in (1,1,4000) do @echo ' +
+       'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx', Id, Err) then
+  begin
+    Check(WaitBackgroundJob(Id, 60000), 'a loud job finishes');
+    First := PollBackgroundJob(Id, IsErr);
+    Check(Length(First) <= 24 * 1024 + 256, 'one poll is bounded');
+    Check(Pos('more output pending', First) > 0, 'and says there is more');
+    Second := PollBackgroundJob(Id, IsErr);
+    Check((Second <> First) and (Pos('xxxxx', Second) > 0),
+      'and the next poll continues rather than repeating or skipping');
+  end
+  else
+    Check(False, 'a loud job starts: ' + Err);
+
+  { The table is capped.  Without the cap a model in a loop fills the machine
+    with detached shells. }
+  uTools.ClearJobs;
+  Started := 0;
+  for I := 1 to 9 do
+  begin
+    J := TJson.NewObj;
+    J.AddStr('command', 'ping -n 30 127.0.0.1');
+    J.AddBool('run_in_background', True);
+    Out_ := RunTool('bash', J, IsErr);
+    if not IsErr then Inc(Started);
+    if I = 9 then
+      Check(IsErr and (Pos('too many', Out_) > 0),
+        'the ninth job is refused: ' + Out_);
+  end;
+  Check(Started <= 8, 'and at most eight are live');
+  Check(uTools.BackgroundJobCount <= 8, 'the table never exceeds the cap');
+  uTools.ClearJobs;
+
+  { An id is a table key, never a path.  If the spool path were built by
+    concatenating the id, this would name something outside the state
+    directory. }
+  J := TJson.NewObj;
+  J.AddStr('job_id', '..\..\windows\system32');
+  Out_ := RunTool('kill_bash', J, IsErr);
+  Check(IsErr and (Pos('no such job', Out_) > 0),
+    'a traversal-shaped job id names no job: ' + Out_);
+
+  { And the spool itself stays out of the model's reach, both directly and
+    through the walkers - otherwise a job's output would come back into the
+    context a second time as a file, growing it by a copy of itself. }
+  uTools.ClearJobs;
+  if StartBackgroundJob('echo needle-in-a-spool', Id, Err) then
+  begin
+    WaitBackgroundJob(Id, 5000);
+    J := TJson.NewObj;
+    J.AddStr('path', '.pasclaude/jobs/' + Id + '.out');
+    Out_ := RunTool('read_file', J, IsErr);
+    Check(IsErr and (Pos('session state', Out_) > 0),
+      'the spool is refused by the state-dir guard: ' + Out_);
+    J := TJson.NewObj;
+    J.AddStr('pattern', 'needle-in-a-spool');
+    Out_ := RunTool('search', J, IsErr);
+    Check(Pos('no matches', Out_) > 0, 'and the walkers do not find it');
+  end
+  else
+    Check(False, 'the spool job starts: ' + Err);
+
+  uTools.ClearJobs;
+  uTools.AllowAllBash := False;
+end;
+
 begin
   TestBinaryFileDoesNotCorruptBody;
   TestNulByteIsEscaped;
@@ -649,6 +765,7 @@ begin
   TestShellOutputIsUtf8;
   TestHostileRegex;
   TestNotebookHostileInput;
+  TestBackgroundJobsHostile;
 
   WriteLn;
   if Fails = 0 then
