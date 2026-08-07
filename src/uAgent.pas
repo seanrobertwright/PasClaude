@@ -26,6 +26,12 @@ type
   { Polled while a response streams; True abandons the request. }
   TCancelProc = function: Boolean;
 
+  TModelInfo = record
+    Id: string;           { what the API wants in "model" }
+    DisplayName: string;  { what a human calls it }
+  end;
+  TModelList = array of TModelInfo;
+
   TBlockKind = (bkText, bkThinking, bkToolUse);
 
   TPartialBlock = record
@@ -131,6 +137,9 @@ type
     function CacheReadTokens: Int64;
     function TurnCount: Integer;
     property Model: string read FModel write FModel;
+    { Asks the API which models this key can use.  Empty with Err set when
+      the endpoint could not be reached or the answer was not understood. }
+    function ListModels(out Err: string): TModelList;
     { Extended thinking budget in tokens; 0 disables it.  When set the
       request carries a thinking block allowance and max_tokens grows to
       leave room for the visible reply on top of the reasoning. }
@@ -551,6 +560,67 @@ end;
 function TAgent.ContextTokens: Int64;
 begin
   Result := FLastPromptTokens;
+end;
+
+{ The models endpoint answers GET /v1/models with {"data":[{id, display_name,
+  ...}]}.  The same authentication rules as the messages endpoint apply, so
+  the header choice mirrors SendOnce's. }
+function TAgent.ListModels(out Err: string): TModelList;
+var
+  Headers: string;
+  Res: THttpResult;
+  Doc, Data, M: TJson;
+  I, N: Integer;
+begin
+  Result := nil;
+  Err := '';
+
+  if Copy(FApiKey, 1, Length(OauthKeyPrefix)) = OauthKeyPrefix then
+    Headers :=
+      'authorization: Bearer ' + FApiKey + #13#10 +
+      'anthropic-beta: ' + OauthBeta + #13#10 +
+      'anthropic-version: ' + ApiVersion
+  else
+    Headers :=
+      'x-api-key: ' + FApiKey + #13#10 +
+      'anthropic-version: ' + ApiVersion;
+
+  Res := HttpGet('https://api.anthropic.com/v1/models?limit=50', Headers, 0);
+  if not Res.Ok then
+  begin
+    Err := Res.Error;
+    if Res.Body <> '' then Err := Err + ' - ' + Copy(Res.Body, 1, 300);
+    Exit;
+  end;
+
+  Doc := JsonParse(Res.Body);
+  if Doc = nil then
+  begin
+    Err := 'the model list was not valid JSON';
+    Exit;
+  end;
+  try
+    Data := Doc.Find('data');
+    if (Data = nil) or (Data.Kind <> jkArr) then
+    begin
+      Err := 'the model list has no data array';
+      Exit;
+    end;
+    N := 0;
+    SetLength(Result, Data.Count);
+    for I := 0 to Data.Count - 1 do
+    begin
+      M := Data.Item(I);
+      if M.Str('id') = '' then Continue;
+      Result[N].Id := M.Str('id');
+      Result[N].DisplayName := M.Str('display_name', M.Str('id'));
+      Inc(N);
+    end;
+    SetLength(Result, N);
+    if N = 0 then Err := 'the API returned no models';
+  finally
+    Doc.Free;
+  end;
 end;
 
 { A turn that failed - no key, no network, a rejected request - leaves the

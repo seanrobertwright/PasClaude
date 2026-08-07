@@ -71,7 +71,7 @@ contents are appended to the system prompt as binding instructions.
 | `/resume` | reload the saved conversation |
 | `/save` | write the conversation now |
 | `/cwd` | show the session root |
-| `/model [name]` | show or change the model |
+| `/model [name]` | pick a model from a live list, or set one by name |
 | `/yolo` | approve every tool for the rest of the session |
 | `/cost` | turns and tokens used |
 | `/exit` | quit (Ctrl+C also works) |
@@ -83,6 +83,14 @@ it is caught and treated as the cancel the user meant. Whatever arrived is
 kept, any tool the model was about to call is not run, and the conversation
 stays usable for the next question. `Ctrl+Break` keeps its default meaning:
 a user reaching for it wants the process gone, not the reply stopped.
+
+A bare `/model` fetches the models this key can actually use from
+`GET /v1/models` and offers them as a numbered list, current one marked,
+Enter to keep it. Typing an id from memory is guesswork about a namespace
+that changes under you - the retired-default 404 was exactly that - so the
+list comes from the API, which cannot be stale. `/model <name>` still sets
+one directly, deliberately unvalidated: a model newer than the list, or one
+behind a beta flag, should not be un-pickable.
 
 Transient failures (429, 529, 5xx) are retried up to three times with a
 widening delay, and the wait is interruptible. When the response carries a

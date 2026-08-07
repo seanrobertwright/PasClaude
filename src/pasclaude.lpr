@@ -409,7 +409,7 @@ begin
   EmitCLn(clGrey,   '  /resume        reload the saved conversation');
   EmitCLn(clGrey,   '  /save          write the conversation now');
   EmitCLn(clGrey,   '  /cwd           show the session root');
-  EmitCLn(clGrey,   '  /model [name]  show or change the model');
+  EmitCLn(clGrey,   '  /model [name]  pick a model from a list, or set one by name');
   EmitCLn(clGrey,   '  /yolo          approve every tool for this session');
   EmitCLn(clGrey,   '  /cost          tokens used so far');
   EmitCLn(clGrey,   '  /exit          quit (Ctrl+C also works)');
@@ -526,6 +526,53 @@ begin
       L.Free;
     end;
   end;
+end;
+
+{ A bare /model lists what the key can actually use and takes a number.
+  Typing a model id from memory is guesswork about a namespace that changes
+  under you - the retired-default 404 was exactly that - so the list comes
+  from the API, which cannot be stale. }
+procedure PickModel;
+var
+  Models: TModelList;
+  Err, Line: string;
+  I, Pick: Integer;
+  Mark: string;
+begin
+  EmitCLn(clGrey, '  fetching the model list...');
+  Models := Agent.ListModels(Err);
+  if Length(Models) = 0 then
+  begin
+    EmitCLn(clRed, '  could not list models: ' + Err);
+    EmitCLn(clGrey, '  current model: ' + Agent.Model +
+      '  (/model <name> still sets one directly)');
+    Exit;
+  end;
+
+  for I := 0 to High(Models) do
+  begin
+    if Models[I].Id = Agent.Model then Mark := ' (current)' else Mark := '';
+    EmitC(clGrey, Format('  %2d  ', [I + 1]));
+    EmitC(clBright, Models[I].DisplayName);
+    EmitCLn(clGrey, '  ' + Models[I].Id + Mark);
+  end;
+
+  EmitC(clYellow, '  pick a number, or Enter to keep ' + Agent.Model + ' > ');
+  if not ReadLineEdit('', Line) then Exit;
+  Line := Trim(Line);
+  if Line = '' then
+  begin
+    EmitCLn(clGrey, '  keeping ' + Agent.Model);
+    Exit;
+  end;
+  Pick := StrToIntDef(Line, 0);
+  if (Pick < 1) or (Pick > Length(Models)) then
+  begin
+    EmitCLn(clRed, '  not a listed number: ' + Line);
+    Exit;
+  end;
+  Agent.Model := Models[Pick - 1].Id;
+  EmitCLn(clGrey, '  model set to ' + Agent.Model);
 end;
 
 procedure ShowBanner;
@@ -679,7 +726,7 @@ begin
       EmitCLn(clGrey, '  model set to ' + Arg);
     end
     else
-      EmitCLn(clGrey, '  ' + Agent.Model);
+      PickModel;
   end
   else if Cmd = '/yolo' then
   begin

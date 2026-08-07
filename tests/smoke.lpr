@@ -5,7 +5,7 @@ program smoke;
 
 {$mode objfpc}{$H+}
 
-uses SysUtils, uJson, uHttp, uTools;
+uses SysUtils, uJson, uHttp, uTools, uAgent;
 
 var
   Fails: Integer = 0;
@@ -348,6 +348,89 @@ begin
   Check(Length(uTools.ChangedFiles) = 0, 'clearing empties the list');
 end;
 
+{ The model list, against the same stand-in transport as fetch.  The parse
+  and the auth-header choice are the testable parts; the live endpoint was
+  verified by hand. }
+var
+  FakeGetHeaders: string;
+
+function FakeGetM(const Url, Headers: string; MaxBytes: Integer): THttpResult;
+begin
+  FakeGetUrl := Url;
+  FakeGetHeaders := Headers;
+  Result := FakeGetResult;
+end;
+
+procedure TestListModels;
+var
+  A: TAgent;
+  Models: TModelList;
+  Err: string;
+begin
+  uHttp.HttpGetTransport := @FakeGetM;
+  try
+    FakeGetResult.Ok := True;
+    FakeGetResult.Status := 200;
+    FakeGetResult.Error := '';
+    FakeGetResult.RetryAfterMs := 0;
+    FakeGetResult.Body :=
+      '{"data":[{"id":"claude-a","display_name":"Claude A"},' +
+      '{"id":"claude-b"},{"display_name":"no id, skipped"}]}';
+
+    A := TAgent.Create('sk-ant-api-key', 'm', 'sys');
+    try
+      Models := A.ListModels(Err);
+      Check(Length(Models) = 2, 'entries without an id are skipped');
+      Check((Length(Models) = 2) and (Models[0].Id = 'claude-a') and
+        (Models[0].DisplayName = 'Claude A'), 'id and display name are read');
+      Check((Length(Models) = 2) and (Models[1].DisplayName = 'claude-b'),
+        'a missing display name falls back to the id');
+      Check(Pos('/v1/models', FakeGetUrl) > 0, 'the models endpoint is asked');
+      Check(Pos('x-api-key: sk-ant-api-key', FakeGetHeaders) > 0,
+        'an API key authenticates the list request');
+    finally
+      A.Free;
+    end;
+
+    A := TAgent.Create('sk-ant-oat01-tok', 'm', 'sys');
+    try
+      Models := A.ListModels(Err);
+      Check(Pos('authorization: Bearer sk-ant-oat01-tok', FakeGetHeaders) > 0,
+        'an OAuth token authenticates as a Bearer');
+    finally
+      A.Free;
+    end;
+
+    FakeGetResult.Ok := False;
+    FakeGetResult.Status := 401;
+    FakeGetResult.Error := 'HTTP 401';
+    FakeGetResult.Body := '{"error":{"message":"bad key"}}';
+    A := TAgent.Create('k', 'm', 'sys');
+    try
+      Models := A.ListModels(Err);
+      Check((Length(Models) = 0) and (Pos('HTTP 401', Err) > 0),
+        'a failed list reports the status');
+    finally
+      A.Free;
+    end;
+
+    FakeGetResult.Ok := True;
+    FakeGetResult.Status := 200;
+    FakeGetResult.Error := '';
+    FakeGetResult.Body := 'not json';
+    A := TAgent.Create('k', 'm', 'sys');
+    try
+      Models := A.ListModels(Err);
+      Check((Length(Models) = 0) and (Err <> ''),
+        'a garbled answer is an error, not a crash');
+    finally
+      A.Free;
+    end;
+  finally
+    uHttp.HttpGetTransport := nil;
+  end;
+end;
+
 var
   Schema: TJson;
 begin
@@ -356,6 +439,7 @@ begin
   TestFetch;
   TestBashPrefixes;
   TestChangedFiles;
+  TestListModels;
   Schema := ToolsSchema;
   try
     Check(Pos('"input_schema"', Schema.ToJson) > 0, 'the schema serialises');
