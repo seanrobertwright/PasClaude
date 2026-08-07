@@ -72,6 +72,19 @@ type
       not declared at all, so the model cannot reach the network and the
       declaration costs nothing. }
     FWebSearch: Boolean;
+    { The tool-round ceiling for this agent.  A field rather than the constant
+      because a subagent gets a lower one. }
+    FMaxRounds: Integer;
+
+    { The cancel test every poll site uses.  ShouldCancel is consume-on-read
+      in the host (CtrlCPressed clears the flag as it answers), so a subagent
+      polling it would swallow the user's abort and leave the parent running.
+      ForceCancel is the latch that makes the abort survive that. }
+    function WantsCancel: Boolean;
+    { Folds a finished subagent's token counts into this agent's, so /cost
+      reports what the turn actually cost rather than what the parent alone
+      spent. }
+    procedure AbsorbUsage(Sub: TAgent);
 
     function BuildBody: string;
     { Turns web search off after the server refused the declaration, so the
@@ -94,6 +107,9 @@ type
     function SleepCancellable(Ms: Integer): Boolean;
     { Strips tool_use blocks that will never get a result. }
     procedure DropUnansweredToolCalls;
+    { Puts the transcript back into a state the next question can legally
+      follow after a cancellation. }
+    procedure UnwindCancelledTail;
   public
     OnText: TTextProc;             { streamed assistant prose }
     OnThinking: TTextProc;         { streamed reasoning, when the model emits it }
@@ -168,6 +184,13 @@ type
       hook to ask permission at, which makes this switch the whole of the
       user's consent to reaching the outside world. }
     property WebSearch: Boolean read FWebSearch write FWebSearch;
+    { The tool-round ceiling for this agent.  MaxToolRounds by default; a
+      subagent gets less, because it is doing one self-contained job and
+      nobody is watching it spend. }
+    property MaxRounds: Integer read FMaxRounds write FMaxRounds;
+    { The text of the last assistant message - what a subagent hands back to
+      its caller as the whole result.  '' when there is none. }
+    function LastAssistantText: string;
 
     { Test seam.  Feeds raw response bytes through the same decoder the live
       stream uses, so the SSE handling can be exercised without a network.
@@ -230,6 +253,22 @@ var
 implementation
 
 uses SysUtils, Classes, uHttp;
+
+var
+  { The agent whose tool call is currently running, so a nested agent spawned
+    from inside that call can find its parent - its key, its model, and the
+    counters its spending has to land in. }
+  ActiveAgent: TAgent = nil;
+  { Whose hooks a subagent's progress lines are forwarded to.  Held apart
+    from ActiveAgent so the forwarding does not have to reach back through a
+    parent pointer on every line. }
+  SubHost: TAgent = nil;
+  { Set when a subagent's own turn reported itself cancelled. }
+  SubWasCancelled: Boolean = False;
+  { The cancellation latch.  The host's ShouldCancel consumes its flag as it
+    answers, so without this a subagent would read the user's Esc, stop, and
+    the parent would carry on as though nothing had happened. }
+  ForceCancel: Boolean = False;
 
 function SessionPath(const Root: string): string;
 begin
@@ -582,7 +621,7 @@ begin
   ConsumeLines(St);
   { Checked per chunk rather than per event: it is the cheapest place that
     still reacts within a few hundred bytes of the user pressing Esc. }
-  if Assigned(St^.Agent.ShouldCancel) and St^.Agent.ShouldCancel() then
+  if St^.Agent.WantsCancel then
     St^.Cancel := True;
   Result := not St^.Cancel;
 end;
@@ -598,9 +637,46 @@ begin
   FSystem := SystemPrompt;
   FMessages := TJson.NewArr;
   FMaxTokens := 8192;
+  FMaxRounds := MaxToolRounds;
   { Stated rather than left to the zero value, because "off" is a decision
     here and not an accident of initialisation. }
   FWebSearch := False;
+end;
+
+function TAgent.WantsCancel: Boolean;
+begin
+  Result := ForceCancel or (Assigned(ShouldCancel) and ShouldCancel());
+end;
+
+procedure TAgent.AbsorbUsage(Sub: TAgent);
+begin
+  if Sub = nil then Exit;
+  Inc(FTotalIn, Sub.FTotalIn);
+  Inc(FTotalOut, Sub.FTotalOut);
+  Inc(FCacheWrite, Sub.FCacheWrite);
+  Inc(FCacheRead, Sub.FCacheRead);
+end;
+
+function TAgent.LastAssistantText: string;
+var
+  I, J: Integer;
+  M, Content, B: TJson;
+begin
+  Result := '';
+  for I := FMessages.Count - 1 downto 0 do
+  begin
+    M := FMessages.Item(I);
+    if (M = nil) or (M.Str('role') <> 'assistant') then Continue;
+    Content := M.Find('content');
+    if Content = nil then Exit;
+    for J := 0 to Content.Count - 1 do
+    begin
+      B := Content.Item(J);
+      if (B <> nil) and (B.Str('type') = 'text') then
+        Result := Result + B.Str('text');
+    end;
+    Exit;
+  end;
 end;
 
 destructor TAgent.Destroy;
@@ -1210,6 +1286,7 @@ var
   Input, Results, R, Msg: TJson;
   Output, Detail: string;
   IsErr: Boolean;
+  Prev: TAgent;
 begin
   Result := False;
   Results := TJson.NewArr;
@@ -1229,7 +1306,17 @@ begin
       try
         Detail := DescribeTool(Blocks[I].Name, Input);
         if Assigned(OnToolStart) then OnToolStart(Blocks[I].Name, Detail);
-        Output := uTools.RunTool(Blocks[I].Name, Input, Ask, IsErr);
+        { Only the call itself is wrapped: this is the window in which a task
+          tool may reach back for its parent, and saving the previous value
+          rather than nil'ing it keeps the nesting honest even though the
+          depth cap allows only one level. }
+        Prev := ActiveAgent;
+        ActiveAgent := Self;
+        try
+          Output := uTools.RunTool(Blocks[I].Name, Input, Ask, IsErr);
+        finally
+          ActiveAgent := Prev;
+        end;
         if Assigned(OnToolResult) then
           OnToolResult(Blocks[I].Name, Output);
 
@@ -1595,11 +1682,11 @@ var
 begin
   Step := 50;
   if Ms < Step then Step := Ms;
-  if Step <= 0 then Exit(not (Assigned(ShouldCancel) and ShouldCancel()));
+  if Step <= 0 then Exit(not WantsCancel);
   Waited := 0;
   while Waited < Ms do
   begin
-    if Assigned(ShouldCancel) and ShouldCancel() then Exit(False);
+    if WantsCancel then Exit(False);
     Sleep(Step);
     Inc(Waited, Step);
   end;
@@ -1630,10 +1717,14 @@ var
   Cancelled: Boolean;
 begin
   Err := '';
+  { Only a top-level turn may clear the latch.  A subagent's own Send runs
+    with ActiveAgent set, and clearing it here would erase the very abort the
+    subagent was started to propagate. }
+  if ActiveAgent = nil then ForceCancel := False;
   AppendUserText(UserText);
 
   Inc(FTurns);
-  for Round := 1 to MaxToolRounds do
+  for Round := 1 to FMaxRounds do
   begin
     if not SendWithRetry(Blocks, StopReason, Err, Cancelled) then
     begin
@@ -1660,12 +1751,7 @@ begin
         still reads sensibly, and the unanswered tool_use blocks are dropped
         from the transcript so the API does not reject the next request. }
       DropUnansweredToolCalls;
-      { If the abort landed before anything was recorded - or left only tool
-        calls, which were just dropped - the transcript now ends on the user's
-        question with nothing answering it.  That gets saved like any other
-        turn, so it is trimmed here rather than in the caller: a cancel is not
-        a failure, so the caller's error path never runs. }
-      TrimUnansweredQuestion;
+      UnwindCancelledTail;
       if Assigned(OnNotice) then OnNotice('cancelled');
       Exit(True);
     end;
@@ -1678,11 +1764,25 @@ begin
     if StopReason = 'pause_turn' then Continue;
     if not RunTools(Blocks) then
       Exit(True);
+    { The abort can also come from inside the tool call that just finished: a
+      subagent that was cancelled propagates the user's Esc through
+      ForceCancel, and a tool that ran for a minute gives the user plenty of
+      time to press it.  Noticing here rather than letting the next request go
+      out to be aborted mid-stream saves a round trip and, more to the point,
+      keeps the transcript from gaining a turn nobody asked for.  ForceCancel
+      is tested first inside WantsCancel, so a latched abort does not consume
+      the host's own consume-on-read flag. }
+    if WantsCancel then
+    begin
+      UnwindCancelledTail;
+      if Assigned(OnNotice) then OnNotice('cancelled');
+      Exit(True);
+    end;
     { A tool ran, so the model gets another go with the results in hand. }
   end;
 
   if Assigned(OnNotice) then
-    OnNotice(Format('stopped after %d tool rounds', [MaxToolRounds]));
+    OnNotice(Format('stopped after %d tool rounds', [FMaxRounds]));
   { The loop exits directly after RunTools appended a tool_result message that
     was never sent, so the transcript ends on a user turn.  The next question
     would then sit behind it as a second user turn in a row, and the work those
@@ -1703,6 +1803,26 @@ end;
   repeats.  It stops while the user's original question is still there, or the
   turn would erase itself entirely; that question is then trimmed too, being
   the same unanswered state a failed turn leaves. }
+{ Two shapes of cancelled turn need two different repairs.  Cancel a reply
+  mid-stream and the transcript ends on the user's question with nothing
+  answering it, which TrimUnansweredQuestion removes.  Cancel from inside a
+  tool call and RunTools has already pushed its results, so the transcript
+  ends on a tool_result user message the model will never see - and
+  TrimUnansweredQuestion rightly refuses to drop a tool_result, so the next
+  question would sit behind it as a second user turn in a row and the API
+  would reject it.  That case needs the full unwind.
+
+  It cannot simply unwind in both cases: with a trailing assistant message the
+  unwind's while loop never runs and a dangling tool_use would survive. }
+procedure TAgent.UnwindCancelledTail;
+begin
+  if (FMessages.Count > 0) and
+     (FMessages.Item(FMessages.Count - 1).Str('role') = 'user') then
+    UnwindUnsentTail
+  else
+    TrimUnansweredQuestion;
+end;
+
 procedure TAgent.UnwindUnsentTail;
 begin
   while (FMessages.Count > 1) and
@@ -1783,5 +1903,108 @@ begin
   else
     Keep.Free;
 end;
+
+{ --------------------------------------------------------------- subagent -- }
+
+{ A subagent's own streaming stays off the terminal: two agents writing prose
+  to one console interleaved is unreadable, and the user did not ask the
+  second one anything.  What is forwarded is one line per tool it runs, so the
+  wait is visibly alive and the user can see what is being read on their
+  behalf. }
+procedure SubToolStart(const Name, Detail: string);
+begin
+  if Assigned(SubHost) and Assigned(SubHost.OnToolStart) then
+    SubHost.OnToolStart(Name, '-> ' + Detail);
+end;
+
+procedure SubNotice(const S: string);
+begin
+  { Latched rather than forwarded and forgotten: this is the only report that
+    the nested turn was aborted, and the parent has to act on it. }
+  if S = 'cancelled' then SubWasCancelled := True;
+  if Assigned(SubHost) and Assigned(SubHost.OnNotice) then
+    SubHost.OnNotice('subagent: ' + S);
+end;
+
+function RunSubagent(const Prompt, SystemExtra: string;
+  out Reply, Err: string): Boolean;
+var
+  Parent, Sub: TAgent;
+  SysText: string;
+  SavedHost: TAgent;
+  SavedCancelled: Boolean;
+begin
+  Result := False;
+  Reply := '';
+  Err := '';
+  Parent := ActiveAgent;
+  if Parent = nil then
+  begin
+    Err := 'no parent agent';
+    Exit;
+  end;
+  { The parent's system prompt is deliberately NOT inherited: it carries the
+    project memory and the guidance about getting writes approved, none of
+    which applies to a helper that cannot write and has no user to ask. }
+  SysText :=
+    'You are a read-only subagent working inside a coding session rooted at ' +
+    uTools.RootDir + '.' + #10 +
+    'You have exactly three tools: read_file, list_dir and search. You ' +
+    'cannot change files, run commands, fetch URLs, or start a subagent of ' +
+    'your own.' + #10 +
+    'Investigate what you were asked and then answer it in full. Your final ' +
+    'message is the whole of what your caller receives - they see none of ' +
+    'your intermediate steps - so it must stand on its own, cite the paths ' +
+    'and line numbers you found, and say plainly when you could not find ' +
+    'something.';
+  if Trim(SystemExtra) <> '' then
+    SysText := SysText + #10#10 + SystemExtra;
+
+  Sub := TAgent.Create(Parent.FApiKey, Parent.FModel, SysText);
+  try
+    Sub.MaxRounds := uTools.SubagentMaxRounds;
+    { Nil by construction rather than by omission: nothing a subagent can call
+      asks permission, and a prompt raised on behalf of a hidden conversation
+      would be unanswerable anyway. }
+    Sub.Ask := nil;
+    Sub.ShouldCancel := Parent.ShouldCancel;
+    Sub.OnToolStart := @SubToolStart;
+    Sub.OnNotice := @SubNotice;
+    { Thinking is left off: a helper that reasons at budget doubles the bill
+      of every delegated question, invisibly. }
+
+    SavedHost := SubHost;
+    SavedCancelled := SubWasCancelled;
+    SubHost := Parent;
+    SubWasCancelled := False;
+    try
+      Result := Sub.Send(Prompt, Err);
+      { Counted whether or not the turn succeeded - a failed subagent still
+        spent tokens, and a /cost that quietly omits them is a counter that
+        lies in exactly the direction the user would mind. }
+      Parent.AbsorbUsage(Sub);
+      if Result then Reply := Sub.LastAssistantText;
+      if SubWasCancelled then
+      begin
+        { The user's abort has to reach the parent's loop, and the parent may
+          be several polls away from its next chance to notice. }
+        ForceCancel := True;
+        Err := 'cancelled';
+        Result := False;
+      end;
+    finally
+      SubHost := SavedHost;
+      SubWasCancelled := SavedCancelled;
+    end;
+  finally
+    Sub.Free;
+  end;
+end;
+
+initialization
+  { The ladder crossing: uTools declares the hole because it is the unit that
+    needs a way to run one, and the unit that knows what an agent is fills it.
+    The same shape uHttp uses for the network transport. }
+  uTools.SubagentRunner := @RunSubagent;
 
 end.

@@ -815,6 +815,95 @@ begin
   end;
 end;
 
+{ Agent definitions are the one place in uTools where a file is opened without
+  SafePath - they live inside the state directory, which SafePath refuses by
+  design.  The whole of the guard is therefore the character filter on the
+  name, and the name is the only part of the path the model supplies. }
+procedure TestAgentDefinitions;
+var
+  Dir, Text, Err, Out_: string;
+  IsErr, Ok: Boolean;
+  J, Arr: TJson;
+  Saved: TSubagentProc;
+
+  procedure Refuses(const Name, What: string);
+  var
+    T, E: string;
+  begin
+    Check((not LoadAgentDefinition(Name, T, E)) and
+          (Pos('bad agent type', E) > 0), What + ': ' + E);
+  end;
+
+begin
+  uTools.RootDir := SessionDir;
+  Dir := IncludeTrailingPathDelimiter(SessionDir) + StateDirName +
+    PathDelim + 'agents' + PathDelim;
+  ForceDirectories(Dir);
+
+  { Every one of these would, unfiltered, name a file outside the agents
+    directory and read it straight into a system prompt. }
+  Refuses('..\..\evil', 'a relative escape is refused');
+  Refuses('a/b', 'a forward slash is refused');
+  Refuses('c:', 'a drive letter is refused');
+  Refuses('x.y', 'a dot is refused, so the extension cannot be steered');
+  Refuses('..', 'the parent directory is refused');
+  Refuses('ok'#0'\..\..\evil', 'a NUL-bearing name is refused');
+
+  Check((not LoadAgentDefinition('nosuchagent', Text, Err)) and
+        (Pos('unknown agent type', Err) > 0),
+    'a legal but undefined type is named as unknown: ' + Err);
+
+  { No type at all is the general-purpose subagent, which is not an error. }
+  Check(LoadAgentDefinition('', Text, Err) and (Text = '') and (Err = ''),
+    'no agent type asks for no extra briefing');
+
+  { This text becomes a system prompt on a nested request, where one bad byte
+    loses the whole call and surfaces only as a mysterious tool failure. }
+  Text := StringOfChar(#$FF, 40) + #0 + 'junk' + StringOfChar('z', 40000);
+  WriteFileText(Dir + 'junk.md', Text);
+  Ok := LoadAgentDefinition('junk', Text, Err);
+  Check(Ok, 'a hostile definition file still loads: ' + Err);
+  Check(IsValidUtf8(Text), 'and comes back as valid UTF-8');
+  { Clip caps the body at MaxOutBytes and adds a line saying it did, so the
+    bound to assert is that plus a note, not the constant on its own. }
+  Check(Length(Text) <= 31 * 1024,
+    Format('and clipped to the tool output bound (%d bytes)', [Length(Text)]));
+
+  Check(Length(SubagentTypes) >= 1, 'the definition is offered as a type');
+
+  SysUtils.DeleteFile(Dir + 'junk.md');
+
+  { A model can send anything for a string field, and reading a non-string
+    must not raise on the way in.  The runner is unhooked first: this suite
+    has no scripted transport, and a task call that got as far as running
+    would go looking for the real API. }
+  Saved := uTools.SubagentRunner;
+  uTools.SubagentRunner := nil;
+  try
+    J := TJson.NewObj;
+    J.AddNum('prompt', 42);
+    Out_ := RunTool('task', J, IsErr);
+    Check(IsErr, 'a numeric prompt is a clean error: ' + Out_);
+
+    J := TJson.NewObj;
+    Arr := TJson.NewArr;
+    Arr.Push(TJson.NewStr('do a thing'));
+    J.Add('prompt', Arr);
+    Out_ := RunTool('task', J, IsErr);
+    Check(IsErr, 'an array prompt is a clean error: ' + Out_);
+
+    J := TJson.NewObj;
+    J.AddStr('prompt', 'find something');
+    J.Add('agent_type', TJson.NewObj);
+    Out_ := RunTool('task', J, IsErr);
+    Check(IsErr, 'an object agent_type is a clean error: ' + Out_);
+  finally
+    uTools.SubagentRunner := Saved;
+  end;
+
+  Check(SubagentDepth = 0, 'and no failed call left the depth raised');
+end;
+
 begin
   TestBinaryFileDoesNotCorruptBody;
   TestNulByteIsEscaped;
@@ -827,6 +916,7 @@ begin
   TestNotebookHostileInput;
   TestBackgroundJobsHostile;
   TestHostileSearchResult;
+  TestAgentDefinitions;
 
   WriteLn;
   if Fails = 0 then

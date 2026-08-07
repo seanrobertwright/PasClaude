@@ -19,6 +19,13 @@ type
   { Supplied by the host so this unit does not depend on the console. }
   TAskProc = function(const Title, Detail: string): TPermission;
 
+  { Runs a nested agent to completion and returns its final reply.  Declared
+    here and supplied by uAgent because the unit ladder runs the other way:
+    the tools may not know what a conversation is, so the conversation loop
+    hands this unit a way in - the same seam uHttp uses for the network. }
+  TSubagentProc = function(const Prompt, SystemExtra: string;
+    out Reply, Err: string): Boolean;
+
 var
   { Session root; every path argument is resolved relative to it. }
   RootDir: string = '';
@@ -26,6 +33,11 @@ var
   AllowAllEdits: Boolean = False;
   AllowAllBash: Boolean = False;
   AllowAllFetch: Boolean = False;
+  { Filled in by uAgent's initialization.  Nil means this build cannot run a
+    subagent at all: the task tool is then not advertised and, if the model
+    names it anyway, it reports a plain error.  Deny-by-default applied to a
+    capability rather than to a file. }
+  SubagentRunner: TSubagentProc = nil;
 
 const
   { pasclaude's own state directory, kept out of listings and searches.  The
@@ -39,6 +51,15 @@ const
     a rejection by the server disables the feature for the session and the
     turn is retried, so a wrong string here costs one request, not a run. }
   WebSearchToolType = 'web_search_20260209';
+
+  { One level, and no further.  A subagent that can spawn subagents turns a
+    confused model into an unbounded bill, and the second level buys nothing
+    a single well-briefed helper cannot do. }
+  MaxSubagentDepth  = 1;
+  { A subagent's tool-round ceiling, well under the parent's: it is doing one
+    self-contained job, and nobody is watching it spend.  Read by uAgent,
+    which is why it lives here beside the depth cap rather than there. }
+  SubagentMaxRounds = 12;
 
 { The tool list, as the API expects it under "tools". }
 function ToolsSchema: TJson;
@@ -113,6 +134,37 @@ procedure ClearChangedFiles;
 function CurrentTodos: TStringArray;
 { Test seam and /clear. }
 procedure ClearTodos;
+
+{ ---- subagents ----
+  A subagent runs inside a tool call, where the user is being asked nothing
+  and is not even looking at a prompt.  So it is read-only: read_file,
+  list_dir, search, and nothing else.  Threading the Ask callback down would
+  put a permission dialog on screen for a conversation the user cannot see -
+  and worse, it would be pointless, because Permit short-circuits on
+  AllowAllEdits and PermitBash on a persisted "always", so under /yolo a
+  writable subagent would write with no prompt at all.  Deny-by-default would
+  be honoured in letter and defeated in spirit. }
+
+{ Claims the one available subagent slot.  False at the cap, which is the
+  guard against a fork bomb; the caller must Leave in a finally. }
+function EnterSubagent: Boolean;
+procedure LeaveSubagent;
+{ Test seam: 0 when no subagent is running. }
+function SubagentDepth: Integer;
+
+{ The read-only allowlist.  RunTool consults this, not just ToolsSchema:
+  the schema is advice to the model, and this is the boundary. }
+function IsSubagentTool(const Name: string): Boolean;
+
+{ The agent types defined under the state directory, one .md file each,
+  named for the choices offered in the schema and in the unknown-type error. }
+function SubagentTypes: TStringArray;
+
+{ The extra system prompt for a named agent type; '' means the general
+  purpose subagent, which is not an error.  False with Err set when the name
+  is malformed or unknown. }
+function LoadAgentDefinition(const AgentType: string;
+  out Text, Err: string): Boolean;
 
 { ---- background jobs, the detached half of bash ----
   A background command's output goes to a spool file under the state
@@ -1568,6 +1620,144 @@ begin
   SetLength(TodoList, 0);
 end;
 
+{ -------------------------------------------------------------- subagents -- }
+
+const
+  AgentsDirName = 'agents';
+
+var
+  { Not a Boolean, because Enter/Leave must nest correctly even though the
+    cap only ever permits one level; a counter cannot get out of step with
+    itself the way a flag and a cap can. }
+  SubDepth: Integer = 0;
+
+function EnterSubagent: Boolean;
+begin
+  Result := SubDepth < MaxSubagentDepth;
+  if Result then Inc(SubDepth);
+end;
+
+procedure LeaveSubagent;
+begin
+  if SubDepth > 0 then Dec(SubDepth);
+end;
+
+function SubagentDepth: Integer;
+begin
+  Result := SubDepth;
+end;
+
+{ The whole of what a subagent may do.  Three names, in one place, so a
+  reviewer can verify the read-only claim by reading this line rather than by
+  trusting six save-and-restore pairs elsewhere: nothing on this list touches
+  the todo list, the changed-file list, the bash prefix table or the rewind
+  snapshots, which is why none of that module state needs scoping. }
+function IsSubagentTool(const Name: string): Boolean;
+begin
+  Result := (Name = 'read_file') or (Name = 'list_dir') or (Name = 'search');
+end;
+
+function AgentsDir: string;
+begin
+  Result := IncludeTrailingPathDelimiter(NormalizeRoot) + StateDirName +
+    PathDelim + AgentsDirName + PathDelim;
+end;
+
+function SubagentTypes: TStringArray;
+var
+  R: TSearchRec;
+  L: TStringList;
+  I: Integer;
+begin
+  SetLength(Result, 0);
+  L := TStringList.Create;
+  try
+    if FindFirst(AgentsDir + '*.md', faAnyFile, R) = 0 then
+    begin
+      repeat
+        if (R.Attr and faDirectory) <> 0 then Continue;
+        L.Add(ChangeFileExt(R.Name, ''));
+      until FindNext(R) <> 0;
+      SysUtils.FindClose(R);
+    end;
+    L.Sort;
+    SetLength(Result, L.Count);
+    for I := 0 to L.Count - 1 do
+      Result[I] := L[I];
+  finally
+    L.Free;
+  end;
+end;
+
+{ The one place in this unit that opens a file without SafePath, and it has
+  to stay that way deliberately: SafePath refuses everything under the state
+  directory by design, and the agent definitions live there.  The guard
+  instead is that only the bare name comes from the model and it is filtered
+  for the path-bearing characters exactly as the custom-command loader
+  filters command names, so the directory part is constructed and can never
+  be walked out of. }
+function LoadAgentDefinition(const AgentType: string;
+  out Text, Err: string): Boolean;
+var
+  Name, Path, List: string;
+  I: Integer;
+  Types: TStringArray;
+  L: TStringList;
+begin
+  Text := '';
+  Err := '';
+  Name := Trim(AgentType);
+  { No type named is the general-purpose subagent, not a mistake. }
+  if Name = '' then Exit(True);
+
+  for I := 1 to Length(Name) do
+    if (Name[I] in ['\', '/', ':', '.']) or (Name[I] < ' ') then
+    begin
+      Err := 'bad agent type: ' + AgentType;
+      Exit(False);
+    end;
+
+  Path := AgentsDir + Name + '.md';
+  if not FileExists(Path) then
+  begin
+    Types := SubagentTypes;
+    List := '';
+    for I := 0 to High(Types) do
+    begin
+      if List <> '' then List := List + ', ';
+      List := List + Types[I];
+    end;
+    if List = '' then
+      Err := 'unknown agent type: ' + Name + ' (none are defined; put one in ' +
+        StateDirName + PathDelim + AgentsDirName + PathDelim + '<name>.md)'
+    else
+      Err := 'unknown agent type: ' + Name + ' (available: ' + List + ')';
+    Exit(False);
+  end;
+
+  L := TStringList.Create;
+  try
+    try
+      L.LoadFromFile(Path);
+      Text := L.Text;
+    except
+      on E: Exception do
+      begin
+        Err := 'cannot read agent type ' + Name + ': ' + E.Message;
+        Exit(False);
+      end;
+    end;
+  finally
+    L.Free;
+  end;
+  { This text becomes a system prompt on a nested request, so one bad byte
+    costs the whole subagent call - and it would surface only as a mysterious
+    tool failure, with nothing pointing at the file. }
+  if not IsValidUtf8(Text) then Text := OemToUtf8(Text);
+  Text := Clip(Text);
+  Result := True;
+end;
+
 { -------------------------------------------------------------- snapshots -- }
 
 type
@@ -1797,6 +1987,26 @@ begin
   Result.Add('input_schema', Schema);
 end;
 
+{ Named types are listed in the description rather than as an enum, because a
+  wrong name is already a clean tool error naming the alternatives, and an
+  enum would have to be rebuilt every time the user drops a file in. }
+function SubagentTypeDescription: string;
+var
+  T: TStringArray;
+  I: Integer;
+begin
+  Result := 'Optional named agent type to brief the subagent with.';
+  T := SubagentTypes;
+  if Length(T) = 0 then Exit;
+  Result := Result + ' Available:';
+  for I := 0 to High(T) do
+  begin
+    if I > 0 then Result := Result + ',';
+    Result := Result + ' ' + T[I];
+  end;
+  Result := Result + '.';
+end;
+
 function ToolsSchema: TJson;
 var
   P: TJson;
@@ -1809,32 +2019,6 @@ begin
     'Read a text file. Output is line-numbered so you can cite line numbers. ' +
     'A .ipynb file comes back instead as numbered notebook cells, with each ' +
     'output summarised by type and size rather than dumped.',
-    P, ['path']));
-
-  P := TJson.NewObj;
-  P.Add('path', StrProp('File path, relative to the session root.'));
-  P.Add('content', StrProp('Full new contents of the file.'));
-  Result.Push(MakeTool('write_file',
-    'Create a file or replace its entire contents. Requires user approval.',
-    P, ['path', 'content']));
-
-  P := TJson.NewObj;
-  P.Add('path', StrProp('File path, relative to the session root.'));
-  P.Add('old_text', StrProp('Exact text to replace. Must occur exactly once.'));
-  P.Add('new_text', StrProp('Replacement text.'));
-  P.Add('edits', TJson.NewObj);
-  with P.Find('edits') do
-  begin
-    AddStr('type', 'array');
-    AddStr('description', 'Several replacements applied together: each item ' +
-      'is {old_text, new_text}. Use this instead of separate calls when one ' +
-      'change spans several places in the file. All must match, or none are ' +
-      'applied.');
-  end;
-  Result.Push(MakeTool('edit_file',
-    'Replace exact snippets in a file: one via old_text/new_text, or several ' +
-    'at once via edits. Prefer this over write_file for changes to existing ' +
-    'files. Requires user approval.',
     P, ['path']));
 
   P := TJson.NewObj;
@@ -1871,6 +2055,39 @@ begin
     'Search file contents under the session root. Returns path:line: text. ' +
     'Set regex for pattern syntax.',
     P, ['pattern']));
+
+  { The cut is made here rather than by filtering afterwards so a subagent is
+    never told about a tool it would be refused: an offered tool that always
+    fails wastes a round and reads to the model as a broken machine.  The
+    three above are the whole read-only set, which is why they were moved to
+    the top - three paragraphs relocated beats eight indented. }
+  if SubDepth > 0 then Exit;
+
+  P := TJson.NewObj;
+  P.Add('path', StrProp('File path, relative to the session root.'));
+  P.Add('content', StrProp('Full new contents of the file.'));
+  Result.Push(MakeTool('write_file',
+    'Create a file or replace its entire contents. Requires user approval.',
+    P, ['path', 'content']));
+
+  P := TJson.NewObj;
+  P.Add('path', StrProp('File path, relative to the session root.'));
+  P.Add('old_text', StrProp('Exact text to replace. Must occur exactly once.'));
+  P.Add('new_text', StrProp('Replacement text.'));
+  P.Add('edits', TJson.NewObj);
+  with P.Find('edits') do
+  begin
+    AddStr('type', 'array');
+    AddStr('description', 'Several replacements applied together: each item ' +
+      'is {old_text, new_text}. Use this instead of separate calls when one ' +
+      'change spans several places in the file. All must match, or none are ' +
+      'applied.');
+  end;
+  Result.Push(MakeTool('edit_file',
+    'Replace exact snippets in a file: one via old_text/new_text, or several ' +
+    'at once via edits. Prefer this over write_file for changes to existing ' +
+    'files. Requires user approval.',
+    P, ['path']));
 
   P := TJson.NewObj;
   P.Add('command', StrProp('Command line, run through cmd.exe /C.'));
@@ -1947,6 +2164,26 @@ begin
     'and execution counts of the cell survive a replace. Requires user ' +
     'approval, like any other file change.',
     P, ['path', 'cell', 'edit_mode']));
+
+  { Only offered when a runner has been installed.  A build with no uAgent
+    linked in - a test suite, say - would otherwise advertise a tool whose
+    every call fails. }
+  if Assigned(SubagentRunner) then
+  begin
+    P := TJson.NewObj;
+    P.Add('prompt', StrProp('The whole job, self-contained: the subagent ' +
+      'sees none of this conversation. Say what to investigate and what to ' +
+      'report back.'));
+    P.Add('agent_type', StrProp(SubagentTypeDescription));
+    Result.Push(MakeTool('task',
+      'Hand a self-contained investigation to a read-only subagent and get ' +
+      'back its written answer. The subagent has its own conversation and ' +
+      'can only read: read_file, list_dir and search. Use it when finding ' +
+      'something would otherwise fill this conversation with intermediate ' +
+      'reading - "which unit owns X", "where is Y configured". It cannot ' +
+      'change anything, run commands, or start a subagent of its own.',
+      P, ['prompt']));
+  end;
 end;
 
 { Unlike everything in ToolsSchema this carries no input_schema: a server-side
@@ -2074,6 +2311,17 @@ begin
       Result := Format('update todos (%d items)', [Input.Find('todos').Count])
     else
       Result := 'update todos';
+  end
+  { The prompt's first line is the whole of what the user can be told about a
+    conversation they will never see, so it is what goes in the transcript. }
+  else if Name = 'task' then
+  begin
+    S := Trim(Input.Str('prompt'));
+    if Pos(#10, S) > 0 then S := Copy(S, 1, Pos(#10, S) - 1);
+    if Length(S) > 60 then S := Copy(S, 1, 57) + '...';
+    Result := 'task: ' + S;
+    if Input.Str('agent_type') <> '' then
+      Result := Result + ' [' + Input.Str('agent_type') + ']';
   end
   else
     Result := Name;
@@ -2308,6 +2556,17 @@ begin
   begin
     IsError := True;
     Exit('missing tool input');
+  end;
+
+  { This, not the schema, is where read-only is true.  The schema is advice
+    to the model and nothing stops it naming a tool it was never offered; and
+    the permission gate is no backstop here, because Permit short-circuits on
+    AllowAllEdits and PermitBash on a persisted "always", so under /yolo a
+    subagent's write would land with a nil Ask and no prompt at all. }
+  if (SubDepth > 0) and not IsSubagentTool(Name) then
+  begin
+    IsError := True;
+    Exit('not available to a subagent: ' + Name);
   end;
 
   if Name = 'read_file' then
@@ -2670,6 +2929,55 @@ begin
     { The final tail comes back in the same round trip: whatever the job
       printed just before it died is usually the reason it was killed. }
     Result := 'killed ' + Cmd + #10 + PollBackgroundJob(Cmd, Ok);
+  end
+
+  { Ungated, like the three tools it is allowed to call.  A subagent can do
+    strictly less than read_file, list_dir and search, which nobody is asked
+    about either; what it does spend is the user's money, and that is bounded
+    by one level of nesting and a low round ceiling rather than by a prompt
+    the model would learn to expect. }
+  else if Name = 'task' then
+  begin
+    Text := Trim(Input.Str('prompt'));
+    if Text = '' then
+    begin
+      IsError := True;
+      Exit('prompt is required');
+    end;
+    if not Assigned(SubagentRunner) then
+    begin
+      IsError := True;
+      Exit('subagents are not available in this build');
+    end;
+    if not LoadAgentDefinition(Input.Str('agent_type'), Note, Err) then
+    begin
+      IsError := True;
+      Exit(Err);
+    end;
+    { The second of the two independent guards - the first being that task is
+      absent from the schema a subagent is sent.  Balanced in a finally so an
+      exception cannot leave the depth raised and the parent permanently
+      unable to delegate. }
+    if not EnterSubagent then
+    begin
+      IsError := True;
+      Exit('a subagent cannot start another subagent');
+    end;
+    try
+      if SubagentRunner(Text, Note, Cmd, Err) then
+      begin
+        if not IsValidUtf8(Cmd) then Cmd := OemToUtf8(Cmd);
+        if Trim(Cmd) = '' then Cmd := '(the subagent returned nothing)';
+        Result := Clip(Cmd);
+      end
+      else
+      begin
+        IsError := True;
+        Result := 'subagent failed: ' + Err;
+      end;
+    finally
+      LeaveSubagent;
+    end;
   end
 
   else

@@ -16,8 +16,12 @@ text preserves what was missing at the time. Unchecked items remain open.
 
 ## Agents and tools
 
-- [ ] **Subagents / Task tool** — no way to spawn parallel or specialized
-  agents (`.claude/agents`, the Task tool, agent teams).
+- [x] ~~**Subagents / Task tool** — no way to spawn parallel or specialized
+  agents (`.claude/agents`, the Task tool, agent teams).~~
+  *Built: the `task` tool runs one read-only subagent at a time with its own
+  transcript and hands back its final message; named types live in
+  `.pasclaude\agents\<name>.md`. One level deep, twelve tool rounds, no
+  parallelism.*
 - [ ] **Web search** — `fetch` does an HTTPS GET of a known URL; there is no
   WebSearch tool.
 - [x] ~~**Todo tracking** — no TodoWrite/task-list tool for plan visibility
@@ -144,6 +148,16 @@ text preserves what was missing at the time. Unchecked items remain open.
   itself when `-p` is bare. (`--output-format json` remains missing.)
 - **Jcode credentials** — `~\.jcode\auth.json` is a second subscription
   token source when Claude Code's credentials are empty.
+- **Subagents** — `task(prompt, agent_type?)` runs a nested agent with its
+  own conversation and returns its final message as the tool result. The
+  subagent is read-only — `read_file`, `list_dir`, `search`, enforced in
+  `RunTool` and not only in the schema — so it needs no permission prompt
+  for a conversation the user cannot see, and it cannot touch the todo
+  list, the changed-file list or the rewind snapshots. One level deep,
+  twelve tool rounds, one at a time; its tokens are folded into `/cost`,
+  and Esc aborts both agents. Named types are markdown files under
+  `.pasclaude\agents\`, exactly as slash commands are under
+  `.pasclaude\commands\`.
 
 *Compiled from `README.md` and the `src/` units at
 `E:\Projects\pascal\pasclaude`, compared against the public Claude Code

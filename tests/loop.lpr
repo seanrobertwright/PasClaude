@@ -1328,7 +1328,7 @@ begin
         if Tools.Item(I).Str('name') = 'web_search' then Inc(Web)
         else Inc(Local);
       Check(Web = 0, 'web search is not declared by default');
-      Check(Local = 11, Format('the local tools are all declared (%d)', [Local]));
+      Check(Local = 12, Format('the local tools are all declared (%d)', [Local]));
     finally
       Doc.Free;
     end;
@@ -1350,7 +1350,7 @@ begin
         end
         else Inc(Local);
       Check(Web = 1, 'web search is declared exactly once when it is on');
-      Check(Local = 11, 'the local tools are still all declared');
+      Check(Local = 12, 'the local tools are still all declared');
     finally
       Doc.Free;
     end;
@@ -1542,6 +1542,345 @@ begin
   CancelAfterChunks := -1;
 end;
 
+{ ------------------------------------------------------------- subagents -- }
+
+{ A reply with usage numbers the caller chooses, so a subagent's spending can
+  be told apart from its parent's. }
+function UsageTextReply(const Text: string;
+  InTok, OutTok, CacheRead: Integer): string;
+begin
+  Result :=
+    Ev(Format('{"type":"message_start","message":{"usage":{"input_tokens":%d,' +
+      '"output_tokens":1,"cache_read_input_tokens":%d}}}', [InTok, CacheRead])) +
+    Ev('{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}') +
+    Ev('{"type":"content_block_delta","index":0,"delta":' +
+       '{"type":"text_delta","text":' + JsonQuote(Text) + '}}') +
+    Ev(Format('{"type":"message_delta","delta":{"stop_reason":"end_turn"},' +
+      '"usage":{"output_tokens":%d}}', [OutTok]));
+end;
+
+function AgentsDirPath: string;
+begin
+  Result := IncludeTrailingPathDelimiter(SessionDir) + '.pasclaude' +
+    PathDelim + 'agents' + PathDelim;
+  ForceDirectories(Result);
+end;
+
+{ The whole shape of the feature in one exchange: the model asks for a task,
+  a second agent with its own transcript answers it, and only that answer
+  comes back. }
+procedure TestSubagent;
+var
+  A: TAgent;
+  Err, Sys: string;
+  Ok: Boolean;
+  Doc, Tools, Msgs, C: TJson;
+  I, Local: Integer;
+  SawRead, SawList, SawSearch, SawTask: Boolean;
+begin
+  ResetScript;
+  uTools.RootDir := SessionDir;
+
+  SetLength(Replies, 3);
+  Replies[0] := ToolReply('t1', 'task', '{"prompt":"count the units"}');
+  Replies[1] := TextReply('there are six units');
+  Replies[2] := TextReply('done');
+
+  A := MakeAgent;
+  try
+    Ok := A.Send('how many units are there?', Err);
+    Check(Ok, 'a turn with a subagent completes: ' + Err);
+    Check(CallCount = 3,
+      Format('three requests: parent, subagent, parent (%d)', [CallCount]));
+    Check(Pos('task: count the units', ToolLog) > 0,
+      'the task shows in the transcript by its prompt: ' + ToolLog);
+
+    { What the subagent was actually sent. }
+    Doc := JsonParse(Requests[1]);
+    try
+      Tools := Doc.Find('tools');
+      Local := 0;
+      SawRead := False; SawList := False; SawSearch := False; SawTask := False;
+      for I := 0 to Tools.Count - 1 do
+      begin
+        Inc(Local);
+        if Tools.Item(I).Str('name') = 'read_file' then SawRead := True;
+        if Tools.Item(I).Str('name') = 'list_dir' then SawList := True;
+        if Tools.Item(I).Str('name') = 'search' then SawSearch := True;
+        if Tools.Item(I).Str('name') = 'task' then SawTask := True;
+      end;
+      Check(Local = 3,
+        Format('the subagent is offered exactly three tools (%d)', [Local]));
+      Check(SawRead and SawList and SawSearch,
+        'and they are read_file, list_dir and search');
+      Check(not SawTask, 'and task is not among them, so it cannot nest');
+
+      Sys := Doc.Find('system').Item(0).Str('text');
+      Check(Pos('read-only', Sys) > 0,
+        'the subagent is told what it is: ' + Copy(Sys, 1, 60));
+      Check(Pos('sys', Sys) = 0,
+        'and it does not inherit the parent''s system prompt');
+
+      Msgs := Doc.Find('messages');
+      Check(Msgs.Count = 1, 'the subagent starts from an empty conversation');
+      Check(Pos('count the units',
+        Msgs.Item(0).Find('content').Item(0).Str('text')) > 0,
+        'and is given the prompt it was called with');
+    finally
+      Doc.Free;
+    end;
+
+    { And what came back. }
+    Doc := JsonParse(Requests[2]);
+    try
+      Msgs := Doc.Find('messages');
+      C := Msgs.Item(Msgs.Count - 1).Find('content').Item(0);
+      Check(C.Str('type') = 'tool_result', 'the parent got a tool result');
+      Check(C.Str('content') = 'there are six units',
+        'carrying the subagent''s final answer and nothing else: ' +
+        C.Str('content'));
+      Check(C.Find('is_error') = nil, 'and not marked as a failure');
+    finally
+      Doc.Free;
+    end;
+  finally
+    A.Free;
+  end;
+end;
+
+{ Agent definitions mirror custom slash commands: a directory of markdown
+  files, the whole file being the briefing. }
+procedure TestSubagentAgentType;
+var
+  A: TAgent;
+  Err, Sys: string;
+  Doc, Msgs, C: TJson;
+  L: TStringList;
+begin
+  ResetScript;
+  uTools.RootDir := SessionDir;
+
+  L := TStringList.Create;
+  try
+    L.Text := 'You are a research subagent. Always cite file paths.';
+    L.SaveToFile(AgentsDirPath + 'research.md');
+  finally
+    L.Free;
+  end;
+
+  SetLength(Replies, 3);
+  Replies[0] := ToolReply('t1', 'task',
+    '{"prompt":"find the parser","agent_type":"research"}');
+  Replies[1] := TextReply('uJson.pas holds it');
+  Replies[2] := TextReply('done');
+
+  A := MakeAgent;
+  try
+    A.Send('where is the parser?', Err);
+    Doc := JsonParse(Requests[1]);
+    try
+      Sys := Doc.Find('system').Item(0).Str('text');
+      Check(Pos('Always cite file paths', Sys) > 0,
+        'the named definition reaches the subagent''s system prompt');
+      Check(Pos('read-only', Sys) > 0,
+        'appended to the standing briefing rather than replacing it');
+    finally
+      Doc.Free;
+    end;
+  finally
+    A.Free;
+  end;
+
+  { An unknown type must fail before any subagent request is made. }
+  ResetScript;
+  SetLength(Replies, 2);
+  Replies[0] := ToolReply('t1', 'task',
+    '{"prompt":"find the parser","agent_type":"nosuch"}');
+  Replies[1] := TextReply('sorry');
+
+  A := MakeAgent;
+  try
+    A.Send('where is the parser?', Err);
+    Check(CallCount = 2,
+      Format('a bad agent type costs no subagent request (%d)', [CallCount]));
+    Doc := JsonParse(Requests[1]);
+    try
+      Msgs := Doc.Find('messages');
+      C := Msgs.Item(Msgs.Count - 1).Find('content').Item(0);
+      Check((C.Str('type') = 'tool_result') and
+            (C.Find('is_error') <> nil) and C.Find('is_error').AsBoolean,
+        'the model is told the call failed');
+      Check(Pos('unknown agent type', C.Str('content')) > 0,
+        'by name: ' + C.Str('content'));
+      Check(Pos('research', C.Str('content')) > 0,
+        'listing the definitions that do exist');
+    finally
+      Doc.Free;
+    end;
+  finally
+    A.Free;
+  end;
+  DeleteFile(AgentsDirPath + 'research.md');
+end;
+
+{ A counter that omits the subagent is a counter that lies in exactly the
+  direction the user would mind, and only the invoice would say so. }
+procedure TestSubagentCost;
+var
+  A: TAgent;
+  Err: string;
+begin
+  ResetScript;
+  uTools.RootDir := SessionDir;
+
+  { Parent: 10 in / 20 out.  Subagent: 111 in / 222 out / 33 cached.
+    Parent again: 10 in / 30 out. }
+  SetLength(Replies, 3);
+  Replies[0] := ToolReply('t1', 'task', '{"prompt":"look"}');
+  Replies[1] := UsageTextReply('the answer', 111, 222, 33);
+  Replies[2] := TextReply('relaying it');
+
+  A := MakeAgent;
+  try
+    A.Send('ask a helper', Err);
+    Check(A.TokensIn = 10 + 111 + 10,
+      Format('the subagent''s input tokens reach /cost (%d)', [A.TokensIn]));
+    Check(A.TokensOut = 20 + 222 + 30,
+      Format('and its output tokens (%d)', [A.TokensOut]));
+    Check(A.CacheReadTokens = 33,
+      Format('and its cache reads (%d)', [A.CacheReadTokens]));
+  finally
+    A.Free;
+  end;
+end;
+
+{ Esc during a subagent must stop both agents.  The host's cancel flag is
+  consume-on-read, so this stand-in is too: without the latch the subagent
+  eats the abort and the parent carries on as though nothing happened. }
+var
+  OneShotArmed: Boolean = False;
+  OneShotFired: Boolean = False;
+  OneShotBase: Integer = 0;
+
+function OneShotCancel: Boolean;
+begin
+  Result := False;
+  if not OneShotArmed or OneShotFired then Exit;
+  { Only once the subagent request is the one in flight: the parent request
+    that asked for the task streams plenty of chunks of its own. }
+  if CallCount < 2 then Exit;
+  if OneShotBase = 0 then OneShotBase := ChunksSeen;
+  if ChunksSeen < OneShotBase + 20 then Exit;
+  OneShotFired := True;
+  Result := True;
+end;
+
+procedure TestSubagentCancel;
+var
+  A: TAgent;
+  Err: string;
+  Ok: Boolean;
+  Doc, M, Content: TJson;
+  I, J: Integer;
+  Dangling: Boolean;
+begin
+  ResetScript;
+  uTools.RootDir := SessionDir;
+
+  SetLength(Replies, 3);
+  Replies[0] := ToolReply('t1', 'task', '{"prompt":"a long look"}');
+  Replies[1] := LongTextReply('chunk ', 40);
+  Replies[2] := TextReply('should never be reached');
+
+  A := MakeAgent;
+  try
+    A.ShouldCancel := @OneShotCancel;
+    ChunksSeen := 0;
+    OneShotArmed := True;
+    OneShotFired := False;
+    OneShotBase := 0;
+
+    Ok := A.Send('go and look', Err);
+    Check(Ok, 'a cancelled subagent is not an error for the caller');
+    Check(Pos('cancelled', Notices) > 0,
+      'the user is told the turn was cancelled: ' + Notices);
+    Check(CallCount = 2,
+      Format('the parent did not send again after the abort (%d)', [CallCount]));
+
+    Doc := JsonParse(A.Transcript);
+    try
+      Check((Doc.Count = 0) or
+            (Doc.Item(Doc.Count - 1).Str('role') <> 'user'),
+        'the transcript does not end on an unanswered user turn');
+      Dangling := False;
+      for I := 0 to Doc.Count - 1 do
+      begin
+        M := Doc.Item(I);
+        if M.Str('role') <> 'assistant' then Continue;
+        Content := M.Find('content');
+        if Content = nil then Continue;
+        for J := 0 to Content.Count - 1 do
+          if Content.Item(J).Str('type') = 'tool_use' then
+            if (I + 1 >= Doc.Count) or
+               (Doc.Item(I + 1).Str('role') <> 'user') then
+              Dangling := True;
+      end;
+      Check(not Dangling, 'and no tool call is left without a result');
+    finally
+      Doc.Free;
+    end;
+  finally
+    A.Free;
+    OneShotArmed := False;
+  end;
+end;
+
+{ A subagent gets a lower round ceiling than its parent: it is doing one job
+  and nobody is watching it spend. }
+procedure TestSubagentRoundCap;
+var
+  A: TAgent;
+  Err: string;
+  I: Integer;
+begin
+  ResetScript;
+  uTools.RootDir := SessionDir;
+  WriteSessionFile('note.txt', 'the answer is 42');
+
+  SetLength(Replies, 14);
+  Replies[0] := ToolReply('t1', 'task', '{"prompt":"read forever"}');
+  for I := 1 to 12 do
+    Replies[I] := ToolReply('s' + IntToStr(I), 'read_file', '{"path":"note.txt"}');
+  Replies[13] := TextReply('the helper gave up');
+
+  A := MakeAgent;
+  try
+    A.Send('delegate something endless', Err);
+    Check(Pos('subagent: stopped after 12 tool rounds', Notices) > 0,
+      'the subagent stops at its own ceiling: ' + Notices);
+    Check(CallCount = 14,
+      Format('one parent call, twelve subagent rounds, one parent call (%d)',
+        [CallCount]));
+  finally
+    A.Free;
+  end;
+
+  { And the parent's own ceiling is untouched by the subagent's. }
+  ResetScript;
+  SetLength(Replies, 24);
+  for I := 0 to 23 do
+    Replies[I] := ToolReply('p' + IntToStr(I), 'read_file', '{"path":"note.txt"}');
+
+  A := MakeAgent;
+  try
+    A.Send('read it over and over', Err);
+    Check(Pos('stopped after 24 tool rounds', Notices) > 0,
+      'while a runaway parent still gets 24: ' + Notices);
+  finally
+    A.Free;
+  end;
+end;
+
 begin
   { Every request in this suite goes to the stand-in rather than the network. }
   uHttp.HttpTransport := @FakePost;
@@ -1575,6 +1914,11 @@ begin
   TestPauseTurnResumes;
   TestWebSearchRejectionSelfHeals;
   TestCancelDropsDanglingServerToolUse;
+  TestSubagent;
+  TestSubagentAgentType;
+  TestSubagentCost;
+  TestSubagentCancel;
+  TestSubagentRoundCap;
 
   WriteLn;
   if Fails = 0 then

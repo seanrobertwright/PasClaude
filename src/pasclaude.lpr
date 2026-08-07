@@ -388,6 +388,10 @@ begin
     '- Prefer edit_file over write_file when changing an existing file.' + #10 +
     '- Jupyter notebooks (.ipynb) read back as numbered cells; change them ' +
     'with notebook_edit, not edit_file.' + #10 +
+    '- For a self-contained question that needs a lot of reading to answer - ' +
+    'which unit owns something, where a setting is used - hand it to task ' +
+    'and work from its answer, so this conversation is not filled with the ' +
+    'intermediate files.' + #10 +
     '- Shell commands run through cmd.exe, so use Windows syntax.' + #10 +
     '- After changing code, build or test it if there is an obvious way to ' +
     'do so, and fix what you broke.' + #10 +
@@ -535,6 +539,8 @@ begin
   EmitCLn(clGrey,   '  /exit          quit (Ctrl+C also works)');
   EmitLn;
   EmitCLn(clGrey,   '  Esc during a reply stops it.');
+  EmitCLn(clGrey,   '  A file in .pasclaude\commands\ is a slash command; one in');
+  EmitCLn(clGrey,   '  .pasclaude\agents\ is a subagent type the task tool can ask for.');
 end;
 
 { Where the prompt history lives, beside the session. }

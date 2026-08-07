@@ -444,7 +444,7 @@ begin
   { The caller owns the schema, so it is freed here rather than leaked. }
   Sch := ToolsSchema;
   try
-    Check(Sch.Count = 11, 'the schema exposes eleven tools');
+    Check(Sch.Count = 12, 'the schema exposes twelve tools');
     { A tool that exists in RunTool but not in the schema is one the model
       never learns about, and no other test would notice. }
     Tool := nil;
@@ -484,7 +484,7 @@ begin
 
   Sch := ToolsSchema;
   try
-    Check(Sch.Count = 11, 'the local schema is unchanged by web search');
+    Check(Sch.Count = 12, 'the local schema is unchanged by web search');
   finally
     Sch.Free;
   end;
@@ -917,6 +917,110 @@ begin
 end;
 
 { Standing approvals surviving a "restart" (a save, a wipe, a load). }
+{ The read-only claim, pinned twice over.  Once in the schema, which is what
+  the model is told, and once in RunTool, which is what is actually true - and
+  the second is the one that matters, because the model can name a tool it was
+  never offered and the permission gate is no backstop when a standing "always"
+  short-circuits it. }
+procedure TestSubagentGate;
+var
+  Dir, Out_, Body: string;
+  IsErr: Boolean;
+  J, Sch: TJson;
+  Saved: TSubagentProc;
+begin
+  Dir := IncludeTrailingPathDelimiter(GetTempDir) + 'pasclaude-test';
+  ForceDirectories(Dir);
+  uTools.RootDir := Dir;
+
+  Check(SubagentDepth = 0, 'no subagent is running to start with');
+
+  Sch := ToolsSchema;
+  try
+    Check(Sch.Count = 12, 'the full schema is twelve tools');
+  finally
+    Sch.Free;
+  end;
+
+  Check(EnterSubagent, 'the one subagent slot can be claimed');
+  try
+    Check(SubagentDepth = 1, 'and the depth says so');
+    Check(not EnterSubagent, 'a second subagent is refused');
+
+    Sch := ToolsSchema;
+    try
+      Body := Sch.ToJson;
+      Check(Sch.Count = 3, Format('a subagent is offered three tools (%d)',
+        [Sch.Count]));
+      Check(Pos('"read_file"', Body) > 0, 'read_file among them');
+      Check(Pos('"list_dir"', Body) > 0, 'list_dir among them');
+      Check(Pos('"search"', Body) > 0, 'search among them');
+      Check(Pos('"write_file"', Body) = 0, 'write_file is not offered');
+      Check(Pos('"bash"', Body) = 0, 'bash is not offered');
+      Check(Pos('"task"', Body) = 0, 'and task is not offered, so it cannot nest');
+    finally
+      Sch.Free;
+    end;
+
+    { The hole a schema alone would leave: AllowAllEdits is on, Ask is nil,
+      and Permit would wave this straight through. }
+    uTools.AllowAllEdits := True;
+    DeleteFile(IncludeTrailingPathDelimiter(Dir) + 'sub-escape.txt');
+    J := TJson.NewObj;
+    J.AddStr('path', 'sub-escape.txt');
+    J.AddStr('content', 'the subagent should never have written this');
+    Out_ := Run('write_file', J, IsErr);
+    Check(IsErr and (Pos('not available to a subagent', Out_) > 0),
+      'a subagent naming write_file is refused: ' + Out_);
+    Check(not FileExists(IncludeTrailingPathDelimiter(Dir) + 'sub-escape.txt'),
+      'and nothing reached the disk');
+
+    J := TJson.NewObj;
+    J.AddStr('prompt', 'go deeper');
+    Out_ := Run('task', J, IsErr);
+    Check(IsErr and (Pos('not available to a subagent', Out_) > 0),
+      'and task itself is refused inside a subagent: ' + Out_);
+
+    { read_file still works, or the toolset would be empty in practice. }
+    J := TJson.NewObj;
+    J.AddStr('path', 'a\b.txt');
+    Out_ := Run('read_file', J, IsErr);
+    Check(not IsErr, 'while read_file still answers: ' + Out_);
+  finally
+    LeaveSubagent;
+  end;
+  Check(SubagentDepth = 0, 'the depth is back to zero after the call');
+
+  J := TJson.NewObj;
+  J.AddStr('prompt', '   ');
+  Out_ := Run('task', J, IsErr);
+  Check(IsErr and (Pos('prompt is required', Out_) > 0),
+    'a blank prompt is refused: ' + Out_);
+
+  { A build with no runner installed must report that, not dereference nil. }
+  Saved := uTools.SubagentRunner;
+  uTools.SubagentRunner := nil;
+  try
+    J := TJson.NewObj;
+    J.AddStr('prompt', 'find the main unit');
+    Out_ := Run('task', J, IsErr);
+    Check(IsErr and (Pos('subagents are not available', Out_) > 0),
+      'with no runner the tool reports it rather than crashing: ' + Out_);
+    Sch := ToolsSchema;
+    try
+      Check(Pos('"task"', Sch.ToJson) = 0,
+        'and task is not advertised at all');
+    finally
+      Sch.Free;
+    end;
+  finally
+    uTools.SubagentRunner := Saved;
+  end;
+
+  Check(SubagentDepth = 0, 'and the depth survived every failure path');
+  uTools.AllowAllEdits := False;
+end;
+
 procedure TestPermissionPersistence;
 var
   P: string;
@@ -987,6 +1091,7 @@ begin
   TestChangedFiles;
   TestListModels;
   TestTodos;
+  TestSubagentGate;
   TestPermissionPersistence;
   Schema := ToolsSchema;
   try
