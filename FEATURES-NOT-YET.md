@@ -265,8 +265,29 @@ text preserves what was missing at the time. Unchecked items remain open.
   per-server grants alone.*
 - [ ] **Sandboxed bash** — commands run directly through `cmd.exe /C`,
   unsandboxed (compound commands are re-prompted, but not isolated).
-- [ ] **Additional working directories** — one session root, fixed at
-  startup; no `--add-dir`.
+- [x] ~~**Additional working directories** — one session root, fixed at
+  startup; no `--add-dir`.~~
+  *Built: `--add-dir <dir>` (repeatable, also `--add-dir=<dir>`) and `/add-dir`
+  at the prompt add directories the file tools may work in; `/cwd` lists them
+  numbered and `/remove-dir <n|path>` takes one away. The guard keeps ONE
+  resolution base: a relative or rooted path still means the session root, so
+  adding a directory can only make previously-refused absolute paths succeed
+  and can never re-point `src\main.pas`. A file in an added directory is named
+  by its full absolute path, which is also how `list_dir` and `search` print
+  it, and the model is told so by a system-prompt block emitted only when
+  there is more than one root. Each root gets its own `.gitignore`; the state
+  directory is refused at the top of every root; deny rules still apply
+  everywhere. An added root grants file access and nothing else: its
+  `.pasclaude\hooks.json`, skills, commands and agents, its `.mcp.json` and
+  its `CLAUDE.md` are all deliberately unread, and the session, history,
+  approvals, snapshots and bash's working directory stay bound to the session
+  root. Roots come only from argv or a typed command — never from a file — and
+  are never persisted, so every session re-states the grant. Still missing:
+  Claude Code lets a relative path resolve in any working directory and
+  persists the set; both are deliberate omissions here, the first because the
+  ambiguity is a security bug and the second because the approvals file only
+  widens on load. Bash is unaffected — its working directory is the session
+  root and it was never path-guarded.*
 
 ## Sessions and memory
 

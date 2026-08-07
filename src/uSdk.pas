@@ -179,13 +179,29 @@ end;
 
 function SdkSystemPrompt: string;
 var
-  GitInfo: string;
+  GitInfo, Extra: string;
+  I: Integer;
 begin
   GitInfo := SdkGitContext;
+  { Emitted only when the user added one, so an ordinary session's prompt -
+    and the cache prefix built on it - is byte-identical to what it was
+    before working directories became a set. }
+  Extra := '';
+  if uTools.RootCount > 1 then
+  begin
+    Extra := 'Additional working directories (same rules as the session ' +
+      'root):' + #10;
+    for I := 1 to uTools.RootCount - 1 do
+      Extra := Extra + '  ' + uTools.RootAt(I) + #10;
+    Extra := Extra + 'Tool paths are relative to the session root. A file ' +
+      'in an additional directory must be given as its full absolute path.' +
+      #10#10;
+  end;
   Result :=
     'You are pasclaude, a terminal coding assistant working inside a user''s ' +
     'project directory on Windows.' + #10#10 +
     'Session root: ' + uTools.RootDir + #10#10 +
+    Extra +
     GitInfo +
     'Guidelines:' + #10 +
     '- Investigate before you act: read the relevant files rather than ' +
@@ -482,6 +498,12 @@ begin
     Root.AddStr('subtype', 'init');
     Root.AddStr('session_id', Opts.SessionId);
     Root.AddStr('cwd', Safe(uTools.RootDir));
+    { Reported, never accepted: a driver can see which directories are in the
+      set and has no message that adds one. }
+    Arr := TJson.NewArr;
+    for I := 1 to uTools.RootCount - 1 do
+      Arr.Push(TJson.NewStr(Safe(uTools.RootAt(I))));
+    Root.Add('working_dirs', Arr);
     Root.AddStr('model', Safe(AModel));
     { A caller that says nothing gets the truth rather than a blank: a driver
       that cannot see the mode cannot explain a refusal to whoever is reading
@@ -956,6 +978,10 @@ begin
   { The ordering that pasclaude.lpr performs by hand, in the one order that
     works: the root first, because the ignore rules and every path guard read
     it, and the system prompt after, because it names the root. }
+  { Before the root, so one session in a process cannot inherit another's
+    working directories - they are a grant made to a session, not a property
+    of the machine. }
+  uTools.ClearWorkingDirs;
   uTools.RootDir := Root;
   { Deny rules, and nothing else out of the approvals store.  They are the one
     kind of rule it is safe to hand an embedder unasked, because they are the

@@ -355,6 +355,66 @@ function IsValidUtf8(const S: string): Boolean;
   @file mentions face the same guard as tool calls. }
 function ResolveInRoot(const P: string; out Full: string; out Err: string): Boolean;
 
+{ ---- additional working directories ----
+  One resolution base, several acceptance tests.  A path argument is resolved
+  against the PRIMARY root exactly as it always was; the resolved absolute
+  path is then accepted if it lies inside any root.  Nothing a relative path
+  meant yesterday changes when a directory is added, which is what makes the
+  widening auditable: --add-dir can only make previously-refused ABSOLUTE
+  paths succeed, never silently re-point src\main.pas at another tree.
+
+  Index 0 is the primary root - NormalizeRoot - and everything that is state
+  rather than workspace binds to it and to nothing else: the session file,
+  the history, the approvals key, snapshots, the jobs spool, plugins.json,
+  hooks.json, skills, agents, custom commands, .mcp.json, the MCP cache and
+  bash's working directory.  An added root therefore contributes no code and
+  no configuration; it grants file access and that alone.  Generalising any
+  of those call sites to scan every root would turn --add-dir into a way to
+  make an arbitrary directory execute code, which is a strictly larger grant
+  than the one the user typed.
+
+  Roots come from the user and from nowhere else: --add-dir on argv and
+  /add-dir typed at the prompt.  There is no tool, no config key and no
+  approvals key, so a repository cannot ship the file that widens its own
+  guard, and nothing is inherited by a later session. }
+const
+  { A bound on a loop that runs on the hottest guard in the program.  Eight is
+    generous for the real use - a project plus a couple of libraries - and an
+    unbounded list here would be an unbounded loop on every path a tool
+    names. }
+  MaxWorkingDirs = 8;
+
+{ How many roots there are, primary included; RootAt(0) is always the primary
+  and is never removed or reordered. }
+function RootCount: Integer;
+function RootAt(Index: Integer): string;
+{ The added ones only, in order, for display. }
+function WorkingDirs: TStringArray;
+
+{ True when Cand is Root or sits under it.  The whole escape rule, written
+  once: with N roots there would otherwise be N chances to reintroduce the
+  classic prefix bug that lets C:\proj-sibling pass for C:\proj. }
+function WithinRoot(const Cand, Root: string): Boolean;
+{ Which root contains Full, primary first; -1 when none does. }
+function RootIndexOf(const Full: string): Integer;
+
+{ Adds a working directory.  Norm is the normalised absolute path the host
+  must echo, so the user sees what was actually granted rather than what they
+  typed.  Refuses a volume or share root, a missing path, a file, a duplicate
+  and anything already covered by an existing root; a directory that is a
+  PARENT of existing extras is accepted and swallows them, which Err reports
+  as a note with Result True. }
+function AddWorkingDir(const Dir: string; out Norm, Err: string): Boolean;
+{ Takes an index (as printed) or a path.  Index 0 is refused: the primary root
+  is the session's identity, not part of the grant. }
+function RemoveWorkingDir(const Dir: string; out Err: string): Boolean;
+procedure ClearWorkingDirs;          { test seam, and TSdkSession.Create }
+
+{ Per-root ignore rules.  The two-argument IsIgnored keeps its meaning - the
+  primary root - so every existing caller and test is unchanged. }
+function IsIgnoredIn(RootIndex: Integer; const RelPath: string;
+  IsDir: Boolean): Boolean;
+
 { ---- deny rules ----
   The one kind of permission state that only ever narrows.  A rule is one
   string, "kind:pattern", and there are exactly three kinds because there are
@@ -888,6 +948,70 @@ begin
   if RootDir = '' then
     RootDir := GetCurrentDir;
   Result := ExcludeTrailingPathDelimiter(ExpandFileName(RootDir));
+end;
+
+var
+  { The added roots, normalised and carrying no trailing delimiter.  Never
+    persisted and never read from a file - see the interface comment. }
+  ExtraRoots: array of string;
+
+{ The escape comparison, and the only copy of it in the program.  Root +
+  PathDelim rather than Root is what refuses C:\proj-sibling\leak.txt against
+  C:\proj; the first disjunct is what still admits the root itself.  Anyone
+  asking "is this path inside that directory" calls this - nobody writes a
+  prefix compare, because the prefix compare is the bug. }
+function WithinRoot(const Cand, Root: string): Boolean;
+begin
+  Result := (CompareText(Cand, Root) = 0) or
+            (CompareText(Copy(Cand, 1, Length(Root) + 1), Root + PathDelim) = 0);
+end;
+
+function RootCount: Integer;
+begin
+  Result := 1 + Length(ExtraRoots);
+end;
+
+function RootAt(Index: Integer): string;
+begin
+  if Index <= 0 then
+    Result := NormalizeRoot
+  else if Index <= Length(ExtraRoots) then
+    Result := ExtraRoots[Index - 1]
+  else
+    Result := '';
+end;
+
+function WorkingDirs: TStringArray;
+var
+  I: Integer;
+begin
+  SetLength(Result, Length(ExtraRoots));
+  for I := 0 to High(ExtraRoots) do Result[I] := ExtraRoots[I];
+end;
+
+function RootIndexOf(const Full: string): Integer;
+var
+  I: Integer;
+begin
+  { Primary first, so a nested added root can never take a path away from the
+    root that owns the session state. }
+  for I := 0 to RootCount - 1 do
+    if WithinRoot(Full, RootAt(I)) then Exit(I);
+  Result := -1;
+end;
+
+{ Today's state-directory check with the root as a parameter.  The slice at
+  Length(Root)+2 is the byte after "Root\", so it is correct only because a
+  root carries no trailing delimiter - which NormalizeRoot guarantees for the
+  primary and AddWorkingDir enforces for every other.  The terminator test is
+  what stops .pasclaudex being caught by it. }
+function InStateDirOf(const Cand, Root: string): Boolean;
+begin
+  Result :=
+    (CompareText(Copy(Cand, Length(Root) + 2, Length(StateDirName)),
+                 StateDirName) = 0) and
+    ((Length(Cand) = Length(Root) + 1 + Length(StateDirName)) or
+     (Cand[Length(Root) + 2 + Length(StateDirName)] = PathDelim));
 end;
 
 { ------------------------------------------------------------- deny rules -- }
@@ -1443,11 +1567,26 @@ begin
 end;
 
 function SessionNote: string;
+var
+  I: Integer;
 begin
   { The plan paragraph goes first, and the additional-working-directories
     block between it and the deny sentence.  Order is fixed so a session with
     two of them on reads the same way every turn. }
   Result := PermModeNote;
+  { Emitted only when there is more than one root, so an ordinary session's
+    request body - and therefore its prompt cache - is byte-identical to what
+    it was before this feature existed. }
+  if RootCount > 1 then
+  begin
+    Result := Result + 'Additional working directories (same rules as the ' +
+      'session root):'#10;
+    for I := 1 to RootCount - 1 do
+      Result := Result + '  ' + RootAt(I) + #10;
+    Result := Result +
+      'Tool paths are relative to the session root. A file in an additional ' +
+      'directory must be given as its full absolute path.'#10;
+  end;
   { The patterns are deliberately absent: the model needs to know a refusal is
     policy, or it burns turns retrying, and it does not need a list of what to
     try.  The permission mode below plan is absent for the same class of
@@ -1459,11 +1598,15 @@ begin
 end;
 
 { Resolves P under the session root.  Fails when the result would sit outside
-  the root, which is the only place this program is allowed to touch. }
+  every root, which are the only places this program is allowed to touch. }
 function SafePath(const P: string; out Full: string; out Err: string): Boolean;
 var
-  Root, Cand, Reason: string;
+  Root, Cand, Reason, List: string;
+  I, Hit: Integer;
 begin
+  { Cleared first, so a caller that ignores the Boolean gets nothing usable
+    rather than a stale path from the last call. }
+  Full := '';
   Err := '';
   Root := NormalizeRoot;
   if P = '' then
@@ -1471,6 +1614,13 @@ begin
     Err := 'path is required';
     Exit(False);
   end;
+  { The identical three-way classification, and against the PRIMARY root only.
+    There is exactly one resolution base however many roots there are: a bare
+    relative path means the same file after --add-dir that it meant before,
+    and a file in an added directory is named by its full absolute path.  A
+    search order over the roots would make read_file('config.json') mean
+    different files depending on what had been added, which is an ambiguity
+    an attacker chooses and a user cannot see. }
   if (Length(P) >= 2) and (P[2] = ':') then
     Cand := ExpandFileName(P)
   else if (Length(P) >= 1) and (P[1] in ['\', '/']) then
@@ -1479,21 +1629,43 @@ begin
     Cand := ExpandFileName(IncludeTrailingPathDelimiter(Root) + P);
   Cand := ExcludeTrailingPathDelimiter(Cand);
 
-  if (CompareText(Cand, Root) <> 0) and
-     (CompareText(Copy(Cand, 1, Length(Root) + 1), Root + PathDelim) <> 0) then
+  { Deny is the fallthrough, not a branch: matching no root cannot pass,
+    however the loop is later edited. }
+  Hit := -1;
+  for I := 0 to RootCount - 1 do
+    if WithinRoot(Cand, RootAt(I)) then
+    begin
+      Hit := I;
+      Break;
+    end;
+  if Hit < 0 then
   begin
     Err := Format('path escapes the session root (%s): %s', [Root, P]);
+    if RootCount > 1 then
+    begin
+      List := '';
+      for I := 1 to RootCount - 1 do
+      begin
+        if List <> '' then List := List + ', ';
+        List := List + RootAt(I);
+      end;
+      Err := Err + ', or any added directory: ' + List;
+    end;
     Exit(False);
   end;
 
   { pasclaude's own state is off limits.  The session file is the conversation
     itself: letting the model read it wastes the context on a copy of what it
     already has, and letting it write there would let a tool call rewrite the
-    history of the very turn that is running. }
-  if (CompareText(Copy(Cand, Length(Root) + 2, Length(StateDirName)),
-                  StateDirName) = 0) and
-     ((Length(Cand) = Length(Root) + 1 + Length(StateDirName)) or
-      (Cand[Length(Root) + 2 + Length(StateDirName)] = PathDelim)) then
+    history of the very turn that is running.
+
+    Refused at the top level of EVERY root, added ones included.  That
+    directory is not ours in an added root - but if it is ever somebody's
+    primary root it holds that session's transcript, and the list_dir and
+    search walkers already skip the name in any tree at any depth.  A
+    SafePath that disagreed with the walkers would be the inconsistency; a
+    uniform rule is the one a reader can verify. }
+  if InStateDirOf(Cand, RootAt(Hit)) then
   begin
     Err := StateDirName + ' holds pasclaude''s own session state and is not accessible';
     Exit(False);
@@ -1538,23 +1710,31 @@ type
     Negated: Boolean;
   end;
 
-var
-  IgnoreRules: array of TIgnoreRule;
+  TIgnoreRuleArray = array of TIgnoreRule;
 
-procedure LoadIgnoreRules;
+var
+  { One rule set per root, parallel to the root list.  A .gitignore is
+    anchored to the tree it sits in, so applying the primary's "/src" to
+    another root would hide the wrong files - and applying an added root's
+    rules to the project would hide files the user came here to change. }
+  IgnoreSets: array of TIgnoreRuleArray;
+
+{ Reads one root's .gitignore.  Nothing is an error: an absent or unreadable
+  file simply means that tree is unfiltered. }
+function LoadIgnoreSet(const Root: string): TIgnoreRuleArray;
 var
   L: TStringList;
   I, N: Integer;
   S: string;
   R: TIgnoreRule;
 begin
-  SetLength(IgnoreRules, 0);
-  if not FileExists(IncludeTrailingPathDelimiter(NormalizeRoot) + '.gitignore') then
+  Result := nil;
+  if not FileExists(IncludeTrailingPathDelimiter(Root) + '.gitignore') then
     Exit;
   L := TStringList.Create;
   try
     try
-      L.LoadFromFile(IncludeTrailingPathDelimiter(NormalizeRoot) + '.gitignore');
+      L.LoadFromFile(IncludeTrailingPathDelimiter(Root) + '.gitignore');
     except
       Exit;   { an unreadable .gitignore just means nothing is filtered }
     end;
@@ -1571,8 +1751,8 @@ begin
       if R.Anchored then Delete(S, 1, 1);
       if S = '' then Continue;
       R.Pattern := LowerCase(StringReplace(S, '\', '/', [rfReplaceAll]));
-      SetLength(IgnoreRules, N + 1);
-      IgnoreRules[N] := R;
+      SetLength(Result, N + 1);
+      Result[N] := R;
       Inc(N);
     end;
   finally
@@ -1580,7 +1760,19 @@ begin
   end;
 end;
 
-function IsIgnored(const RelPath: string; IsDir: Boolean): Boolean;
+procedure LoadIgnoreRules;
+var
+  I: Integer;
+begin
+  { Signature unchanged, meaning widened: every root, because a root added
+    mid-session has a .gitignore too and calling this is how it gets read. }
+  SetLength(IgnoreSets, RootCount);
+  for I := 0 to RootCount - 1 do
+    IgnoreSets[I] := LoadIgnoreSet(RootAt(I));
+end;
+
+function IsIgnoredIn(RootIndex: Integer; const RelPath: string;
+  IsDir: Boolean): Boolean;
 var
   I, J: Integer;
   Path, Seg: string;
@@ -1588,8 +1780,11 @@ var
   Segs: array of string;
   NSeg: Integer;
   Hit: Boolean;
+  IgnoreRules: TIgnoreRuleArray;
 begin
   Result := False;
+  if (RootIndex < 0) or (RootIndex > High(IgnoreSets)) then Exit;
+  IgnoreRules := IgnoreSets[RootIndex];
   if Length(IgnoreRules) = 0 then Exit;
   Path := LowerCase(StringReplace(RelPath, '\', '/', [rfReplaceAll]));
 
@@ -1638,6 +1833,193 @@ begin
     if Hit then
       Result := not Rule.Negated;
   end;
+end;
+
+{ The public two-argument form keeps its old meaning exactly: a path relative
+  to the primary root, against the primary root's rules.  Every existing
+  caller and test therefore reads unchanged. }
+function IsIgnored(const RelPath: string; IsDir: Boolean): Boolean;
+begin
+  Result := IsIgnoredIn(0, RelPath, IsDir);
+end;
+
+{ ------------------------------------------- the working-directory set -- }
+
+{ A directory argument, resolved by SafePath's own three-way rule and stripped
+  of any trailing delimiter.  Written once and shared by add and remove
+  because the two must agree on what a typed path names: a remove that
+  normalised differently from the add could not find what it was given. }
+function NormalizeDirArg(const Dir: string): string;
+begin
+  if (Length(Dir) >= 2) and (Dir[2] = ':') then
+    Result := ExpandFileName(Dir)
+  else if (Length(Dir) >= 2) and (Dir[1] in ['\', '/']) and
+          (Dir[2] in ['\', '/']) then
+    { A UNC name expands to itself; ExpandFileName would not improve it. }
+    Result := Dir
+  else if (Length(Dir) >= 1) and (Dir[1] in ['\', '/']) then
+    Result := ExpandFileName(NormalizeRoot + Dir)
+  else
+    Result := ExpandFileName(IncludeTrailingPathDelimiter(NormalizeRoot) + Dir);
+  Result := ExcludeTrailingPathDelimiter(Result);
+end;
+
+{ The one rule for turning what a user typed into a root, shared by argv, the
+  slash command, the SDK and the suites - the same reason ValidExtensionName
+  is public.  Err carries a refusal when Result is False and a note about
+  what was swallowed when it is True. }
+function AddWorkingDir(const Dir: string; out Norm, Err: string): Boolean;
+var
+  Cand, Swallowed: string;
+  I, N: Integer;
+  Kept: array of string;
+begin
+  Norm := '';
+  Err := '';
+  Result := False;
+  if Trim(Dir) = '' then
+  begin
+    Err := 'a directory is required';
+    Exit;
+  end;
+  { Relative to the primary root, like every other path this program is
+    handed, and stripped of any trailing delimiter: InStateDirOf's slice
+    arithmetic is correct only for a root that carries none, so storing
+    'D:\lib\' would silently admit .pasclaude in that tree. }
+  Cand := NormalizeDirArg(Dir);
+  { A bare volume or share root grants the machine.  Honestly a fat-finger
+    guard rather than a security boundary - C:\Users is still accepted and is
+    nearly as wide - but it stops the guard degenerating to nothing by typo. }
+  if (Length(Cand) <= 2) and (Pos(':', Cand) > 0) then
+  begin
+    Err := 'a whole drive cannot be a working directory: ' + Cand;
+    Exit;
+  end;
+  if (Copy(Cand, 1, 2) = '\\') and
+     (Pos('\', Copy(Cand, 3, MaxInt)) = 0) then
+  begin
+    Err := 'a whole share cannot be a working directory: ' + Cand;
+    Exit;
+  end;
+  { A typo that silently grants nothing and becomes reachable later, when
+    somebody happens to create the directory, is the worst of the failures
+    available here. }
+  if FileExists(Cand) and not DirectoryExists(Cand) then
+  begin
+    Err := 'not a directory: ' + Cand;
+    Exit;
+  end;
+  if not DirectoryExists(Cand) then
+  begin
+    Err := 'no such directory: ' + Cand;
+    Exit;
+  end;
+  for I := 0 to RootCount - 1 do
+    if CompareText(Cand, RootAt(I)) = 0 then
+    begin
+      Err := 'already a working directory: ' + Cand;
+      Exit;
+    end
+    else if WithinRoot(Cand, RootAt(I)) then
+    begin
+      Err := 'already covered by ' + RootAt(I) + ': ' + Cand;
+      Exit;
+    end;
+
+  { A parent of existing extras is accepted and swallows them, so the list
+    says what it means; index 0 is never dropped, because the primary root is
+    the session's identity rather than part of the grant. }
+  Swallowed := '';
+  SetLength(Kept, 0);
+  N := 0;
+  for I := 0 to High(ExtraRoots) do
+    if WithinRoot(ExtraRoots[I], Cand) then
+    begin
+      if Swallowed <> '' then Swallowed := Swallowed + ', ';
+      Swallowed := Swallowed + ExtraRoots[I];
+    end
+    else
+    begin
+      SetLength(Kept, N + 1);
+      Kept[N] := ExtraRoots[I];
+      Inc(N);
+    end;
+
+  if N + 1 > MaxWorkingDirs then
+  begin
+    Err := Format('at most %d additional working directories', [MaxWorkingDirs]);
+    Exit;
+  end;
+
+  SetLength(ExtraRoots, N + 1);
+  for I := 0 to N - 1 do ExtraRoots[I] := Kept[I];
+  ExtraRoots[N] := Cand;
+  { A new root has its own .gitignore, and this is the only place that can
+    know it just arrived. }
+  LoadIgnoreRules;
+  Norm := Cand;
+  if Swallowed <> '' then
+    Err := 'it contains, and replaces, ' + Swallowed;
+  Result := True;
+end;
+
+function RemoveWorkingDir(const Dir: string; out Err: string): Boolean;
+var
+  I, J, Idx, Code: Integer;
+  Cand: string;
+begin
+  Err := '';
+  Result := False;
+  Idx := -1;
+  Val(Trim(Dir), Idx, Code);
+  if Code <> 0 then Idx := -1;
+  if Code = 0 then
+  begin
+    if Idx = 0 then
+    begin
+      { The primary root is where the session, the history and the approvals
+        key live.  Removing it would not narrow anything; it would just make
+        the program unable to find its own state. }
+      Err := 'the session root cannot be removed';
+      Exit;
+    end;
+    if (Idx < 1) or (Idx > Length(ExtraRoots)) then
+    begin
+      Err := 'no working directory numbered ' + Trim(Dir);
+      Exit;
+    end;
+  end
+  else
+  begin
+    Cand := NormalizeDirArg(Dir);
+    if CompareText(Cand, NormalizeRoot) = 0 then
+    begin
+      Err := 'the session root cannot be removed';
+      Exit;
+    end;
+    for I := 0 to High(ExtraRoots) do
+      if CompareText(ExtraRoots[I], Cand) = 0 then
+      begin
+        Idx := I + 1;
+        Break;
+      end;
+    if Idx < 1 then
+    begin
+      Err := 'not a working directory: ' + Cand;
+      Exit;
+    end;
+  end;
+  for J := Idx - 1 to High(ExtraRoots) - 1 do
+    ExtraRoots[J] := ExtraRoots[J + 1];
+  SetLength(ExtraRoots, Length(ExtraRoots) - 1);
+  LoadIgnoreRules;
+  Result := True;
+end;
+
+procedure ClearWorkingDirs;
+begin
+  SetLength(ExtraRoots, 0);
+  LoadIgnoreRules;
 end;
 
 function Clip(const S: string): string;
@@ -1817,6 +2199,7 @@ end;
 function ListDir(const Full: string; MaxDepth: Integer): string;
 var
   RootPrefix: string;
+  RootIdx: Integer;
 
   procedure Walk(const Dir, Prefix: string; Depth: Integer);
   var
@@ -1844,13 +2227,13 @@ var
           begin
             if (R.Name = '.git') or (R.Name = 'node_modules') or
                (CompareText(R.Name, StateDirName) = 0) then Continue;
-            if IsIgnored(RelName, True) then Continue;
+            if IsIgnoredIn(RootIdx, RelName, True) then Continue;
             if DenyWalkReason(RelName, R.Name) <> '' then Continue;
             Dirs.Add(R.Name);
           end
           else
           begin
-            if IsIgnored(RelName, False) then Continue;
+            if IsIgnoredIn(RootIdx, RelName, False) then Continue;
             if DenyWalkReason(RelName, R.Name) <> '' then Continue;
             Files.Add(Format('%s (%d bytes)', [R.Name, R.Size]));
           end;
@@ -1875,7 +2258,12 @@ var
 
 begin
   Result := Rel(Full) + '\'#10;
-  RootPrefix := IncludeTrailingPathDelimiter(NormalizeRoot);
+  { The containing root, not the primary: the relative name a rule is matched
+    against has to be relative to the tree the rule came from, and an added
+    root's listing is labelled by Rel with its absolute path anyway. }
+  RootIdx := RootIndexOf(Full);
+  if RootIdx < 0 then RootIdx := 0;
+  RootPrefix := IncludeTrailingPathDelimiter(RootAt(RootIdx));
   Walk(Full, '  ', 0);
 end;
 
@@ -1886,15 +2274,18 @@ end;
   literally - "Result :=", "array[0]", "foo.bar" - and a "looks like a regex"
   heuristic would silently reinterpret them with no error anyone could see.
   Err is non-empty only when the pattern would not compile; the caller turns
-  that into a tool error. }
+  that into a tool error.
+
+  Hits and Truncated are in/out because one search may now walk several roots,
+  and the 200-hit and step budgets are budgets for the CALL: a hostile pattern
+  must not get its allowance again for every directory the user added. }
 function GrepTree(const Root, Pattern, Glob: string;
   UseRegex, CaseSensitive: Boolean; MaxDepth: Integer;
-  out Err: string): string;
+  var Hits: Integer; var Truncated: Boolean; out Err: string): string;
 var
-  Hits: Integer;
   RootPrefix, Needle: string;
   Rx: TRegex;
-  Truncated: Boolean;
+  RootIdx: Integer;
 
   { The match decision for one line.  A budget exhaustion is not a miss: it
     means the answer is unknown, so it stops the walk and is reported. }
@@ -1959,7 +2350,7 @@ var
             the context every turn with a copy of itself. }
           if (R.Name = '.git') or (R.Name = 'node_modules') or
              (CompareText(R.Name, StateDirName) = 0) then Continue;
-          if IsIgnored(RelName, True) then Continue;
+          if IsIgnoredIn(RootIdx, RelName, True) then Continue;
           { A denied directory is not descended into and a denied file is not
             read.  Without this half, search would happily print a line out of
             the very file SafePath refuses to open - the single most damaging
@@ -1969,7 +2360,7 @@ var
         end
         else if Matches(R.Name) and (R.Size < MaxReadBytes) then
         begin
-          if IsIgnored(RelName, False) then Continue;
+          if IsIgnoredIn(RootIdx, RelName, False) then Continue;
           if DenyWalkReason(RelName, R.Name) <> '' then Continue;
           if not LoadFileText(IncludeTrailingPathDelimiter(Dir) + R.Name, LText, LErr) then
             Continue;
@@ -2017,21 +2408,49 @@ var
 begin
   Result := '';
   Err := '';
-  Hits := 0;
-  Truncated := False;
   Rx := nil;
   if CaseSensitive then Needle := Pattern else Needle := LowerCase(Pattern);
   if UseRegex and not TRegex.Compile(Pattern, CaseSensitive, Rx, Err) then
     Exit('');
+  RootIdx := RootIndexOf(Root);
+  if RootIdx < 0 then RootIdx := 0;
+  RootPrefix := IncludeTrailingPathDelimiter(RootAt(RootIdx));
   try
     { One budget for the whole call rather than one per line, so a hostile
       pattern cannot spend its allowance again on every file in the tree. }
     if Rx <> nil then Rx.Budget := DefaultRegexBudget;
-    RootPrefix := IncludeTrailingPathDelimiter(NormalizeRoot);
     Walk(Root, 0);
   finally
     Rx.Free;
   end;
+end;
+
+{ The search tool's whole answer.  With no path it walks every root, primary
+  first, under one shared budget - so the project's own hits are the ones that
+  survive truncation when a large library has been added. }
+function SearchRoots(const Where, Pattern, Glob: string;
+  UseRegex, CaseSensitive: Boolean; MaxDepth: Integer;
+  out Err: string): string;
+var
+  I, Hits: Integer;
+  Truncated: Boolean;
+begin
+  Result := '';
+  Err := '';
+  Hits := 0;
+  Truncated := False;
+  if Where <> '' then
+    Result := GrepTree(Where, Pattern, Glob, UseRegex, CaseSensitive,
+      MaxDepth, Hits, Truncated, Err)
+  else
+    for I := 0 to RootCount - 1 do
+    begin
+      Result := Result + GrepTree(RootAt(I), Pattern, Glob, UseRegex,
+        CaseSensitive, MaxDepth, Hits, Truncated, Err);
+      if Err <> '' then Exit('');
+      if (Hits >= 200) or Truncated then Break;
+    end;
+  if Err <> '' then Exit('');
   { Partial hits are still worth having, so this is a note rather than an
     error - but the model has to be told the answer is incomplete. }
   if Truncated then
@@ -2978,6 +3397,10 @@ end;
   same shape uAgent uses to fill SubagentRunner.  Doing it this way rather
   than mirroring RootDir into a second variable means a test that moves the
   root moves the hooks with it and cannot forget. }
+{ NormalizeRoot, deliberately: an added working directory contributes no
+  code and no configuration.  --add-dir grants file access to a directory and
+  nothing else, so generalising this to scan every root would turn it into a
+  way to make an arbitrary directory execute what it ships. }
 function HookRoot: string;
 begin
   Result := NormalizeRoot;
@@ -3103,6 +3526,10 @@ begin
   Result := True;
 end;
 
+{ NormalizeRoot, deliberately: an added working directory contributes no
+  code and no configuration.  --add-dir grants file access to a directory and
+  nothing else, so generalising this to scan every root would turn it into a
+  way to make an arbitrary directory execute what it ships. }
 function SkillsDirProject: string;
 begin
   Result := IncludeTrailingPathDelimiter(NormalizeRoot) + StateDirName +
@@ -3975,6 +4402,10 @@ begin
     (Name = 'fetch');
 end;
 
+{ NormalizeRoot, deliberately: an added working directory contributes no
+  code and no configuration.  --add-dir grants file access to a directory and
+  nothing else, so generalising this to scan every root would turn it into a
+  way to make an arbitrary directory execute what it ships. }
 function AgentsDir: string;
 begin
   Result := IncludeTrailingPathDelimiter(NormalizeRoot) + StateDirName +
@@ -4264,7 +4695,14 @@ end;
   file, and only one of them may ever run early.  SavePermissions writes the
   array back verbatim, including a line it could not parse, because the file
   is hand-edited and a rule silently erased on exit is worse than one that
-  never worked. }
+  never worked.
+
+  Additional working directories are deliberately NOT stored here either, and
+  the only-widen rule is again the reason: a persisted root would be a grant
+  no later session could revoke by any means the file offers, and a clone
+  that shipped one would have widened the path guard by existing.  A root
+  comes from argv or from a typed /add-dir, lasts the session, and is
+  re-stated next time. }
 procedure LoadPermissions(const Path: string);
 var
   F: TFileStream;
@@ -4446,6 +4884,8 @@ begin
   P.Add('pattern', StrProp('Text to find. A case-insensitive substring ' +
     'unless regex is true.'));
   P.Add('glob', StrProp('Optional filename filter, e.g. ".pas" or "test".'));
+  P.Add('path', StrProp('Optional directory to search, instead of every ' +
+    'working directory.'));
   P.Add('regex', BoolProp('Treat pattern as a regular expression: . * + ? ' +
     'repeat counts, [a-z], \d \w \s \b ^ $ | and (groups). ASCII byte ' +
     'semantics; no backreferences or lookaround.'));
@@ -4458,8 +4898,10 @@ begin
       'Default 8.');
   end;
   Result.Push(MakeTool('search',
-    'Search file contents under the session root. Returns path:line: text. ' +
-    'Set regex for pattern syntax.',
+    'Search file contents under the session root, and under any additional ' +
+    'working directory. Returns path:line: text; a result outside the ' +
+    'session root is shown as an absolute path and must be given back as ' +
+    'one. Set regex for pattern syntax.',
     P, ['pattern']));
 
   { The cut is made here rather than by filtering afterwards so a subagent is
@@ -5279,6 +5721,10 @@ var
     than describe the configuration. }
   McpBudgetDropped: Integer = 0;
 
+{ NormalizeRoot, deliberately: an added working directory contributes no
+  code and no configuration.  --add-dir grants file access to a directory and
+  nothing else, so generalising this to scan every root would turn it into a
+  way to make an arbitrary directory execute what it ships. }
 function McpConfigPath: string;
 begin
   Result := IncludeTrailingPathDelimiter(NormalizeRoot) + '.mcp.json';
@@ -6434,7 +6880,23 @@ begin
   begin
     { No permission call: search reads and reports, so it stays ungated and
       nothing new joins the edits class. }
-    Text := GrepTree(NormalizeRoot, Input.Str('pattern'), Input.Str('glob'),
+    { An explicit path goes through the guard like any other; with none, every
+      root is walked, primary first. }
+    Full := '';
+    if Input.Str('path') <> '' then
+    begin
+      if not SafePath(Input.Str('path'), Full, Err) then
+      begin
+        IsError := True;
+        Exit(Err);
+      end;
+      if not DirectoryExists(Full) then
+      begin
+        IsError := True;
+        Exit('no such directory: ' + Rel(Full));
+      end;
+    end;
+    Text := SearchRoots(Full, Input.Str('pattern'), Input.Str('glob'),
       Input.Bool('regex'), Input.Bool('case_sensitive'),
       WalkDepth(Input, 8), Err);
     if Err <> '' then

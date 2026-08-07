@@ -200,10 +200,10 @@ end;
 { ------------------------------------------------------------- completion -- }
 
 const
-  SlashCommands: array[0..25] of string = (
+  SlashCommands: array[0..27] of string = (
     '/help', '/clear', '/compact', '/deny', '/diff', '/hooks', '/jobs', '/mcp',
     '/memory', '/init', '/mode', '/plan', '/rewind', '/sessions', '/skills',
-    '/plugins', '/think', '/web',
+    '/plugins', '/think', '/web', '/add-dir', '/remove-dir',
     '/resume', '/save', '/cwd', '/model', '/yolo', '/cost', '/exit', '/quit');
 
 { Candidates for the token being completed: slash commands when the token
@@ -444,6 +444,57 @@ begin
     ShowMode(Arg);
 end;
 
+{ ------------------------------------------------ working directories -- }
+
+{ With no argument, the whole set, numbered as /remove-dir wants them; with
+  one, the add.  The echo is uTools' normalised path rather than what was
+  typed, because a fat-fingered ..\.. is only visible once it is expanded -
+  and because what was granted is the resolved directory, not the text. }
+procedure ShowWorkingDirs(const Arg: string);
+var
+  I: Integer;
+  Norm, Err: string;
+begin
+  if Trim(Arg) = '' then
+  begin
+    EmitCLn(clGrey, Format('  %2d  %s  (session root)', [0, uTools.RootDir]));
+    for I := 1 to uTools.RootCount - 1 do
+      EmitCLn(clGrey, Format('  %2d  %s', [I, uTools.RootAt(I)]));
+    if uTools.RootCount = 1 then
+      EmitCLn(clGrey, '  /add-dir <directory> to work in another one too');
+    Exit;
+  end;
+  if not uTools.AddWorkingDir(Trim(Arg), Norm, Err) then
+  begin
+    EmitCLn(clRed, '  ' + Err);
+    Exit;
+  end;
+  EmitCLn(clGrey, '  added ' + Norm);
+  if Err <> '' then
+    EmitCLn(clYellow, '  ' + Err);
+  { Said every time rather than once: a user who expected a relative path to
+    start meaning the added tree would otherwise find out by a refusal. }
+  EmitCLn(clGrey, '  name files there by absolute path; relative paths still ' +
+    'mean the session root');
+end;
+
+procedure DropWorkingDir(const Arg: string);
+var
+  Err: string;
+begin
+  if Trim(Arg) = '' then
+  begin
+    EmitCLn(clGrey, '  /remove-dir <number|path> - /cwd lists them');
+    Exit;
+  end;
+  if uTools.RemoveWorkingDir(Trim(Arg), Err) then
+    { Honest about what it does not do: anything already read is in the
+      transcript and stays there.  This narrows future reach only. }
+    EmitCLn(clGrey, '  removed; files already read stay in the conversation')
+  else
+    EmitCLn(clRed, '  ' + Err);
+end;
+
 procedure ShowHelp;
 begin
   EmitCLn(clBright, 'Commands');
@@ -465,7 +516,9 @@ begin
   EmitCLn(clGrey,   '  /web [on|off]  let the model search the web (off by default)');
   EmitCLn(clGrey,   '  /resume        reload the saved conversation');
   EmitCLn(clGrey,   '  /save          write the conversation now');
-  EmitCLn(clGrey,   '  /cwd           show the session root');
+  EmitCLn(clGrey,   '  /cwd           show the session root and any added directories');
+  EmitCLn(clGrey,   '  /add-dir <dir> also work in that directory (absolute paths only)');
+  EmitCLn(clGrey,   '  /remove-dir <n> stop working in it; the session root cannot go');
   EmitCLn(clGrey,   '  /model [name]  pick a model from a list, or set one by name');
   EmitCLn(clGrey,   '  /deny          rules nothing can override; add <rule>, remove <n>');
   EmitCLn(clGrey,   '  /mode [name]   ask | plan | accept-edits; no argument shows the state');
@@ -1406,6 +1459,7 @@ end;
 procedure ShowBanner;
 var
   Auth: string;
+  I: Integer;
 begin
   EmitLn;
   EmitC(clBlue,  '    /    ');  EmitC(clBright, '/');  EmitC(clBlue, '  \');
@@ -1421,6 +1475,8 @@ begin
   if BannerAuth <> '' then Auth := Auth + ' (' + BannerAuth + ')';
   EmitCLn(clGrey, '  ' + Auth);
   EmitCLn(clGrey, '  ' + uTools.RootDir);
+  for I := 1 to uTools.RootCount - 1 do
+    EmitCLn(clGrey, '  + ' + uTools.RootAt(I));
   { Only when there are any: a user in a stricter state than they believe is a
     smaller problem than one in a looser state, but a refusal nobody can
     explain is still a bug report. }
@@ -1529,7 +1585,11 @@ begin
     end;
   end
   else if Cmd = '/cwd' then
-    EmitCLn(clGrey, '  ' + uTools.RootDir)
+    ShowWorkingDirs('')
+  else if Cmd = '/add-dir' then
+    ShowWorkingDirs(Arg)
+  else if Cmd = '/remove-dir' then
+    DropWorkingDir(Arg)
   else if Cmd = '/diff' then
   begin
     { Approvals happen one edit at a time; this is the aggregated answer.
@@ -1691,6 +1751,9 @@ begin
       that question is about running a repository's commands, not about the
       tools the model was declared.  Bypass reaches neither, because it is one
       line inside Permit and neither of those goes through Permit. }
+    { And it adds no working directory either.  Reach and asking are separate
+      axes on purpose: /yolo says "stop asking me about this session's tools",
+      which is not a sentence about which directories exist. }
     uTools.SetPermMode(uTools.pmodeBypass);
     YoloSession := True;
     { Deliberately not persisted: /yolo is "I trust this session", and a
@@ -1801,6 +1864,11 @@ var
     in. }
   PlanFlag: Boolean = False;
   BypassFlag: Boolean = False;
+  { Collected rather than applied as they are parsed: AddWorkingDir resolves
+    relative to the session root, and the root is not set until after the
+    optional [directory] argument has been seen. }
+  AddDirs: TStringArray;
+  AddArg: string = '';
   StopActive: Boolean = False;
   Again: Boolean = False;
   TurnOk: Boolean = False;
@@ -1828,6 +1896,7 @@ begin
   TermInit;
   try
     Dir := '';
+    AddDirs := nil;
     SkipNext := False;
     for ArgI := 1 to ParamCount do
     begin
@@ -1886,6 +1955,20 @@ begin
         PlanFlag := PlanFlag or (ModeWanted = uTools.pmodePlan);
         SkipNext := True;
       end
+      else if (Arg = '--add-dir') or (Copy(Arg, 1, 10) = '--add-dir=') then
+      begin
+        if Copy(Arg, 1, 10) = '--add-dir=' then
+          AddArg := Copy(Arg, 11, MaxInt)
+        else
+        begin
+          if ArgI >= ParamCount then
+            FailStart('--add-dir needs a directory', '', 2);
+          AddArg := ParamStr(ArgI + 1);
+          SkipNext := True;
+        end;
+        SetLength(AddDirs, Length(AddDirs) + 1);
+        AddDirs[High(AddDirs)] := AddArg;
+      end
       else if Arg = '--dangerously-skip-permissions' then
       begin
         ModeWanted := uTools.pmodeBypass;
@@ -1917,7 +2000,7 @@ begin
       end
       else if (Arg = '--help') or (Arg = '-h') or (Arg = '/?') then
       begin
-        EmitCLn(clBright, 'pasclaude [directory] [--resume] [--web] [-p "prompt"]');
+        EmitCLn(clBright, 'pasclaude [directory] [--resume] [--web] [--add-dir <dir>] [-p "prompt"]');
         EmitCLn(clGrey, '  --resume  continue the conversation saved in that directory');
         EmitCLn(clGrey, '  --web     let the model search the web (off by default)');
         EmitCLn(clGrey, '  -p        answer one prompt and exit (reads stdin when piped)');
@@ -1935,6 +2018,12 @@ begin
         EmitCLn(clGrey, '            approve everything, asking nothing, for this run only.');
         EmitCLn(clGrey, '            Nothing is persisted.  Deny rules, the session root and');
         EmitCLn(clGrey, '            the subagent read-only list still apply; nothing else does.');
+        EmitCLn(clGrey, '  --add-dir <dir>');
+        EmitCLn(clGrey, '            also work in that directory, repeatable. Paths there must');
+        EmitCLn(clGrey, '            be given absolute; a bare relative path always means the');
+        EmitCLn(clGrey, '            session root. An added directory grants file access only:');
+        EmitCLn(clGrey, '            its hooks, skills, commands, agents and .mcp.json are not');
+        EmitCLn(clGrey, '            read. Nothing is persisted, so say it again next session.');
         EmitCLn(clGrey, '  --output-format text|json|stream-json   (needs -p)');
         EmitCLn(clGrey, '  --input-format  text|stream-json        (needs -p and stream-json out)');
         EmitCLn(clGrey, '            json/stream-json put one JSON object per line on stdout,');
@@ -1989,6 +2078,23 @@ begin
       SetCurrentDir(Dir);
     end;
     uTools.RootDir := GetCurrentDir;
+    { Above LoadIgnoreRules, because each root's own .gitignore is read there,
+      and above the print-mode halt below, because argv is the human speaking:
+      a -p run honours the flag.  What it grants there is read-only in
+      practice - -p leaves Ask nil, so every gated tool in an added directory
+      denies exactly as it denies in the session root.
+
+      A failure exits rather than continuing with less reach than was asked
+      for: a run that quietly starts without a directory it was told to use
+      produces a wrong answer instead of an error. }
+    for ArgI := 0 to High(AddDirs) do
+      if not uTools.AddWorkingDir(AddDirs[ArgI], AddArg, SaveErr) then
+        FailStart('--add-dir ' + AddDirs[ArgI] + ': ' + SaveErr, '', 2)
+      else
+      begin
+        if not PrintMode then EmitCLn(clGrey, '  + ' + AddArg);
+        if SaveErr <> '' then EmitCLn(clYellow, '  ' + SaveErr);
+      end;
     uTools.LoadIgnoreRules;
     { Deny rules load here, before the print-mode halt below, where the
       standing approvals deliberately do not: a rule can only ever narrow, so

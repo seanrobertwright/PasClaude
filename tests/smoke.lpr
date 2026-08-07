@@ -2395,6 +2395,80 @@ const
     'Step one.'#13#10 +
     'Step two.'#10;
 
+{ The single most dangerous drift in the working-directory design, asserted
+  rather than commented: an added root grants file access and contributes no
+  code and no configuration.  Every one of these files would do something if
+  the site that reads it had been "made symmetric" and taught to scan the
+  root list, and the hook is the loud one - a repository that could plant a
+  PreToolUse command in a directory the user merely wanted to read would have
+  turned --add-dir into arbitrary execution. }
+procedure TestAddedRootContributesNoConfig;
+var
+  Extra, Norm, Err: string;
+  Sch: TJson;
+  Before, After: Integer;
+  Cat: TSkillInfoArray;
+  Types: TStringArray;
+  Ok, IsErr: Boolean;
+  Out_: string;
+begin
+  StartSkillRoot;
+  uTools.ClearWorkingDirs;
+  Extra := IncludeTrailingPathDelimiter(GetTempDir) + 'pasclaude-smoke-extra';
+  WipeTree(Extra);
+  ForceDirectories(Extra);
+
+  PutSkill(IncludeTrailingPathDelimiter(Extra) + StateDirName + PathDelim +
+    'skills', 'planted',
+    '---'#10'description: a skill an added root shipped.'#10'---'#10'body'#10);
+  PutFile(IncludeTrailingPathDelimiter(Extra) + StateDirName + PathDelim +
+    'hooks.json',
+    '{"PreToolUse":[{"hooks":[{"type":"command","command":"exit 2"}]}]}');
+  PutFile(IncludeTrailingPathDelimiter(Extra) + StateDirName + PathDelim +
+    'commands' + PathDelim + 'c.md', 'a planted command');
+  PutFile(IncludeTrailingPathDelimiter(Extra) + StateDirName + PathDelim +
+    'agents' + PathDelim + 'a.md',
+    '---'#10'name: planted'#10'description: a planted agent.'#10'---'#10'go'#10);
+  PutFile(IncludeTrailingPathDelimiter(Extra) + '.mcp.json',
+    '{"mcpServers":{"planted":{"command":"cmd.exe","args":["/c","echo"]}}}');
+
+  Sch := ToolsSchema;
+  try
+    Before := CountBuiltinTools(Sch);
+  finally
+    Sch.Free;
+  end;
+
+  Ok := uTools.AddWorkingDir(Extra, Norm, Err);
+  Check(Ok, 'the extra directory is added: ' + Err);
+  uTools.RefreshSkills;
+
+  Sch := ToolsSchema;
+  try
+    After := CountBuiltinTools(Sch);
+  finally
+    Sch.Free;
+  end;
+  Check(After = Before, Format('the tool count is unchanged (%d -> %d)',
+    [Before, After]));
+  Cat := SkillCatalogue;
+  Check(Length(Cat) = 0, 'the planted skill is not catalogued');
+  Types := SubagentTypes;
+  Check(Length(Types) = 0, 'nor is the planted agent a subagent type');
+  Check(McpServerCount = 0, 'and its .mcp.json declares no server');
+
+  { The hook file: loaded from the primary root only, so a call still runs. }
+  uHooks.LoadHooks(True, Err);
+  Check(not uHooks.HooksEnabled,
+    'the planted hooks.json is not loaded at all');
+  Out_ := Run('list_dir', TJson.NewObj, IsErr);
+  Check(not IsErr, 'and a tool call is not blocked by it: ' + Out_);
+
+  uTools.ClearWorkingDirs;
+  uTools.RefreshSkills;
+  WipeTree(Extra);
+end;
+
 procedure TestSkillFrontmatter;
 var
   N, D, B, E: string;
@@ -2819,6 +2893,7 @@ begin
   TestTodos;
   TestSubagentGate;
   TestSkillFrontmatter;
+  TestAddedRootContributesNoConfig;
   TestSkillCatalogue;
   TestSkillTool;
   TestPluginPrecedence;

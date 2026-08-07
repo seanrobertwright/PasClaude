@@ -47,9 +47,27 @@ procedure WriteFileText(const Full, Text: string);
 var
   F: TFileStream;
 begin
+  ForceDirectories(ExtractFilePath(Full));
   F := TFileStream.Create(Full, fmCreate);
   try
     if Text <> '' then F.WriteBuffer(Text[1], Length(Text));
+  finally
+    F.Free;
+  end;
+end;
+
+{ Reads a file straight off disk, past every guard - the only way to assert
+  that a refused write really did not land. }
+function ReadWhole(const Full: string): string;
+var
+  F: TFileStream;
+begin
+  Result := '';
+  if not FileExists(Full) then Exit;
+  F := TFileStream.Create(Full, fmOpenRead or fmShareDenyNone);
+  try
+    SetLength(Result, F.Size);
+    if F.Size > 0 then F.ReadBuffer(Result[1], F.Size);
   finally
     F.Free;
   end;
@@ -2464,6 +2482,301 @@ end;
 { Everything the protocol emits has been somewhere this program does not
   control.  These are the bytes that make a line unparseable, which costs the
   driver the whole run and not just the field. }
+{ ---------------------------------------- additional working directories -- }
+
+function ExtraDir: string;
+begin
+  Result := ExcludeTrailingPathDelimiter(SessionDir) + '-extra';
+  ForceDirectories(Result);
+end;
+
+function ReadsOk(const Path: string): Boolean;
+var
+  J: TJson;
+  IsErr: Boolean;
+begin
+  J := TJson.NewObj;
+  J.AddStr('path', Path);
+  RunTool('read_file', J, IsErr);
+  Result := not IsErr;
+end;
+
+{ The acceptance test is a set; the resolution base is not.  Everything the
+  single-root guard refused it must go on refusing per root, and the sibling
+  case has to be asserted against an ADDED root specifically: the original
+  assertion covers the primary and would still pass if WithinRoot dropped the
+  + PathDelim for everyone. }
+procedure TestAddedRootBoundary;
+var
+  Extra, Norm, Err: string;
+  J: TJson;
+  IsErr, Ok: Boolean;
+begin
+  uTools.RootDir := SessionDir;
+  uTools.ClearWorkingDirs;
+  Extra := ExtraDir;
+  WriteFileText(IncludeTrailingPathDelimiter(Extra) + 'ok.txt', 'in the extra');
+  ForceDirectories(Extra + '-sibling');
+  WriteFileText(Extra + '-sibling\leak.txt', 'secret');
+
+  Check(not ReadsOk(IncludeTrailingPathDelimiter(Extra) + 'ok.txt'),
+    'before the add, the directory is outside every root');
+
+  Ok := uTools.AddWorkingDir(Extra, Norm, Err);
+  Check(Ok, 'the directory is accepted: ' + Err);
+  Check(Norm = Extra, 'and comes back normalised: ' + Norm);
+  Check(uTools.RootCount = 2, 'there are now two roots');
+
+  Check(ReadsOk(IncludeTrailingPathDelimiter(Extra) + 'ok.txt'),
+    'a file in the added root reads by absolute path');
+  J := TJson.NewObj;
+  J.AddStr('path', IncludeTrailingPathDelimiter(Extra) + 'written.txt');
+  J.AddStr('content', 'hello');
+  uTools.AllowAllEdits := True;
+  RunTool('write_file', J, IsErr);
+  Check((not IsErr) and
+        FileExists(IncludeTrailingPathDelimiter(Extra) + 'written.txt'),
+    'and a write lands there');
+
+  Check(not ReadsOk(Extra + '-sibling\leak.txt'),
+    'a sibling sharing the ADDED root''s name prefix is still refused');
+  Check(not ReadsOk(ExcludeTrailingPathDelimiter(GetTempDir)),
+    'the parent both roots sit in is not itself reachable');
+
+  uTools.ClearWorkingDirs;
+  Check(not ReadsOk(IncludeTrailingPathDelimiter(Extra) + 'ok.txt'),
+    'and clearing the set refuses it again');
+end;
+
+{ There is one resolution base however many roots there are.  A search order
+  would make a bare name mean whichever tree happened to be added, which is an
+  ambiguity an attacker picks and a user cannot see. }
+procedure TestRelativeMeansPrimary;
+var
+  Extra, Norm, Err, Out_: string;
+  J: TJson;
+  IsErr: Boolean;
+begin
+  uTools.RootDir := SessionDir;
+  uTools.ClearWorkingDirs;
+  Extra := ExtraDir;
+  WriteFileText(IncludeTrailingPathDelimiter(Extra) + 'only-there.txt', 'ONLY');
+  WriteFileText(IncludeTrailingPathDelimiter(Extra) + 'both.txt', 'EXTRACOPY');
+  WriteFileText(IncludeTrailingPathDelimiter(SessionDir) + 'both.txt', 'PRIMARYCOPY');
+  SysUtils.DeleteFile(IncludeTrailingPathDelimiter(SessionDir) + 'only-there.txt');
+  Check(uTools.AddWorkingDir(Extra, Norm, Err), 'the extra root is added');
+
+  Check(not ReadsOk('only-there.txt'),
+    'a bare relative name never reaches an added root');
+  Check(ReadsOk(IncludeTrailingPathDelimiter(Extra) + 'only-there.txt'),
+    'the same file reads by absolute path');
+
+  J := TJson.NewObj;
+  J.AddStr('path', 'both.txt');
+  Out_ := RunTool('read_file', J, IsErr);
+  Check((not IsErr) and (Pos('PRIMARYCOPY', Out_) > 0),
+    'a name in both roots resolves to the primary copy');
+  uTools.ClearWorkingDirs;
+end;
+
+{ The state directory is refused at the top level of every root.  It is not
+  pasclaude's in an added tree - but if that directory is ever somebody's
+  primary root it holds their transcript, and the walkers skip the name in
+  any tree already. }
+procedure TestAddedRootStateDirRefused;
+var
+  Extra, Norm, Err: string;
+  J: TJson;
+  IsErr: Boolean;
+begin
+  uTools.RootDir := SessionDir;
+  uTools.ClearWorkingDirs;
+  Extra := ExtraDir;
+  WriteFileText(IncludeTrailingPathDelimiter(Extra) + StateDirName +
+    PathDelim + 'session.json', 'MARKER-TRANSCRIPT');
+  WriteFileText(IncludeTrailingPathDelimiter(Extra) + '.pasclaudex' +
+    PathDelim + 'f.txt', 'ordinary');
+  Check(uTools.AddWorkingDir(Extra, Norm, Err), 'the extra root is added');
+
+  Check(not ReadsOk(IncludeTrailingPathDelimiter(Extra) + StateDirName +
+    PathDelim + 'session.json'),
+    'the state directory of an added root is not readable');
+
+  J := TJson.NewObj;
+  J.AddStr('path', IncludeTrailingPathDelimiter(Extra) + StateDirName +
+    PathDelim + 'session.json');
+  J.AddStr('content', 'clobbered');
+  uTools.AllowAllEdits := True;
+  RunTool('write_file', J, IsErr);
+  Check(IsErr, 'nor writable');
+  Check(Pos('MARKER-TRANSCRIPT', ReadWhole(IncludeTrailingPathDelimiter(Extra) +
+    StateDirName + PathDelim + 'session.json')) > 0,
+    'and the file on disk is untouched');
+
+  Check(ReadsOk(IncludeTrailingPathDelimiter(Extra) + '.pasclaudex' +
+    PathDelim + 'f.txt'),
+    'a name that merely starts the same is still readable');
+  uTools.ClearWorkingDirs;
+end;
+
+{ Everything AddWorkingDir must say no to.  Each refusal leaves the set as it
+  was: a half-applied add is a root nobody can see and nobody can remove. }
+procedure TestAddWorkingDirRejects;
+var
+  Norm, Err: string;
+  I, N: Integer;
+  Ok: Boolean;
+  Sub, Tmp: string;
+
+  procedure Refuses(const D, Why: string);
+  begin
+    N := uTools.RootCount;
+    Check(not uTools.AddWorkingDir(D, Norm, Err), Why);
+    Check((Norm = '') and (Err <> ''),
+      'and says why with no path: ' + Norm + '/' + Err);
+    Check(uTools.RootCount = N, 'and the set is unchanged');
+  end;
+
+begin
+  uTools.RootDir := SessionDir;
+  uTools.ClearWorkingDirs;
+  Tmp := IncludeTrailingPathDelimiter(GetTempDir);
+  Sub := IncludeTrailingPathDelimiter(SessionDir) + 'sub';
+  ForceDirectories(Sub);
+  WriteFileText(IncludeTrailingPathDelimiter(SessionDir) + 'afile.txt', 'x');
+
+  Refuses(Tmp + 'pasclaude-no-such-dir',
+    'a directory that does not exist is refused');
+  Refuses(IncludeTrailingPathDelimiter(SessionDir) + 'afile.txt',
+    'an existing file is refused');
+  Refuses('C:\', 'a whole drive is refused');
+  Refuses(SessionDir, 'the primary root itself is refused as a duplicate');
+  Refuses(Sub, 'a subdirectory of an existing root is refused as covered');
+
+  { The cap.  Eight added directories, and the ninth is refused. }
+  for I := 1 to uTools.MaxWorkingDirs do
+  begin
+    ForceDirectories(Format('%spasclaude-fuzz-w%d', [Tmp, I]));
+    Ok := uTools.AddWorkingDir(Format('%spasclaude-fuzz-w%d', [Tmp, I]),
+      Norm, Err);
+    Check(Ok, Format('added working directory %d: %s', [I, Err]));
+  end;
+  ForceDirectories(Tmp + 'pasclaude-fuzz-w9');
+  Refuses(Tmp + 'pasclaude-fuzz-w9', 'the ninth is refused');
+  uTools.ClearWorkingDirs;
+
+  { A trailing delimiter must never be stored: the state-directory check
+    slices at Length(Root)+2, so a stored 'D:\lib\' would compare the wrong
+    bytes and silently admit .pasclaude in that tree. }
+  Ok := uTools.AddWorkingDir(IncludeTrailingPathDelimiter(ExtraDir), Norm, Err);
+  Check(Ok, 'a path with a trailing delimiter is accepted: ' + Err);
+  Check(Norm = ExtraDir, 'and stored without it: ' + Norm);
+  Check(uTools.RootAt(1) = ExtraDir, 'as the root itself: ' + uTools.RootAt(1));
+  Check(not ReadsOk(IncludeTrailingPathDelimiter(ExtraDir) + StateDirName +
+    PathDelim + 'session.json'),
+    'so the state-dir check still bites in that root');
+
+  { And index 0 can never be removed - it is where the session, the history
+    and the approvals key live. }
+  Check(not uTools.RemoveWorkingDir('0', Err),
+    'the session root cannot be removed');
+  Check(uTools.RootAt(0) = ExcludeTrailingPathDelimiter(SessionDir),
+    'and it survives: ' + uTools.RootAt(0));
+  Ok := uTools.RemoveWorkingDir('1', Err);
+  Check(Ok, 'an added one can: ' + Err);
+  Check(uTools.RootCount = 1, 'leaving just the primary');
+  uTools.ClearWorkingDirs;
+end;
+
+{ Property 2 of the round, for this feature: nothing in the project directory,
+  and nothing in the approvals store, may add a root.  Both files are written
+  carrying keys that would do it if anything read them. }
+procedure TestNoRootFromProject;
+var
+  Sibling, P, Q: string;
+begin
+  uTools.RootDir := SessionDir;
+  uTools.ClearWorkingDirs;
+  Sibling := ExtraDir;
+  WriteFileText(IncludeTrailingPathDelimiter(Sibling) + 'ok.txt', 'in the extra');
+  Q := StringReplace(Sibling, '\', '\\', [rfReplaceAll]);
+
+  P := IncludeTrailingPathDelimiter(SessionDir) + 'roots-approvals.json';
+  WriteFileText(P, '{"allow_edits":true,"add_dir":["' + Q +
+    '"],"working_dirs":["' + Q + '"]}');
+  uTools.LoadPermissions(P);
+  Check(uTools.RootCount = 1, 'the approvals file cannot add a root');
+
+  WriteFileText(IncludeTrailingPathDelimiter(SessionDir) + StateDirName +
+    PathDelim + 'config.json', '{"working_dirs":["' + Q + '"]}');
+  uTools.RefreshSkills;
+  Check(uTools.RootCount = 1, 'nor can anything in the state directory');
+  Check(not ReadsOk(IncludeTrailingPathDelimiter(Sibling) + 'ok.txt'),
+    'and the directory they named is still refused');
+  SysUtils.DeleteFile(P);
+end;
+
+{ The gate did not get looser.  A deny rule covering a path keeps denying it
+  after --add-dir names the directory, under bypass, with every class grant
+  set - because SafePath asks DenyPathReason once, on the winning candidate,
+  outside the root loop. }
+procedure TestDenyBeatsAddedRoot;
+var
+  Extra, Norm, Err: string;
+  SB, Ok: Boolean;
+begin
+  uTools.RootDir := SessionDir;
+  uTools.ClearWorkingDirs;
+  uTools.ClearDenyRules;
+  SB := uTools.BypassMode;
+  Extra := ExtraDir;
+  WriteFileText(IncludeTrailingPathDelimiter(Extra) + 'secret.pem', 'KEY');
+  WriteFileText(IncludeTrailingPathDelimiter(Extra) + 'plain.txt', 'fine');
+  try
+    uTools.AddDenyRule('path:*.pem', 'test');
+    Ok := uTools.AddWorkingDir(Extra, Norm, Err);
+    Check(Ok, 'the extra root is added: ' + Err);
+    uTools.AllowAllEdits := True;
+    uTools.BypassMode := True;
+    Check(ReadsOk(IncludeTrailingPathDelimiter(Extra) + 'plain.txt'),
+      'an ordinary file in the added root reads');
+    Check(not ReadsOk(IncludeTrailingPathDelimiter(Extra) + 'secret.pem'),
+      'a denied path in an added root is still denied, under bypass');
+    Check(uTools.DenyRuleCount = 1, 'and adding a root did not touch the rule');
+  finally
+    uTools.BypassMode := SB;
+    uTools.ClearDenyRules;
+    uTools.ClearWorkingDirs;
+  end;
+end;
+
+{ One session in a process cannot inherit another's working directories: they
+  are a grant made to a session, not a property of the machine. }
+procedure TestSdkSessionDoesNotInheritRoots;
+var
+  Extra, Norm, Err, Other: string;
+  S: uSdk.TSdkSession;
+begin
+  uTools.RootDir := SessionDir;
+  uTools.ClearWorkingDirs;
+  Extra := ExtraDir;
+  WriteFileText(IncludeTrailingPathDelimiter(Extra) + 'ok.txt', 'in the extra');
+  Check(uTools.AddWorkingDir(Extra, Norm, Err), 'a root is added');
+
+  Other := IncludeTrailingPathDelimiter(GetTempDir) + 'pasclaude-fuzz-sdk';
+  ForceDirectories(Other);
+  S := uSdk.TSdkSession.Create(Other, 'k', '');
+  try
+    Check(uTools.RootCount = 1, 'a new session starts with one root');
+    Check(not ReadsOk(IncludeTrailingPathDelimiter(Extra) + 'ok.txt'),
+      'and the previous session''s directory is refused');
+  finally
+    S.Free;
+  end;
+  uTools.RootDir := SessionDir;
+  uTools.ClearWorkingDirs;
+end;
+
 procedure TestSdkEncoderHardening;
 var
   Line, Content, Decoded: string;
@@ -2577,6 +2890,14 @@ begin
   TestMcpSchemaTrust;
   TestMcpHostileServer;
   TestSdkEncoderHardening;
+  TestAddedRootBoundary;
+  TestRelativeMeansPrimary;
+  TestAddedRootStateDirRefused;
+  TestAddWorkingDirRejects;
+  TestNoRootFromProject;
+  TestDenyBeatsAddedRoot;
+  TestSdkSessionDoesNotInheritRoots;
+  uTools.ClearWorkingDirs;
 
   WriteLn;
   if Fails = 0 then

@@ -1982,6 +1982,23 @@ begin
     SubHost.OnNotice('subagent: ' + S);
 end;
 
+{ The same block the main system prompt carries, under the same condition:
+  a subagent reads in every root the parent can, and a path it cannot name is
+  a path it will waste a round guessing at.  '' when there is one root, so an
+  ordinary subagent's prompt is unchanged. }
+function SubRootsNote: string;
+var
+  I: Integer;
+begin
+  Result := '';
+  if uTools.RootCount <= 1 then Exit;
+  Result := 'Additional working directories you may also read:' + #10;
+  for I := 1 to uTools.RootCount - 1 do
+    Result := Result + '  ' + uTools.RootAt(I) + #10;
+  Result := Result + 'Paths are relative to the session root; a file in an ' +
+    'additional directory must be given as its full absolute path.' + #10;
+end;
+
 function RunSubagent(const Prompt, SystemExtra: string;
   out Reply, Err: string): Boolean;
 var
@@ -2005,6 +2022,7 @@ begin
   SysText :=
     'You are a read-only subagent working inside a coding session rooted at ' +
     uTools.RootDir + '.' + #10 +
+    SubRootsNote +
     'You have exactly three tools: read_file, list_dir and search. You ' +
     'cannot change files, run commands, fetch URLs, or start a subagent of ' +
     'your own.' + #10 +

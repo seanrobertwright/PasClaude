@@ -626,6 +626,95 @@ begin
   end;
 end;
 
+{ Adding a working directory is the only thing in this feature the model ever
+  learns about, and it must be told - a directory it cannot name is a
+  directory it wastes turns guessing at.  The other half matters more: with
+  one root the request body has to be exactly what it was before the feature
+  existed, or every session in the world re-reads its cached prefix. }
+procedure TestExtraRootsReachTheModel;
+var
+  A: TAgent;
+  Err, Norm, AErr, Extra, Text: string;
+  Doc, Sys: TJson;
+  Ok: Boolean;
+begin
+  ResetScript;
+  uTools.RootDir := SessionDir;
+  uTools.ClearDenyRules;
+  uTools.ClearWorkingDirs;
+
+  SetLength(Replies, 1);
+  Replies[0] := TextReply('hello');
+  A := MakeAgent;
+  try
+    A.Send('hi', Err);
+    Doc := JsonParse(Requests[0]);
+    try
+      Check(Doc.Find('system').Count = 1,
+        'with one root there is no second system block');
+      Check(Pos('Additional working directories', Requests[0]) = 0,
+        'and nothing in the body mentions them');
+    finally
+      Doc.Free;
+    end;
+  finally
+    A.Free;
+  end;
+
+  Extra := ExcludeTrailingPathDelimiter(SessionDir) + '-lib';
+  ForceDirectories(Extra);
+  Ok := uTools.AddWorkingDir(Extra, Norm, AErr);
+  Check(Ok, 'a working directory is added: ' + AErr);
+
+  ResetScript;
+  SetLength(Replies, 1);
+  Replies[0] := TextReply('hello');
+  A := MakeAgent;
+  try
+    A.Send('hi', Err);
+    Doc := JsonParse(Requests[0]);
+    try
+      Sys := Doc.Find('system');
+      Check(Sys.Count = 2, 'and now there is a second block');
+      Check(Sys.Item(Sys.Count - 1).Find('cache_control') = nil,
+        'still outside the cached prefix, so /add-dir is cheap');
+      Text := Sys.Item(Sys.Count - 1).Str('text');
+      Check(Pos('Additional working directories', Text) > 0,
+        'which names them: ' + Text);
+      Check(Pos(Extra, Text) > 0, 'and gives the directory in full');
+      Check(Pos('full absolute path', Text) > 0,
+        'and says how to name a file in it');
+    finally
+      Doc.Free;
+    end;
+  finally
+    A.Free;
+  end;
+
+  { And the subagent prompt, which is built separately and would otherwise be
+    the one place the roots went unmentioned. }
+  Check(Pos('Additional working directories', uTools.SessionNote) > 0,
+    'SessionNote is the single seam it comes through');
+
+  uTools.ClearWorkingDirs;
+  ResetScript;
+  SetLength(Replies, 1);
+  Replies[0] := TextReply('hello');
+  A := MakeAgent;
+  try
+    A.Send('hi', Err);
+    Doc := JsonParse(Requests[0]);
+    try
+      Check(Doc.Find('system').Count = 1,
+        'removing the root removes the block again');
+    finally
+      Doc.Free;
+    end;
+  finally
+    A.Free;
+  end;
+end;
+
 { Plan mode is told to the model twice: once as a paragraph in the system
   prompt, so it does not spend a turn walking into the boundary, and once as
   the refusal when it does anyway.  Both halves are here, plus the shape of
@@ -3049,6 +3138,7 @@ begin
   TestMidLoopFailure;
   TestDeniedToolContinues;
   TestDenyProducesToolResult;
+  TestExtraRootsReachTheModel;
   TestPlanModeReachesTheModel;
   TestPrintModeInheritsNoGrants;
   TestConversationPersists;

@@ -2640,6 +2640,138 @@ begin
   end;
 end;
 
+{ ---------------------------------------- additional working directories -- }
+
+{ What the user actually sees once a second directory is in play.  The two
+  things that would look wrong on screen: a hit in an added tree printed
+  relative (untypeable - the model would hand it back and be refused), and
+  the primary root's anchored .gitignore rule silently hiding a directory in
+  somebody else's tree. }
+procedure TestExtraRootDisplay;
+var
+  Extra, Norm, Err, Before, After, Out_: string;
+  Input: TJson;
+  IsErr, Ok: Boolean;
+begin
+  WriteLn('-- working directories --');
+  uTools.ClearWorkingDirs;
+  Extra := ExcludeTrailingPathDelimiter(TmpRoot) + '-lib';
+  Cleanup(Extra);
+  ForceDirectories(Extra);
+  WriteFileText(IncludeTrailingPathDelimiter(Extra) + 'lib.txt', 'ROOTMARK');
+  WriteFileText(IncludeTrailingPathDelimiter(Extra) + 'src\deep.txt', 'DEEPMARK');
+  WriteFileText(IncludeTrailingPathDelimiter(Extra) + 'noisy.tmp', 'HIDDENMARK');
+  WriteFileText(IncludeTrailingPathDelimiter(Extra) + '.gitignore', '*.tmp'#10);
+  { The primary already carries an anchored /topsecret.txt rule from the
+    gitignore test; give it an anchored /src rule too, which must not travel. }
+  WriteFileText(IncludeTrailingPathDelimiter(TmpRoot) + '.gitignore',
+    'obj/'#10'*.log'#10'/topsecret.txt'#10'!keep.log'#10'/src'#10);
+  WriteFileText(IncludeTrailingPathDelimiter(TmpRoot) + 'primary-mark.txt',
+    'ROOTMARK');
+  LoadIgnoreRules;
+
+  Input := TJson.NewObj;
+  Input.AddStr('path', '.');
+  Before := RunTool('list_dir', Input, nil, IsErr);
+  Input.Free;
+
+  Ok := uTools.AddWorkingDir(Extra, Norm, Err);
+  Check(Ok, 'the library directory is added: ' + Err);
+  LoadIgnoreRules;
+
+  Input := TJson.NewObj;
+  Input.AddStr('path', '.');
+  After := RunTool('list_dir', Input, nil, IsErr);
+  Input.Free;
+  Check(After = Before,
+    'a listing of the session root is byte-identical to the single-root run');
+
+  Input := TJson.NewObj;
+  Input.AddStr('path', Extra);
+  Out_ := RunTool('list_dir', Input, nil, IsErr);
+  Input.Free;
+  Check((not IsErr) and (Pos('lib.txt', Out_) > 0),
+    'the added directory lists by absolute path');
+  Check(Pos(Extra, Out_) > 0,
+    'and its header names it absolutely, which is how it must be typed back');
+  Check(Pos('noisy.tmp', Out_) = 0,
+    'its own .gitignore hides its own file');
+  Check(Pos('src', Out_) > 0,
+    'and the primary root''s anchored /src rule does not reach into it');
+
+  Input := TJson.NewObj;
+  Input.AddStr('pattern', 'ROOTMARK');
+  Out_ := RunTool('search', Input, nil, IsErr);
+  Input.Free;
+  Check(Pos('primary-mark.txt', Out_) > 0, 'search finds the primary hit');
+  Check(Pos('  primary-mark.txt', '  ' + Out_) > 0,
+    'labelled relative, as it always was');
+  Check(Pos(IncludeTrailingPathDelimiter(Extra) + 'lib.txt', Out_) > 0,
+    'and the added-root hit, labelled with its absolute path: ' + Out_);
+
+  { An explicit path narrows the walk to one tree. }
+  Input := TJson.NewObj;
+  Input.AddStr('pattern', 'ROOTMARK');
+  Input.AddStr('path', Extra);
+  Out_ := RunTool('search', Input, nil, IsErr);
+  Input.Free;
+  Check((Pos('lib.txt', Out_) > 0) and (Pos('primary-mark.txt', Out_) = 0),
+    'search path restricts the walk to that directory');
+
+  uTools.ClearWorkingDirs;
+  Cleanup(Extra);
+  LoadIgnoreRules;
+end;
+
+{ The add and remove operations as the REPL drives them.  What breaks here is
+  invisible in the guard: an echo of what the user typed rather than of what
+  was resolved, or a remove that takes the session root with it. }
+procedure TestAddDirCommands;
+var
+  Extra, Norm, Err: string;
+  N: Integer;
+  Ok: Boolean;
+begin
+  uTools.ClearWorkingDirs;
+  Extra := ExcludeTrailingPathDelimiter(TmpRoot) + '-cmd';
+  Cleanup(Extra);
+  ForceDirectories(Extra);
+
+  Check(uTools.RootCount = 1, 'a session starts with the session root alone');
+  Check(uTools.RootAt(0) = ExcludeTrailingPathDelimiter(TmpRoot),
+    'index 0 is the session root: ' + uTools.RootAt(0));
+  Check(Length(uTools.WorkingDirs) = 0, 'and there are no added ones to list');
+
+  { The '..\name' form is exactly what a user types and exactly what an echo
+    of the raw argument would render uselessly. }
+  Ok := uTools.AddWorkingDir('..\' + ExtractFileName(Extra), Norm, Err);
+  Check(Ok, 'a relative directory is accepted: ' + Err);
+  Check(Norm = Extra, 'and echoed as the absolute path it resolved to: ' + Norm);
+  Check(Length(uTools.WorkingDirs) = 1, 'the list has one entry');
+
+  N := uTools.RootCount;
+  Check(not uTools.AddWorkingDir(Extra, Norm, Err),
+    'the same directory twice is refused');
+  Check(uTools.RootCount = N, 'and the list did not grow');
+
+  Check(not uTools.RemoveWorkingDir('0', Err),
+    'index 0 cannot be removed: ' + Err);
+  Check(uTools.RootAt(0) = ExcludeTrailingPathDelimiter(TmpRoot),
+    'and the session root survives');
+  Ok := uTools.RemoveWorkingDir('1', Err);
+  Check(Ok, 'index 1 can: ' + Err);
+  Check(uTools.RootCount = 1, 'leaving the session root alone');
+
+  { /yolo lifts asking, not reach.  The two axes are separate on purpose. }
+  Ok := uTools.AddWorkingDir(Extra, Norm, Err);
+  N := uTools.RootCount;
+  uTools.SetPermMode(uTools.pmodeBypass);
+  Check(uTools.RootCount = N, 'bypass adds no working directory');
+  uTools.SetPermMode(uTools.pmodeAsk);
+  uTools.ClearWorkingDirs;
+  Cleanup(Extra);
+end;
+
 begin
   TmpRoot := IncludeTrailingPathDelimiter(GetTempDir) + 'pasclaude-ux';
   Cleanup(TmpRoot);
@@ -2672,6 +2804,8 @@ begin
     TestSystemPromptLift;
     TestModeIsVisible;
     TestLoadedGrantIsAnnounced;
+    TestExtraRootDisplay;
+    TestAddDirCommands;
   finally
     { Before the cleanup, not after: a live child holding a spool handle under
       TmpRoot would make the recursive delete fail. }
@@ -2684,6 +2818,7 @@ begin
     uTools.ClearSkills;
     uTools.ClearPluginState;
     uTools.ClearDenyRules;
+    uTools.ClearWorkingDirs;
     uTools.RootDir := '';
     Cleanup(TmpRoot);
   end;
