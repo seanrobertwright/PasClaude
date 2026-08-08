@@ -496,8 +496,48 @@ text preserves what was missing at the time. Unchecked items remain open.
 
 ## Configuration and diagnostics
 
-- [ ] **settings.json** — no hierarchical user/project/local config, no
-  `/config`.
+- [x] ~~**settings.json** — no hierarchical user/project/local config, no
+  `/config`.~~
+  *Built: three files — `%USERPROFILE%\.pasclaude\settings.json`,
+  `<root>\.pasclaude\settings.json` and `<root>\.pasclaude\settings.local.json`
+  — resolved per key by the same "nearer wins" rule skills and styles already
+  use: local, then project, then user, then the built-in default. The charter
+  is one sentence: **settings.json carries display and economy keys only;
+  authority stays where it is.** One table in `uSettings` gives every key a
+  scope, and one function consulted from one place enforces it, so a value at
+  a tier its key does not permit is never stored rather than stored and
+  overruled. A project or local file may set four keys: `output_style`,
+  `thinking_budget`, `tool_result_bytes` and `auto_compact_tokens` — and only
+  ever downward on the last three, because a repository may lower your cost
+  and never raise it. `model` and the model-routing and telemetry keys are
+  user-scope only; a project value is refused by name. Every key somebody
+  might paste out of Claude Code's `settings.json` — `permissions`,
+  `allow_edits`, `deny`, `sandbox`, `permission_mode`, `env`, `apiKey`,
+  `mcpServers`, `plugins`, `vim`, `bindings`, `hooks` and the rest — is in the
+  same table as a refusal with a sentence naming the file that really owns it,
+  because a user believing a pasted file took effect is worse than any wrong
+  default. A file with any problem in it contributes **nothing** and every
+  problem is named in yellow at startup, like a bad deny rule; it never halts,
+  because a project file is attacker-controlled. `/config` prints the three
+  absolute paths and a table of key, value and tier with an "overruled:" line
+  under anything shadowed; `/config get` shows the whole chain, `/config set
+  [--local]` writes the user file or `settings.local.json` and never the
+  project file, and `/config reload` re-reads. The writer is read-modify-write,
+  so a hand-written block survives — including refused keys.
+  **What is narrower than Claude Code's: `settings.local.json` carries
+  PROJECT authority, not user authority, because `.gitignore` is a convention
+  and a repository can simply commit one.** There is no `permissions` block,
+  no `env`, no `hooks`, no `mcpServers`, no `apiKeyHelper` and no enterprise
+  or managed-policy tier — those are the keys the whole design exists to
+  refuse. Nothing writes `<root>\.pasclaude\settings.json` ever. A settings
+  file is read once at startup, so a mid-session edit needs `/config reload`,
+  and even then only the three economy keys re-apply: the system prompt is
+  frozen at session start for prompt-cache reasons, so a reloaded
+  `output_style` needs `/output-style` and a reloaded `model` needs `/model`.
+  A `-p` run inherits the file but not its `output_style` — a scripted run
+  still gets a style only from `--output-style`. `keys.json` and
+  `plugins.json` were deliberately NOT folded in: one is `%USERPROFILE%`-only
+  by design and the other is program-written in both directions.*
 - [ ] **/doctor, /status, /bug** — no health check, status view, or
   feedback command.
 - [ ] **/login, /logout** — cannot authenticate on its own; it reuses the

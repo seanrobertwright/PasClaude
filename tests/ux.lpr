@@ -14,8 +14,8 @@ program ux;
 
 { Windows first, so SysUtils' DeleteFile and GetEnvironmentVariable win over
   the raw API of the same names. }
-uses Windows, SysUtils, Classes, uJson, uDiff, uHooks, uSandbox, uTools,
-  uImage, uAgent, uTerm, uNotebook, uSdk;
+uses Windows, SysUtils, Classes, uJson, uSettings, uDiff, uHooks, uSandbox,
+  uTools, uImage, uAgent, uTerm, uNotebook, uSdk;
 
 var
   Fails: Integer = 0;
@@ -4245,6 +4245,356 @@ begin
   Cleanup(Extra);
 end;
 
+{ ------------------------------------------------------- settings.json -- }
+
+{ The three settings files, written under a scratch directory this suite owns.
+  uSettings never learns a path of its own, so the tests either hand it bytes
+  or hand it these. }
+function SetDir: string;
+begin
+  Result := IncludeTrailingPathDelimiter(TmpRoot) + 'cfg' + PathDelim;
+end;
+
+function UserSet: string;  begin Result := SetDir + 'user.json'; end;
+function ProjSet: string;  begin Result := SetDir + 'project.json'; end;
+function LocalSet: string; begin Result := SetDir + 'local.json'; end;
+
+procedure ClearSetFiles;
+begin
+  ForceDirectories(SetDir);
+  if FileExists(UserSet) then DeleteFile(UserSet);
+  if FileExists(ProjSet) then DeleteFile(ProjSet);
+  if FileExists(LocalSet) then DeleteFile(LocalSet);
+end;
+
+{ True when any note or refusal mentions Needle.  The assertions are about the
+  user being TOLD, so they look at the text rather than at a count. }
+function Mentions(const A: TStringArray; const Needle: string): Boolean;
+var
+  I: Integer;
+begin
+  Result := False;
+  for I := 0 to High(A) do
+    if Pos(Needle, A[I]) > 0 then Exit(True);
+end;
+
+{ The Scope column is the whole feature.  A project document setting the model
+  must not merely lose a precedence race - the value must never be stored, and
+  the user must be told it was refused and where it would work. }
+procedure TestSettingsScopeTable;
+var
+  Problems: TStringArray;
+begin
+  SettingsClear;
+  Check(not SettingsParseTier(stProject, '{"model":"claude-opus-4"}',
+    'proj.json', Problems), 'a project file may not set the model');
+  Check(SettingStr('model') = '', 'and the value is not readable afterwards');
+  Check(SettingSource('model') = stDefault, 'and the source is still default');
+  Check(SettingTierValue('model', stProject) = '',
+    'and the project tier holds nothing: it was never stored, not overridden');
+  Check(Mentions(Problems, 'model'), 'the problem names the key');
+  Check(Mentions(SettingsRefusals, 'proj.json'),
+    'and the refusal names the file it came from');
+
+  SettingsClear;
+  Check(SettingsParseTier(stUser, '{"model":"claude-opus-4"}',
+    'user.json', Problems), 'the same document at the user tier is honoured');
+  Check(SettingStr('model') = 'claude-opus-4', 'and the value reads back');
+  Check(SettingSource('model') = stUser, 'from the user tier');
+  SettingsClear;
+end;
+
+{ The realistic failure is a user pasting Claude Code's settings.json and
+  believing it took effect.  Every name they would paste is refused BY NAME,
+  and afterwards nothing that decides authority has moved. }
+procedure TestSettingsRefusedKeys;
+const
+  Names: array[0..14] of string = ('permissions', 'allow_edits', 'allow_bash',
+    'allow_fetch', 'deny', 'sandbox', 'permission_mode', 'add_dir', 'env',
+    'apiKey', 'mcpServers', 'plugins', 'vim', 'bindings', 'hooks');
+var
+  Problems: TStringArray;
+  Doc: string;
+  I, Denies: Integer;
+  Mode: uTools.TPermMode;
+  Level: uSandbox.TSandboxLevel;
+begin
+  SettingsClear;
+  Mode := uTools.CurrentPermMode;
+  Level := uSandbox.SandboxLevel;
+  Denies := uTools.DenyRuleCount;
+  Doc := '{';
+  for I := 0 to High(Names) do
+  begin
+    if I > 0 then Doc := Doc + ',';
+    Doc := Doc + '"' + Names[I] + '":true';
+  end;
+  Doc := Doc + '}';
+  Check(not SettingsParseTier(stProject, Doc, 'evil.json', Problems),
+    'a pasted Claude Code settings.json contributes nothing');
+  for I := 0 to High(Names) do
+    Check(Mentions(Problems, '"' + Names[I] + '"'),
+      '  refused by name: ' + Names[I]);
+  Check(Length(SettingsRefusals) >= Length(Names),
+    'and every one of them is in the refusals list');
+  Check(not uTools.AllowAllEdits, 'edits are still not blanket-approved');
+  Check(not uTools.AllowAllBash, 'nor bash');
+  Check(not uTools.AllowAllFetch, 'nor fetch');
+  Check(uSandbox.SandboxLevel = Level, 'the sandbox level did not move');
+  Check(uTools.CurrentPermMode = Mode, 'the permission mode did not move');
+  Check(uTools.DenyRuleCount = Denies, 'the deny rules did not move');
+  Check(not uHooks.HooksEnabled, 'and hooks are still not enabled');
+  SettingsClear;
+end;
+
+{ Partial application is how a typo silently changes half a configuration.  A
+  document with one bad value applies NONE of its good ones. }
+procedure TestSettingsAllOrNothing;
+var
+  Problems: TStringArray;
+begin
+  SettingsClear;
+  Check(SettingsParseTier(stUser, '{"output_style":"learning"}', 'u', Problems),
+    'a good user file loads');
+  Check(SettingStr('output_style') = 'learning', 'and applies');
+  Check(not SettingsParseTier(stProject,
+    '{"output_style":"explanatory","thinking_budget":999999,' +
+    '"tool_result_bytes":8192}', 'p.json', Problems),
+    'a project file with one out-of-range value is refused whole');
+  Check(SettingStr('output_style') = 'learning',
+    'the good key beside it did NOT apply');
+  Check(SettingInt('tool_result_bytes') = 0,
+    'nor did the third key, which was legal on its own');
+  Check(Mentions(Problems, '999999'),
+    'the out-of-range value is named');
+  Check(Mentions(Problems, 'contributed nothing'),
+    'and the file-level sentence says the whole file was dropped');
+  SettingsClear;
+end;
+
+{ local -> project -> user -> default, per key rather than per file. }
+procedure TestSettingsPrecedence;
+var
+  P: TStringArray;
+begin
+  SettingsClear;
+  SettingsParseTier(stUser, '{"thinking_budget":4096,"output_style":"a"}', 'u', P);
+  SettingsParseTier(stProject, '{"thinking_budget":2048}', 'p', P);
+  SettingsParseTier(stLocal, '{"thinking_budget":1024}', 'l', P);
+  Check(SettingInt('thinking_budget') = 1024, 'local wins');
+  Check(SettingSource('thinking_budget') = stLocal, 'and says so');
+  Check(SettingStr('output_style') = 'a',
+    'a key only the user file set resolves independently: the nearest FILE ' +
+    'does not shadow keys it never mentions');
+
+  SettingsClear;
+  SettingsParseTier(stUser, '{"thinking_budget":4096}', 'u', P);
+  SettingsParseTier(stProject, '{"thinking_budget":2048}', 'p', P);
+  Check(SettingInt('thinking_budget') = 2048, 'without local, project wins');
+  Check(SettingSource('thinking_budget') = stProject, 'and says so');
+
+  SettingsClear;
+  SettingsParseTier(stUser, '{"thinking_budget":4096}', 'u', P);
+  Check(SettingInt('thinking_budget') = 4096, 'without project, user wins');
+  Check(SettingSource('thinking_budget') = stUser, 'and says so');
+
+  SettingsClear;
+  Check(not SettingIsSet('thinking_budget'), 'with nothing set, nothing is set');
+  Check(SettingSource('thinking_budget') = stDefault, 'and the source is default');
+end;
+
+{ ProjMax is narrow-only: a project may lower the user's cost and never raise
+  it, and a value above the ceiling is REFUSED rather than clamped - a clamp
+  teaches the repository that the key half-works and teaches the user nothing. }
+procedure TestSettingsProjectCeiling;
+var
+  P: TStringArray;
+begin
+  SettingsClear;
+  Check(not SettingsParseTier(stProject, '{"thinking_budget":32768}', 'p', P),
+    'a project may not raise thinking_budget past its ceiling');
+  Check(Mentions(P, '8192'), 'and the ceiling is named in the refusal');
+  Check(not SettingIsSet('thinking_budget'), 'nothing was stored');
+
+  SettingsClear;
+  Check(SettingsParseTier(stUser, '{"thinking_budget":32768}', 'u', P),
+    'the user file may set the same value');
+  Check(SettingInt('thinking_budget') = 32768, 'at its full range');
+
+  SettingsClear;
+  Check(SettingsParseTier(stProject, '{"thinking_budget":2048}', 'p', P),
+    'and a project lowering it is fine: narrowing cost is always allowed');
+  Check(SettingInt('thinking_budget') = 2048, 'and applies');
+
+  SettingsClear;
+  Check(not SettingsParseTier(stProject, '{"tool_result_bytes":131072}', 'p', P),
+    'a project may not quadruple the tool result cap either');
+  Check(SettingsParseTier(stUser, '{"tool_result_bytes":131072}', 'u', P),
+    'though the user may');
+  SettingsClear;
+end;
+
+{ settings.local.json is gitignored by convention, and .gitignore is a
+  convention rather than a guard: a repository can simply commit one.  The
+  local tier therefore carries PROJECT authority, and treating it as user
+  scope is the single most likely "improvement" someone makes to this. }
+procedure TestSettingsLocalHasProjectAuthority;
+var
+  P: TStringArray;
+begin
+  SettingsClear;
+  Check(SettingIsProjectClass(stLocal),
+    'the local tier is project class, not user class');
+  Check(not SettingsParseTier(stLocal, '{"model":"x"}', 'settings.local.json', P),
+    'a local file may not set the model either');
+  Check(SettingStr('model') = '', 'and nothing was stored');
+  Check(Mentions(SettingsRefusals, 'settings.local.json'),
+    'the refusal names the local file');
+  SettingsClear;
+  Check(not SettingsParseTier(stLocal, '{"hooks":{}}', 'settings.local.json', P),
+    'and a refused key in a local file is refused just as loudly');
+  SettingsClear;
+  Check(not SettingsParseTier(stLocal, '{"thinking_budget":32768}', 'l', P),
+    'and the project ceiling applies to it too');
+  SettingsClear;
+end;
+
+{ The load position is above the print-mode halt, which is legal only because
+  nothing in the table can grant.  This walks the table, so a new scAny key is
+  covered the day somebody adds one. }
+procedure TestSettingsGrantsNothing;
+var
+  P: TStringArray;
+  I: Integer;
+  Mode: uTools.TPermMode;
+  Level: uSandbox.TSandboxLevel;
+  Denies: Integer;
+  Ok: Boolean;
+  Val: string;
+begin
+  Mode := uTools.CurrentPermMode;
+  Level := uSandbox.SandboxLevel;
+  Denies := uTools.DenyRuleCount;
+  Ok := True;
+  for I := 0 to SettingCount - 1 do
+  begin
+    if SettingDefs[I].Scope <> scAny then Continue;
+    SettingsClear;
+    case SettingDefs[I].Kind of
+      skInt: Val := IntToStr(SettingDefs[I].Lo);
+      skBool: Val := 'true';
+    else
+      Val := '"default"';
+    end;
+    SettingsParseTier(stProject,
+      '{"' + SettingDefs[I].Name + '":' + Val + '}', 'p', P);
+    if uTools.AllowAllEdits or uTools.AllowAllBash or uTools.AllowAllFetch or
+       (uSandbox.SandboxLevel <> Level) or (uTools.CurrentPermMode <> Mode) or
+       (uTools.DenyRuleCount <> Denies) then
+      Ok := False;
+  end;
+  Check(Ok, 'no key a project may set moves any of the six authority variables');
+  SettingsClear;
+end;
+
+{ A hierarchy nobody can debug is worse than none, so the report has to carry
+  where each value actually came from - including when a typed command has
+  taken the key over since. }
+procedure TestConfigShowsProvenance;
+var
+  P, Rows: TStringArray;
+  I: Integer;
+  Row: string;
+begin
+  SettingsClear;
+  SettingsParseTier(stUser, '{"thinking_budget":4096}', 'u', P);
+  SettingsParseTier(stProject, '{"thinking_budget":2048}', 'p', P);
+  Rows := SettingsReport;
+  Row := '';
+  for I := 0 to High(Rows) do
+    if Copy(Rows[I], 1, 15) = 'thinking_budget' then Row := Rows[I];
+  Check(Pos(#9'2048'#9'project'#9, Row) > 0,
+    'the report carries the tier that actually supplied the value');
+  Check(Pos('user=4096', Row) > 0,
+    'and names the tier it shadowed, with the value it shadowed');
+
+  SettingsSetRuntime('thinking_budget', '16384', '/think');
+  Rows := SettingsReport;
+  Row := '';
+  for I := 0 to High(Rows) do
+    if Copy(Rows[I], 1, 15) = 'thinking_budget' then Row := Rows[I];
+  Check(Pos(#9'16384'#9'/think'#9, Row) > 0,
+    'and after /think it reports the typed value and the typed source, not ' +
+    'the file''s');
+  SettingsClear;
+end;
+
+{ The writer is read-modify-write for a documented reason: LoadPermissions
+  widens on load but SavePermissions rewrites wholesale, so a key its loader
+  does not understand dies silently.  This is the test standing between that
+  and a user's hand-written block. }
+procedure TestConfigSetPreservesUnknownKeys;
+var
+  Err, Raw, Before: string;
+begin
+  ClearSetFiles;
+  WriteFileText(UserSet,
+    '{"permissions":{"allow":["Bash"]},"output_style":"a"}');
+  Check(SettingsWrite(UserSet, 'model', 'x', False, Err),
+    'a write into a file with a refused key succeeds');
+  Raw := ReadFileText(UserSet);
+  Check(Pos('permissions', Raw) > 0, 'the refused block is still there');
+  Check(Pos('Bash', Raw) > 0, 'with its contents intact');
+  Check(Pos('"output_style"', Raw) > 0, 'and so is the key beside it');
+  Check(Pos('"x"', Raw) > 0, 'and the new value landed');
+
+  WriteFileText(UserSet, '{"output_style":"a"');
+  Before := ReadFileText(UserSet);
+  Check(not SettingsWrite(UserSet, 'model', 'y', False, Err),
+    'a truncated file refuses the write');
+  Check(Err <> '', 'and says why');
+  Check(ReadFileText(UserSet) = Before,
+    'and leaves the file byte-identical rather than replacing it with a ' +
+    'fresh document');
+end;
+
+{ set writes the user file; --local writes settings.local.json; nothing ever
+  writes the project file, because pasclaude committing configuration into
+  somebody's repository on their behalf is not a convenience. }
+procedure TestConfigSetWritesUserTier;
+var
+  Err, ProjBefore, LocalBefore: string;
+  N: TStringArray;
+begin
+  ClearSetFiles;
+  WriteFileText(UserSet, '{}');
+  WriteFileText(ProjSet, '{"output_style":"learning"}');
+  WriteFileText(LocalSet, '{}');
+  ProjBefore := ReadFileText(ProjSet);
+  LocalBefore := ReadFileText(LocalSet);
+
+  Check(SettingsWrite(UserSet, 'output_style', 'x', False, Err),
+    '/config set writes the user file');
+  Check(ReadFileText(ProjSet) = ProjBefore, 'the project file is untouched');
+  Check(ReadFileText(LocalSet) = LocalBefore, 'and so is the local file');
+  SettingsLoad(UserSet, ProjSet, LocalSet, N);
+  Check(SettingSource('output_style') = stProject,
+    'and the project tier still wins, which is what /config says on the spot');
+
+  Check(SettingsWrite(LocalSet, 'output_style', 'x', False, Err),
+    '--local writes settings.local.json');
+  Check(ReadFileText(ProjSet) = ProjBefore,
+    'and still nothing writes the project file');
+  SettingsLoad(UserSet, ProjSet, LocalSet, N);
+  Check(SettingSource('output_style') = stLocal, 'which now wins');
+
+  Check(not SettingsWrite(UserSet, 'permissions', 'x', False, Err),
+    'and a refused key cannot be written at all');
+  Check(Pos('no file in a repository can grant one', Err) > 0,
+    'and the refusal says why rather than just saying no');
+  SettingsClear;
+end;
+
 begin
   TmpRoot := IncludeTrailingPathDelimiter(GetTempDir) + 'pasclaude-ux';
   Cleanup(TmpRoot);
@@ -4297,6 +4647,16 @@ begin
     TestSandboxLowBlocksProfileWrite;
     TestSandboxAnnotatesFailure;
     TestForegroundTimeoutKillsTree;
+    TestSettingsScopeTable;
+    TestSettingsRefusedKeys;
+    TestSettingsAllOrNothing;
+    TestSettingsPrecedence;
+    TestSettingsProjectCeiling;
+    TestSettingsLocalHasProjectAuthority;
+    TestSettingsGrantsNothing;
+    TestConfigShowsProvenance;
+    TestConfigSetPreservesUnknownKeys;
+    TestConfigSetWritesUserTier;
   finally
     { Before the cleanup, not after: a live child holding a spool handle under
       TmpRoot would make the recursive delete fail. }
@@ -4310,6 +4670,9 @@ begin
     uTools.ClearPluginState;
     uTools.ClearDenyRules;
     uTools.ClearWorkingDirs;
+    { And the settings store, for the same reason: nothing this suite put in
+      module state may outlive it. }
+    uSettings.SettingsClear;
     { Beside the two above and for a related reason: the cached low-integrity
       token is a handle, and a suite that left one open would report it.  The
       level goes back to the default so nothing after this point is confined

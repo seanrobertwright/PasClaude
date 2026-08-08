@@ -10,8 +10,8 @@ program pasclaude;
 {$mode objfpc}{$H+}
 
 uses
-  Windows, SysUtils, Classes, DateUtils, uTerm, uJson, uHttp, uMcp, uHooks,
-  uSandbox, uTools, uImage, uAgent, uSdk;
+  Windows, SysUtils, Classes, DateUtils, uTerm, uJson, uSettings, uHttp, uMcp,
+  uHooks, uSandbox, uTools, uImage, uAgent, uSdk;
 
 const
   Version = '0.1';
@@ -19,11 +19,6 @@ const
     100k characters, which is a fraction of the context window but well past
     the point where old file dumps are still earning their place. }
   CompactKeepBytes = 100 * 1024;
-  { When the API reports the prompt at more than this many tokens, the
-    transcript is trimmed even if its byte count looks fine.  Bytes are a
-    proxy; this is the measured thing the context window actually fills
-    with, and 150k leaves headroom under a 200k window for the reply. }
-  CompactTokens = 150000;
   { A pasted image is encoded here rather than merely forwarded, and a stored
     deflate PNG is about the size of its raw pixels, so the budget has to be
     generous enough to be useful and small enough that it is not re-sent
@@ -37,6 +32,14 @@ const
   DefaultThinkBudget = 8192;
 
 var
+  { When the API reports the prompt at more than this many tokens, the
+    transcript is trimmed even if its byte count looks fine.  Bytes are a
+    proxy; this is the measured thing the context window actually fills
+    with, and 150k leaves headroom under a 200k window for the reply.
+    A var rather than a const because settings.json may move it, within the
+    clamped range uSettings enforces - a project may only ever compact
+    SOONER, never later. }
+  CompactTokens: Integer = 150000;
   Agent: TAgent;
   AtLineStart: Boolean = True;
   { One checkpoint per user turn: the transcript length before it ran and
@@ -208,12 +211,12 @@ end;
 { ------------------------------------------------------------- completion -- }
 
 const
-  SlashCommands: array[0..32] of string = (
-    '/help', '/clear', '/compact', '/deny', '/diff', '/hooks', '/jobs', '/mcp',
-    '/memory', '/init', '/mode', '/plan', '/rewind', '/sandbox', '/sessions',
-    '/skills', '/plugins', '/think', '/web', '/add-dir', '/remove-dir',
-    '/resume', '/save', '/cwd', '/model', '/yolo', '/cost', '/output-style',
-    '/paste', '/vim', '/keys', '/exit', '/quit');
+  SlashCommands: array[0..33] of string = (
+    '/help', '/clear', '/compact', '/config', '/deny', '/diff', '/hooks',
+    '/jobs', '/mcp', '/memory', '/init', '/mode', '/plan', '/rewind',
+    '/sandbox', '/sessions', '/skills', '/plugins', '/think', '/web',
+    '/add-dir', '/remove-dir', '/resume', '/save', '/cwd', '/model', '/yolo',
+    '/cost', '/output-style', '/paste', '/vim', '/keys', '/exit', '/quit');
 
 { Candidates for the token being completed: slash commands when the token
   opens the line with a slash, file and directory names under the session
@@ -626,6 +629,8 @@ begin
   EmitCLn(clGrey,   '  /paste         attach the clipboard image to your next message');
   EmitCLn(clGrey,   '  /vim [on|off|save]  modal line editing; save keeps it');
   EmitCLn(clGrey,   '  /keys          the editing keys, and where to rebind them');
+  EmitCLn(clGrey,   '  /config        settings and where each value came from;');
+  EmitCLn(clGrey,   '                 get <k>, set [--local] <k> <v>, unset, reload');
   EmitCLn(clGrey,   '  /cost          tokens used so far');
   EmitCLn(clGrey,   '  /exit          quit (Ctrl+C also works)');
   EmitLn;
@@ -670,6 +675,63 @@ begin
   Result := IncludeTrailingPathDelimiter(
     GetEnvironmentVariable('USERPROFILE')) + SessionDir + PathDelim +
     'keys.json';
+end;
+
+{ The three settings files, and the scope argument for each written out the
+  way KeysPath's is, because this is the surface where getting the scope wrong
+  is most expensive.
+
+  The user file sits in %USERPROFILE% for exactly KeysPath's reason:
+  LOCALAPPDATA is where the program keeps state IT writes, keyed by session
+  (approvals, deny.json, the sandbox scratch), and this is hand-authored
+  configuration the user must be able to find and edit - the same argument as
+  the user-level CLAUDE.md.
+
+  The project and local files arrive with a clone, and that is why the key
+  table exists: what they may say is a property of uSettings.SettingDefs, not
+  of what happens to be written in them.  The local one is gitignored by
+  convention only, so it carries project authority and not user authority -
+  .gitignore does not stop a committed file. }
+function SettingsUserPath: string;                          { user scope }
+begin
+  Result := IncludeTrailingPathDelimiter(
+    GetEnvironmentVariable('USERPROFILE')) + SessionDir + PathDelim +
+    uSettings.SettingsFileName;
+end;
+
+function SettingsProjectPath: string;                       { project scope }
+begin
+  Result := IncludeTrailingPathDelimiter(uTools.RootDir) + SessionDir +
+    PathDelim + uSettings.SettingsFileName;
+end;
+
+function SettingsLocalPath: string;             { project scope, gitignored }
+begin
+  Result := IncludeTrailingPathDelimiter(uTools.RootDir) + SessionDir +
+    PathDelim + uSettings.SettingsLocalFileName;
+end;
+
+{ The four keys settings.json may actually move, applied in one place so
+  startup and /config reload cannot drift apart.  Deliberately NOT the style:
+  that has three sources to rank and lives in the post-halt startup block with
+  the other two.
+
+  Agent may be nil - the startup call happens before TAgent.Create, because
+  MaxOutBytes and CompactTokens have to be right before anything reads them
+  and the agent does not exist yet.  The thinking budget is picked up on the
+  second call, immediately after Create. }
+procedure ApplySettings;
+begin
+  if uSettings.SettingIsSet('tool_result_bytes') then
+    uTools.MaxOutBytes := uSettings.SettingInt('tool_result_bytes');
+  if uSettings.SettingIsSet('auto_compact_tokens') then
+    CompactTokens := uSettings.SettingInt('auto_compact_tokens');
+  { Guarded on IsSet rather than assigned unconditionally: a settings file
+    that never mentions thinking must not switch it off, and /think later in
+    the session records itself as the runtime source so this reads back the
+    typed value rather than the file's. }
+  if (Agent <> nil) and uSettings.SettingIsSet('thinking_budget') then
+    Agent.ThinkingBudget := uSettings.SettingInt('thinking_budget');
 end;
 
 var
@@ -1326,6 +1388,223 @@ begin
   end
   else
     EmitCLn(clYellow, '  not running (not trusted this session, or /hooks off)');
+end;
+
+{ /config, and it is the entire debugging surface for this feature: SafePath
+  refuses every path under .pasclaude in every root, so the model's own tools
+  cannot read a settings file even when asked to explain why a value did not
+  take.  That is why this prints absolute paths and raw problem text rather
+  than tier words alone.
+
+  /config                 the three files, then key / value / where from
+  /config get <k>         the full provenance chain for one key
+  /config set [--local] <k> <v>
+  /config unset [--local] <k>
+  /config reload          re-read the files and re-apply what can be re-applied
+
+  set and unset write the USER file by default, and settings.local.json with
+  --local.  They never write <root>\.pasclaude\settings.json: pasclaude
+  committing configuration into somebody's repository on their behalf is not a
+  convenience. }
+procedure ShowConfig(const Arg: string);
+var
+  Rows, Notes: TStringArray;
+  Cmd, Rest, Name, Value, Path, Err, Field: string;
+  I, Sp: Integer;
+  Local, Removing: Boolean;
+  T: uSettings.TSettingTier;
+  Idx: Integer;
+
+  { One row of the report: name, value, where from, what it shadows. }
+  procedure EmitRow(const R: string);
+  var
+    P, Q: Integer;
+    N, V, Src, Shadow: string;
+  begin
+    P := Pos(#9, R);
+    N := Copy(R, 1, P - 1);
+    Q := Pos(#9, R, P + 1);
+    V := Copy(R, P + 1, Q - P - 1);
+    P := Q;
+    Q := Pos(#9, R, P + 1);
+    Src := Copy(R, P + 1, Q - P - 1);
+    Shadow := Copy(R, Q + 1, Length(R));
+    EmitCLn(clGrey, Format('  %-22s %-24s %s', [N, V, Src]));
+    if Shadow <> '' then
+      EmitCLn(clGrey, '                         overruled: ' + Shadow);
+  end;
+
+  procedure ShowFile(const Label_, P: string);
+  begin
+    if FileExists(P) then
+      EmitCLn(clGrey, '  ' + Label_ + '  ' + P)
+    else
+      EmitCLn(clGrey, '  ' + Label_ + '  ' + P + '  (absent)');
+  end;
+
+begin
+  Rest := Trim(Arg);
+  Sp := Pos(' ', Rest);
+  if Sp > 0 then
+  begin
+    Cmd := LowerCase(Copy(Rest, 1, Sp - 1));
+    Rest := Trim(Copy(Rest, Sp + 1, Length(Rest)));
+  end
+  else
+  begin
+    Cmd := LowerCase(Rest);
+    Rest := '';
+  end;
+
+  if (Cmd = 'set') or (Cmd = 'unset') then
+  begin
+    Removing := Cmd = 'unset';
+    Local := False;
+    if LowerCase(Copy(Rest, 1, 7)) = '--local' then
+    begin
+      Local := True;
+      Rest := Trim(Copy(Rest, 8, Length(Rest)));
+    end;
+    Sp := Pos(' ', Rest);
+    if Sp > 0 then
+    begin
+      Name := Copy(Rest, 1, Sp - 1);
+      Value := Trim(Copy(Rest, Sp + 1, Length(Rest)));
+    end
+    else
+    begin
+      Name := Rest;
+      Value := '';
+    end;
+    if Name = '' then
+    begin
+      EmitCLn(clGrey, '  /config ' + Cmd + ' [--local] <key> [value]');
+      Exit;
+    end;
+    if (not Removing) and (Value = '') then
+    begin
+      EmitCLn(clRed, '  /config set needs a value (/config unset removes one)');
+      Exit;
+    end;
+    if Local then Path := SettingsLocalPath else Path := SettingsUserPath;
+    if not uSettings.SettingsWrite(Path, Name, Value, Removing, Err) then
+    begin
+      EmitCLn(clRed, '  ' + Err);
+      Exit;
+    end;
+    EmitCLn(clGrey, '  wrote ' + Path);
+    { Re-read rather than patched in memory, so what is in force is exactly
+      what a restart would produce - the same rule /deny follows. }
+    uSettings.SettingsLoad(SettingsUserPath, SettingsProjectPath,
+      SettingsLocalPath, Notes);
+    ApplySettings;
+    for I := 0 to High(Notes) do
+      EmitCLn(clYellow, '  ' + Notes[I]);
+    { Said on the spot: a user who set a value and saw nothing change would
+      otherwise have to read the whole table to find out why. }
+    if (not Removing) and (not Local) and
+       uSettings.SettingIsProjectClass(uSettings.SettingSource(Name)) then
+    begin
+      EmitCLn(clYellow, '  ' + Name + ' is still ' +
+        uSettings.SettingStr(Name) + ' from the ' +
+        uSettings.TierName(uSettings.SettingSource(Name)) + ' file');
+      EmitCLn(clGrey, '  /config set --local ' + Name + ' ' + Value +
+        ' beats it for this checkout');
+    end;
+    Exit;
+  end;
+
+  if Cmd = 'reload' then
+  begin
+    uSettings.SettingsLoad(SettingsUserPath, SettingsProjectPath,
+      SettingsLocalPath, Notes);
+    ApplySettings;
+    for I := 0 to High(Notes) do
+      EmitCLn(clYellow, '  settings: ' + Notes[I]);
+    EmitCLn(clGrey, '  re-read; tool_result_bytes, auto_compact_tokens and ' +
+      'thinking_budget now apply');
+    { Honest about the half it cannot honour.  TAgent has no setter for its
+      system prompt, deliberately, because changing it mid-session throws the
+      prompt cache away on every turn afterwards. }
+    EmitCLn(clGrey, '  output_style needs /output-style <name>; model needs ' +
+      '/model; both are frozen into this session');
+    Exit;
+  end;
+
+  if Cmd = 'get' then
+  begin
+    if Rest = '' then
+    begin
+      EmitCLn(clGrey, '  /config get <key>');
+      Exit;
+    end;
+    Idx := uSettings.SettingIndex(Rest);
+    if Idx < 0 then
+    begin
+      EmitCLn(clRed, '  no such setting: ' + Rest);
+      Exit;
+    end;
+    if uSettings.SettingDefs[Idx].Scope = uSettings.scRefused then
+    begin
+      EmitCLn(clYellow, '  ' + Rest + ' is not a settings key');
+      EmitCLn(clGrey, '  ' + uSettings.SettingDefs[Idx].Note);
+      Exit;
+    end;
+    EmitCLn(clBright, '  ' + Rest);
+    EmitCLn(clGrey, '  ' + uSettings.SettingDefs[Idx].Note);
+    if uSettings.SettingDefs[Idx].Scope = uSettings.scUserOnly then
+      EmitCLn(clGrey, '  user settings file only; a project file may not set it');
+    { The whole chain, nearest first, so the answer to "why is my value not
+      taking effect" is visible rather than inferred. }
+    for T := High(uSettings.TSettingTier) downto uSettings.stUser do
+    begin
+      Field := uSettings.SettingTierValue(Rest, T);
+      if T = uSettings.stRuntime then
+        Field := uSettings.SettingRuntimeLabel(Rest) + ' ' + Field;
+      if Trim(Field) = '' then Continue;
+      if T = uSettings.SettingSource(Rest) then
+        EmitCLn(clGreen, Format('  %-8s %s   <- in force',
+          [uSettings.TierName(T), Trim(Field)]))
+      else
+        EmitCLn(clGrey, Format('  %-8s %s', [uSettings.TierName(T), Trim(Field)]));
+    end;
+    if not uSettings.SettingIsSet(Rest) then
+      EmitCLn(clGrey, '  not set anywhere; the built-in default applies');
+    Exit;
+  end;
+
+  if Cmd <> '' then
+  begin
+    EmitCLn(clGrey, '  /config [get <k> | set [--local] <k> <v> | ' +
+      'unset [--local] <k> | reload]');
+    Exit;
+  end;
+
+  EmitCLn(clBright, 'Settings');
+  ShowFile('user   ', SettingsUserPath);
+  ShowFile('project', SettingsProjectPath);
+  ShowFile('local  ', SettingsLocalPath);
+  EmitCLn(clGrey, '  nearer wins: local, then project, then user, then the ' +
+    'built-in default');
+  EmitCLn(clGrey, '  the project and local files may set display and economy ' +
+    'keys only');
+  EmitLn;
+  Rows := uSettings.SettingsReport;
+  if Length(Rows) = 0 then
+    EmitCLn(clGrey, '  nothing set; every value is the built-in default')
+  else
+  begin
+    EmitCLn(clGrey, Format('  %-22s %-24s %s', ['key', 'value', 'from']));
+    for I := 0 to High(Rows) do EmitRow(Rows[I]);
+  end;
+  Notes := uSettings.SettingsRefusals;
+  if Length(Notes) > 0 then
+  begin
+    EmitLn;
+    EmitCLn(clBright, 'Refused');
+    for I := 0 to High(Notes) do
+      EmitCLn(clYellow, '  ' + Notes[I]);
+  end;
 end;
 
 { /deny, /deny add <rule>, /deny remove <n>.  The listing names the file each
@@ -2253,6 +2532,11 @@ begin
       if (Agent.ThinkingBudget > 0) and (Agent.ThinkingBudget < 1024) then
         Agent.ThinkingBudget := 1024;
     end;
+    { Recorded so /config reports what is actually in force rather than what
+      the file says.  A hierarchy nobody can debug is worse than none, and the
+      first thing a user checks after typing /think is /config. }
+    uSettings.SettingsSetRuntime('thinking_budget',
+      IntToStr(Agent.ThinkingBudget), '/think');
     if Agent.ThinkingBudget > 0 then
       EmitCLn(clGrey, Format('  extended thinking on, %d token budget',
         [Agent.ThinkingBudget]))
@@ -2340,6 +2624,8 @@ begin
     ShowHooks(Arg)
   else if Cmd = '/mcp' then
     ShowMcp(Arg)
+  else if Cmd = '/config' then
+    ShowConfig(Arg)
   else if Cmd = '/deny' then
     ShowDeny(Arg)
   else if Cmd = '/sandbox' then
@@ -2450,6 +2736,7 @@ var
   SkillList: uTools.TSkillInfoArray;
   NewPlugins: TStringArray;
   BadRules: TStringArray;
+  SettingNotes: TStringArray;
   Handled: Boolean;
   Dropped: Integer;
   Resume: Boolean = False;
@@ -2806,6 +3093,23 @@ begin
       SetCurrentDir(Dir);
     end;
     uTools.RootDir := GetCurrentDir;
+    { Settings, immediately after the root is known and above everything that
+      could consult one, so deny, plugins, mode, sandbox and style all see the
+      same values a restart would produce.
+
+      This is ABOVE the print-mode halt, and that is legal for exactly one
+      reason: no key in uSettings.SettingDefs can grant anything.  Not a
+      permission, not a root, not a sandbox level, not a permission mode, not
+      a tool.  The authority split is what buys the load position.  The day a
+      granting key is wanted, it does not go in this table; if it somehow
+      must, this call does not move - a SECOND load goes down beside
+      LoadPermissions, below the halt, where a scripted run cannot inherit it.
+
+      Notes are printed with the deny rules below rather than here, so every
+      configuration complaint at startup arrives in one yellow block. }
+    uSettings.SettingsLoad(SettingsUserPath, SettingsProjectPath,
+      SettingsLocalPath, SettingNotes);
+    ApplySettings;
     { Above LoadIgnoreRules, because each root's own .gitignore is read there,
       and above the print-mode halt below, because argv is the human speaking:
       a -p run honours the flag.  What it grants there is read-only in
@@ -2844,6 +3148,19 @@ begin
     for ArgI := 0 to High(BadRules) do
       EmitCLn(clYellow, '  deny rule not understood, NOT in force: ' +
         BadRules[ArgI] + ' (/deny)');
+    { Settings problems, in the same block and the same colour and for the
+      same reason: a file the user wrote is not doing what they think, and the
+      only thing standing between that and a silent surprise is this loop.
+      Never fatal - a project file is attacker-controlled, and halting on one
+      would hand a clone a way to stop the program. }
+    for ArgI := 0 to High(SettingNotes) do
+      EmitCLn(clYellow, '  settings: ' + SettingNotes[ArgI]);
+    { Said out loud rather than left to /cost: a repository that doubled the
+      size of every tool result, or moved the compaction point, has changed
+      what this session costs and the user did not type it. }
+    if uSettings.SettingsProjectEconomyNote <> '' then
+      EmitCLn(clYellow, '  settings: this project sets ' +
+        uSettings.SettingsProjectEconomyNote + ' (/config)');
     { Beside LoadIgnoreRules and therefore BEFORE the print-mode halt below,
       on purpose: a scripted run honours an enablement the user already made
       but, having no console, can never create one.  Skills need no enabling
@@ -2902,6 +3219,14 @@ begin
     end;
 
     ModelName := GetEnvironmentVariable('ANTHROPIC_MODEL');
+    { Below the environment variable, deliberately: a variable is set for this
+      invocation and a settings file is a standing preference, so the more
+      specific statement wins.  A saved session still beats both when /resume
+      restores its own model (uAgent.LoadSession) - that is unchanged.  The
+      key is user scope only, so nothing in the project tree reaches here: a
+      repository that could pick the model would be spending the user's money
+      on its own say-so, and could pick a weaker one to review its own code. }
+    if Trim(ModelName) = '' then ModelName := uSettings.SettingStr('model');
     if UsingSubscription then BannerAuth := 'subscription';
 
     { Hooks, before the agent exists, because SessionStart's output can only
@@ -2952,6 +3277,10 @@ begin
       binding" line has to stay attached to the files it introduces. }
     Agent := TAgent.Create(ApiKey, ModelName, uSdk.SdkFullSystem);
     try
+      { Second call, now that the agent exists: this is what picks up
+        thinking_budget.  The other two keys were applied at the load point
+        because they had to be right before anything could read them. }
+      ApplySettings;
       Agent.OnText := @OnText;
       Agent.OnThinking := @OnThinking;
       Agent.OnToolStart := @OnToolStart;
@@ -3132,6 +3461,29 @@ begin
         voice they did not pick and no way to find out why. }
       if uTools.StyleStartupNote <> '' then
         EmitCLn(clYellow, '  ' + uTools.StyleStartupNote);
+      { And settings last of the three, which is the whole of its authority
+        here: argv is the user speaking about this run, the approvals file is
+        the user's persisted answer to /output-style, and settings.json only
+        supplies a default when neither of those said anything.  A project may
+        set it because a style is prose of the same trust class as CLAUDE.md,
+        which a repository already supplies unprompted.  A name that does not
+        resolve is a yellow note and never an error - by now there is a
+        session worth keeping. }
+      if (StyleWanted = '') and (uTools.StyleStartupNote = '') and
+         (uTools.OutputStyleName = uTools.DefaultStyleName) and
+         (Trim(uSettings.SettingStr('output_style')) <> '') then
+      begin
+        StyleErr := '';
+        if not uTools.SetOutputStyle(Trim(uSettings.SettingStr('output_style')),
+             StyleErr) then
+          EmitCLn(clYellow, '  settings: output_style ' +
+            uSettings.SettingStr('output_style') + ': ' + StyleErr)
+        else if uSettings.SettingSource('output_style') <> uSettings.stUser then
+          { Named, because the voice the replies are written in is now coming
+            out of a file that arrived with the clone. }
+          EmitCLn(clGrey, '  output style ' + uTools.OutputStyleName +
+            ' comes from this project''s settings (/config)');
+      end;
       { And the residual risk stated out loud on every launch that hits it:
         the project could have created this file after the name was persisted,
         and project wins the precedence.  The source check above turns that

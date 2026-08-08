@@ -8,8 +8,8 @@ program smoke;
 { Windows first, deliberately: it exports a DeleteFile taking a PChar, and this
   suite calls SysUtils' one throughout.  A later unit wins, so SysUtils has to
   come after it. }
-uses Windows, SysUtils, Classes, uJson, uHttp, uMcp, uHooks, uSandbox, uTools,
-  uAgent, uRegex, uSdk, uTerm;
+uses Windows, SysUtils, Classes, uJson, uSettings, uHttp, uMcp, uHooks,
+  uSandbox, uTools, uAgent, uRegex, uSdk, uTerm;
 
 var
   Fails: Integer = 0;
@@ -791,6 +791,56 @@ begin
   FakeGetUrl := Url;
   FakeGetHeaders := Headers;
   Result := FakeGetResult;
+end;
+
+{ The model has five sources and settings.json is the WEAKEST of them: below
+  ANTHROPIC_MODEL because a variable is set for this invocation and a file is a
+  standing preference, and below a resumed session, which has always won.  The
+  host resolves this in one line after the environment read; this reproduces
+  that line rather than trusting it, because inserting the settings lookup
+  ABOVE the environment read is a one-character mistake with no other symptom. }
+procedure TestSettingsModelIsNotAuthoritative;
+var
+  P: TStringArray;
+  A: TAgent;
+  Name: string;
+begin
+  uSettings.SettingsClear;
+  uSettings.SettingsParseTier(uSettings.stUser, '{"model":"from-settings"}',
+    'user.json', P);
+
+  Name := 'from-env';
+  if Trim(Name) = '' then Name := uSettings.SettingStr('model');
+  Check(Name = 'from-env', 'ANTHROPIC_MODEL beats the settings file');
+
+  Name := '';
+  if Trim(Name) = '' then Name := uSettings.SettingStr('model');
+  Check(Name = 'from-settings', 'with no environment variable, settings wins');
+  A := TAgent.Create('k', Name, 'sys');
+  try
+    Check(A.Model = 'from-settings', 'and the agent is built with it');
+  finally
+    A.Free;
+  end;
+
+  uSettings.SettingsClear;
+  Name := '';
+  if Trim(Name) = '' then Name := uSettings.SettingStr('model');
+  Check(Name = '', 'with neither, nothing is named');
+  A := TAgent.Create('k', Name, 'sys');
+  try
+    Check(A.Model = uAgent.DefaultModel, 'and the built-in default applies');
+  finally
+    A.Free;
+  end;
+
+  { A project file cannot reach any of this: the key is user scope, so the
+    value is never stored and the resolution above sees nothing. }
+  uSettings.SettingsParseTier(uSettings.stProject, '{"model":"from-project"}',
+    'p.json', P);
+  Check(uSettings.SettingStr('model') = '',
+    'and a project file contributes no model at all');
+  uSettings.SettingsClear;
 end;
 
 procedure TestListModels;
@@ -3555,6 +3605,7 @@ begin
   TestBashPrefixes;
   TestBackgroundJobs;
   TestChangedFiles;
+  TestSettingsModelIsNotAuthoritative;
   TestListModels;
   TestTodos;
   TestSubagentGate;

@@ -125,6 +125,12 @@ type
   TStyleInfoArray = array of TStyleInfo;
 
 var
+  { Cap on any single tool result.  A var rather than a const because
+    settings.json may move it, within a range uSettings clamps before anything
+    assigns here - this unit does the capping, not the deciding.  Read at use
+    time and never cached, so a /config reload takes effect on the next tool
+    call rather than the next launch. }
+  MaxOutBytes: Integer = 30 * 1024;
   { Session root; every path argument is resolved relative to it. }
   RootDir: string = '';
   { Set once the user picks "always" for a tool class. }
@@ -993,7 +999,6 @@ const
     are summarised away - what reaches the model is the cells, not the
     base64 that makes the file big. }
   MaxNotebookBytes = 8 * 1024 * 1024;
-  MaxOutBytes  = 30 * 1024;    { cap on any single tool result }
   { A fetched page larger than this is cut; the model gets the front, which
     is where documents put what they are about. }
   MaxFetchBytes = 200 * 1024;

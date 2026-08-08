@@ -8,8 +8,8 @@ program fuzz;
 
 {$mode objfpc}{$H+}
 
-uses SysUtils, Classes, Windows, uJson, uMcp, uHooks, uSandbox, uTools,
-  uImage, uAgent, uHttp, uSdk;
+uses SysUtils, Classes, Windows, uJson, uSettings, uMcp, uHooks, uSandbox,
+  uTools, uImage, uAgent, uHttp, uSdk;
 
 var
   Fails: Integer = 0;
@@ -3568,6 +3568,81 @@ begin
     'and a header of all-ones, which claims an enormous image, is refused');
 end;
 
+{ A settings.json arrives with a clone, so it is attacker-controlled input in
+  exactly the sense .mcp.json and hooks.json are.  Every one of these must
+  come back False with something to say, apply nothing, raise nothing, and
+  leave no block behind - the last of which is what -gh is here for, because
+  the parser has an early exit on nearly every line and each one has to get
+  past the same Root.Free. }
+procedure TestSettingsHostile;
+var
+  P: TStringArray;
+  Big, Deep, Key: string;
+  I: Integer;
+  Ok: Boolean;
+
+  procedure Refuses(const Doc, What: string);
+  var
+    Probs: TStringArray;
+  begin
+    Check(not uSettings.SettingsParseTier(uSettings.stProject, Doc, 'x.json',
+      Probs) and (Length(Probs) > 0), What);
+  end;
+
+begin
+  uSettings.SettingsClear;
+  Refuses('{"output_style":"a"', 'truncated JSON is refused');
+  Refuses('[1,2,3]', 'a top-level array is refused');
+  Refuses('null', 'a bare null is refused');
+  Refuses('', 'an empty document is refused');
+
+  { Larger than the cap, and refused on its length before the parser is
+    even asked - a startup that had to parse four megabytes of a project's
+    choosing would be a denial of service with no error message. }
+  Big := '{"output_style":"' + StringOfChar('a', 4 * 1024 * 1024) + '"}';
+  Refuses(Big, 'a 4 MB document is refused on its size, not parsed');
+
+  Deep := StringOfChar('[', 200) + StringOfChar(']', 200);
+  Refuses(Deep, '200-deep nesting is refused');
+
+  { Invalid UTF-8 matters more here than in most files: an output style name
+    out of this document reaches the system prompt, and one bad byte loses
+    the whole request rather than the value it was in. }
+  Refuses('{"output_style":"' + #$C3 + '"}', 'invalid UTF-8 is refused');
+
+  Key := '{"' + StringOfChar('k', 100 * 1024) + '":1}';
+  Refuses(Key, 'a 100 KB key name is refused as unknown, not matched');
+
+  Refuses('{"model":{"a":1}}', 'an object where a string belongs is refused');
+  Refuses('{"thinking_budget":null}', 'a null where an int belongs is refused');
+  Refuses('{"output_style":[]}', 'an array where a string belongs is refused');
+  Refuses('{"tool_result_bytes":"8192"}',
+    'a stringified number is refused rather than coerced');
+  Refuses('{"thinking_budget":-1}', 'a negative budget is refused');
+  Refuses('{"telemetry.endpoint":"http://evil.example"}',
+    'a non-loopback http endpoint is refused');
+
+  { A duplicate key is legal JSON and the parser keeps both.  What matters is
+    that the loader does not crash and does not end up in a half-applied
+    state; whichever value it settles on, it must be one that was written. }
+  uSettings.SettingsClear;
+  uSettings.SettingsParseTier(uSettings.stUser,
+    '{"output_style":"a","output_style":"b"}', 'dup.json', P);
+  Ok := (uSettings.SettingStr('output_style') = 'a') or
+        (uSettings.SettingStr('output_style') = 'b');
+  Check(Ok, 'a duplicate key resolves to one of the values written, not to ' +
+    'a mixture');
+
+  { Nothing above applied anything a project could not set anyway, and the
+    accessors are all still answering from the defaults. }
+  uSettings.SettingsClear;
+  Ok := True;
+  for I := 0 to uSettings.SettingCount - 1 do
+    if uSettings.SettingDefs[I].Scope <> uSettings.scRefused then
+      if uSettings.SettingIsSet(uSettings.SettingDefs[I].Name) then Ok := False;
+  Check(Ok, 'and after all of it not one setting is in force');
+end;
+
 begin
   TestImageDecodersHostile;
   TestBinaryFileDoesNotCorruptBody;
@@ -3617,6 +3692,7 @@ begin
   TestSandboxLevelNotFromProject;
   TestSandboxScratchOutOfTree;
   TestSandboxEnvBlock;
+  TestSettingsHostile;
   uTools.ClearWorkingDirs;
   uSandbox.SandboxShutdown;
 

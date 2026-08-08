@@ -600,9 +600,16 @@ begin
         '{"hooks":{"PreToolUse":[...]}}; no hooks are loaded');
       Exit;
     end;
-    { The outer "hooks" wrapper costs one line here and saves a migration: the
-      day a settings.json lands, this file becomes the value of its "hooks"
-      key with no reshaping at all. }
+    { The outer "hooks" wrapper was originally kept against the day a
+      settings.json landed, so this file could become the value of its "hooks"
+      key with no reshaping.  That day came and the migration was declined:
+      settings.json is not fingerprinted for trust the way this file is, and
+      honouring "hooks" there would create a SECOND place executable
+      configuration comes from - one that LoadHooks' deny-by-default gate at
+      the top of this procedure could not see.  "hooks" is a refused key in
+      uSettings.SettingDefs with a sentence pointing back here.  The wrapper
+      stays because it makes the document self-describing, not because
+      anything is going to adopt it. }
     Map := Root.Find('hooks');
     if (Map = nil) or (Map.Kind <> jkObj) then
     begin
