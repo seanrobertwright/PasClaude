@@ -9,7 +9,7 @@ program smoke;
   suite calls SysUtils' one throughout.  A later unit wins, so SysUtils has to
   come after it. }
 uses Windows, SysUtils, Classes, uJson, uSettings, uAuth, uHttp, uTelem, uMcp,
-  uHooks, uSandbox, uTools, uAgent, uRegex, uSdk, uTerm;
+  uHooks, uSandbox, uTools, uAgent, uDiag, uRegex, uSdk, uTerm;
 
 var
   Fails: Integer = 0;
@@ -4687,6 +4687,254 @@ begin
   end;
 end;
 
+{ ------------------------------------------------ /status /doctor /bug --- }
+
+{ The one thing that must never survive a bug report.  Both patterns are
+  deliberately mid-line: a token reaches a report inside a log line, never at
+  the start of one, so an anchored pattern would look correct and redact
+  nothing that mattered. }
+procedure TestDiagRedactSecrets;
+var
+  S, R: string;
+begin
+  S := 'key=sk-ant-oat01-AAAABBBB and Authorization: Bearer abc.def and ' +
+       'ANTHROPIC_API_KEY=sk-ant-api03-ZZZZ';
+  R := DiagRedactSecrets(S);
+  Check(Pos('oat01', R) = 0, 'a subscription token is redacted');
+  Check(Pos('abc.def', R) = 0, 'a Bearer value is redacted');
+  Check(Pos('ZZZZ', R) = 0, 'an API key is redacted even after NAME=');
+  { The SHAPE survives, because "which kind of key was it" is the most
+    useful line in a bug report and the only part that is not a secret. }
+  Check(Pos('sk-ant-***', R) > 0, 'and the shape of the key survives');
+  Check(Pos('Authorization: Bearer ***', R) > 0, 'as does the Bearer prose');
+  Check(Pos('and ', R) > 0, 'the surrounding prose is untouched');
+  { A NAME= whose value is not a recognised key shape is still redacted. }
+  R := DiagRedactSecrets('MY_SECRET=hunter2 rest');
+  Check((Pos('hunter2', R) = 0) and (Pos('rest', R) > 0),
+    'a sensitive NAME= redacts an unrecognised value too');
+  R := DiagRedactSecrets('nothing to see here, path=E:\a\b');
+  Check(R = 'nothing to see here, path=E:\a\b',
+    'a string with no secret comes back byte-identical');
+end;
+
+procedure TestDiagRedactPaths;
+var
+  Roots: TStringArray;
+  R: string;
+begin
+  SetLength(Roots, 2);
+  Roots[0] := 'E:\Projects\pascal\pasclaude';
+  Roots[1] := 'E:\Projects\pascal\pasclaude\sub';
+  R := DiagRedactPaths(
+    'E:\Projects\pascal\pasclaude\src and E:\Projects\pascal\pasclaude\sub\x ' +
+    'and C:\Users\u\AppData\Local\pasclaude and e:\projects\pascal\pasclaude\z',
+    Roots, 'C:\Users\u', 'C:\Users\u\AppData\Local');
+  Check(Pos('<root0>\src', R) > 0, 'the primary root is replaced');
+  { The nested root must go whole.  Replacing in array order would leave
+    "<root0>\sub", which still names the directory the report was meant to
+    hide. }
+  Check(Pos('<root1>\x', R) > 0, 'the nested root is replaced whole');
+  Check(Pos('<root0>\sub', R) = 0, 'and not half-substituted');
+  Check(Pos('%LOCALAPPDATA%', R) > 0, 'local appdata is replaced');
+  { And it must beat the home directory it lives under, for the same
+    longest-first reason. }
+  Check(Pos('%USERPROFILE%\AppData', R) = 0,
+    'local appdata beats the home directory it sits inside');
+  Check(Pos('<root0>\z', R) > 0, 'matching is case-insensitive');
+  Check(Pos('E:\Projects', R) = 0, 'and no real root survives');
+end;
+
+procedure TestDiagTokenExpiry;
+var
+  D: string;
+  Now_: Int64;
+begin
+  Now_ := DiagNowUnixMs;
+  Check(DiagTokenExpiry(0, Now_, D) = dlSkipped,
+    'no expiry is skipped, not a warning');
+  Check(Pos('unknown', D) > 0, 'and says so');
+  Check(DiagTokenExpiry(Now_ + 3600000, Now_, D) = dlOk,
+    'an hour away is ok');
+  Check(DiagTokenExpiry(Now_ + 60000, Now_, D) = dlWarn,
+    'a minute away is a warning');
+  Check(Pos('expires in', D) > 0, 'and says when');
+  { The mid-session 401, reported green, is the failure this catches: a
+    seconds-versus-milliseconds mix-up or a > where >= belongs. }
+  Check(DiagTokenExpiry(Now_ - 1, Now_, D) = dlProblem,
+    'one millisecond past is a problem');
+  Check(DiagTokenExpiry(Now_, Now_, D) = dlProblem,
+    'and so is exactly now');
+end;
+
+procedure TestDiagReportInvariants;
+var
+  R: TDiagReport;
+  S: TStatusReport;
+  I, J: Integer;
+  Ok: Boolean;
+
+  function LowerId(const Id: string): Boolean;
+  var
+    K: Integer;
+  begin
+    Result := (Id <> '') and (Id[1] >= 'a') and (Id[1] <= 'z');
+    for K := 1 to Length(Id) do
+      if not (((Id[K] >= 'a') and (Id[K] <= 'z')) or
+              ((Id[K] >= '0') and (Id[K] <= '9')) or (Id[K] = '_')) then
+        Result := False;
+  end;
+
+begin
+  ClearDiagNotes;
+  ClearDiagFacts;
+  DiagFacts.Version := '0.1';
+  DiagFacts.AuthSource := 'claude_code';
+  DiagFacts.AuthPresent := True;
+  DiagFacts.ConsoleOutCp := 65001;
+  DiagFacts.ConsoleInCp := 65001;
+  DiagFacts.VtActive := True;
+  DiagFacts.SettingsSupported := True;
+  R := DiagBuildDoctor(nil, False);
+  Check(Length(R) > 8, 'the doctor produces a full set of checks');
+  Ok := True;
+  for I := 0 to High(R) do
+  begin
+    if not LowerId(R[I].Id) then Ok := False;
+    { A duplicate id would silently overwrite a key in the JSON object a
+      driver reads, and nothing else would notice. }
+    for J := I + 1 to High(R) do
+      if R[I].Id = R[J].Id then Ok := False;
+  end;
+  Check(Ok, 'every doctor id is unique and lowercase_underscore');
+  Ok := True;
+  for I := 0 to High(R) do
+    if (R[I].Level in [dlWarn, dlProblem]) and (Trim(R[I].Remedy) = '') then
+      Ok := False;
+  Check(Ok, 'every warning and problem carries a remedy');
+  S := DiagBuildStatus(nil);
+  Ok := True;
+  for I := 0 to High(S) do
+  begin
+    if not LowerId(S[I].Id) then Ok := False;
+    for J := I + 1 to High(S) do
+      if S[I].Id = S[J].Id then Ok := False;
+  end;
+  Check(Ok, 'and every status id is unique and lowercase_underscore');
+  ClearDiagFacts;
+end;
+
+procedure TestDiagJsonShape;
+var
+  R: TDiagReport;
+  S: TStatusReport;
+  Doc, K: TJson;
+  Err: string;
+begin
+  ClearDiagNotes;
+  ClearDiagFacts;
+  DiagFacts.SettingsSupported := True;
+  R := DiagBuildDoctor(nil, False);
+  Doc := JsonParse(DiagDoctorJson(R), Err);
+  Check(Doc <> nil, 'the doctor payload parses');
+  if Doc <> nil then
+  try
+    Check(Doc.Str('type') = 'doctor', 'and is typed');
+    Check(Doc.Find('ok') <> nil, 'and carries a boolean ok');
+    Check((Doc.Find('counts') <> nil) and (Doc.Find('counts').Kind = jkObj),
+      'and a counts object');
+    K := Doc.Find('checks');
+    Check((K <> nil) and (K.Kind = jkArr) and (K.Count = Length(R)),
+      'and a checks ARRAY of the right length');
+  finally
+    Doc.Free;
+  end;
+  S := DiagBuildStatus(nil);
+  Doc := JsonParse(DiagStatusJson(S), Err);
+  Check(Doc <> nil, 'the status payload parses');
+  if Doc <> nil then
+  try
+    Check(Doc.Str('model') <> '', 'and exposes model at the top level');
+    Check(Doc.Str('permission_mode') <> '', 'and permission_mode');
+    K := Doc.Find('added_roots');
+    { A list key that came back as a string once and an array the next time
+      has no contract at all, so IsList decides it and not the contents. }
+    Check((K <> nil) and (K.Kind = jkArr),
+      'and added_roots is always an array, even when empty');
+  finally
+    Doc.Free;
+  end;
+  ClearDiagFacts;
+end;
+
+procedure TestSdkDiagnosticLine;
+var
+  Line: string;
+  Doc: TJson;
+  Err: string;
+begin
+  Line := SdkDiagnosticLine('status',
+    '{"type":"status","model":"m","added_roots":["a"],"note":"one'#10'two"}');
+  { The payload carried a newline.  Spliced rather than re-parsed, it would
+    split one protocol event into two lines and desynchronise every driver
+    reading the stream. }
+  Check(Pos(#10, Copy(Line, 1, Length(Line) - 1)) = 0,
+    'a diagnostic line has no raw newline in it');
+  Doc := JsonParse(Line, Err);
+  Check(Doc <> nil, 'and it parses');
+  if Doc <> nil then
+  try
+    Check(Doc.Str('type') = 'diagnostic', 'type is diagnostic');
+    Check(Doc.Str('kind') = 'status', 'kind is carried');
+    Check(Doc.Str('model') = 'm', 'and the payload keys are merged in');
+    Check((Doc.Find('added_roots') <> nil) and
+          (Doc.Find('added_roots').Kind = jkArr), 'arrays survive the merge');
+  finally
+    Doc.Free;
+  end;
+  Line := SdkDiagnosticLine('doctor', 'not json');
+  Doc := JsonParse(Line, Err);
+  Check(Doc <> nil, 'an unparseable payload still yields one legal line');
+  if Doc <> nil then
+  try
+    Check(Doc.Str('kind') = 'doctor', 'with the kind intact');
+  finally
+    Doc.Free;
+  end;
+end;
+
+procedure TestDiagWorstLevel;
+var
+  R: TDiagReport;
+begin
+  SetLength(R, 0);
+  Check(DiagWorstLevel(R) = dlOk, 'an empty report is ok');
+  SetLength(R, 3);
+  R[0].Level := dlProblem;
+  R[1].Level := dlOk;
+  R[2].Level := dlWarn;
+  Check(DiagWorstLevel(R) = dlProblem, 'a problem wins wherever it sits');
+  R[0].Level := dlOk;
+  Check(DiagWorstLevel(R) = dlWarn, 'otherwise the worst is the warning');
+  { dlSkipped is ordinally ABOVE dlProblem in the enum, so ranking by
+    ordinal would make --doctor exit 1 for a check nobody ran. }
+  R[0].Level := dlSkipped;
+  R[2].Level := dlSkipped;
+  Check(DiagWorstLevel(R) = dlOk, 'a skipped check is not a failure');
+end;
+
+procedure TestDiagEnvironment;
+begin
+  { Reported in every bug report, so a silent '' here would be discovered by
+    a maintainer reading a report that says nothing about the machine. }
+  Check(Pos('windows', DiagOsVersion) > 0, 'the OS version is reported');
+  Check(Pos('build', DiagOsVersion) > 0, 'with a real build number');
+  Check(Pos('fpc', DiagBuildInfo) > 0, 'and the compiler version');
+  { Case-insensitively: FPCTARGETOS is spelled Win64 by the compiler and
+    the exact casing is not what the report needs to be right about. }
+  Check(Pos('WIN64', UpperCase(DiagBuildInfo)) > 0, 'and the target');
+  Check(Pos('X86_64', UpperCase(DiagBuildInfo)) > 0, 'and the CPU');
+end;
+
 var
   Schema: TJson;
 begin
@@ -4753,6 +5001,14 @@ begin
   TestTelemHeaders;
   TestTelemetryIsUserScopeOnly;
   TestTelemetryOffSendsNothing;
+  TestDiagRedactSecrets;
+  TestDiagRedactPaths;
+  TestDiagTokenExpiry;
+  TestDiagReportInvariants;
+  TestDiagJsonShape;
+  TestSdkDiagnosticLine;
+  TestDiagWorstLevel;
+  TestDiagEnvironment;
   Schema := ToolsSchema;
   try
     Check(Pos('"input_schema"', Schema.ToJson) > 0, 'the schema serialises');

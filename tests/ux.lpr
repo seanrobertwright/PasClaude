@@ -15,8 +15,8 @@ program ux;
 { Windows first, so SysUtils' DeleteFile and GetEnvironmentVariable win over
   the raw API of the same names. }
 uses Windows, SysUtils, Classes, DateUtils, uJson, uSettings, uAuth, uDiff,
-  uHttp, uTelem, uHooks, uSandbox, uTools, uImage, uAgent, uTerm, uNotebook,
-  uSdk;
+  uHttp, uTelem, uHooks, uSandbox, uTools, uImage, uAgent, uDiag, uTerm,
+  uNotebook, uSdk;
 
 var
   Fails: Integer = 0;
@@ -4988,6 +4988,339 @@ begin
   end;
 end;
 
+{ ------------------------------------------------- /status /doctor /bug --- }
+
+function StatusValue(const R: TStatusReport; const Id: string): string;
+var
+  I: Integer;
+begin
+  Result := '';
+  for I := 0 to High(R) do
+    if R[I].Id = Id then Exit(R[I].Value);
+end;
+
+function DoctorLevel(const R: TDiagReport; const Id: string): TDiagLevel;
+var
+  I: Integer;
+begin
+  Result := dlSkipped;
+  for I := 0 to High(R) do
+    if R[I].Id = Id then Exit(R[I].Level);
+end;
+
+function DoctorField(const R: TDiagReport; const Id: string;
+  Remedy: Boolean): string;
+var
+  I: Integer;
+begin
+  Result := '';
+  for I := 0 to High(R) do
+    if R[I].Id = Id then
+      if Remedy then Exit(R[I].Remedy) else Exit(R[I].Detail);
+end;
+
+function LinesJoin(const A: TStringArray): string;
+var
+  I: Integer;
+begin
+  Result := '';
+  for I := 0 to High(A) do Result := Result + A[I] + #10;
+end;
+
+{ /status must BORROW the mode word, the deny count and the sandbox name from
+  the units that own them.  A second copy in uDiag would look identical today
+  and drift the first time /mode or /sandbox grows a word - which is exactly
+  the duplication the whole feature was asked not to create. }
+procedure TestStatusBorrowsTheOwningUnits;
+var
+  R: TStatusReport;
+  Text: string;
+  Err: string;
+begin
+  ClearDiagNotes;
+  ClearDiagFacts;
+  uTools.ClearDenyRules;
+  uTools.AddDenyRule('tool:bash', 'test');
+  uTools.AddDenyRule('path:.env', 'test');
+  uTools.SetPermMode(pmodePlan);
+  uSandbox.SandboxLevel := slLow;
+  uTools.SetOutputStyle('explanatory', Err);
+  uHooks.ClearHooks;
+  DiagFacts.Version := '9.9';
+  DiagFacts.VimOn := True;
+
+  R := DiagBuildStatus(nil);
+  Check(StatusValue(R, 'permission_mode') =
+    uTools.PermModeName(uTools.CurrentPermMode),
+    'the mode value IS uTools.PermModeName, not a literal');
+  Check(StatusValue(R, 'deny_rules') = IntToStr(uTools.DenyRuleCount),
+    'the deny count IS uTools.DenyRuleCount');
+  Check(StatusValue(R, 'sandbox') =
+    uSandbox.SandboxLevelName(uSandbox.SandboxLevel),
+    'the sandbox word IS uSandbox.SandboxLevelName');
+  Check(StatusValue(R, 'output_style') = uTools.OutputStyleName,
+    'the style name IS uTools.OutputStyleName');
+  Text := LinesJoin(DiagStatusText(R));
+  Check(Pos('plan', Text) > 0, 'and the rendered text carries the mode word');
+  Check(Pos('2', StatusValue(R, 'deny_rules')) > 0, 'and the deny count');
+  Check(Pos('low', Text) > 0, 'and the sandbox level');
+  Check(Pos('explanatory', Text) > 0, 'and the style name');
+  Check(Pos('vim mode:', Text) > 0, 'and the vim state');
+  Check(Pos('hooks:', Text) > 0, 'and the hook state');
+  Check(Pos('9.9', Text) > 0, 'and the version from DiagFacts');
+  { The footer that says the report describes the SESSION and not the disk.
+    /help has never had one place for this. }
+  Check(Pos('/config reload', Text) > 0,
+    'and a footer naming the caches and what refreshes each');
+
+  uTools.SetOutputStyle('default', Err);
+  uTools.SetPermMode(pmodeAsk);
+  uSandbox.SandboxLevel := slLimits;
+  uTools.ClearDenyRules;
+  ClearDiagFacts;
+end;
+
+procedure TestDoctorLevelsAndCosts;
+var
+  R: TDiagReport;
+  I: Integer;
+  AnyNetwork: Boolean;
+begin
+  ClearDiagNotes;
+  ClearDiagFacts;
+  DiagFacts.AuthSource := 'claude_code';
+  DiagFacts.AuthPresent := False;
+  R := DiagBuildDoctor(nil, False);
+  Check(DoctorLevel(R, 'credential') = dlProblem,
+    'no credential is a problem');
+  Check(Pos('ANTHROPIC_API_KEY', DoctorField(R, 'credential', True)) > 0,
+    'and the remedy names ANTHROPIC_API_KEY');
+  Check(DoctorLevel(R, 'credential_expiry') = dlSkipped,
+    'with no credential there is no expiry to judge');
+
+  DiagFacts.AuthPresent := True;
+  DiagFacts.AuthExpiresAtMs := DiagNowUnixMs - 60000;
+  R := DiagBuildDoctor(nil, False);
+  Check(DoctorLevel(R, 'credential_expiry') = dlProblem,
+    'a credential that expired during the session is a problem');
+  Check(DoctorField(R, 'credential_expiry', True) <> '',
+    'and carries a remedy');
+
+  Check(DoctorLevel(R, 'model_access') = dlSkipped,
+    'model access is not checked offline');
+  Check(Pos('--online', DoctorField(R, 'model_access', False)) > 0,
+    'and its detail names the opt-in');
+  { The rule this codebase applies to web search and to fetch: an outbound
+    request is a channel, and typing a command must not open one. }
+  AnyNetwork := False;
+  for I := 0 to High(R) do
+    if R[I].Cost = dcNetwork then AnyNetwork := True;
+  Check(not AnyNetwork, 'and no check in an offline report costs the network');
+  ClearDiagFacts;
+end;
+
+{ /doctor replays the ledger and must never re-read a config file.  The
+  count assertion is the real one: uTools.LoadMcpConfig calls
+  ClearMcpServers as its first statement, so a builder that "checked"
+  .mcp.json by re-reading it would tear down every live connection. }
+procedure TestDoctorReplaysTheLedger;
+var
+  R: TDiagReport;
+  Before, After: Integer;
+begin
+  ClearDiagNotes;
+  ClearDiagFacts;
+  DiagFacts.SettingsSupported := True;
+  R := DiagBuildDoctor(nil, False);
+  Check(DoctorLevel(R, 'config_files') = dlOk,
+    'an empty ledger is a clean config report');
+  DiagNote('deny', dlWarn, 'rule not understood: nonsense', '/deny');
+  DiagNote('hooks', dlWarn, 'PreToolUse entry has no command', '/hooks');
+  Before := uTools.McpServerCount;
+  R := DiagBuildDoctor(nil, False);
+  After := uTools.McpServerCount;
+  Check(DoctorLevel(R, 'config_files') = dlWarn,
+    'a ledger entry makes the config check a warning');
+  Check((Pos('deny', DoctorField(R, 'config_files', False)) > 0) and
+        (Pos('hooks', DoctorField(R, 'config_files', False)) > 0),
+    'and the detail names both sources');
+  Check(Before = After,
+    'and building the report did not disturb the MCP server table');
+  ClearDiagNotes;
+  R := DiagBuildDoctor(nil, False);
+  Check(DoctorLevel(R, 'config_files') = dlOk,
+    'clearing the ledger clears the check');
+  ClearDiagFacts;
+end;
+
+procedure TestProbeWritableLeavesNothing;
+var
+  Dir, Err: string;
+  R: TSearchRec;
+  Before, After: Integer;
+
+  function CountEntries(const D: string): Integer;
+  begin
+    Result := 0;
+    if SysUtils.FindFirst(IncludeTrailingPathDelimiter(D) + '*',
+         faAnyFile, R) = 0 then
+      try
+        repeat
+          if (R.Attr and faDirectory) = 0 then Inc(Result);
+        until SysUtils.FindNext(R) <> 0;
+      finally
+        SysUtils.FindClose(R);
+      end;
+  end;
+
+begin
+  Dir := IncludeTrailingPathDelimiter(TmpRoot) + 'probe';
+  ForceDirectories(Dir);
+  Before := CountEntries(Dir);
+  Check(DiagProbeWritable(Dir, Err), 'a writable directory probes true');
+  After := CountEntries(Dir);
+  { A probe that leaves its own litter has made the directory it was
+    checking slightly worse. }
+  Check(Before = After, 'and leaves nothing behind');
+  { And the machine whose disk is the problem is the one running /doctor,
+    so the probe may report but never raise. }
+  Check(not DiagProbeWritable('\\?\Q:\nowhere\at\all', Err),
+    'an impossible path probes false');
+  Check(Err <> '', 'with a reason, and without raising');
+end;
+
+{ The authority boundary this feature touches: NOTHING in a project
+  directory may add a check, remove one, change a level, move where /bug
+  writes, or turn redaction off.  uDiag has no settings key of its own, and
+  the four names a project might reach for are refused BY NAME in
+  uSettings.SettingDefs so that adding one later is a review conflict rather
+  than a one-line diff. }
+procedure TestDiagTakesNothingFromTheProject;
+var
+  Problems: TStringArray;
+  BeforeIds, AfterIds: string;
+  R: TDiagReport;
+  I: Integer;
+  Dir: string;
+
+  function IdsOf(const Rep: TDiagReport): string;
+  var
+    K: Integer;
+  begin
+    Result := '';
+    for K := 0 to High(Rep) do Result := Result + Rep[K].Id + ',';
+  end;
+
+begin
+  ClearDiagNotes;
+  ClearDiagFacts;
+  DiagFacts.SettingsSupported := True;
+  R := DiagBuildDoctor(nil, False);
+  BeforeIds := IdsOf(R);
+
+  uSettings.SettingsClear;
+  Check(not uSettings.SettingsParseTier(stProject,
+    '{"report_dir":"' + StringReplace(TmpRoot, '\', '\\', [rfReplaceAll]) +
+    '","redact":false,"doctor":"off","bug":"upload"}',
+    '<project settings.json>', Problems),
+    'a project file naming report_dir, redact, doctor or bug is refused');
+  Check(Length(Problems) > 0, 'and every refusal is named');
+  { And the same four names are refused from the USER file too: they are not
+    scope-limited keys, they do not exist at all. }
+  Check(not uSettings.SettingsParseTier(stUser, '{"report_dir":"x"}',
+    '<user settings.json>', Problems),
+    'and not even the user file may name report_dir');
+  uSettings.SettingsClear;
+
+  R := DiagBuildDoctor(nil, False);
+  AfterIds := IdsOf(R);
+  Check(BeforeIds = AfterIds,
+    'and the set of checks is byte-identical either way');
+
+  { Where /bug writes is computed, never configured, and is outside every
+    root - which is also why uTools.SafePath means the model's own read_file
+    cannot read a report back. }
+  Dir := DiagReportsDir;
+  Check(Dir <> '', 'there is a reports directory');
+  for I := 0 to uTools.RootCount - 1 do
+    Check(not uTools.WithinRoot(Dir, uTools.RootAt(I)),
+      'and it is outside root ' + IntToStr(I));
+  ClearDiagFacts;
+end;
+
+procedure TestBugReportEndToEnd;
+var
+  Opts: TBugOptions;
+  Path, TranscriptPath, Err, Body: string;
+  A: TAgent;
+  Dir, SavedLocal, SavedHome: string;
+begin
+  ClearDiagNotes;
+  ClearDiagFacts;
+  Dir := IncludeTrailingPathDelimiter(TmpRoot) + 'reports';
+  DiagReportsDirOverride := Dir;
+  DiagFacts.Version := '0.1';
+  DiagFacts.AuthSource := 'claude_code';
+  DiagFacts.AuthPresent := True;
+  { Planted where a careless implementation would copy it straight through:
+    the detail string is display material and goes into the report body. }
+  DiagFacts.AuthDetail := 'token sk-ant-oat01-PLANTEDSECRET';
+  A := TAgent.Create('sk-ant-oat01-NOTINTHEREPORT', 'm', 'sys');
+  try
+    Opts.IncludeTranscript := False;
+    Opts.RealPaths := False;
+    Opts.AsJson := False;
+    Check(DiagWriteBug(A, Opts, Path, TranscriptPath, Err),
+      'a bug report is written');
+    Check(FileExists(Path), 'and the file is there');
+    Check(TranscriptPath = '',
+      'and no transcript is written unless it was asked for');
+    Body := ReadFileText(Path);
+    Check((Pos('## Included', Body) > 0) and (Pos('## Excluded', Body) > 0),
+      'it carries the manifest of what is in and out');
+    Check(Pos('0.1', Body) > 0, 'the pasclaude version');
+    Check(Pos('build', Body) > 0, 'and the Windows build');
+    Check(Pos('PLANTEDSECRET', Body) = 0,
+      'and no token survives, even one planted in a display field');
+    Check(Pos('sk-ant-***', Body) > 0, 'though its shape is named');
+    Check(Pos('<root0>', Body) > 0, 'roots are replaced');
+    Check(Pos(TmpRoot, Body) = 0, 'and no real root survives');
+
+    Opts.IncludeTranscript := True;
+    Check(DiagWriteBug(A, Opts, Path, TranscriptPath, Err),
+      'and again with the transcript');
+    Check((TranscriptPath <> '') and FileExists(TranscriptPath),
+      'the sibling file exists');
+    Body := ReadFileText(Path);
+    Check(Pos('Transcript', Body) > 0, 'and the report names it');
+
+    { With nowhere outside the project to write, /bug must refuse and write
+      NOTHING - never a fallback into the tree, where it would be committed
+      by accident. }
+    DiagReportsDirOverride := '';
+    SavedLocal := SysUtils.GetEnvironmentVariable('LOCALAPPDATA');
+    SavedHome := SysUtils.GetEnvironmentVariable('USERPROFILE');
+    SetEnvironmentVariable('LOCALAPPDATA', nil);
+    SetEnvironmentVariable('USERPROFILE', nil);
+    try
+      Check(DiagReportsDir = '', 'with no home there is nowhere to write');
+      Check(not DiagWriteBug(A, Opts, Path, TranscriptPath, Err),
+        'and the report is refused');
+      Check(Err <> '', 'with a reason');
+      Check(Path = '', 'and no path is claimed');
+      Check(not FileExists(IncludeTrailingPathDelimiter(TmpRoot) +
+        'bug-report.md'), 'and nothing is written into the project');
+    finally
+      SetEnvironmentVariable('LOCALAPPDATA', PChar(SavedLocal));
+      SetEnvironmentVariable('USERPROFILE', PChar(SavedHome));
+    end;
+  finally
+    A.Free;
+    DiagReportsDirOverride := '';
+    ClearDiagFacts;
+  end;
+end;
+
 begin
   TmpRoot := IncludeTrailingPathDelimiter(GetTempDir) + 'pasclaude-ux';
   Cleanup(TmpRoot);
@@ -5057,6 +5390,12 @@ begin
     TestTelemetryPanel;
     TestTelemetryPreviewIsWhatShips;
     TestTelemetrySelfDisableIsSaidOnce;
+    TestStatusBorrowsTheOwningUnits;
+    TestDoctorLevelsAndCosts;
+    TestDoctorReplaysTheLedger;
+    TestProbeWritableLeavesNothing;
+    TestDiagTakesNothingFromTheProject;
+    TestBugReportEndToEnd;
   finally
     { Before the cleanup, not after: a live child holding a spool handle under
       TmpRoot would make the recursive delete fail. }
@@ -5073,6 +5412,11 @@ begin
     { And the settings store, for the same reason: nothing this suite put in
       module state may outlive it. }
     uSettings.SettingsClear;
+    { And the diagnostic ledger and host facts, for exactly the same
+      reason: nothing this suite put in module state may outlive it. }
+    uDiag.ClearDiagNotes;
+    uDiag.ClearDiagFacts;
+    uDiag.DiagReportsDirOverride := '';
     { Beside the two above and for a related reason: the cached low-integrity
       token is a handle, and a suite that left one open would report it.  The
       level goes back to the default so nothing after this point is confined

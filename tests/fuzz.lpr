@@ -9,7 +9,7 @@ program fuzz;
 {$mode objfpc}{$H+}
 
 uses SysUtils, Classes, Windows, uJson, uSettings, uAuth, uTelem, uMcp, uHooks,
-  uSandbox, uTools, uImage, uAgent, uHttp, uSdk;
+  uSandbox, uTools, uImage, uAgent, uDiag, uHttp, uSdk;
 
 var
   Fails: Integer = 0;
@@ -4025,6 +4025,107 @@ begin
   TelemInit(TelemDefaultConfig);
 end;
 
+{ Everything a diagnostic renders about hooks, MCP servers and styles is
+  project-authored text that arrived with a clone.  Rendered straight, a
+  hostile hooks.json could paint the terminal with escapes, truncate the
+  JSON payload with a NUL, or push invalid UTF-8 onto a protocol stream the
+  API rule and the driver rule both forbid it on. }
+procedure TestDiagRendersHostileStrings;
+var
+  Nasty: string;
+  R: TDiagReport;
+  S: TStatusReport;
+  Lines: TStringArray;
+  I: Integer;
+  Ok: Boolean;
+  Doc: TJson;
+  Err: string;
+begin
+  ClearDiagNotes;
+  ClearDiagFacts;
+  Nasty := #27'[31mRED' + #0 + StringOfChar('A', 8192) + #7#9 +
+    { A lead byte with no continuation: valid-looking until it is cut. }
+    #$E2#$82;
+  DiagNote('hooks', dlWarn, Nasty, Nasty);
+  DiagNote(Nasty, dlProblem, 'a source name can be hostile too', 'fix it');
+  DiagFacts.SettingsSupported := True;
+  SetLength(DiagFacts.SettingsRefused, 1);
+  DiagFacts.SettingsRefused[0] := Nasty;
+  DiagFacts.AuthSource := Nasty;
+  DiagFacts.AuthDetail := Nasty;
+  DiagFacts.Version := Nasty;
+
+  R := DiagBuildDoctor(nil, False);
+  Lines := DiagDoctorText(R);
+  Ok := True;
+  for I := 0 to High(Lines) do
+  begin
+    if not IsValidUtf8(Lines[I]) then Ok := False;
+    if Pos(#27, Lines[I]) > 0 then Ok := False;
+    if Pos(#0, Lines[I]) > 0 then Ok := False;
+    if Pos(#7, Lines[I]) > 0 then Ok := False;
+    { The per-field budget, plus the fixed prefix each line carries. }
+    if Length(Lines[I]) > 1024 then Ok := False;
+  end;
+  Check(Ok, 'the doctor text is valid UTF-8, control-free and bounded');
+
+  S := DiagBuildStatus(nil);
+  Lines := DiagStatusText(S);
+  Ok := True;
+  for I := 0 to High(Lines) do
+    if (not IsValidUtf8(Lines[I])) or (Pos(#27, Lines[I]) > 0) or
+       (Pos(#0, Lines[I]) > 0) then Ok := False;
+  Check(Ok, 'and so is the status text');
+
+  Doc := JsonParse(DiagDoctorJson(R), Err);
+  Check(Doc <> nil, 'and the doctor payload still round-trips through JSON');
+  Doc.Free;
+  Doc := JsonParse(DiagStatusJson(S), Err);
+  Check(Doc <> nil, 'and so does the status payload');
+  Doc.Free;
+  { And through the protocol encoder, which is where a NUL or a stray
+    newline would desynchronise a driver rather than merely look wrong. }
+  Check(Pos(#10, Copy(SdkDiagnosticLine('doctor', DiagDoctorJson(R)), 1,
+    Length(SdkDiagnosticLine('doctor', DiagDoctorJson(R))) - 1)) = 0,
+    'and the protocol line is still one line');
+  ClearDiagNotes;
+  ClearDiagFacts;
+end;
+
+{ A crash log is the single most likely thing to be pasted into a bug
+  report, and it is exactly the input an off-by-one in a scanner's lookahead
+  raises on. }
+procedure TestDiagRedactorsSurviveGarbage;
+var
+  Junk, R: string;
+  I: Integer;
+  Roots: TStringArray;
+begin
+  SetLength(Junk, 65536);
+  for I := 1 to Length(Junk) do Junk[I] := Chr(Random(256));
+  SetLength(Roots, 1);
+  Roots[0] := 'E:\x';
+  R := DiagRedactSecrets(Junk);
+  Check(Length(R) > 0, '64 KB of random bytes redacts without raising');
+  R := DiagRedactPaths(Junk, Roots, 'C:\h', 'C:\h\l');
+  Check(Length(R) > 0, 'and so does the path pass');
+  Check(DiagRedactSecrets('') = '', 'an empty string is empty');
+  Check(DiagRedactPaths('', Roots, '', '') = '', 'both ways');
+  { A lone lead byte: the shape that makes a naive scanner read past the
+    end of the string. }
+  R := DiagRedactSecrets(#$E2);
+  Check(R = #$E2, 'an unterminated UTF-8 lead byte survives untouched');
+  R := DiagRedactSecrets('sk-');
+  Check(R = 'sk-', 'and a prefix with no token is not a key');
+  R := DiagRedactSecrets('sk-ant-');
+  Check(R = 'sk-ant-***', 'while a bare sk-ant- prefix is still redacted');
+  { A trailing '=' with nothing after it. }
+  R := DiagRedactSecrets('TOKEN=');
+  Check(R = 'TOKEN=', 'a sensitive name with no value is left alone');
+  R := DiagRedactSecrets('Bearer');
+  Check(R = 'Bearer', 'and a Bearer with nothing after it');
+end;
+
 begin
   TestImageDecodersHostile;
   TestBinaryFileDoesNotCorruptBody;
@@ -4080,6 +4181,8 @@ begin
   TestHostileForeignCredentials;
   TestTelemetryHostileConfig;
   TestTelemetryCardinality;
+  TestDiagRendersHostileStrings;
+  TestDiagRedactorsSurviveGarbage;
   uTools.ClearWorkingDirs;
   uSandbox.SandboxShutdown;
 

@@ -111,6 +111,14 @@ function HookFingerprint: string;
 { One line per loaded hook: event, matcher and command. }
 function HookSummary: string;
 
+{ The loaded table, one entry at a time.  Read-only and display-only: they
+  exist so /doctor can ask whether each hook's PROGRAM resolves on PATH
+  without running any of them, and without splitting HookSummary's padded
+  columns back apart - a command containing the arrow would have made that
+  parse wrong exactly where the report needed to be right. }
+function HookEntryCount: Integer;
+function HookCommandAt(I: Integer): string;      { '' when out of range }
+
 { The same rendering, straight off a file that has not been loaded.  It exists
   because the approval prompt has to show what the file says before the file is
   trusted, and trusting it in order to describe it would be the wrong order.
@@ -678,6 +686,17 @@ begin
   for I := 0 to High(Hooks) do
     Result := Result + SummaryLine(HookEventName(Hooks[I].Event),
       Hooks[I].Matcher, Hooks[I].Command);
+end;
+
+function HookEntryCount: Integer;
+begin
+  Result := Length(Hooks);
+end;
+
+function HookCommandAt(I: Integer): string;
+begin
+  if (I < 0) or (I > High(Hooks)) then Exit('');
+  Result := Hooks[I].Command;
 end;
 
 function HookSummaryOf(const Path: string): string;

@@ -538,8 +538,31 @@ text preserves what was missing at the time. Unchecked items remain open.
   still gets a style only from `--output-style`. `keys.json` and
   `plugins.json` were deliberately NOT folded in: one is `%USERPROFILE%`-only
   by design and the other is program-written in both directions.*
-- [ ] **/doctor, /status, /bug** — no health check, status view, or
-  feedback command.
+- [x] ~~**/doctor, /status, /bug** — no health check, status view, or
+  feedback command.~~
+  *Built: one unit, `src/uDiag.pas`, holds all three as data plus pure
+  renderers, so a suite asserts on the content with no console. `/status`
+  reports what is true now — model and routing, credential source, mode and
+  standing grants, deny count, roots, MCP servers, hooks, style, vim,
+  sandbox, tokens, session file, settings — and borrows every word from the
+  unit that owns it rather than restating it. `/doctor` runs thirteen named
+  checks, each with a level, a stated cost and a remedy that the builder
+  asserts is non-empty; it replays a note ledger recorded where startup
+  already printed its yellow warnings instead of re-reading configuration,
+  because `LoadMcpConfig` tears down live connections at its first line.
+  `/bug` writes a redacted markdown or JSON report to
+  `%LOCALAPPDATA%\pasclaude\reports\` and **uploads nothing** — there is no
+  upload path, not a disabled one — refusing outright rather than falling
+  back into the project when there is no home. `--status` and `--doctor` are
+  also top-level flags that take `--output-format json|stream-json`, exit 1
+  on a problem, and are the only two modes that continue past a missing
+  credential — safe because they cannot run a turn.
+  Narrower than Claude Code: there is no `/doctor` auto-repair, no
+  installation or update check, no IDE or terminal-integration diagnosis, no
+  MCP handshake probe (servers are resolved on PATH, never spawned, because
+  approving a spawn is a permission answer), no `/bug` upload to an issue
+  tracker and no `/feedback` at all. Path redaction is substring matching and
+  says so; reports are never pruned, only counted.*
 - [x] ~~**/login, /logout** — cannot authenticate on its own; it reuses the
   token Claude Code or Jcode wrote (read-only, never refreshed) or
   `ANTHROPIC_API_KEY`.~~

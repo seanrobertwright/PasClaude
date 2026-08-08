@@ -134,6 +134,9 @@ contents are appended to the system prompt as binding instructions.
 | `/yolo` | approve every tool for the rest of the session (bypass mode) |
 | `/sandbox [level]` | `off`, `limits` or `low`: how confined child processes are |
 | `/cost` | turns and tokens used |
+| `/status` | what is true right now: model, credential, mode, roots, MCP, hooks, style, tokens |
+| `/doctor [--online]` | what is wrong or might be, with a remedy each; offline unless `--online` |
+| `/bug [--transcript] [--paths] [--json]` | write a redacted report to a file; nothing is uploaded |
 | `/exit` | quit (Ctrl+C also works) |
 
 A prompt starting with `# ` is a note for the project memory rather than a
@@ -1812,6 +1815,115 @@ That unit is also where the system prompt now lives. It was lifted out of
 `pasclaude.lpr` verbatim, which is what makes it testable for the first time -
 specifically that user memory loads *before* the project's own instruction
 files, so nearer still wins.
+
+## Status, doctor and bug reports
+
+```
+/status                              :: what is true right now
+/doctor [--online]                   :: what is wrong, and what to do
+/bug [--transcript] [--paths] [--json]  :: a report a maintainer can read
+pasclaude --status                   :: the same report, then exit 0
+pasclaude --doctor [--online]        :: exit 1 if anything is a problem
+```
+
+Three commands, one unit. `src/uDiag.pas` builds `TStatusReport` and
+`TDiagReport` and renders each of them twice - once as console lines, once as
+JSON - through functions that are *pure in the record and take nothing else*.
+That is what stops the two renderings disagreeing, which is the classic way a
+bug report drifts from the status view it claims to quote. It also makes the
+whole feature testable: the builders read in-memory state, the host's only
+jobs are to fill one facts record, record a note where it already prints a
+yellow one, and print what comes back.
+
+`/status` is the report with no judgement. It names the model and any routing,
+the credential source, the permission mode and standing grants, the deny-rule
+count, the session root and added directories, MCP servers, hooks, output
+style, vim, sandbox level, skills and plugins, the token counters `/cost`
+prints, the session file and the settings in force. Every one of those values
+is *borrowed*: the mode word is `uTools.PermModeName(CurrentPermMode)` and the
+sandbox word is `uSandbox.SandboxLevelName`, not a second copy that would
+drift the first time `/mode` grew a word. It ends with the footer `/help`
+never had: the three things read once at startup - skills, the output style,
+the MCP config - plus `settings.json`, and the command that refreshes each.
+`/status` reports the **session**, which after a mid-session edit is not what
+is on disk, and that is exactly when somebody types it.
+
+`/doctor` is the judgement. Thirteen checks with fixed ids, each carrying a
+level, a cost and - whenever it is not ok - a remedy that the builder asserts
+is non-empty, because a health check that says "problem" without saying what
+to do is a riddle. What each costs:
+
+| check | cost |
+|---|---|
+| `winhttp` `credential` `credential_expiry` `config_files` `settings_scope` `console` | nothing; memory only |
+| `state_dir_writable` `project_state_dir_writable` | one file created and deleted in a `finally` |
+| `mcp_servers` `hook_commands` `session_file` `disk_reports` | reads PATH and file metadata; **nothing is spawned** |
+| `model_access` | one `GET /v1/models`, and only with `--online` |
+
+Nothing is spawned and nothing is sent unless you type `--online`. That is the
+rule this codebase applies to web search and to `fetch`: an outbound request
+is a channel, and a command must not open one because its name sounded
+harmless. Resolving an MCP server's or a hook's program on `PATH` is a
+heuristic - a shell builtin or an unusual `PATHEXT` can look like a missing
+program - so those checks report `warning` and never `problem`, and say so.
+
+`/doctor` never re-reads a configuration file. Startup records a note wherever
+it already prints a yellow warning - a bad deny rule, a settings refusal, a
+hook or keys.json note, an MCP error, a style that no longer resolves, a
+sandbox downgrade - and the check replays that ledger. Re-reading is how a
+diagnostic becomes destructive: `LoadMcpConfig` calls `ClearMcpServers` as its
+first statement, so "checking" `.mcp.json` would tear down every live server.
+
+`/bug` writes a file and **uploads nothing**. There is no upload path in the
+program, not a disabled one. The report goes to
+`%LOCALAPPDATA%\pasclaude\reports\bug-<utc>.md`, falling back to
+`%USERPROFILE%\.pasclaude\reports\`; with neither it refuses and writes
+nothing at all - never into the project, where it would be committed by
+accident. Out of tree also means `SafePath` refuses it, so the model's own
+`read_file` cannot read the report back.
+
+Included: a manifest of what is in and out, the pasclaude version, the FPC
+version and target, the real Windows build (`RtlGetVersion` from `ntdll`, not
+the 6.2 an unmanifested `GetVersionEx` reports forever), console codepages and
+VT state, the whole `/status` report, the whole `/doctor` report, the note
+ledger, and the counters. Excluded, and named as excluded in the file itself:
+your prompts, the model's replies, tool inputs and outputs, file contents,
+environment variable values, and the credential in any form. That last one is
+structural rather than a promise - the token is never placed in the
+diagnostic record at all, only the source word, whether it is an OAuth token
+and when it expires, so `/bug` could not leak it even if every redactor
+failed.
+
+Secrets are redacted always, with no flag that turns it off: `sk-ant-…`,
+long `sk-…`, anything after `Bearer`, and the value of any `NAME=` whose name
+mentions KEY, TOKEN, SECRET, PASSWORD or CREDENTIAL. The *shape* survives -
+`sk-ant-***` - because which kind of key it was is the one useful part.
+Paths are redacted to `%USERPROFILE%`, `%LOCALAPPDATA%` and `<root0>`,
+`<root1>`… unless you pass `--paths`, longest needle first so a nested
+`--add-dir` root is replaced whole rather than left half-substituted, and
+case-insensitively because Windows paths arrive in three different cases.
+It is substring matching and the report says so: read the file before you
+share it. `--transcript` writes your conversation to a sibling file with a
+yellow warning that secrets are redacted and meaning is not. Reports are
+never deleted automatically - `/doctor` counts them past twenty and leaves
+them alone, because a program that silently removes your evidence is worse
+than one that accumulates files.
+
+As flags, `--status` and `--doctor` run the whole of startup - including the
+below-the-halt loads, because a status that cannot see the approvals file is a
+lie - and then emit in place of the REPL. `--status` always exits 0;
+`--doctor` exits 1 when any check is a problem and 0 otherwise (a warning and
+a skipped check are not failures), so `pasclaude --doctor || setup` works in a
+batch file. With `--output-format json` the payload is the object; with
+`stream-json` it is one `{"type":"diagnostic","kind":"status"|"doctor",…}`
+line, and the banner and startup notices are suppressed so stdout carries only
+the protocol. Both modes refuse to combine with `-p`, a prompt, `--resume` or
+a driver, and neither approves or connects an MCP server: approving a spawn is
+a permission answer, and a health check must not be a way to obtain one. They
+are also the only two modes that continue past a missing credential or a
+missing `winhttp.dll` and report it as one problem among thirteen instead of
+exiting 2 - safe only because the branch ends in `Halt` and cannot reach a
+turn or a tool.
 
 ## Tests
 

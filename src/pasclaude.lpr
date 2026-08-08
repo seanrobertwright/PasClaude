@@ -11,7 +11,7 @@ program pasclaude;
 
 uses
   Windows, SysUtils, Classes, DateUtils, uTerm, uJson, uSettings, uAuth,
-  uHttp, uTelem, uMcp, uHooks, uSandbox, uTools, uImage, uAgent, uSdk;
+  uHttp, uTelem, uMcp, uHooks, uSandbox, uTools, uImage, uAgent, uDiag, uSdk;
 
 const
   Version = '0.1';
@@ -227,13 +227,13 @@ end;
 { ------------------------------------------------------------- completion -- }
 
 const
-  SlashCommands: array[0..36] of string = (
+  SlashCommands: array[0..39] of string = (
     '/help', '/clear', '/compact', '/config', '/deny', '/diff', '/hooks',
     '/jobs', '/mcp', '/memory', '/init', '/mode', '/plan', '/rewind',
     '/sandbox', '/sessions', '/skills', '/plugins', '/think', '/web',
     '/add-dir', '/remove-dir', '/resume', '/save', '/cwd', '/model', '/yolo',
     '/cost', '/telemetry', '/output-style', '/paste', '/vim', '/keys',
-    '/login', '/logout', '/exit', '/quit');
+    '/login', '/logout', '/status', '/doctor', '/bug', '/exit', '/quit');
 
 { Candidates for the token being completed: slash commands when the token
   opens the line with a slash, file and directory names under the session
@@ -656,6 +656,15 @@ begin
   EmitCLn(clGrey,   '                 pasclaude''s own, encrypted, out of the project');
   EmitCLn(clGrey,   '  /logout        remove that stored credential (only that one:');
   EmitCLn(clGrey,   '                 Claude Code''s and Jcode''s are read, never written)');
+  EmitCLn(clGrey,   '  /status        what is true right now: model, credential,');
+  EmitCLn(clGrey,   '                 mode, roots, MCP, hooks, style, tokens');
+  EmitCLn(clGrey,   '  /doctor        what is wrong or might be, with a remedy each.');
+  EmitCLn(clGrey,   '                 Offline and makes no request; --online adds one');
+  EmitCLn(clGrey,   '                 GET asking which models this credential can use');
+  EmitCLn(clGrey,   '  /bug           write a redacted report to a file for a');
+  EmitCLn(clGrey,   '                 maintainer. Nothing is uploaded, ever.');
+  EmitCLn(clGrey,   '                 --transcript adds your conversation, --paths');
+  EmitCLn(clGrey,   '                 keeps real paths, --json writes JSON');
   EmitCLn(clGrey,   '  /exit          quit (Ctrl+C also works)');
   EmitLn;
   EmitCLn(clGrey,   '  Esc during a reply stops it.');
@@ -677,6 +686,12 @@ procedure HookNotice(const Msg: string);
 begin
   NeedNewLine;
   EmitCLn(clYellow, '  ' + Msg);
+  { And into the ledger, because this is the funnel for both the hook notes
+    and the keys.json ones and /doctor replays the ledger rather than
+    re-reading either file - re-reading hooks.json would re-ask a trust
+    question the user already answered. }
+  uDiag.DiagNote('hooks', uDiag.dlWarn, Msg,
+    '/hooks shows what hooks.json asks for; /keys shows the bindings');
 end;
 
 { Where the prompt history lives, beside the session. }
@@ -2746,6 +2761,202 @@ begin
     EmitCLn(clGrey, '  ' + Err);
 end;
 
+{ ------------------------------------------------------- status / doctor -- }
+
+{ Everything uDiag cannot know: the console, the credential, the keybinding
+  file, whether anybody is watching.  One block rather than a dozen
+  callbacks, and called again at the top of each of the three commands so a
+  report typed an hour into the session describes the session as it is now
+  rather than as it started.
+
+  The credential VALUE is deliberately absent.  Only the source word, the two
+  booleans and the expiry cross this line, which is why /bug cannot leak a
+  token even if every redactor in uDiag failed: the secret is not in the
+  record the report is built from. }
+procedure FillDiagFacts;
+var
+  Sub, Comp: string;
+begin
+  uDiag.DiagFacts.Version := Version;
+  if ActiveAuth.Source = uAuth.asNone then
+    uDiag.DiagFacts.AuthSource := ''
+  else
+    uDiag.DiagFacts.AuthSource := uAuth.AuthSourceName(ActiveAuth.Source);
+  uDiag.DiagFacts.AuthDetail := uAuth.AuthDescribe(ActiveAuth);
+  uDiag.DiagFacts.AuthPresent := (not NoCredential) and
+    (ActiveAuth.Token <> '');
+  { The one line in the host that reads the key, and it reads a prefix and
+    produces a Boolean.  uAgent.IsOauth is a private method of the agent, so
+    the same test is spelled here against the same exported constant. }
+  uDiag.DiagFacts.AuthIsOauth := Copy(ActiveAuth.Token, 1,
+    Length(uAgent.OauthKeyPrefix)) = uAgent.OauthKeyPrefix;
+  uDiag.DiagFacts.AuthExpiresAtMs := ActiveAuth.ExpiresMs;
+  uDiag.DiagFacts.HasConsole := StdinIsConsole;
+  uDiag.DiagFacts.StdinIsConsole := StdinIsConsole;
+  uDiag.DiagFacts.VtActive := TermVtActive;
+  uDiag.DiagFacts.ConsoleOutCp := GetConsoleOutputCP;
+  uDiag.DiagFacts.ConsoleInCp := GetConsoleCP;
+  uDiag.DiagFacts.VimOn := PromptProfile.Vim;
+  uDiag.DiagFacts.Scripted := ScriptedRun;
+  uDiag.DiagFacts.KeysPath := KeysPath;
+  uDiag.DiagFacts.HistoryPath := HistoryPath;
+  uDiag.DiagFacts.PermissionsPath := PermissionsPath;
+  uDiag.DiagFacts.SessionFilePath := SessionPath(uTools.RootDir);
+  uDiag.DiagFacts.SettingsSupported := True;
+  { One report builder, not two: /config colours these same rows.  A second
+    derivation here is how /status and /config end up disagreeing about
+    which tier a value came from. }
+  uDiag.DiagFacts.SettingsSummary := uSettings.SettingsReport;
+  uDiag.DiagFacts.SettingsRefused := uSettings.SettingsRefusals;
+  { Where the model name came from at STARTUP.  /model typed since is not
+    visible here, which is why the caption says "at startup". }
+  if Trim(GetEnvironmentVariable('ANTHROPIC_MODEL')) <> '' then
+    uDiag.DiagFacts.ModelSource := 'ANTHROPIC_MODEL'
+  else if uSettings.SettingIsSet('model') then
+    uDiag.DiagFacts.ModelSource := 'settings.json (' +
+      uSettings.TierName(uSettings.SettingSource('model')) + ')'
+  else
+    uDiag.DiagFacts.ModelSource := 'the built-in default';
+  Sub := uAgent.ModelRoute(uAgent.mrSubagent);
+  Comp := uAgent.ModelRoute(uAgent.mrCompact);
+  uDiag.DiagFacts.ModelRouting := '';
+  if (Sub <> '') or (Comp <> '') then
+    uDiag.DiagFacts.ModelRouting := 'subagent ' + Sub + ', compaction ' + Comp;
+  if uTelem.TelemEnabled then
+    uDiag.DiagFacts.TelemetrySummary := 'on, sending to ' +
+      uTelem.TelemState.Endpoint
+  else if uTelem.TelemState.SelfDisabled then
+    uDiag.DiagFacts.TelemetrySummary := 'stopped for this session after ' +
+      'repeated failures (/telemetry)'
+  else
+    uDiag.DiagFacts.TelemetrySummary := '';
+end;
+
+procedure ShowStatus;
+var
+  Report: uDiag.TStatusReport;
+  Lines: TStringArray;
+  I: Integer;
+begin
+  FillDiagFacts;
+  Report := uDiag.DiagBuildStatus(Agent);
+  Lines := uDiag.DiagStatusText(Report);
+  for I := 0 to High(Lines) do EmitCLn(clGrey, Lines[I]);
+end;
+
+procedure ShowDoctor(const Arg: string);
+var
+  Report, One: uDiag.TDiagReport;
+  Lines: TStringArray;
+  I, J, Problems, Warnings: Integer;
+  Online: Boolean;
+  C: TColor;
+begin
+  Online := (Arg = '--online') or (Arg = 'online');
+  if (Arg <> '') and not Online then
+  begin
+    EmitCLn(clRed, '  /doctor takes no argument, or --online');
+    Exit;
+  end;
+  FillDiagFacts;
+  if Online then
+    { Said before it happens, not after.  One GET is still a request, and
+      this program does not make one because a command's name sounded
+      harmless. }
+    EmitCLn(clGrey, '  --online: asking the API which models this ' +
+      'credential can use (one GET, no tokens billed)');
+  Report := uDiag.DiagBuildDoctor(Agent, Online);
+  Problems := 0;
+  Warnings := 0;
+  SetLength(One, 1);
+  for I := 0 to High(Report) do
+  begin
+    case Report[I].Level of
+      uDiag.dlProblem: begin C := clRed; Inc(Problems); end;
+      uDiag.dlWarn: begin C := clYellow; Inc(Warnings); end;
+    else
+      C := clGrey;
+    end;
+    { Rendered one check at a time through the SAME pure renderer the JSON
+      path and /bug use, so a colour decision here can never change what a
+      line says. }
+    One[0] := Report[I];
+    Lines := uDiag.DiagDoctorText(One);
+    for J := 0 to High(Lines) do EmitCLn(C, Lines[J]);
+  end;
+  EmitLn;
+  if Problems > 0 then
+    EmitCLn(clRed, Format('  %d problem(s), %d warning(s)',
+      [Problems, Warnings]))
+  else if Warnings > 0 then
+    EmitCLn(clYellow, Format('  no problems, %d warning(s)', [Warnings]))
+  else
+    EmitCLn(clGreen, '  no problems found');
+  if not Online then
+    EmitCLn(clGrey, '  (/doctor --online also asks the API which models ' +
+      'this credential can use)');
+end;
+
+procedure DoBug(const Arg: string);
+var
+  Opts: uDiag.TBugOptions;
+  Path, TranscriptPath, Err, Tok, Rest: string;
+  Sp: Integer;
+begin
+  Opts.IncludeTranscript := False;
+  Opts.RealPaths := False;
+  Opts.AsJson := False;
+  Rest := Trim(Arg);
+  while Rest <> '' do
+  begin
+    Sp := Pos(' ', Rest);
+    if Sp = 0 then
+    begin
+      Tok := Rest;
+      Rest := '';
+    end
+    else
+    begin
+      Tok := Copy(Rest, 1, Sp - 1);
+      Rest := Trim(Copy(Rest, Sp + 1, MaxInt));
+    end;
+    if Tok = '--transcript' then Opts.IncludeTranscript := True
+    else if Tok = '--paths' then Opts.RealPaths := True
+    else if Tok = '--json' then Opts.AsJson := True
+    else
+    begin
+      EmitCLn(clRed, '  unknown option: ' + Tok);
+      EmitCLn(clGrey, '  /bug [--transcript] [--paths] [--json]');
+      Exit;
+    end;
+  end;
+  FillDiagFacts;
+  if not uDiag.DiagWriteBug(Agent, Opts, Path, TranscriptPath, Err) then
+  begin
+    EmitCLn(clRed, '  no report was written: ' + Err);
+    Exit;
+  end;
+  EmitCLn(clGreen, '  wrote ' + Path);
+  if TranscriptPath <> '' then
+  begin
+    EmitCLn(clGrey, '  and ' + TranscriptPath);
+    { Yellow, because --transcript is the one flag whose cost is not
+      obvious from its name.  Secrets are redacted; meaning cannot be. }
+    EmitCLn(clYellow, '  that second file is your conversation. Secrets ' +
+      'are redacted, nothing else is.');
+  end;
+  EmitCLn(clGrey, '  Nothing was uploaded - there is no upload path in this');
+  EmitCLn(clGrey, '  program, not a disabled one. Read the file before you');
+  EmitCLn(clGrey, '  share it: it names your files, and path redaction is');
+  EmitCLn(clGrey, '  best effort by substring match.');
+  if not Opts.RealPaths then
+    EmitCLn(clGrey, '  Paths are replaced with %USERPROFILE%, %LOCALAPPDATA% ' +
+      'and <root0>..; --paths keeps the real ones.');
+  EmitCLn(clGrey, '  Excluded: prompts, replies, tool input and output, file');
+  EmitCLn(clGrey, '  contents, environment values, and the credential in any');
+  EmitCLn(clGrey, '  form.');
+end;
+
 function HandleCommand(const Line: string; out Handled: Boolean): Boolean;
 var
   Cmd, Arg: string;
@@ -3037,6 +3248,12 @@ begin
     DoLogin(Arg)
   else if Cmd = '/logout' then
     DoLogout
+  else if Cmd = '/status' then
+    ShowStatus
+  else if Cmd = '/doctor' then
+    ShowDoctor(Arg)
+  else if Cmd = '/bug' then
+    DoBug(Arg)
   else if Cmd = '/config' then
     ShowConfig(Arg)
   else if Cmd = '/deny' then
@@ -3127,6 +3344,18 @@ end;
 var
   OutFormat: uSdk.TSdkFormat = uSdk.sfText;
   StreamInput: Boolean = False;
+
+type
+  { --status and --doctor as top-level modes.  A local enum set ONLY in the
+    argv loop, and that is load-bearing: it is the single condition under
+    which the missing-credential and missing-winhttp refusals below become
+    recorded notes instead of a startup halt, and the branch it selects ends
+    in Halt with no path past it to the REPL.  Nothing in a file, an
+    environment variable or a settings key can reach it. }
+  TDiagMode = (dmNone, dmStatus, dmDoctor);
+var
+  DiagMode: TDiagMode = dmNone;
+  DiagOnline: Boolean = False;
 
 { Every early exit goes through here.  Hint is the human's extra context and
   is printed only in text mode - the machine gets the one line it can act on. }
@@ -3223,6 +3452,11 @@ var
   StopActive: Boolean = False;
   Again: Boolean = False;
   TurnOk: Boolean = False;
+  { The two reports and their rendered text, for the --status/--doctor
+    branch below.  Built once, rendered once, never re-derived. }
+  StatusReport: uDiag.TStatusReport;
+  DoctorReport: uDiag.TDiagReport;
+  DiagLines: TStringArray;
 
 { Applied twice, and idempotently, on purpose.  Once before the print-mode
   halt, because a -p run never reaches the second call and a flag it was given
@@ -3254,6 +3488,10 @@ begin
   if uSandbox.SandboxLevel <> uSandbox.slLow then Exit;
   if PrepareSandbox then Exit;
   uSandbox.SandboxLevel := uSandbox.slLimits;
+  uDiag.DiagNote('sandbox', uDiag.dlWarn,
+    'sandbox low is unavailable, using limits: no writable scratch ' +
+    'directory outside the project to give children as %TEMP%',
+    'set %LOCALAPPDATA% or %USERPROFILE%; /sandbox shows the level in force');
   if not PrintMode then
     EmitCLn(clYellow, '  sandbox low is unavailable: no writable scratch ' +
       'directory outside the project to give children as %TEMP%. Using ' +
@@ -3356,6 +3594,12 @@ begin
         SetLength(AddDirs, Length(AddDirs) + 1);
         AddDirs[High(AddDirs)] := AddArg;
       end
+      else if Arg = '--status' then
+        DiagMode := dmStatus
+      else if Arg = '--doctor' then
+        DiagMode := dmDoctor
+      else if Arg = '--online' then
+        DiagOnline := True
       else if Arg = '--dangerously-skip-permissions' then
       begin
         ModeWanted := uTools.pmodeBypass;
@@ -3461,6 +3705,17 @@ begin
         EmitCLn(clGrey, '            this path, so a session that outgrows the context window is');
         EmitCLn(clGrey, '            answered with a new file.  Two processes sharing one file');
         EmitCLn(clGrey, '            race: each write is atomic, but the loser''s turn is lost.');
+        EmitCLn(clGrey, '  --status        print what is true right now and exit 0.');
+        EmitCLn(clGrey, '  --doctor [--online]');
+        EmitCLn(clGrey, '            check for problems and exit 1 if there are any, so');
+        EmitCLn(clGrey, '            "pasclaude --doctor || setup" works in a script.');
+        EmitCLn(clGrey, '            Offline and makes no request; --online adds one GET');
+        EmitCLn(clGrey, '            asking which models the credential can use.  Both');
+        EmitCLn(clGrey, '            modes run alone - never with -p, a prompt, --resume');
+        EmitCLn(clGrey, '            or a driver - and neither can run a turn or a tool,');
+        EmitCLn(clGrey, '            which is why they continue past a missing credential');
+        EmitCLn(clGrey, '            and report it instead of refusing to start.  Both');
+        EmitCLn(clGrey, '            take --output-format json|stream-json.');
         EmitCLn(clGrey, '  --output-format text|json|stream-json   (needs -p)');
         EmitCLn(clGrey, '  --input-format  text|stream-json        (needs -p and stream-json out)');
         EmitCLn(clGrey, '            json/stream-json put one JSON object per line on stdout,');
@@ -3484,8 +3739,12 @@ begin
       otherwise sit waiting for a protocol nobody is speaking. }
     if not PrintMode then
     begin
-      if OutFormat <> uSdk.sfText then
-        FailStart('--output-format needs -p', '', 2);
+      { --status and --doctor are the exception, and a deliberate one: a
+        driver that can ask "am I healthy" and parse the answer is worth
+        more than one that scrapes prose, and these two modes answer without
+        a turn ever happening. }
+      if (OutFormat <> uSdk.sfText) and (DiagMode = dmNone) then
+        FailStart('--output-format needs -p, --status or --doctor', '', 2);
       if StreamInput then
         FailStart('--input-format needs -p', '', 2);
       { Interactive already has /resume and the session picker.  A second way
@@ -3522,6 +3781,31 @@ begin
     if PlanFlag and BypassFlag then
       FailStart('--permission-mode plan and --dangerously-skip-permissions '
         + 'contradict each other', 'pick one', 2);
+    { The refusals that keep the diagnostic relaxation honest.  --status and
+      --doctor continue past a missing credential and past a missing
+      winhttp.dll, because a doctor that exits saying "ANTHROPIC_API_KEY is
+      not set" instead of listing that as one problem among thirteen is the
+      riddle the whole feature exists to avoid.  That is only safe because
+      the mode structurally cannot run a turn or a tool - so it must not be
+      combinable with anything that can. }
+    if DiagMode <> dmNone then
+    begin
+      if PrintMode then
+        FailStart('--status and --doctor cannot be combined with -p',
+          'they are modes of their own: run them alone', 2);
+      if Trim(PrintPrompt) <> '' then
+        FailStart('--status and --doctor take no prompt', '', 2);
+      if Resume then
+        FailStart('--status and --doctor cannot be combined with --resume',
+          'they report on a fresh session, and loading a transcript would ' +
+          'change what they report', 2);
+      if StreamInput then
+        FailStart('--status and --doctor cannot be combined with ' +
+          '--input-format stream-json', '', 2);
+    end;
+    if DiagOnline and (DiagMode <> dmDoctor) then
+      FailStart('--online needs --doctor',
+        'it is the opt-in for the one check that makes a request', 2);
     if Dir <> '' then
     begin
       if not DirectoryExists(Dir) then
@@ -3582,15 +3866,28 @@ begin
       that and a user who believes they are protected is this line. }
     BadRules := uTools.BadDenyRules;
     for ArgI := 0 to High(BadRules) do
+    begin
       EmitCLn(clYellow, '  deny rule not understood, NOT in force: ' +
         BadRules[ArgI] + ' (/deny)');
+      { And into the ledger beside the print, so /doctor can report it
+        without re-reading deny.json.  Every one of these five sites prints
+        exactly once at startup; the ledger is the only thing that lets a
+        command typed an hour later still know it happened. }
+      uDiag.DiagNote('deny', uDiag.dlWarn,
+        'rule not understood, NOT in force: ' + BadRules[ArgI],
+        '/deny lists what is in force; fix or remove the rule');
+    end;
     { Settings problems, in the same block and the same colour and for the
       same reason: a file the user wrote is not doing what they think, and the
       only thing standing between that and a silent surprise is this loop.
       Never fatal - a project file is attacker-controlled, and halting on one
       would hand a clone a way to stop the program. }
     for ArgI := 0 to High(SettingNotes) do
+    begin
       EmitCLn(clYellow, '  settings: ' + SettingNotes[ArgI]);
+      uDiag.DiagNote('settings', uDiag.dlWarn, SettingNotes[ArgI],
+        '/config shows every key, its value and the tier it came from');
+    end;
     { Said out loud rather than left to /cost: a repository that doubled the
       size of every tool result, or moved the compaction point, has changed
       what this session costs and the user did not type it. }
@@ -3662,10 +3959,24 @@ begin
         if AuthList[ArgI].Why <> '' then
           SaveErr := SaveErr + uAuth.AuthSourceName(AuthList[ArgI].Source) +
             ': ' + AuthList[ArgI].Why + #10;
-      FailStart('no usable credential was found',
-        SaveErr +
-        'set ANTHROPIC_API_KEY=sk-ant-..., sign in to Claude Code once, ' +
-        'or run pasclaude and type /login', 2);
+      { The one place a startup refusal is deliberately weakened, and the
+        guard is DiagMode and nothing else - not a settings key, not an
+        environment variable, not -p.  A diagnostic run continues with an
+        empty key so that "no credential" can be one problem among thirteen
+        rather than the exit code; it is safe only because the diag branch
+        below ends in Halt and cannot reach the REPL, a turn or a tool.
+        --doctor --online is the sole path that then makes a request, and
+        it reports the API's own refusal, which is the honest answer. }
+      if DiagMode <> dmNone then
+        uDiag.DiagNote('credential', uDiag.dlProblem,
+          'no usable credential was found in any of the six sources',
+          'set ANTHROPIC_API_KEY=sk-ant-..., sign in to Claude Code once, ' +
+          'or run pasclaude and type /login')
+      else
+        FailStart('no usable credential was found',
+          SaveErr +
+          'set ANTHROPIC_API_KEY=sk-ant-..., sign in to Claude Code once, ' +
+          'or run pasclaude and type /login', 2);
     end;
     if not PrintMode then
     begin
@@ -3683,7 +3994,17 @@ begin
     end;
     if not HttpAvailable then
     begin
-      FailStart('winhttp.dll could not be loaded; no network available.', '', 2);
+      { Same relaxation, same single guard, same reason: a machine with no
+        winhttp.dll is exactly the machine somebody would type --doctor on,
+        and refusing to run there means the check that would name the
+        problem never runs. }
+      if DiagMode <> dmNone then
+        uDiag.DiagNote('winhttp', uDiag.dlProblem,
+          'winhttp.dll could not be loaded; no request can be made',
+          'check that %SystemRoot%\system32\winhttp.dll exists')
+      else
+        FailStart('winhttp.dll could not be loaded; no network available.',
+          '', 2);
     end;
 
     ModelName := GetEnvironmentVariable('ANTHROPIC_MODEL');
@@ -3970,7 +4291,12 @@ begin
         named: falling back silently would leave the user reading replies in a
         voice they did not pick and no way to find out why. }
       if uTools.StyleStartupNote <> '' then
+      begin
         EmitCLn(clYellow, '  ' + uTools.StyleStartupNote);
+        uDiag.DiagNote('output_style', uDiag.dlWarn,
+          uTools.StyleStartupNote,
+          '/output-style lists the styles that resolve now');
+      end;
       { And settings last of the three, which is the whole of its authority
         here: argv is the user speaking about this run, the approvals file is
         the user's persisted answer to /output-style, and settings.json only
@@ -4012,12 +4338,31 @@ begin
         arrive with a nil Ask and deny everything if it did. }
       if uTools.LoadMcpConfig(uTools.McpConfigPath, McpErr) then
       begin
-        uTools.McpApproveAll(@AskPermission, @McpNotice);
-        uTools.McpConnectApproved(@McpNotice);
+        { Parsed, but NOT approved and NOT connected under --status or
+          --doctor.  Approving a spawn is a permission answer, and a health
+          check must never be a way to obtain one; connecting would also
+          mean a command called "doctor" started programs from a cloned
+          repository.  The report still names every configured server and
+          whether its program resolves on PATH, which is the whole of what
+          it could honestly say anyway. }
+        if DiagMode = dmNone then
+        begin
+          uTools.McpApproveAll(@AskPermission, @McpNotice);
+          uTools.McpConnectApproved(@McpNotice);
+        end;
       end;
-      if McpErr <> '' then EmitCLn(clYellow, '  ' + McpErr);
+      if McpErr <> '' then
+      begin
+        EmitCLn(clYellow, '  ' + McpErr);
+        uDiag.DiagNote('mcp', uDiag.dlWarn, McpErr,
+          '/mcp shows each server; the file is ' + uTools.McpConfigPath);
+      end;
 
-      ShowBanner;
+      { A driver asked for JSON on stdout, so nothing else may go there: one
+        line of prose is indistinguishable from a protocol line that went
+        wrong.  Only reachable from --status/--doctor, which are the only
+        modes that get this far with a non-text format. }
+      if OutFormat = uSdk.sfText then ShowBanner;
 
       { Keybindings, from %USERPROFILE% and nowhere else - below the banner
         because any note it prints is about a file the user wrote and belongs
@@ -4030,7 +4375,7 @@ begin
         text out of the repository is now in the model's catalogue, and here
         is the command that shows what it says. }
       SkillList := uTools.SkillCatalogue;
-      if Length(SkillList) > 0 then
+      if (OutFormat = uSdk.sfText) and (Length(SkillList) > 0) then
       begin
         SkillNames := '';
         for ArgI := 0 to High(SkillList) do
@@ -4051,7 +4396,7 @@ begin
         the notice stops when the user has looked, not when they have
         enabled. }
       NewPlugins := uTools.UnseenPlugins;
-      if Length(NewPlugins) > 0 then
+      if (OutFormat = uSdk.sfText) and (Length(NewPlugins) > 0) then
       begin
         SkillNames := '';
         for ArgI := 0 to High(NewPlugins) do
@@ -4074,12 +4419,18 @@ begin
           EmitCLn(clYellow, '  starting fresh: ' + ResumeErr);
         EmitLn;
       end
-      else if FileExists(SessionPath(uTools.RootDir)) then
+      else if (DiagMode = dmNone) and
+              FileExists(SessionPath(uTools.RootDir)) then
       begin
         { A session was left here and this run is not continuing it, so the
           first save would overwrite it.  It is copied aside first: the user
           who wanted it can still get it back, and the one who did not loses
-          nothing but a file. }
+          nothing but a file.
+
+          Skipped under --status/--doctor, and that is not tidiness: this is
+          the only mutation left in the startup path, and a command whose
+          name promises diagnosis must not rewrite session.prev.json merely
+          by being run. }
         if BackupSession(SessionPath(uTools.RootDir), SaveErr) then
           EmitCLn(clGrey,
             '  a saved conversation exists here; /resume loads it' +
@@ -4088,6 +4439,67 @@ begin
           EmitCLn(clYellow, '  a saved conversation exists here but could not ' +
             'be copied aside: ' + SaveErr);
         EmitLn;
+      end;
+
+      { --status / --doctor emit here and halt, in place of the REPL.  They
+        deliberately run the WHOLE of startup first, including the
+        below-the-halt loads (LoadPermissions, LoadKeys, the MCP parse),
+        because a status that cannot see the approvals file or the configured
+        servers is a lie.  That is affordable only because the mode cannot
+        run a turn: Halt is the last statement on every path out of here. }
+      if DiagMode <> dmNone then
+      begin
+        FillDiagFacts;
+        if DiagMode = dmStatus then
+        begin
+          StatusReport := uDiag.DiagBuildStatus(Agent);
+          case OutFormat of
+            uSdk.sfText:
+              begin
+                DiagLines := uDiag.DiagStatusText(StatusReport);
+                for ArgI := 0 to High(DiagLines) do
+                  EmitCLn(clGrey, DiagLines[ArgI]);
+              end;
+            uSdk.sfStreamJson:
+              uSdk.SdkEmit(uSdk.SdkDiagnosticLine('status',
+                uDiag.DiagStatusJson(StatusReport)));
+          else
+            uSdk.SdkEmit(uDiag.DiagStatusJson(StatusReport));
+          end;
+          SdkCode := 0;
+        end
+        else
+        begin
+          DoctorReport := uDiag.DiagBuildDoctor(Agent, DiagOnline);
+          case OutFormat of
+            uSdk.sfText:
+              begin
+                DiagLines := uDiag.DiagDoctorText(DoctorReport);
+                for ArgI := 0 to High(DiagLines) do
+                  EmitCLn(clGrey, DiagLines[ArgI]);
+              end;
+            uSdk.sfStreamJson:
+              uSdk.SdkEmit(uSdk.SdkDiagnosticLine('doctor',
+                uDiag.DiagDoctorJson(DoctorReport)));
+          else
+            uSdk.SdkEmit(uDiag.DiagDoctorJson(DoctorReport));
+          end;
+          { 1 for a problem, 0 for anything else, so
+            "pasclaude --doctor || setup" works in a batch file.  A warning
+            does not fail the run and neither does a skipped check: an exit
+            code that fired on a check nobody asked to run would be
+            unusable in exactly the script that wants it. }
+          if uDiag.DiagWorstLevel(DoctorReport) = uDiag.dlProblem then
+            SdkCode := 1
+          else
+            SdkCode := 0;
+        end;
+        { Halt skips finally, so the shutdown is spelled out here as it is
+          at every other Halt in this file. }
+        uTelem.TelemShutdown;
+        uSandbox.SandboxShutdown;
+        TermDone;
+        Halt(SdkCode);
       end;
 
       repeat

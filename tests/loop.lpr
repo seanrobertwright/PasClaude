@@ -12,7 +12,8 @@ program loop;
 
 {$mode objfpc}{$H+}
 
-uses SysUtils, Classes, uJson, uHttp, uTelem, uHooks, uTools, uAgent, uSdk;
+uses SysUtils, Classes, uJson, uHttp, uTelem, uHooks, uTools, uAgent, uDiag,
+  uSdk;
 
 var
   Fails: Integer = 0;
@@ -3981,6 +3982,63 @@ begin
   end;
 end;
 
+{ /status reports the agent's live counters, not a private copy that goes
+  stale - and building either report must make no request.  This suite is the
+  only one that can prove the second half: its transport always answers, so a
+  check that quietly sent something would otherwise pass everywhere. }
+procedure TestDiagReadsLiveCountersAndSendsNothing;
+var
+  A: TAgent;
+  Err: string;
+  R: TStatusReport;
+  D: TDiagReport;
+  Before: Integer;
+
+  function ValueOf(const Id: string): string;
+  var
+    I: Integer;
+  begin
+    Result := '';
+    for I := 0 to High(R) do
+      if R[I].Id = Id then Exit(R[I].Value);
+  end;
+
+begin
+  ResetScript;
+  uTools.RootDir := SessionDir;
+  SetLength(Replies, 2);
+  Replies[0] := TextReply('first');
+  Replies[1] := TextReply('second');
+  uDiag.ClearDiagNotes;
+  uDiag.ClearDiagFacts;
+  A := MakeAgent;
+  try
+    Check(A.Send('one', Err), 'first turn');
+    Check(A.Send('two', Err), 'second turn');
+    Before := Length(Requests);
+    R := uDiag.DiagBuildStatus(A);
+    Check(ValueOf('turns') = IntToStr(A.TurnCount),
+      'status reports the agent''s own turn count');
+    Check(ValueOf('tokens_in') = IntToStr(A.TokensIn),
+      'and its input tokens');
+    Check(ValueOf('tokens_out') = IntToStr(A.TokensOut),
+      'and its output tokens');
+    Check(ValueOf('context') = IntToStr(A.ContextTokens),
+      'and the context size of the last request');
+    Check(A.TurnCount = 2, 'and the counters really moved');
+    D := uDiag.DiagBuildDoctor(A, False);
+    Check(Length(D) > 0, 'the doctor builds');
+    { The rule this codebase applies to web search and fetch: nothing goes
+      out because a command was typed. }
+    Check(Length(Requests) = Before,
+      'and neither report produced a single request');
+  finally
+    A.Free;
+    uDiag.ClearDiagNotes;
+    uDiag.ClearDiagFacts;
+  end;
+end;
+
 begin
   { Every request in this suite goes to the stand-in rather than the network. }
   SetEnvironmentVariable('USERPROFILE',
@@ -4047,6 +4105,7 @@ begin
   TestSdkSaveFailureReported;
   TestRequestDoneSeam;
   TestTelemetryNeverCostsATurn;
+  TestDiagReadsLiveCountersAndSendsNothing;
 
   WriteLn;
   if Fails = 0 then

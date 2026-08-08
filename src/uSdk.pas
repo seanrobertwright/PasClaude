@@ -108,6 +108,16 @@ function SdkDeltaLine(const Kind, Text: string): string;
 function SdkToolUseLine(const Id, Name, InputJson: string): string;
 function SdkToolResultLine(const Id, Name, Content: string; IsError: Boolean): string;
 function SdkNoticeLine(const Text: string): string;
+{ One diagnostic report as one protocol line: {"type":"diagnostic","kind":...}
+  with the payload's own keys merged in beside them.  PayloadJson is PARSED
+  and re-emitted rather than spliced, exactly as SdkToolUseLine handles a
+  model's argument text: a payload carrying a newline would otherwise split
+  one event into two lines and desynchronise every driver reading the stream.
+  A payload that will not parse becomes an empty object with the kind intact,
+  which a driver can survive; a broken line is not survivable.
+  Deliberately a string parameter and not a uDiag type, so uSdk gains no
+  dependency on the unit that produces it. }
+function SdkDiagnosticLine(const Kind, PayloadJson: string): string;
 function SdkHookLine(const Event, ToolName, Detail: string; Blocked: Boolean): string;
 function SdkErrorLine(const Text: string): string;
 function SdkPermissionRequestLine(const Id, ToolName, Title, Detail: string): string;
@@ -697,6 +707,33 @@ begin
   Root := TJson.NewObj;
   Root.AddStr('type', 'notice');
   Root.AddStr('text', Safe(Text));
+  Result := Finish(Root);
+end;
+
+function SdkDiagnosticLine(const Kind, PayloadJson: string): string;
+var
+  Root, Payload: TJson;
+  I: Integer;
+begin
+  Root := TJson.NewObj;
+  Root.AddStr('type', 'diagnostic');
+  Root.AddStr('kind', Safe(Kind));
+  Payload := nil;
+  if Trim(PayloadJson) <> '' then Payload := JsonParse(PayloadJson);
+  if (Payload <> nil) and (Payload.Kind = jkObj) then
+  try
+    { Merged rather than nested under a 'payload' key, so a driver reads
+      report.model and not report.payload.model.  The payload's own 'type'
+      is skipped: this line's type is 'diagnostic', and letting a nested
+      value overwrite it would produce an event no driver has a case for. }
+    for I := 0 to Payload.Count - 1 do
+      if (Payload.Key(I) <> 'type') and (Payload.Key(I) <> 'kind') then
+        Root.Add(Payload.Key(I), Payload.Take(I));
+  finally
+    Payload.Free;
+  end
+  else
+    Payload.Free;
   Result := Finish(Root);
 end;
 
