@@ -60,6 +60,19 @@ type
       the name above so reporting a mode and answering a prompt are two
       decisions, taken by whoever knows each. }
     AskViaDriver: Boolean;
+    { Where this run's transcript is saved and, with Resume, loaded from.
+      Empty means persist nothing, which is what -p has always done and stays
+      the default: a script's throwaway question must not touch the
+      directory's saved conversation. }
+    SessionFile: string;
+    { Load SessionFile before the first turn.  A file that is not there yet is
+      a fresh start; a file that is there and unreadable stops the run. }
+    Resume: Boolean;
+    { What the load actually did, filled in by SdkRun and reported on the init
+      line so a driver can tell a continuation from a fresh start without
+      guessing. }
+    Resumed: Boolean;
+    ResumedMessages: Integer;
   end;
 
 var
@@ -105,7 +118,28 @@ function SdkParseFormat(const S: string; out F: TSdkFormat): Boolean;
   difference of two snapshots.  Computing it here costs uAgent nothing. }
 function SdkSnapshotUsage(A: TAgent): TSdkUsage;
 
-{ Runs the whole SDK session and returns the process exit code (0/1/2). }
+{ A TSdkOptions with every field at its default.  A locally declared record
+  only has its string fields initialised by the compiler - its Booleans and
+  Integers keep whatever was on the stack - so a caller that sets the fields
+  it knows about silently inherits garbage in the ones added after it was
+  written.  A garbage Boolean deciding whether to load a session would be
+  machine-dependent and not a compile error, so every construction goes
+  through here. }
+function SdkDefaultOptions: TSdkOptions;
+
+{ Loads Path into A if there is anything to load.  An empty path and a file
+  that is not there yet are both a fresh start, because the first call in a
+  subprocess-per-turn loop has no file: Msgs comes back 0 and the run goes on.
+  A file that IS there and cannot be read is a refusal, not a fresh start - a
+  script that asked to continue a conversation and quietly got a blank one
+  does work on absent context and then overwrites the evidence.  Err is
+  LoadSession's own reason, unaltered. }
+function SdkResumeInto(A: TAgent; const Path: string;
+  out Msgs: Integer; out Err: string): Boolean;
+
+{ Runs the whole SDK session and returns the process exit code.  0 is a clean
+  run, 1 means some turn failed or a save did not happen, and 2 means the run
+  never started: the named session file exists and could not be resumed. }
 function SdkRun(A: TAgent; const Opts: TSdkOptions;
   const FirstPrompt: string; out Err: string): Integer;
 
@@ -567,6 +601,15 @@ begin
       Arr.Push(Ent);
     end;
     Root.Add('skills', Arr);
+
+    { All three unconditional, by the same rule as mcp_servers above: a driver
+      that branches on a missing key gets it wrong on the run where nothing
+      was resumed, which is most of them.  resumed is the outcome SdkRun
+      found, not what the caller asked for, so a --resume against a file that
+      was not there yet reports false rather than a hopeful true. }
+    Root.AddBool('resumed', Opts.Resumed);
+    Root.AddNum('resumed_messages', Opts.ResumedMessages);
+    Root.AddStr('session_file', Safe(Opts.SessionFile));
   except
     Root.Free;
     raise;
@@ -775,6 +818,41 @@ var
     that uTools' own globals already impose. }
   RunOpts: TSdkOptions;
   PermSeq: Integer = 0;
+  { Set by OneTurn when a save failed, read by SdkRun for the exit code.  It
+    is not the turn's own result: the answer is in the result line either way,
+    and telling a driver its work was lost when the text is right there would
+    be a worse lie than the silence it replaces. }
+  SaveFailed: Boolean = False;
+
+function SdkDefaultOptions: TSdkOptions;
+begin
+  Result.Format := sfText;
+  Result.StreamInput := False;
+  Result.SessionId := '';
+  Result.PermissionMode := '';
+  Result.AskViaDriver := False;
+  Result.SessionFile := '';
+  Result.Resume := False;
+  Result.Resumed := False;
+  Result.ResumedMessages := 0;
+end;
+
+function SdkResumeInto(A: TAgent; const Path: string;
+  out Msgs: Integer; out Err: string): Boolean;
+begin
+  Msgs := 0;
+  Err := '';
+  Result := True;
+  if (A = nil) or (Path = '') then Exit;
+  { Absence is not corruption.  The first iteration of a subprocess-per-turn
+    loop has no file, and requiring the driver to omit --resume on turn one
+    would be a special case in every script that uses this.  Asked with
+    FileExists rather than by sniffing LoadSession's reason string, because a
+    reason is prose and prose gets reworded. }
+  if not FileExists(Path) then Exit;
+  Result := A.LoadSession(Path, Err);
+  if Result then Msgs := A.MessageCount;
+end;
 
 procedure HookText(const S: string);
 begin
@@ -902,7 +980,7 @@ function OneTurn(A: TAgent; const Prompt: string): Boolean;
 var
   Before, After, Delta: TSdkUsage;
   T0: QWord;
-  Err, Subtype: string;
+  Err, Subtype, SaveErr: string;
 begin
   Before := SdkSnapshotUsage(A);
   T0 := GetTickCount64;
@@ -917,6 +995,20 @@ begin
   if not Result then Subtype := 'error'
   else if A.TurnWasCancelled then Subtype := 'cancelled'
   else Subtype := 'success';
+
+  { Before the result line, and that ordering is the contract: the result line
+    is the driver's signal that the transcript is on disk, so a
+    subprocess-per-turn agent may spawn the next process the moment it reads
+    one.  Saved whatever the subtype, matching the REPL's unconditional save -
+    Send has already trimmed an unanswered question and dropped unanswered
+    tool calls, so even a failed turn leaves a legal transcript. }
+  if RunOpts.SessionFile <> '' then
+    if not A.SaveSession(RunOpts.SessionFile, SaveErr) then
+    begin
+      SdkEmit(SdkErrorLine('session not saved: ' + SaveErr));
+      SaveFailed := True;
+    end;
+
   SdkEmit(SdkResultLine(Subtype, Err, A.LastAssistantText,
     Int64(GetTickCount64 - T0), A.TurnCount, Delta, After));
 end;
@@ -927,12 +1019,14 @@ var
   Line, MsgType, Text: string;
   Doc: TJson;
   AnyFail: Boolean;
-  Imgs: Integer;
+  Imgs, Msgs: Integer;
+  Zero: TSdkUsage;
 begin
   Err := '';
   RunOpts := Opts;
   PermSeq := 0;
   AnyFail := False;
+  SaveFailed := False;
 
   { The console hooks are replaced wholesale, nils included: uTerm is never
     reached in this mode, and a leftover renderer writing prose between two
@@ -963,9 +1057,38 @@ begin
   else
     A.Ask := nil;
 
+  { The load happens before the init line so that line describes the session
+    that is actually starting rather than the one that was asked for. }
+  RunOpts.Resumed := False;
+  RunOpts.ResumedMessages := 0;
+  if RunOpts.Resume then
+    if not SdkResumeInto(A, RunOpts.SessionFile, Msgs, Err) then
+    begin
+      { Not "start fresh".  A script that asked to continue a conversation and
+        silently got a blank one does work on absent context, and the next
+        save would overwrite the file it could not read.  The frame is kept
+        whole in each format: stream-json opens with system and ends with
+        result, json emits exactly the one line it always emits. }
+      FillChar(Zero, SizeOf(Zero), 0);
+      if Opts.Format = sfStreamJson then
+      begin
+        SdkEmit(SdkInitLine(RunOpts, A.Model));
+        SdkEmit(SdkErrorLine('cannot resume ' + RunOpts.SessionFile +
+          ': ' + Err));
+      end;
+      SdkEmit(SdkResultLine('error', Err, '', 0, A.TurnCount, Zero,
+        SdkSnapshotUsage(A)));
+      Exit(2);
+    end
+    else
+    begin
+      RunOpts.Resumed := Msgs > 0;
+      RunOpts.ResumedMessages := Msgs;
+    end;
+
   { Once, for the whole run.  A driver reads this line to learn what this
     build can do before it sends anything. }
-  if Opts.Format = sfStreamJson then SdkEmit(SdkInitLine(Opts, A.Model));
+  if Opts.Format = sfStreamJson then SdkEmit(SdkInitLine(RunOpts, A.Model));
 
   if Trim(FirstPrompt) <> '' then
     if not OneTurn(A, FirstPrompt) then AnyFail := True;
@@ -1018,7 +1141,7 @@ begin
       end;
     end;
 
-  if AnyFail then Result := 1 else Result := 0;
+  if AnyFail or SaveFailed then Result := 1 else Result := 0;
 end;
 
 { ------------------------------------------------------------------ facade -- }

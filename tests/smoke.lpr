@@ -3370,6 +3370,7 @@ var
   Names: TStringArray;
   Same: Boolean;
 begin
+  Opts := uSdk.SdkDefaultOptions;
   Opts.Format := uSdk.sfStreamJson;
   Opts.StreamInput := False;
   Opts.SessionId := uSdk.SdkNewSessionId;
@@ -3425,9 +3426,76 @@ begin
       'mcp_servers is always an array, never absent or null');
     Check((Doc.Find('skills') <> nil) and (Doc.Find('skills').Kind = jkArr),
       'and so is skills');
+
+    { Present on a fresh run, not only on a resumed one - checked with Find
+      rather than by value, because a driver that branches on a missing key
+      is wrong on every run that resumed nothing, which is most of them. }
+    Check((Doc.Find('resumed') <> nil) and (Doc.Find('resumed').Kind = jkBool),
+      'resumed is always a boolean, never absent');
+    Check((Doc.Find('resumed') <> nil) and not Doc.Find('resumed').AsBoolean,
+      'and is false on a fresh run');
+    Check((Doc.Find('resumed_messages') <> nil) and
+          (Doc.Find('resumed_messages').Kind = jkNum),
+      'resumed_messages is always a number');
+    Check(Round(Doc.Num('resumed_messages', -1)) = 0, 'and is 0 when fresh');
+    Check(Doc.Find('session_file') <> nil,
+      'session_file is present even when nothing is persisted');
+    Check(Doc.Str('session_file') = '', 'and is empty then');
   finally
     Doc.Free;
   end;
+
+  { The outcome is what SdkRun found, so the encoder has to report whatever it
+    is handed rather than deriving it from Resume. }
+  Opts.Resumed := True;
+  Opts.ResumedMessages := 7;
+  Opts.SessionFile := 'C:\x\s.json';
+  Doc := JsonParse(uSdk.SdkInitLine(Opts, 'some-model'));
+  if Doc = nil then Exit;
+  try
+    Check((Doc.Find('resumed') <> nil) and Doc.Find('resumed').AsBoolean,
+      'a resumed run says so on the init line');
+    Check(Round(Doc.Num('resumed_messages', -1)) = 7,
+      'with the message count it restored');
+    Check(Doc.Str('session_file') = 'C:\x\s.json',
+      'and the file it came from');
+  finally
+    Doc.Free;
+  end;
+end;
+
+{ Fills a kilobyte of stack with a value no field's default resembles, so the
+  next frame - the one holding a local TSdkOptions - is standing on rubbish.
+  FPC initialises only a record's managed fields, so without SdkDefaultOptions
+  a Boolean added to that record decides whether a session is loaded from
+  whatever happened to be there. }
+procedure DirtyStack;
+var
+  Junk: array[0..1023] of Byte;
+  I: Integer;
+  Sum: Integer;
+begin
+  for I := 0 to High(Junk) do Junk[I] := $CC;
+  Sum := 0;
+  for I := 0 to High(Junk) do Inc(Sum, Junk[I]);
+  if Sum = -1 then WriteLn('unreachable');
+end;
+
+procedure TestSdkDefaultOptionsZeroes;
+var
+  Opts: uSdk.TSdkOptions;
+begin
+  DirtyStack;
+  Opts := uSdk.SdkDefaultOptions;
+  Check(Opts.Format = uSdk.sfText, 'the default output format is text');
+  Check(not Opts.StreamInput, 'with no driver on stdin');
+  Check(not Opts.AskViaDriver, 'and nobody to ask');
+  Check(not Opts.Resume, 'nothing is resumed by default');
+  Check(not Opts.Resumed, 'and nothing was');
+  Check(Opts.ResumedMessages = 0, 'no messages came back');
+  Check(Opts.SessionFile = '', 'no session file is named');
+  Check(Opts.SessionId = '', 'no session id');
+  Check(Opts.PermissionMode = '', 'and no mode name, which means "ask uTools"');
 end;
 
 var
@@ -3475,6 +3543,7 @@ begin
   TestHookDispatch;
   TestHookPermission;
   TestSdkInitInventory;
+  TestSdkDefaultOptionsZeroes;
   Schema := ToolsSchema;
   try
     Check(Pos('"input_schema"', Schema.ToJson) > 0, 'the schema serialises');

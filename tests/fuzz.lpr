@@ -2901,6 +2901,69 @@ begin
   uTools.ClearWorkingDirs;
 end;
 
+{ Every one of ValidTranscript's rules, put to the resume path as a file on
+  disk.  The point is not to re-test the validator - ux does that - but to
+  prove the resume path goes THROUGH it and replaces nothing when it refuses.
+  The last case is the contract images depend on: an unknown block type is
+  accepted and round-trips, so nobody may add a type whitelist here. }
+procedure TestSdkResumePathHostile;
+const
+  { Each is one rule, named by what it violates. }
+  Cases: array[0..8] of string = (
+    '{"version":1,"messages":{}}',
+    '{"version":1,"messages":[{"role":"assistant","content":[{"type":"text","text":"a"}]}]}',
+    '{"version":1,"messages":[{"role":"wizard","content":[{"type":"text","text":"a"}]}]}',
+    '{"version":1,"messages":[{"role":"user"}]}',
+    '{"version":1,"messages":[{"role":"user","content":"a string"}]}',
+    '{"version":1,"messages":[{"role":"user","content":[]}]}',
+    '{"version":1,"messages":[{"role":"user","content":["not an object"]}]}',
+    '{"version":1,"messages":[{"role":"user","content":[{"text":"no type"}]}]}',
+    '{"version":1,"messages":[{"role":"user","content":[{"type":"tool_use",' +
+      '"id":"t1","name":"read_file","input":{}}]}]}'
+  );
+var
+  A: TAgent;
+  P, Err, Before, T: string;
+  I, N: Integer;
+begin
+  uTools.RootDir := SessionDir;
+  P := IncludeTrailingPathDelimiter(SessionDir) + 'hostile-session.json';
+
+  A := TAgent.Create('k', 'm', 'sys');
+  try
+    A.AppendUserText('the live conversation');
+    Before := A.Transcript;
+    for I := 0 to High(Cases) do
+    begin
+      WriteFileText(P, Cases[I]);
+      N := -1;
+      Err := '';
+      Check(not uSdk.SdkResumeInto(A, P, N, Err),
+        Format('hostile transcript %d is refused', [I]));
+      Check(Err <> '', Format('  with a reason (%d): %s', [I, Err]));
+      Check(A.Transcript = Before,
+        Format('  and the live transcript is untouched (%d)', [I]));
+    end;
+
+    { A block type this build has never heard of.  It is an object with a
+      non-empty type, which is the whole rule, so it loads - and that is
+      deliberate: the alternative makes every already-saved image session
+      unloadable the day a type whitelist is added. }
+    WriteFileText(P, '{"version":1,"messages":[{"role":"user","content":[' +
+      '{"type":"image","source":{"type":"base64","media_type":"image/png",' +
+      '"data":"AAAA"}},{"type":"text","text":"look at this"}]}]}');
+    N := -1;
+    Err := '';
+    Check(uSdk.SdkResumeInto(A, P, N, Err),
+      'a session carrying an unknown block type still resumes: ' + Err);
+    Check(N = 1, 'restoring its one message');
+    T := A.Transcript;
+    Check(Pos('look at this', T) > 0, 'with the text block intact');
+  finally
+    A.Free;
+  end;
+end;
+
 procedure TestSdkEncoderHardening;
 var
   Line, Content, Decoded: string;
@@ -3540,6 +3603,7 @@ begin
   TestMcpSchemaTrust;
   TestMcpHostileServer;
   TestSdkEncoderHardening;
+  TestSdkResumePathHostile;
   TestAddedRootBoundary;
   TestRelativeMeansPrimary;
   TestAddedRootStateDirRefused;

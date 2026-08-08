@@ -1845,8 +1845,12 @@ begin
     FTurns := Round(Root.Num('turns', 0));
     FTotalIn := Round(Root.Num('tokens_in', 0));
     FTotalOut := Round(Root.Num('tokens_out', 0));
-    { The model is restored only when the caller did not pick one, so an
-      explicit ANTHROPIC_MODEL still wins over whatever was saved. }
+    { The saved model wins whenever it is not blank, including over an
+      explicit ANTHROPIC_MODEL.  The comment here used to claim the opposite;
+      the code has always done this, and telling the truth is the cheaper fix -
+      distinguishing "the caller picked one" from "the caller took the
+      default" needs a flag threaded through TAgent.Create, and changing the
+      behaviour would change interactive /resume with it. }
     if Root.Str('model') <> '' then FModel := Root.Str('model');
     Result := True;
   finally

@@ -2719,8 +2719,19 @@ var
   DriverLines: array of string;
   DriverAt: Integer = 0;
 
+var
+  { Set by a resume test to the session file it is watching.  The save has to
+    happen BEFORE the result line - that ordering is the contract a
+    subprocess-per-turn driver relies on to spawn the next process the moment
+    it reads one - and the only honest way to assert it is to stat the file at
+    the instant the result line is emitted. }
+  WatchPath: string = '';
+  FileAtResult: Boolean = False;
+
 procedure CollectLine(const S: string);
 begin
+  if (WatchPath <> '') and (Pos('"type":"result"', S) > 0) then
+    FileAtResult := FileExists(WatchPath);
   SetLength(SdkLines, Length(SdkLines) + 1);
   SdkLines[High(SdkLines)] := S;
 end;
@@ -2832,6 +2843,9 @@ end;
 
 function SdkOptions(F: TSdkFormat; Stream: Boolean): TSdkOptions;
 begin
+  { From the zeroing constructor, so a field added to TSdkOptions later cannot
+    reach SdkRun as stack garbage through this helper. }
+  Result := uSdk.SdkDefaultOptions;
   Result.Format := F;
   Result.StreamInput := Stream;
   Result.SessionId := 'sess-test';
@@ -3253,6 +3267,238 @@ begin
   end;
 end;
 
+{ The use case the feature exists for, both halves: turn one writes a file
+  that was not there, turn two - a different process, so a different agent -
+  continues it. }
+procedure TestSdkResumeRoundTrip;
+var
+  A: TAgent;
+  Err, P, T: string;
+  Code, FirstCount: Integer;
+  Opts: TSdkOptions;
+  Doc: TJson;
+begin
+  ResetScript;
+  ResetSdk;
+  uTools.RootDir := SessionDir;
+  P := IncludeTrailingPathDelimiter(SessionDir) + 'resume-roundtrip.json';
+  if FileExists(P) then DeleteFile(P);
+
+  SetLength(Replies, 1);
+  Replies[0] := TextReply('first answer');
+  Opts := SdkOptions(sfStreamJson, False);
+  Opts.SessionFile := P;
+  Opts.Resume := True;
+
+  WatchPath := P;
+  FileAtResult := False;
+  uSdk.SdkSink := @CollectLine;
+  A := MakeAgent;
+  FirstCount := 0;
+  try
+    Code := uSdk.SdkRun(A, Opts, 'first question', Err);
+    Check(Code = 0, 'a run whose session file does not exist yet starts clean');
+    Doc := JsonParse(SdkNthOf('system', 0));
+    try
+      Check(not Doc.Find('resumed').AsBoolean,
+        'and reports that it resumed nothing');
+      Check(Round(Doc.Num('resumed_messages', -1)) = 0, 'with no messages');
+      Check(Doc.Str('session_file') = P, 'naming the file it will write');
+    finally
+      Doc.Free;
+    end;
+    Check(FileExists(P), 'the turn wrote the session file');
+    { The ordering contract: a driver may spawn the next process the moment it
+      reads the result line, so the file has to be there by then. }
+    Check(FileAtResult,
+      'and it was already on disk when the result line was emitted');
+    FirstCount := A.MessageCount;
+  finally
+    A.Free;
+    WatchPath := '';
+    uSdk.SdkSink := nil;
+  end;
+
+  { A second process: a brand new agent, told to resume the same path. }
+  ResetScript;
+  ResetSdk;
+  SetLength(Replies, 1);
+  Replies[0] := TextReply('second answer');
+  uSdk.SdkSink := @CollectLine;
+  A := MakeAgent;
+  try
+    Code := uSdk.SdkRun(A, Opts, 'second question', Err);
+    Check(Code = 0, 'the continuation run also exits 0');
+    Doc := JsonParse(SdkNthOf('system', 0));
+    try
+      Check(Doc.Find('resumed').AsBoolean, 'and this one says it resumed');
+      Check(Round(Doc.Num('resumed_messages', -1)) = FirstCount,
+        Format('restoring the first run''s message count (%d/%d)',
+          [Round(Doc.Num('resumed_messages', -1)), FirstCount]));
+    finally
+      Doc.Free;
+    end;
+    T := A.Transcript;
+    Check(Pos('first question', T) > 0,
+      'the continued transcript opens with the first run''s question');
+    Check(Pos('second question', T) > Pos('first question', T),
+      'and the new turn comes after it');
+    { The proof it reached the model rather than merely the transcript. }
+    Check(Pos('first question', Requests[0]) > 0,
+      'and the restored history was in the request that was sent');
+  finally
+    A.Free;
+    uSdk.SdkSink := nil;
+  end;
+end;
+
+{ A file that is there and cannot be read stops the run before any turn, in
+  both protocol formats, without overwriting what it could not understand. }
+procedure TestSdkResumeRefusesCorrupt;
+var
+  A: TAgent;
+  Err, P, Original, After_: string;
+  Code: Integer;
+  Opts: TSdkOptions;
+  Doc: TJson;
+  L: TStringList;
+begin
+  ResetScript;
+  ResetSdk;
+  uTools.RootDir := SessionDir;
+  P := IncludeTrailingPathDelimiter(SessionDir) + 'resume-corrupt.json';
+  { A transcript that does not open with a user message: one of
+    ValidTranscript's rules, refused by the load path unchanged. }
+  Original := '{"version":1,"messages":[{"role":"assistant","content":' +
+    '[{"type":"text","text":"x"}]}]}';
+  L := TStringList.Create;
+  try
+    L.Text := Original;
+    L.SaveToFile(P);
+  finally
+    L.Free;
+  end;
+
+  SetLength(Replies, 1);
+  Replies[0] := TextReply('should never be asked for');
+  Opts := SdkOptions(sfStreamJson, False);
+  Opts.SessionFile := P;
+  Opts.Resume := True;
+
+  uSdk.SdkSink := @CollectLine;
+  A := MakeAgent;
+  try
+    Code := uSdk.SdkRun(A, Opts, 'a question', Err);
+    Check(Code = 2, Format('a corrupt resume exits 2, not 1 (%d)', [Code]));
+    Check(SdkTypes = 'system;error;result;',
+      'the frame is still whole: system, then the reason, then result: ' +
+      SdkTypes);
+    Doc := JsonParse(SdkNthOf('error', 0));
+    try
+      Check(Pos(P, Doc.Str('error')) > 0, 'the error line names the file');
+      Check(Pos('user', Doc.Str('error')) > 0,
+        'and carries ValidTranscript''s own reason: ' + Doc.Str('error'));
+    finally
+      Doc.Free;
+    end;
+    Doc := JsonParse(SdkNthOf('result', 0));
+    try
+      Check(Doc.Str('subtype') = 'error', 'the result says error');
+    finally
+      Doc.Free;
+    end;
+    Check(CallCount = 0, 'and no turn was run at all');
+  finally
+    A.Free;
+    uSdk.SdkSink := nil;
+  end;
+
+  { The refused file is still the file.  A run that started fresh would have
+    saved over the evidence on its way out. }
+  L := TStringList.Create;
+  try
+    L.LoadFromFile(P);
+    After_ := Trim(L.Text);
+  finally
+    L.Free;
+  end;
+  Check(After_ = Original,
+    'the unreadable file was not overwritten by a fresh save');
+
+  { json, where the one-line invariant has to survive the refusal. }
+  ResetScript;
+  ResetSdk;
+  SetLength(Replies, 1);
+  Replies[0] := TextReply('should never be asked for');
+  Opts := SdkOptions(sfJson, False);
+  Opts.SessionFile := P;
+  Opts.Resume := True;
+  uSdk.SdkSink := @CollectLine;
+  A := MakeAgent;
+  try
+    Code := uSdk.SdkRun(A, Opts, 'a question', Err);
+    Check(Code = 2, 'json refuses with 2 as well');
+    Check(Length(SdkLines) = 1,
+      Format('emitting exactly one line (%d)', [Length(SdkLines)]));
+    Check(SdkTypes = 'result;', 'and it is the result line: ' + SdkTypes);
+  finally
+    A.Free;
+    uSdk.SdkSink := nil;
+  end;
+end;
+
+{ A save that cannot happen is reported and fails the run, but the turn's own
+  result still says what the turn did. }
+procedure TestSdkSaveFailureReported;
+var
+  A: TAgent;
+  Err, P: string;
+  Code: Integer;
+  Opts: TSdkOptions;
+  Doc: TJson;
+begin
+  ResetScript;
+  ResetSdk;
+  uTools.RootDir := SessionDir;
+  { An existing directory: SaveSession's stream cannot be created on it. }
+  P := IncludeTrailingPathDelimiter(SessionDir) + 'a-directory-not-a-file';
+  ForceDirectories(P);
+
+  SetLength(Replies, 1);
+  Replies[0] := TextReply('the answer survives');
+  Opts := SdkOptions(sfStreamJson, False);
+  Opts.SessionFile := P;
+
+  uSdk.SdkSink := @CollectLine;
+  A := MakeAgent;
+  try
+    Code := uSdk.SdkRun(A, Opts, 'a question', Err);
+    Check(Code = 1, Format('a failed save fails the run (%d)', [Code]));
+    Check(SdkCountOf('error') = 1, 'with one error line');
+    Doc := JsonParse(SdkNthOf('error', 0));
+    try
+      Check(Pos('session not saved', Doc.Str('error')) > 0,
+        'saying the save is what failed: ' + Doc.Str('error'));
+    finally
+      Doc.Free;
+    end;
+    Doc := JsonParse(SdkNthOf('result', 0));
+    try
+      { Not 'error'.  The turn succeeded and the answer is right there; saying
+        otherwise would tell a driver its work was lost when it was not. }
+      Check(Doc.Str('subtype') = 'success',
+        'while the turn itself still reports success: ' + Doc.Str('subtype'));
+      Check(Pos('the answer survives', Doc.Str('result')) > 0,
+        'with the model''s answer intact');
+    finally
+      Doc.Free;
+    end;
+  finally
+    A.Free;
+    uSdk.SdkSink := nil;
+  end;
+end;
+
 begin
   { Every request in this suite goes to the stand-in rather than the network. }
   SetEnvironmentVariable('USERPROFILE',
@@ -3308,6 +3554,9 @@ begin
   TestSdkPermissionDelegation;
   TestSdkJsonSingleLine;
   TestSdkDriverInputHostile;
+  TestSdkResumeRoundTrip;
+  TestSdkResumeRefusesCorrupt;
+  TestSdkSaveFailureReported;
 
   WriteLn;
   if Fails = 0 then

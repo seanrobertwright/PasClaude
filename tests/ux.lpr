@@ -517,6 +517,96 @@ end;
   straight to the API.  That makes it the one input here that is both
   persistent and structurally load-bearing: a stale or hand-edited file must be
   refused rather than turned into requests that fail forever after. }
+{ The whole resume policy, driven directly so no network is involved.  Two
+  rules carry the feature and both are asserted here: a file that is not there
+  yet is a fresh start, because the first iteration of a subprocess-per-turn
+  loop has none, and a file that IS there and cannot be read stops the run,
+  because a script that asked to continue and quietly got a blank session does
+  work on absent context and then overwrites the evidence. }
+procedure TestSdkResumePolicy;
+var
+  A: TAgent;
+  Blocks: TPartialBlocks;
+  Err, Dir, Good, Bad, Newer, Missing: string;
+  N: Integer;
+  Ran: Boolean;
+begin
+  WriteLn('-- sdk resume --');
+  Dir := IncludeTrailingPathDelimiter(TmpRoot) + 'sdkresume';
+  ForceDirectories(Dir);
+  Good := IncludeTrailingPathDelimiter(Dir) + 'good.json';
+  Bad := IncludeTrailingPathDelimiter(Dir) + 'bad.json';
+  Newer := IncludeTrailingPathDelimiter(Dir) + 'newer.json';
+  Missing := IncludeTrailingPathDelimiter(Dir) + 'not-here.json';
+  if FileExists(Missing) then DeleteFile(Missing);
+
+  A := TAgent.Create('k', 'm', 'sys');
+  try
+    A.AppendUserText('the saved question');
+    SetLength(Blocks, 1);
+    Blocks[0].Kind := bkText;
+    Blocks[0].Text := 'the saved answer';
+    Blocks[0].Id := '';
+    Blocks[0].Name := '';
+    Blocks[0].Signature := '';
+    A.ApplyBlocks(Blocks, Ran);
+    Check(A.SaveSession(Good, Err), 'a session to resume from is written');
+  finally
+    A.Free;
+  end;
+
+  WriteFileText(Bad, '{not json');
+  WriteFileText(Newer,
+    '{"version":99,"messages":[{"role":"user","content":' +
+    '[{"type":"text","text":"hi"}]}]}');
+
+  A := TAgent.Create('k', 'm', 'sys');
+  try
+    N := -1;
+    Check(uSdk.SdkResumeInto(A, '', N, Err), 'an empty path is not a refusal');
+    Check(N = 0, 'and restores nothing');
+    Check(A.MessageCount = 0, 'leaving the transcript empty');
+
+    N := -1;
+    Check(uSdk.SdkResumeInto(A, Missing, N, Err),
+      'a file that is not there yet is a fresh start, not a failure');
+    Check(N = 0, 'with no messages restored');
+    Check(A.MessageCount = 0, 'and an untouched transcript');
+
+    N := -1;
+    Check(uSdk.SdkResumeInto(A, Good, N, Err),
+      'a good session file resumes: ' + Err);
+    Check(N = 2, Format('reporting the message count it restored (%d)', [N]));
+    Check(N = A.MessageCount, 'which is the agent''s own count');
+    Check(Pos('the saved question', A.Transcript) > 0,
+      'and the conversation came back');
+  finally
+    A.Free;
+  end;
+
+  { The refusals, each against an agent that already has a conversation, so a
+    load that replaced FMessages before finishing validation is visible. }
+  A := TAgent.Create('k', 'm', 'sys');
+  try
+    A.AppendUserText('the live question');
+    N := -1;
+    Check(not uSdk.SdkResumeInto(A, Bad, N, Err),
+      'a file that is not JSON is refused, not started fresh');
+    Check(Err <> '', 'with a reason');
+    Check(Pos('the live question', A.Transcript) > 0,
+      'and the live conversation is untouched');
+
+    Err := '';
+    Check(not uSdk.SdkResumeInto(A, Newer, N, Err),
+      'a session from a newer build is refused');
+    Check(Pos('version', Err) > 0, 'saying so: ' + Err);
+    Check(Pos('the live question', A.Transcript) > 0,
+      'and that conversation is untouched too');
+  finally
+    A.Free;
+  end;
+end;
+
 procedure TestSession;
 var
   A: TAgent;
@@ -3601,6 +3691,7 @@ begin
     TestPreview;
     TestCompact;
     TestSession;
+    TestSdkResumePolicy;
     TestDeniedPathIsInvisible;
     TestDenyRoundTrip;
     TestStateDirIsHidden;

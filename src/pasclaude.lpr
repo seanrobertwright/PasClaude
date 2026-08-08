@@ -2306,6 +2306,12 @@ var
   HookCallRec: THookCall;
   SdkOpts: uSdk.TSdkOptions;
   SdkCode: Integer;
+  { The transcript a -p run continues and saves to, as typed and then as
+    resolved.  Empty means the flag was not given, which is what -p has always
+    meant: nothing is written at all. }
+  SessionFileArg: string = '';
+  SessionFileFull: string = '';
+  ResumeMsgs: Integer = 0;
   SkipNext: Boolean = False;
   { The mode asked for on the command line, held rather than applied: it has
     to beat a grant loaded from the approvals file, and that file is read much
@@ -2486,6 +2492,13 @@ begin
             'text, json or stream-json', 2);
         SkipNext := True;
       end
+      else if Arg = '--session-file' then
+      begin
+        if ArgI >= ParamCount then
+          FailStart('--session-file needs a path', '', 2);
+        SessionFileArg := ParamStr(ArgI + 1);
+        SkipNext := True;
+      end
       else if Arg = '--input-format' then
       begin
         if ArgI >= ParamCount then
@@ -2503,6 +2516,7 @@ begin
       begin
         EmitCLn(clBright, 'pasclaude [directory] [--resume] [--web] [--add-dir <dir>] [-p "prompt"]');
         EmitCLn(clGrey, '  --resume  continue the conversation saved in that directory');
+        EmitCLn(clGrey, '            (under -p it needs --session-file, below)');
         EmitCLn(clGrey, '  --web     let the model search the web (off by default)');
         EmitCLn(clGrey, '  -p        answer one prompt and exit (reads stdin when piped)');
         EmitCLn(clGrey, '            (-p never loads hooks: nobody is there to approve them)');
@@ -2546,6 +2560,23 @@ begin
         EmitCLn(clGrey, '            grants nothing and cannot change what you are asked to');
         EmitCLn(clGrey, '            approve.  Interactively the name is remembered; under -p');
         EmitCLn(clGrey, '            nothing is remembered and this flag is the only way in.');
+        EmitCLn(clGrey, '  --session-file <path>   (needs -p)');
+        EmitCLn(clGrey, '            names the transcript a -p run saves to after every turn,');
+        EmitCLn(clGrey, '            and with --resume the one it continues.  Without it -p');
+        EmitCLn(clGrey, '            saves nothing at all, as it always has: a throwaway');
+        EmitCLn(clGrey, '            question does not disturb the directory''s conversation.');
+        EmitCLn(clGrey, '            The path must be inside the session root or an --add-dir');
+        EmitCLn(clGrey, '            root.  A file that is not there yet is a fresh start; one');
+        EmitCLn(clGrey, '            that is there and unreadable, or written by a newer build,');
+        EmitCLn(clGrey, '            stops the run with exit 2 rather than starting blank -');
+        EmitCLn(clGrey, '            interactive --resume warns and carries on instead, because');
+        EmitCLn(clGrey, '            somebody is there to read the warning.  A resumed session');
+        EmitCLn(clGrey, '            restores messages, model and counters and NOTHING else: no');
+        EmitCLn(clGrey, '            mode, no approvals, no roots, so it can never come back');
+        EmitCLn(clGrey, '            more permissive than a fresh one.  Nothing is compacted on');
+        EmitCLn(clGrey, '            this path, so a session that outgrows the context window is');
+        EmitCLn(clGrey, '            answered with a new file.  Two processes sharing one file');
+        EmitCLn(clGrey, '            race: each write is atomic, but the loser''s turn is lost.');
         EmitCLn(clGrey, '  --output-format text|json|stream-json   (needs -p)');
         EmitCLn(clGrey, '  --input-format  text|stream-json        (needs -p and stream-json out)');
         EmitCLn(clGrey, '            json/stream-json put one JSON object per line on stdout,');
@@ -2573,7 +2604,21 @@ begin
         FailStart('--output-format needs -p', '', 2);
       if StreamInput then
         FailStart('--input-format needs -p', '', 2);
+      { Interactive already has /resume and the session picker.  A second way
+        to name the same file is a second thing to keep consistent with the
+        first, so it is refused rather than quietly honoured. }
+      if SessionFileArg <> '' then
+        FailStart('--session-file needs -p',
+          'interactive sessions use /resume and the session picker', 2);
     end;
+    { The load-bearing refusal.  Defaulting to SessionPath(RootDir) here is
+      exactly what -p has always declined to do: a scripted run must name the
+      conversation it continues, and the directory's saved session is left
+      alone unless somebody types its path. }
+    if Resume and PrintMode and (SessionFileArg = '') then
+      FailStart('--resume under -p needs --session-file <path>',
+        'a scripted run must name the conversation it continues; the ' +
+        'directory''s saved session is left alone', 2);
     if StreamInput and (OutFormat <> uSdk.sfStreamJson) then
       FailStart('--input-format stream-json needs --output-format stream-json',
         'a driver that sends messages has to be able to read the answers', 2);
@@ -2617,6 +2662,13 @@ begin
         if not PrintMode then EmitCLn(clGrey, '  + ' + AddArg);
         if SaveErr <> '' then EmitCLn(clYellow, '  ' + SaveErr);
       end;
+    { Resolved with the same guard the tools use, and only now, because
+      --add-dir is what makes  --add-dir %TEMP% --session-file %TEMP%\s.json
+      legal.  One notion of where pasclaude may write, not two. }
+    if SessionFileArg <> '' then
+      if not uTools.ResolveInRoot(SessionFileArg, SessionFileFull, SaveErr) then
+        FailStart('--session-file must be inside the session root: ' + SaveErr,
+          'use --add-dir to work in another directory', 2);
     uTools.LoadIgnoreRules;
     { Deny rules load here, before the print-mode halt below, where the
       standing approvals deliberately do not: a rule can only ever narrow, so
@@ -2772,9 +2824,16 @@ begin
           arrives over it rather than on the command line. }
         if (OutFormat <> uSdk.sfText) and StreamInput then
         begin
+          { From the zeroing constructor, never field-by-field on the bare
+            local: FPC initialises only a record's managed fields, so every
+            Boolean added to TSdkOptions after this line was written would
+            otherwise start as whatever was on the stack. }
+          SdkOpts := uSdk.SdkDefaultOptions;
           SdkOpts.Format := OutFormat;
           SdkOpts.StreamInput := True;
           SdkOpts.SessionId := uSdk.SdkNewSessionId;
+          SdkOpts.SessionFile := SessionFileFull;
+          SdkOpts.Resume := Resume;
           { The reported name and the answering channel, decided separately.
             A driver is a permission answerer and nothing more, so it is armed
             only in the two modes where a question can arise: plan refuses
@@ -2813,9 +2872,12 @@ begin
 
         if OutFormat <> uSdk.sfText then
         begin
+          SdkOpts := uSdk.SdkDefaultOptions;
           SdkOpts.Format := OutFormat;
           SdkOpts.StreamInput := False;
           SdkOpts.SessionId := uSdk.SdkNewSessionId;
+          SdkOpts.SessionFile := SessionFileFull;
+          SdkOpts.Resume := Resume;
           { No driver, so nobody can be asked and SdkRun leaves Ask nil.  The
             reported name is still the truth about the session: a bypass run
             asks nobody because it needs nobody, which is a different fact
@@ -2831,10 +2893,31 @@ begin
           Halt(SdkCode);
         end;
 
+        { The same policy function the protocol paths use, reported in console
+          idiom because this path has a console.  BackupSession is deliberately
+          NOT called: the caller named the file, so the caller owns it. }
+        if Resume then
+          if not uSdk.SdkResumeInto(Agent, SessionFileFull, ResumeMsgs,
+               ResumeErr) then
+          begin
+            NeedNewLine;
+            EmitCLn(clRed, 'cannot resume ' + SessionFileFull + ': ' + ResumeErr);
+            TermDone;
+            Halt(2);
+          end;
+
         MdReset;
         if Agent.Send(PrintPrompt, Err) then
         begin
           MdFinish;
+          if SessionFileFull <> '' then
+            if not Agent.SaveSession(SessionFileFull, SaveErr) then
+            begin
+              NeedNewLine;
+              EmitCLn(clYellow, '  (session not saved: ' + SaveErr + ')');
+              TermDone;
+              Halt(1);
+            end;
           TermDone;
           Halt(0);
         end

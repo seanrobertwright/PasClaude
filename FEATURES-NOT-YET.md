@@ -372,9 +372,27 @@ text preserves what was missing at the time. Unchecked items remain open.
   bare. `--output-format json` prints one JSON object — the finished result —
   and `--output-format stream-json` prints one per line as the turn happens;
   `--input-format stream-json` lets a driver send further turns and answer
-  permission requests. Still missing: no mid-turn interrupt over the wire, no
-  `total_cost_usd` on the result line, and no `--resume` in SDK mode. See the
-  Agent SDK entry above.*
+  permission requests. `--session-file <path>` names a transcript a `-p` run
+  saves to after every turn — before the `result` line, so a driver may spawn
+  the next process the moment it reads one — and with `--resume` continues; it
+  is the whole opt-in, because without it `-p` still writes nothing at all and
+  the directory's own conversation is never touched. The path goes through the
+  same root guard the tools use, and the file is the ordinary session file, so
+  one written by a script loads in the REPL and back. A file that is not there
+  yet is a fresh start; one that is there and unreadable stops the run with
+  exit 2 rather than doing work on absent context and then overwriting the
+  evidence — interactive `--resume` warns and carries on instead, because
+  somebody is there to read the warning. The init line reports `resumed`,
+  `resumed_messages` and `session_file` on every run, present even when
+  nothing was resumed. A resumed session restores messages, model and counters
+  and nothing else: no mode, no approvals, no roots, so it can never come back
+  more permissive than a fresh one. Still missing: no mid-turn interrupt over
+  the wire and no `total_cost_usd` on the result line, both deliberate — the
+  first needs a thread this program does not have, the second a price table
+  that becomes a lie the first time a model is repriced. Nothing is compacted
+  on this path either, so a scripted session that outgrows the context window
+  is answered with a new file, and two processes sharing one file race with
+  last writer winning. See the Agent SDK entry above.*
 - [x] ~~**Image input** — cannot paste or attach screenshots/images.~~
   *Built: `@shot.png` in a prompt attaches the image instead of refusing it as
   a binary, and `/paste` takes one off the Windows clipboard (`/paste drop`
