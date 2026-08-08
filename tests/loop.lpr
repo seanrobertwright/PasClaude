@@ -1498,6 +1498,60 @@ begin
   end;
 end;
 
+{ Compaction is pasclaude asking a question of its own, and the user may have
+  an image queued for the question they were about to ask.  If the summarise
+  instruction went through the draining builder it would carry that image into
+  a request the user never sees, and the image would be gone: attached,
+  charged for, and never shown to the model in the context it was meant for.
+  Only a real round trip proves it, because the drain happens before the
+  request goes out and the transcript is replaced after it comes back. }
+procedure TestCompactWithSummaryKeepsPendingImages;
+var
+  A: TAgent;
+  Err: string;
+  Ok: Boolean;
+  Doc, Msgs, Content: TJson;
+begin
+  ResetScript;
+  uTools.RootDir := SessionDir;
+  SetLength(Replies, 3);
+  Replies[0] := TextReply('First answer.');
+  Replies[1] := TextReply('A summary of what we did.');
+  Replies[2] := TextReply('I can see it.');
+
+  A := MakeAgent;
+  try
+    A.Send('a first question', Err);
+    Check(A.AttachImage('image/png', 'cGVuZGluZw==', 12, 8, Err),
+      'an image is queued before compaction: ' + Err);
+
+    Ok := A.CompactWithSummary(Err);
+    Check(Ok, 'the summary still runs with an image pending: ' + Err);
+    Check(A.PendingImages = 1,
+      'and the pending image is NOT spent on the summarise request');
+    Check(Pos('cGVuZGluZw==', A.Transcript) = 0,
+      'nothing put it in the compacted transcript');
+
+    { And it is still there for the message it was meant for. }
+    Ok := A.Send('what is in this picture?', Err);
+    Check(Ok, 'the next turn sends: ' + Err);
+    Check(A.PendingImages = 0, 'which is what finally drains the queue');
+    Doc := JsonParse(Requests[High(Requests)]);
+    try
+      Msgs := Doc.Find('messages');
+      Content := Msgs.Item(Msgs.Count - 1).Find('content');
+      Check(Content.Item(0).Str('type') = 'image',
+        'the image rides the user question, ahead of the prose');
+      Check(Content.Item(0).Find('source').Str('data') = 'cGVuZGluZw==',
+        'with its data intact');
+    finally
+      Doc.Free;
+    end;
+  finally
+    A.Free;
+  end;
+end;
+
 { A summary request that fails must leave the conversation exactly as it
   was - this is the mutation a suite is most likely to miss, because every
   assertion about the failure itself still passes. }
@@ -3229,6 +3283,7 @@ begin
   TestRetryHonorsRetryAfter;
   TestRetryDefaultBackoffWithoutHeader;
   TestCompactWithSummary;
+  TestCompactWithSummaryKeepsPendingImages;
   TestCompactWithSummaryFailureRestores;
   TestCompactWithSummaryEmptyRestores;
   TestToolUseStreamingHooks;

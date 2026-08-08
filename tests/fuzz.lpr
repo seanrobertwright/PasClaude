@@ -8,8 +8,8 @@ program fuzz;
 
 {$mode objfpc}{$H+}
 
-uses SysUtils, Classes, Windows, uJson, uMcp, uHooks, uSandbox, uTools, uAgent,
-  uHttp, uSdk;
+uses SysUtils, Classes, Windows, uJson, uMcp, uHooks, uSandbox, uTools,
+  uImage, uAgent, uHttp, uSdk;
 
 var
   Fails: Integer = 0;
@@ -3383,7 +3383,130 @@ begin
   end;
 end;
 
+{ The DIB comes off the clipboard, which any process on the machine can write,
+  and the sniffers run over whatever bytes a mentioned file happens to hold.
+  Neither may raise, over-report a size, or hand back a buffer whose length
+  disagrees with the dimensions it claims - the caller sizes its loops from
+  those dimensions. }
+procedure TestImageDecodersHostile;
+var
+  Seed, I, J, K, W, H: Integer;
+  B, Rgb, Mutant: RawByteString;
+  Media, Err: string;
+  Ok: Boolean;
+  Valid: array[0..3] of RawByteString;
+
+  { A well-formed 40-byte BITMAPINFOHEADER with masks and pixels, as the
+    starting point for mutation - random bytes alone would almost never get
+    past the magic checks and would test nothing. }
+  function GoodDib: RawByteString;
+  begin
+    SetLength(Result, 40);
+    FillChar(Result[1], 40, 0);
+    Result[1] := Chr(40);
+    Result[5] := Chr(4);       { biWidth = 4 }
+    Result[9] := Chr(4);       { biHeight = 4, bottom-up }
+    Result[13] := Chr(1);
+    Result[15] := Chr(32);     { 32bpp }
+    Result[17] := Chr(3);      { BI_BITFIELDS }
+    Result := Result + StringOfChar(#0, 12) + StringOfChar(#170, 4 * 4 * 4);
+  end;
+
 begin
+  WriteLn('-- hostile image input --');
+
+  Valid[0] := #137'PNG'#13#10#26#10 + #0#0#0#13 + 'IHDR' + #0#0#1#0 +
+    #0#0#0#128 + #8#2#0#0#0;
+  Valid[1] := 'GIF89a' + #100#0 + #100#0 + #0#0#0;
+  Valid[2] := #255#216#255#224 + #0#16 + 'JFIF' + StringOfChar(#0, 10) +
+    #255#192 + #0#17 + #8 + #1#44 + #1#144 + #3#1#17#0#2#17#1#3#17#1;
+  Valid[3] := 'RIFF' + #0#0#0#0 + 'WEBP' + 'VP8 ' + #0#0#0#0 + #0#0#0 +
+    #157#1#42 + #50#0 + #50#0 + #0#0;
+
+  Ok := True;
+  Seed := 12345;
+  for I := 0 to 3 do
+    for J := 0 to 600 do
+    begin
+      B := Valid[I];
+      { Truncation at every length, then single-byte mutations: the two ways
+        a header stops describing the bytes behind it. }
+      if (J mod 3) = 0 then
+        B := Copy(B, 1, J mod (Length(B) + 1))
+      else
+      begin
+        Seed := (Seed * 1103515245 + 12345) and $7FFFFFFF;
+        if Length(B) > 0 then
+        begin
+          K := (Seed mod Length(B)) + 1;
+          B[K] := Chr((Seed shr 7) and $FF);
+        end;
+      end;
+      try
+        if uImage.SniffImage(B, Media, W, H) then
+        begin
+          if (W < 0) or (H < 0) or (W > uImage.MaxImageDim * 25) or
+             (H > uImage.MaxImageDim * 25) then Ok := False;
+          if (Media <> 'image/png') and (Media <> 'image/jpeg') and
+             (Media <> 'image/gif') and (Media <> 'image/webp') then Ok := False;
+        end;
+      except
+        Ok := False;
+      end;
+    end;
+  Check(Ok, 'SniffImage survives truncation and mutation of every format');
+
+  { VisualTokens is fed whatever SniffImage reported, so it takes the same
+    abuse. }
+  Ok := True;
+  try
+    for I := -4 to 40 do
+      if uImage.VisualTokens(I * 500, 700 - I * 13) > 4784 then Ok := False;
+  except
+    Ok := False;
+  end;
+  Check(Ok, 'VisualTokens never exceeds the cap and never raises');
+
+  Ok := True;
+  Seed := 999;
+  for J := 0 to 1500 do
+  begin
+    Mutant := GoodDib;
+    if (J mod 4) = 0 then
+      Mutant := Copy(Mutant, 1, J mod (Length(Mutant) + 1))
+    else
+      for K := 1 to 3 do
+      begin
+        Seed := (Seed * 1103515245 + 12345) and $7FFFFFFF;
+        if Length(Mutant) > 0 then
+          Mutant[(Seed mod Length(Mutant)) + 1] := Chr((Seed shr 9) and $FF);
+      end;
+    try
+      if uImage.DibToRgb(Mutant, Rgb, W, H, Err) then
+      begin
+        { The header is the attacker's; the buffer is the truth.  A claimed
+          40000x40000 must never drive an allocation, and the returned pixels
+          must match the dimensions the caller will loop over. }
+        if (W <= 0) or (H <= 0) or (W > uImage.MaxImageDim) or
+           (H > uImage.MaxImageDim) then Ok := False;
+        if Length(Rgb) <> W * H * 3 then Ok := False;
+      end
+      else if (W <> 0) or (H <> 0) or (Err = '') then
+        Ok := False;
+    except
+      Ok := False;
+    end;
+  end;
+  Check(Ok, 'DibToRgb refuses a header its buffer cannot back, and never ' +
+    'returns pixels that disagree with W*H*3');
+
+  Check(not uImage.DibToRgb('', Rgb, W, H, Err), 'an empty DIB is refused');
+  Check(not uImage.DibToRgb(StringOfChar(#255, 40), Rgb, W, H, Err),
+    'and a header of all-ones, which claims an enormous image, is refused');
+end;
+
+begin
+  TestImageDecodersHostile;
   TestBinaryFileDoesNotCorruptBody;
   TestNulByteIsEscaped;
   TestPathGuardEdgeCases;

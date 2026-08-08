@@ -17,9 +17,21 @@ unit uAgent;
 
 interface
 
-uses uJson, uTools;
+uses uJson, uTools, uImage;
 
 type
+  { An image waiting to go out with the next user message.  It is queued
+    rather than pushed straight into the transcript because the user's prose
+    and the image belong in one message - the API is explicit that an image
+    works best placed before the text it is asked about, and a message per
+    attachment would put them in the wrong order and the wrong turns. }
+  TImageAttach = record
+    Media: string;    { one of the four types the API accepts }
+    Data: string;     { base64, no line breaks }
+    W, H: Integer;    { 0 when the format was recognised but not measurable }
+  end;
+  TImageAttachArray = array of TImageAttach;
+
   { Rendering hooks, so this unit stays free of console code. }
   TTextProc = procedure(const S: string);
   TToolProc = procedure(const Name, Detail: string);
@@ -66,6 +78,9 @@ type
     FModel: string;
     FSystem: string;
     FMessages: TJson;              { the "messages" array, owned here }
+    { Images the user attached that no message has carried yet.  Drained by
+      AppendUserText, never by AppendUserTextOnly. }
+    FPendingImages: TImageAttachArray;
     FMaxTokens: Integer;
     FTotalIn, FTotalOut: Int64;
     FCacheWrite, FCacheRead: Int64;
@@ -124,6 +139,12 @@ type
     { Puts the transcript back into a state the next question can legally
       follow after a cancellation. }
     procedure UnwindCancelledTail;
+    { AppendUserText's original semantics: one text block, and the pending
+      image queue is left strictly alone.  Every append this unit makes on its
+      own behalf goes through here, because an internal bookkeeping message -
+      a summarise instruction, say - must not spend the image the user just
+      pasted and meant for their next question. }
+    procedure AppendUserTextOnly(const S: string);
   public
     OnText: TTextProc;             { streamed assistant prose }
     OnThinking: TTextProc;         { streamed reasoning, when the model emits it }
@@ -162,6 +183,26 @@ type
       any failure, so a refusal or a dropped connection costs nothing.  The
       summary streams through OnText like any reply. }
     function CompactWithSummary(out Err: string): Boolean;
+    { Queues an image for the next user message.  B64 is already base64; this
+      unit never sees pixels.  False with Err set when the queue is full or
+      the media type is not one the API takes - a refusal the user reads beats
+      a request the API rejects whole. }
+    function AttachImage(const Media, B64: string; W, H: Integer;
+      out Err: string): Boolean;
+    { How many images are waiting for the next message. }
+    function PendingImages: Integer;
+    { Throws the queue away, for a user who changed their mind. }
+    procedure ClearPendingImages;
+    { Replaces every image block except the newest KeepNewest with a short
+      text placeholder, oldest first, and returns how many it replaced.  Base64
+      is re-sent in full on every turn until it goes, so on a long session the
+      stale images are the most expensive and least re-read thing in the
+      transcript.  Substitution rather than deletion is deliberate: removing a
+      block could empty a content array, which ValidTranscript rejects, so a
+      measure meant to save context would produce a session that will not
+      load. }
+    function EvictImages(KeepNewest: Integer): Integer;
+
     { Bytes the transcript currently occupies as JSON. }
     function TranscriptBytes: Integer;
     function MessageCount: Integer;
@@ -250,8 +291,19 @@ const
   { Bumped when the saved-session shape changes incompatibly. }
   SessionVersion = 1;
   { A mentioned file larger than this is refused rather than attached; the
-    model can read it in slices through the tool instead. }
+    model can read it in slices through the tool instead.  This is a budget
+    for TEXT: an image is not prose, is not read in slices, and is bounded by
+    MaxImageFileBytes instead. }
   MaxMentionBytes = 100 * 1024;
+  { Images in one message.  The API allows far more, but above twenty blocks
+    it imposes a stricter per-image dimension limit, and eight keeps a turn
+    structurally clear of that rule while bounding it at roughly twenty
+    thousand visual tokens. }
+  MaxImagesPerMessage = 8;
+  { A mentioned image file larger than this is refused rather than attached.
+    Its bytes are never transcoded - a JPEG cannot be resized without a
+    decoder - so an oversize file is a refusal, not a resize. }
+  MaxImageFileBytes = 5 * 1024 * 1024;
   { Where a session lives, relative to the session root. }
   SessionDir  = '.pasclaude';
   SessionFile = 'session.json';
@@ -262,8 +314,21 @@ function SessionPath(const Root: string): string;
 { Expands @path mentions in a prompt.  Each mention of a readable text file
   under the session root becomes an attachment appended after the prose, so
   the model gets the file without spending a tool round reading it.  Returns
-  the expanded text; Notes lists what was attached or why something was not. }
-function ExpandMentions(const Text: string; out Notes: string): string;
+  the expanded text; Notes lists what was attached or why something was not.
+
+  A mentioned image goes to A's pending queue instead of into the prose, and A
+  is an explicit parameter rather than a module hook: a var hook exists so a
+  unit need not learn about something below it, and uAgent already depends on
+  uTools and uImage, so a hook here would buy nothing and hide the dependency.
+  A nil agent refuses images with the same note a non-image binary gets. }
+function ExpandMentions(const Text: string; A: TAgent;
+  out Notes: string): string;
+
+{ '[image 1920x1080 image/png]' for a block that cannot be shown - the
+  placeholder style uMcp and uNotebook already use for content a terminal
+  cannot render.  Base64 must never reach the console: it is megabytes of
+  noise that says nothing a reader can act on. }
+function DescribeImageBlock(B: TJson): string;
 
 { Copies an existing session aside so a run that is not resuming it cannot
   destroy it on the first save.  True when there was nothing to do, or the
@@ -311,12 +376,47 @@ begin
   Result := C in ['A'..'Z', 'a'..'z', '0'..'9', '\', '/', '.', '_', '-', ':'];
 end;
 
-function ExpandMentions(const Text: string; out Notes: string): string;
+{ '1920x1080 image/png', or as much of it as the block records.  Shared so the
+  placeholder EvictImages leaves behind and the transcript description say the
+  same thing about the same image. }
+function ImageFacts(B: TJson): string;
+var
+  Src: TJson;
+  Media: string;
+  W, H: Integer;
+begin
+  Result := '';
+  if (B = nil) or (B.Kind <> jkObj) then Exit;
+  Src := B.Find('source');
+  Media := '';
+  if Src <> nil then Media := Src.Str('media_type');
+  W := Round(B.Num('width'));
+  H := Round(B.Num('height'));
+  if (W > 0) and (H > 0) then Result := Format('%dx%d', [W, H]);
+  if Media <> '' then
+  begin
+    if Result <> '' then Result := Result + ' ';
+    Result := Result + Media;
+  end;
+end;
+
+function DescribeImageBlock(B: TJson): string;
+var
+  Facts: string;
+begin
+  Facts := ImageFacts(B);
+  if Facts = '' then Result := '[image]' else Result := '[image ' + Facts + ']';
+end;
+
+function ExpandMentions(const Text: string; A: TAgent;
+  out Notes: string): string;
 var
   I, Start: Integer;
   Path, Full, FileText, Attach: string;
   F: TFileStream;
   N: Int64;
+  Media, AttachErr: string;
+  IW, IH: Integer;
 begin
   Result := Text;
   Notes := '';
@@ -351,16 +451,39 @@ begin
         Notes := Notes + Format('@%s: no such file'#10, [Path]);
         Continue;
       end;
+      Media := '';
       try
         F := TFileStream.Create(Full, fmOpenRead or fmShareDenyNone);
         try
           N := F.Size;
-          if N > MaxMentionBytes then
+          { The header alone decides which budget applies, so a four-megabyte
+            text file is refused without being read and a four-megabyte PNG is
+            not refused for being over a limit that was only ever about
+            prose. }
+          SetLength(FileText, N);
+          if N > 64 then SetLength(FileText, 64);
+          if Length(FileText) > 0 then
+            F.ReadBuffer(FileText[1], Length(FileText));
+          if not uImage.SniffImage(FileText, Media, IW, IH) then Media := '';
+
+          if Media <> '' then
+          begin
+            if N > MaxImageFileBytes then
+            begin
+              Notes := Notes + Format(
+                '@%s: %d bytes, too large to attach (limit %d)'#10,
+                [Path, N, MaxImageFileBytes]);
+              Continue;
+            end;
+          end
+          else if N > MaxMentionBytes then
           begin
             Notes := Notes + Format('@%s: %d bytes, too large to attach'#10,
               [Path, N]);
             Continue;
           end;
+
+          F.Position := 0;
           SetLength(FileText, N);
           if N > 0 then F.ReadBuffer(FileText[1], N);
         finally
@@ -373,6 +496,47 @@ begin
           Continue;
         end;
       end;
+
+      { The old refusal of a binary file is where images branch off: the bytes
+        are one of the four types the API takes, so they go up verbatim as an
+        image block instead of being turned away.  A user's own file is never
+        transcoded - it is already properly compressed, and re-encoding it
+        would cost quality for nothing. }
+      if Media <> '' then
+      begin
+        if A = nil then
+        begin
+          Notes := Notes + Format('@%s: images cannot be attached here'#10,
+            [Path]);
+          Continue;
+        end;
+        if (IW > uImage.MaxImageDim) or (IH > uImage.MaxImageDim) then
+        begin
+          Notes := Notes + Format('@%s: %dx%d is over the %d px limit'#10,
+            [Path, IW, IH, uImage.MaxImageDim]);
+          Continue;
+        end;
+        if not A.AttachImage(Media, uImage.Base64Encode(FileText), IW, IH,
+             AttachErr) then
+        begin
+          Notes := Notes + Format('@%s: %s'#10, [Path, AttachErr]);
+          Continue;
+        end;
+        { The token figure is the documented patch formula, not a guess: an
+          image is expensive and cannot be skimmed later in the transcript, so
+          the moment of attaching is the only honest place to say what it
+          costs. }
+        if (IW > 0) and (IH > 0) then
+          Notes := Notes + Format(
+            '@%s: image attached (%dx%d %s, %d bytes, ~%d tokens)'#10,
+            [Path, IW, IH, Media, N, uImage.VisualTokens(IW, IH)])
+        else
+          Notes := Notes + Format(
+            '@%s: image attached (%s, %d bytes, size unknown)'#10,
+            [Path, Media, N]);
+        Continue;
+      end;
+
       { A binary file would poison the request body; the model can still ask
         for a hex dump through the tool if it really wants one. }
       if not uTools.IsValidUtf8(FileText) then
@@ -944,7 +1108,10 @@ begin
   end;
 
   Backup := FMessages.ToJson;
-  AppendUserText(
+  { Only-text on purpose: this is pasclaude asking a question of its own, and
+    draining the user's pending attachment into it would spend the image on a
+    summary the user never sees. }
+  AppendUserTextOnly(
     'Summarize this conversation so far for your own future reference. ' +
     'Write plain prose, no tool calls. Preserve: what the user asked for, ' +
     'what was done and how, exact file paths and names involved, decisions ' +
@@ -979,8 +1146,8 @@ begin
     so the next question follows an assistant turn as the API requires. }
   FMessages.Free;
   FMessages := TJson.NewArr;
-  AppendUserText('Summary of the conversation so far, carried over after ' +
-    'compaction:'#10#10 + Summary);
+  AppendUserTextOnly('Summary of the conversation so far, carried over ' +
+    'after compaction:'#10#10 + Summary);
   Arr := TJson.NewArr;
   B := TJson.NewObj;
   B.AddStr('type', 'text');
@@ -1746,7 +1913,7 @@ begin
   Result := True;
 end;
 
-procedure TAgent.AppendUserText(const S: string);
+procedure TAgent.AppendUserTextOnly(const S: string);
 var
   Msg, Arr, B: TJson;
 begin
@@ -1760,6 +1927,151 @@ begin
   Msg.AddStr('role', 'user');
   Msg.Add('content', Arr);
   FMessages.Push(Msg);
+end;
+
+function TAgent.AttachImage(const Media, B64: string; W, H: Integer;
+  out Err: string): Boolean;
+var
+  N: Integer;
+begin
+  Err := '';
+  Result := False;
+  if (Media <> 'image/png') and (Media <> 'image/jpeg') and
+     (Media <> 'image/gif') and (Media <> 'image/webp') then
+  begin
+    Err := Media + ' is not an image type the API accepts';
+    Exit;
+  end;
+  if B64 = '' then
+  begin
+    Err := 'the image is empty';
+    Exit;
+  end;
+  N := Length(FPendingImages);
+  if N >= MaxImagesPerMessage then
+  begin
+    Err := Format('at most %d images per message; send these first',
+      [MaxImagesPerMessage]);
+    Exit;
+  end;
+  SetLength(FPendingImages, N + 1);
+  FPendingImages[N].Media := Media;
+  FPendingImages[N].Data := B64;
+  FPendingImages[N].W := W;
+  FPendingImages[N].H := H;
+  Result := True;
+end;
+
+function TAgent.PendingImages: Integer;
+begin
+  Result := Length(FPendingImages);
+end;
+
+procedure TAgent.ClearPendingImages;
+begin
+  SetLength(FPendingImages, 0);
+end;
+
+{ The one builder of user messages, for prose and images alike.  A second one
+  would eventually drift from this ordering, and the ordering is not
+  arbitrary: the API documents that an image works best before the text that
+  asks about it. }
+procedure TAgent.AppendUserText(const S: string);
+var
+  Msg, Arr, B, Src: TJson;
+  I: Integer;
+begin
+  { An image-only paste is a real message.  Testing the text alone here would
+    make it vanish silently, which is the worst outcome available: the user
+    paid for the image and it never left the machine. }
+  if (Trim(S) = '') and (Length(FPendingImages) = 0) then Exit;
+
+  Arr := TJson.NewArr;
+  for I := 0 to High(FPendingImages) do
+  begin
+    Src := TJson.NewObj;
+    Src.AddStr('type', 'base64');
+    Src.AddStr('media_type', FPendingImages[I].Media);
+    Src.AddStr('data', FPendingImages[I].Data);
+    B := TJson.NewObj;
+    B.AddStr('type', 'image');
+    B.Add('source', Src);
+    { Dimensions the API ignores and this program reads back: they are what
+      lets a resumed transcript say '[image 1920x1080 image/png]' rather than
+      '[image]', without decoding a megabyte of base64 to find out. }
+    if (FPendingImages[I].W > 0) and (FPendingImages[I].H > 0) then
+    begin
+      B.AddNum('width', FPendingImages[I].W);
+      B.AddNum('height', FPendingImages[I].H);
+    end;
+    Arr.Push(B);
+  end;
+  SetLength(FPendingImages, 0);
+
+  if Trim(S) <> '' then
+  begin
+    B := TJson.NewObj;
+    B.AddStr('type', 'text');
+    B.AddStr('text', S);
+    Arr.Push(B);
+  end;
+
+  Msg := TJson.NewObj;
+  Msg.AddStr('role', 'user');
+  Msg.Add('content', Arr);
+  FMessages.Push(Msg);
+end;
+
+function TAgent.EvictImages(KeepNewest: Integer): Integer;
+var
+  I, J, Total, Seen: Integer;
+  Content, B, Repl: TJson;
+  Desc: string;
+
+  function CountImages: Integer;
+  var
+    A, C: Integer;
+    Ct: TJson;
+  begin
+    Result := 0;
+    for A := 0 to FMessages.Count - 1 do
+    begin
+      Ct := FMessages.Item(A).Find('content');
+      if (Ct = nil) or (Ct.Kind <> jkArr) then Continue;
+      for C := 0 to Ct.Count - 1 do
+        if Ct.Item(C).Str('type') = 'image' then Inc(Result);
+    end;
+  end;
+
+begin
+  Result := 0;
+  if KeepNewest < 0 then KeepNewest := 0;
+  Total := CountImages;
+  if Total <= KeepNewest then Exit;
+
+  { Oldest first: the image the user just pasted is the one still being
+    discussed, and the stale ones at the front are what nobody will look at
+    again. }
+  Seen := 0;
+  for I := 0 to FMessages.Count - 1 do
+  begin
+    Content := FMessages.Item(I).Find('content');
+    if (Content = nil) or (Content.Kind <> jkArr) then Continue;
+    for J := 0 to Content.Count - 1 do
+    begin
+      B := Content.Item(J);
+      if (B = nil) or (B.Str('type') <> 'image') then Continue;
+      Inc(Seen);
+      if Seen > Total - KeepNewest then Exit;
+      Desc := ImageFacts(B);
+      if Desc = '' then Desc := 'unknown';
+      Repl := TJson.NewObj;
+      Repl.AddStr('type', 'text');
+      Repl.AddStr('text', '[image removed to save context: ' + Desc + ']');
+      Content.SetAt(J, Repl);
+      Inc(Result);
+    end;
+  end;
 end;
 
 function TAgent.Send(const UserText: string; out Err: string): Boolean;

@@ -375,7 +375,34 @@ text preserves what was missing at the time. Unchecked items remain open.
   permission requests. Still missing: no mid-turn interrupt over the wire, no
   `total_cost_usd` on the result line, and no `--resume` in SDK mode. See the
   Agent SDK entry above.*
-- [ ] **Image input** — cannot paste or attach screenshots/images.
+- [x] ~~**Image input** — cannot paste or attach screenshots/images.~~
+  *Built: `@shot.png` in a prompt attaches the image instead of refusing it as
+  a binary, and `/paste` takes one off the Windows clipboard (`/paste drop`
+  cancels). Both report dimensions, byte size and the real token cost — the
+  documented `ceil(w/28)*ceil(h/28)` patch formula, not a rule of thumb — so
+  you see what a screenshot costs before you send it. png, jpeg, gif and webp;
+  base64 only. Mentioned files go up untouched under a 5 MB cap; clipboard
+  pixels are encoded here, since Windows offers CF_DIB and the API takes no
+  BMP. That encoder writes a PNG over STORED deflate blocks because paszlib is
+  a package, not the RTL — verified against Windows Imaging Component and
+  Python zlib, not assumed. The price is that a stored PNG is about the size
+  of its raw pixels: pasted images are capped at 2 MB and downscaled at most
+  twice to fit, then refused with the size named rather than shrunk to
+  something unreadable. Palette encoding rescues the common terminal or dialog
+  screenshot; photographs are what hit the refusal. Images survive save/load
+  and `--resume` unchanged, and compaction evicts all but the two newest
+  first, since base64 is re-sent in full every turn. Still missing: no image
+  from `read_file` (it keeps its hex dump — a tool result has no human in the
+  loop, and `uNotebook` and `uMcp` already refuse to sail base64 into context
+  unexamined), no images in tool results at all, no URL or Files API sources,
+  8 per message, and `-p` never expands `@mentions` so an image cannot be
+  attached in print mode. **An image can carry text instructing the model that
+  a person reading the transcript cannot see — the transcript shows only
+  `[image 1920x1080 image/png]`. Nothing here detects that and nothing can.
+  What bounds it: an image enters only by your own `@mention` or `/paste`, the
+  mention is root-guarded exactly as a tool call is, and it lands in a user
+  block, so it carries the authority of text you typed and no more. A saved
+  session also keeps the image on disk in plaintext under `.pasclaude\`.***
 - [ ] **Vim mode / keybindings** — line editing is fixed (arrows, Home/End,
   Ctrl+A/E/U); no `/vim`, no configurable keybindings.
 - [x] ~~**Output styles** — no `/output-style`.~~

@@ -109,6 +109,12 @@ function SdkSnapshotUsage(A: TAgent): TSdkUsage;
 function SdkRun(A: TAgent; const Opts: TSdkOptions;
   const FirstPrompt: string; out Err: string): Integer;
 
+{ Queues any image blocks in a driver's user message onto the agent, and says
+  how many.  Public so a suite can drive it without stdin; called from the
+  type:'user' arm before the turn runs, because UserTextOf keeps only text and
+  a driver's image would otherwise be dropped without a word. }
+function AttachUserImages(A: TAgent; M: TJson): Integer;
+
 type
   { The Pascal embedding facade: the ordering ritual in one object.  One
     session per process, and that is not a simplification - RootDir, the
@@ -849,6 +855,46 @@ begin
   end;
 end;
 
+{ Honours image blocks in a driver's user message, which UserTextOf drops on
+  the floor because it flattens content to a string.  Returns how many were
+  queued.  The same four media types and the same caps as every other entry
+  point - a driver is not more trusted than a keyboard, so the base64 charset
+  and the decoded size are checked before anything reaches the transcript. }
+function AttachUserImages(A: TAgent; M: TJson): Integer;
+var
+  Msg, C, B, Src: TJson;
+  I: Integer;
+  Media, Data, Err: string;
+begin
+  Result := 0;
+  if (A = nil) or (M = nil) then Exit;
+  Msg := M.Find('message');
+  if (Msg <> nil) and (Msg.Kind = jkObj) then
+    C := Msg.Find('content')
+  else
+    C := M.Find('content');
+  if (C = nil) or (C.Kind <> jkArr) then Exit;
+  for I := 0 to C.Count - 1 do
+  begin
+    B := C.Item(I);
+    if (B = nil) or (B.Kind <> jkObj) or (B.Str('type') <> 'image') then
+      Continue;
+    Src := B.Find('source');
+    if (Src = nil) or (Src.Kind <> jkObj) then Continue;
+    { base64 only.  A url source would have the API fetch a host this program
+      cannot vet, and a file_id needs a beta header and an upload round trip. }
+    if Src.Str('type') <> 'base64' then Continue;
+    Media := Src.Str('media_type');
+    Data := Src.Str('data');
+    if Data = '' then Continue;
+    if A.AttachImage(Media, Data, Round(B.Num('width')), Round(B.Num('height')),
+         Err) then
+      Inc(Result)
+    else
+      SdkEmit(SdkErrorLine('image not attached: ' + Err));
+  end;
+end;
+
 { One turn: echo the prompt, run it, and emit exactly one result.  The
   per-turn cost is the difference of two snapshots, so turn fifty reports what
   turn fifty spent rather than the running total. }
@@ -881,6 +927,7 @@ var
   Line, MsgType, Text: string;
   Doc: TJson;
   AnyFail: Boolean;
+  Imgs: Integer;
 begin
   Err := '';
   RunOpts := Opts;
@@ -949,7 +996,11 @@ begin
         else if MsgType = 'user' then
         begin
           Text := UserTextOf(Doc);
-          if Trim(Text) = '' then
+          { Images are queued before the turn so AppendUserText carries them
+            in the same message as the prose.  An image-only message is a
+            legal turn, so the blank test has to account for one. }
+          Imgs := AttachUserImages(A, Doc);
+          if (Trim(Text) = '') and (Imgs = 0) then
             SdkEmit(SdkErrorLine('user message has no content'))
           else if not OneTurn(A, Text) then
             AnyFail := True;

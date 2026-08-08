@@ -10,8 +10,8 @@ program pasclaude;
 {$mode objfpc}{$H+}
 
 uses
-  SysUtils, Classes, DateUtils, uTerm, uJson, uHttp, uMcp, uHooks, uSandbox,
-  uTools, uAgent, uSdk;
+  Windows, SysUtils, Classes, DateUtils, uTerm, uJson, uHttp, uMcp, uHooks,
+  uSandbox, uTools, uImage, uAgent, uSdk;
 
 const
   Version = '0.1';
@@ -24,6 +24,14 @@ const
     proxy; this is the measured thing the context window actually fills
     with, and 150k leaves headroom under a 200k window for the reply. }
   CompactTokens = 150000;
+  { A pasted image is encoded here rather than merely forwarded, and a stored
+    deflate PNG is about the size of its raw pixels, so the budget has to be
+    generous enough to be useful and small enough that it is not re-sent
+    forever.  Beyond it the encoder halves the image, at most twice. }
+  MaxPasteBytes = 2 * 1024 * 1024;
+  { The model's own maximum long edge.  Sending more pixels than this cannot
+    improve the answer: the API downscales to it before looking. }
+  PasteMaxEdge = 2576;
   { The /think default: enough for real multi-step reasoning, small enough
     that a casual "on" does not silently multiply the bill. }
   DefaultThinkBudget = 8192;
@@ -200,12 +208,12 @@ end;
 { ------------------------------------------------------------- completion -- }
 
 const
-  SlashCommands: array[0..29] of string = (
+  SlashCommands: array[0..30] of string = (
     '/help', '/clear', '/compact', '/deny', '/diff', '/hooks', '/jobs', '/mcp',
     '/memory', '/init', '/mode', '/plan', '/rewind', '/sandbox', '/sessions',
     '/skills', '/plugins', '/think', '/web', '/add-dir', '/remove-dir',
     '/resume', '/save', '/cwd', '/model', '/yolo', '/cost', '/output-style',
-    '/exit', '/quit');
+    '/paste', '/exit', '/quit');
 
 { Candidates for the token being completed: slash commands when the token
   opens the line with a slash, file and directory names under the session
@@ -615,6 +623,7 @@ begin
   EmitCLn(clGrey,   '  /yolo          approve every tool for this session (bypass)');
   EmitCLn(clGrey,   '  /sandbox [lvl] off | limits | low: how confined child processes are');
   EmitCLn(clGrey,   '  /output-style [name]  how replies are written; no argument lists them');
+  EmitCLn(clGrey,   '  /paste         attach the clipboard image to your next message');
   EmitCLn(clGrey,   '  /cost          tokens used so far');
   EmitCLn(clGrey,   '  /exit          quit (Ctrl+C also works)');
   EmitLn;
@@ -1619,6 +1628,264 @@ begin
     EmitCLn(clYellow, '  (the rewound session could not be saved: ' + Err + ')');
 end;
 
+{ ------------------------------------------------------------- clipboard -- }
+
+{ Windows hands over an image as CF_DIB - raw pixels - and the API takes png,
+  jpeg, gif and webp but not BMP, so something has to encode.  uImage does the
+  encoding; this function only acquires bytes, which is what keeps the DIB
+  parsing testable without a clipboard.
+
+  Three sources, best first: a copied FILE keeps its own bytes and its own
+  compression; the registered "PNG" format, which browsers and capture tools
+  commonly set, is already what we want; and CF_DIB is the fallback that
+  always exists, because Windows synthesises it from CF_BITMAP whenever any
+  image is on the clipboard. }
+function ClipboardImage(out Bytes: RawByteString; out Media: string;
+  out Note, Err: string): Boolean;
+var
+  Tries, N: Integer;
+  H: THandle;
+  P: Pointer;
+  Dib, Rgb, Png: RawByteString;
+  W, Ht, OW, OH, NW, NH: Integer;
+  PngFmt: UINT;
+  Drop: PByte;
+  WideName: PWideChar;
+  Name: string;
+  F: TFileStream;
+  SW, SH: Integer;
+
+  { The bytes of a clipboard handle, copied out under a lock. }
+  function Grab(Fmt: UINT; out Data: RawByteString): Boolean;
+  var
+    Hh: THandle;
+    Pp: Pointer;
+    Sz: PtrUInt;
+  begin
+    Data := '';
+    Result := False;
+    if not IsClipboardFormatAvailable(Fmt) then Exit;
+    Hh := GetClipboardData(Fmt);
+    if Hh = 0 then Exit;
+    Sz := GlobalSize(Hh);
+    if (Sz = 0) or (Sz > 64 * 1024 * 1024) then Exit;
+    Pp := GlobalLock(Hh);
+    if Pp = nil then Exit;
+    try
+      SetLength(Data, Sz);
+      Move(Pp^, Data[1], Sz);
+    finally
+      GlobalUnlock(Hh);
+    end;
+    Result := True;
+  end;
+
+begin
+  Bytes := '';
+  Media := '';
+  Note := '';
+  Err := '';
+  Result := False;
+
+  { Another process can hold the clipboard open for a moment; failing on the
+    first try would make /paste flaky for no reason. }
+  Tries := 0;
+  while not OpenClipboard(0) do
+  begin
+    Inc(Tries);
+    if Tries >= 8 then
+    begin
+      Err := 'the clipboard is in use by another program';
+      Exit;
+    end;
+    Sleep(30);
+  end;
+  try
+    { 1. A copied file: read its own bytes, which are already compressed
+      properly and must not be re-encoded. }
+    if IsClipboardFormatAvailable(CF_HDROP) then
+    begin
+      H := GetClipboardData(CF_HDROP);
+      if H <> 0 then
+      begin
+        P := GlobalLock(H);
+        if P <> nil then
+          try
+            { DROPFILES: a DWORD offset to the names, a POINT, and two BOOLs;
+              the names follow as a double-null-terminated list. }
+            Drop := PByte(P);
+            if PBoolean(Drop + 16)^ then   { fWide }
+            begin
+              WideName := PWideChar(Drop + PDWORD(Drop)^);
+              Name := UTF8Encode(WideString(WideName));
+            end
+            else
+              Name := string(PAnsiChar(Drop + PDWORD(Drop)^));
+          finally
+            GlobalUnlock(H);
+          end;
+        if (Name <> '') and FileExists(Name) then
+        begin
+          try
+            F := TFileStream.Create(Name, fmOpenRead or fmShareDenyNone);
+            try
+              N := F.Size;
+              if N > MaxImageFileBytes then
+              begin
+                Err := Format('%s is %d bytes, over the %d limit',
+                  [ExtractFileName(Name), N, MaxImageFileBytes]);
+                Exit;
+              end;
+              SetLength(Bytes, N);
+              if N > 0 then F.ReadBuffer(Bytes[1], N);
+            finally
+              F.Free;
+            end;
+          except
+            on E: Exception do
+            begin
+              Err := E.Message;
+              Bytes := '';
+              Exit;
+            end;
+          end;
+          if uImage.SniffImage(Bytes, Media, SW, SH) then
+          begin
+            Note := ExtractFileName(Name);
+            Exit(True);
+          end;
+          Bytes := '';
+          Media := '';
+          Err := ExtractFileName(Name) + ' is not an image the API accepts';
+          Exit;
+        end;
+      end;
+    end;
+
+    { 2. An already-encoded PNG, when the source app offered one. }
+    PngFmt := RegisterClipboardFormatW('PNG');
+    if (PngFmt <> 0) and Grab(PngFmt, Bytes) then
+      if uImage.SniffImage(Bytes, Media, SW, SH) and (Media = 'image/png') and
+         (Length(Bytes) <= MaxImageFileBytes) then
+        Exit(True)
+      else
+      begin
+        Bytes := '';
+        Media := '';
+      end;
+
+    { 3. Raw pixels.  This is the path that needs an encoder. }
+    if not Grab(CF_DIB, Dib) then
+    begin
+      Err := 'there is no image on the clipboard';
+      Exit;
+    end;
+  finally
+    CloseClipboard;
+  end;
+
+  if not uImage.DibToRgb(Dib, Rgb, W, Ht, Err) then Exit;
+
+  { The model's own maximum is 2576 on the long edge; beyond it the API
+    downscales anyway, so uploading more pixels buys nothing and costs
+    upload time and, with stored deflate, a great many bytes. }
+  NW := W;
+  NH := Ht;
+  if (W > PasteMaxEdge) or (Ht > PasteMaxEdge) then
+  begin
+    if W >= Ht then
+    begin
+      NW := PasteMaxEdge;
+      NH := (Ht * PasteMaxEdge) div W;
+    end
+    else
+    begin
+      NH := PasteMaxEdge;
+      NW := (W * PasteMaxEdge) div Ht;
+    end;
+    if NW < 1 then NW := 1;
+    if NH < 1 then NH := 1;
+    Rgb := uImage.Downscale(Rgb, W, Ht, NW, NH);
+    if Rgb = '' then
+    begin
+      Err := 'the clipboard image could not be resized';
+      Exit;
+    end;
+  end;
+
+  if not uImage.EncodePngAuto(Rgb, NW, NH, MaxPasteBytes, Png, OW, OH) then
+  begin
+    { Two halvings and it still does not fit.  A quarter-scale screenshot is
+      readable and a sixteenth is not, so this is an honest refusal rather
+      than an image the user cannot check. }
+    Err := Format('the clipboard image is %dx%d and will not fit in %d KB ' +
+      'even reduced; save it as a PNG or JPEG and use @path',
+      [W, Ht, MaxPasteBytes div 1024]);
+    Exit;
+  end;
+  Bytes := Png;
+  Media := 'image/png';
+  if (OW <> W) or (OH <> Ht) then
+    Note := Format('%dx%d downscaled to %dx%d to fit', [W, Ht, OW, OH]);
+  Result := True;
+end;
+
+{ /paste, and /paste drop to change your mind.  The terminal cannot show an
+  image, so the note is the whole of the feedback: what it is, how big, and
+  what it will cost.  Base64 never reaches the console. }
+procedure DoPaste(const Arg: string);
+var
+  Bytes: RawByteString;
+  Media, Note, Err: string;
+  W, H, Tokens: Integer;
+begin
+  if SameText(Trim(Arg), 'drop') then
+  begin
+    if Agent.PendingImages = 0 then
+      EmitCLn(clGrey, '  nothing attached')
+    else
+    begin
+      EmitCLn(clGrey, Format('  dropped %d attached image(s)',
+        [Agent.PendingImages]));
+      Agent.ClearPendingImages;
+    end;
+    Exit;
+  end;
+
+  if not ClipboardImage(Bytes, Media, Note, Err) then
+  begin
+    EmitCLn(clYellow, '  ' + Err);
+    Exit;
+  end;
+  if not uImage.SniffImage(Bytes, Media, W, H) then
+  begin
+    EmitCLn(clYellow, '  the clipboard image could not be identified');
+    Exit;
+  end;
+  if (W > uImage.MaxImageDim) or (H > uImage.MaxImageDim) then
+  begin
+    EmitCLn(clYellow, Format('  %dx%d is over the %d px limit',
+      [W, H, uImage.MaxImageDim]));
+    Exit;
+  end;
+  if not Agent.AttachImage(Media, uImage.Base64Encode(Bytes), W, H, Err) then
+  begin
+    EmitCLn(clYellow, '  ' + Err);
+    Exit;
+  end;
+  Tokens := uImage.VisualTokens(W, H);
+  if (W > 0) and (H > 0) then
+    EmitCLn(clGrey, Format(
+      '  /paste: image attached (%dx%d %s, %d KB, ~%d tokens)',
+      [W, H, Media, (Length(Bytes) + 1023) div 1024, Tokens]))
+  else
+    EmitCLn(clGrey, Format('  /paste: image attached (%s, %d KB)',
+      [Media, (Length(Bytes) + 1023) div 1024]));
+  if Note <> '' then
+    EmitCLn(clGrey, '  /paste: ' + Note);
+  EmitCLn(clGrey, '  it goes with your next message; /paste drop cancels it');
+end;
+
 { The logo: logo.png's </> mark as ASCII art, blue like the source image,
   with the wordmark beside it.  Three lines tall - enough to read as the
   mark, small enough that the banner is still a banner. }
@@ -1900,6 +2167,8 @@ begin
     else
       PickModel;
   end
+  else if Cmd = '/paste' then
+    DoPaste(Arg)
   else if Cmd = '/skills' then
     ShowSkills
   else if Cmd = '/output-style' then
@@ -2750,7 +3019,7 @@ begin
           model starts with the file instead of spending a round reading it. }
         if Pos('@', Line) > 0 then
         begin
-          Line := ExpandMentions(Line, MentionNotes);
+          Line := ExpandMentions(Line, Agent, MentionNotes);
           if MentionNotes <> '' then
           begin
             EmitC(clGrey, '  ' + StringReplace(Trim(MentionNotes), #10,
@@ -2786,6 +3055,20 @@ begin
           the byte count (a proxy, available before the first request) and
           the token count the API actually reported, which is the measured
           truth and catches token-dense transcripts the byte guess misses. }
+        { Images go before either trim, and the ordering is load-bearing.
+          Base64 is re-sent in full every turn, so one screenshot puts
+          TranscriptBytes permanently over the byte threshold - and the byte
+          trim cannot help, because the image sits in the tail it is trying to
+          keep.  Left alone that branch would fire every single turn and drop
+          nothing.  Evicting the stale images is what brings the transcript
+          back under the line and makes the trim mean something again. }
+        if Agent.TranscriptBytes > CompactKeepBytes then
+        begin
+          Dropped := Agent.EvictImages(2);
+          if Dropped > 0 then
+            EmitCLn(clGrey, Format(
+              '  (dropped %d older image(s) to save context)', [Dropped]));
+        end;
         if Agent.ContextTokens > CompactTokens then
         begin
           { The token trigger fires at a measured size, which is also the

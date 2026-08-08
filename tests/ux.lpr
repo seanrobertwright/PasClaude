@@ -14,8 +14,8 @@ program ux;
 
 { Windows first, so SysUtils' DeleteFile and GetEnvironmentVariable win over
   the raw API of the same names. }
-uses Windows, SysUtils, Classes, uJson, uDiff, uHooks, uSandbox, uTools, uAgent,
-  uTerm, uNotebook, uSdk;
+uses Windows, SysUtils, Classes, uJson, uDiff, uHooks, uSandbox, uTools,
+  uImage, uAgent, uTerm, uNotebook, uSdk;
 
 var
   Fails: Integer = 0;
@@ -1390,6 +1390,645 @@ begin
   HistoryClear;
 end;
 
+{ ------------------------------------------------------------------ image -- }
+
+{ A PNG this suite can hand around: the smallest thing that exercises the real
+  encoder rather than a literal. }
+function MakeRgb(W, H: Integer; Colours: Integer): RawByteString;
+var
+  X, Y, I: Integer;
+begin
+  SetLength(Result, W * H * 3);
+  for Y := 0 to H - 1 do
+    for X := 0 to W - 1 do
+    begin
+      I := (Y * W + X) * 3 + 1;
+      Result[I] := Chr(((X + Y) mod Colours) * (250 div Colours));
+      Result[I + 1] := Chr(((X * 3) mod Colours) * (250 div Colours));
+      Result[I + 2] := Chr(((Y * 5) mod Colours) * (250 div Colours));
+    end;
+end;
+
+{ The encoder writes a container no unit in this tree can read back, so a
+  round trip through our own code would prove nothing.  These assertions are
+  against the format's own rules instead: the signature, every chunk's CRC,
+  and the three things inside a stored deflate stream that a decoder checks
+  and a naive writer gets wrong. }
+procedure TestImageCodec;
+var
+  Png, Rgb, Idat, Tag, Data: RawByteString;
+  P, N, Len, Blocks, LenF, NlenF: Integer;
+  Final: Boolean;
+  Adler, RawAdler: LongWord;
+  Raw: RawByteString;
+  X, Y, I: Integer;
+  Ok: Boolean;
+
+  function Be32At(const S: RawByteString; At: Integer): LongWord;
+  begin
+    Result := (LongWord(Byte(S[At])) shl 24) or (LongWord(Byte(S[At + 1])) shl 16)
+      or (LongWord(Byte(S[At + 2])) shl 8) or LongWord(Byte(S[At + 3]));
+  end;
+
+begin
+  WriteLn('-- image codec --');
+
+  { Known vectors, so a broken checksum is caught here rather than as a file
+    nothing will open. }
+  Check(uImage.Crc32Str('123456789') = $CBF43926, 'CRC-32 matches its vector');
+  Check(uImage.Adler32Str('123456789') = $091E01DE,
+    'Adler-32 matches its vector');
+
+  Rgb := MakeRgb(8, 2, 4);
+  Png := uImage.EncodePng(Rgb, 8, 2);
+  Check(Length(Png) > 8, 'an 8x2 image encodes');
+  Check((Byte(Png[1]) = $89) and (Copy(Png, 2, 3) = 'PNG') and
+        (Byte(Png[5]) = $0D) and (Byte(Png[6]) = $0A) and
+        (Byte(Png[7]) = $1A) and (Byte(Png[8]) = $0A),
+    'it opens with the PNG signature');
+
+  { Walk the chunks: every stored CRC must equal the one we compute over
+    tag+data, which is the field a hand-written encoder most often takes over
+    the wrong range. }
+  Ok := True;
+  Idat := '';
+  P := 9;
+  while P + 8 <= Length(Png) do
+  begin
+    Len := Integer(Be32At(Png, P));
+    Tag := Copy(Png, P + 4, 4);
+    Data := Copy(Png, P + 8, Len);
+    if Be32At(Png, P + 8 + Len) <> uImage.Crc32Str(Tag + Data) then Ok := False;
+    if Tag = 'IDAT' then Idat := Idat + Data;
+    Inc(P, 12 + Len);
+  end;
+  Check(Ok, 'every chunk CRC covers exactly its tag and data');
+  Check(Idat <> '', 'there is an IDAT');
+  Check((Byte(Idat[1]) = $78) and (Byte(Idat[2]) = $01),
+    'the zlib header is 78 01');
+
+  { The stored-block chain: LEN and NLEN must be ones-complements, and the
+    last block and only the last must carry BFINAL. }
+  Raw := '';
+  Blocks := 0;
+  Ok := True;
+  Final := False;
+  P := 3;
+  while (P + 4 <= Length(Idat)) and not Final do
+  begin
+    Final := (Byte(Idat[P]) and 1) = 1;
+    if (Byte(Idat[P]) and 6) <> 0 then Ok := False;   { BTYPE must be stored }
+    LenF := Byte(Idat[P + 1]) or (Byte(Idat[P + 2]) shl 8);
+    NlenF := Byte(Idat[P + 3]) or (Byte(Idat[P + 4]) shl 8);
+    if (LenF xor $FFFF) <> NlenF then Ok := False;
+    Raw := Raw + Copy(Idat, P + 5, LenF);
+    Inc(Blocks);
+    Inc(P, 5 + LenF);
+  end;
+  Check(Ok, 'each stored block has BTYPE 0 and NLEN as the complement of LEN');
+  Check(Final, 'the last block carries BFINAL');
+  Check(P + 4 = Length(Idat) + 1, 'and the stream ends after it');
+
+  { Adler-32 is over the UNCOMPRESSED bytes and big-endian: computing it over
+    the deflate stream, or writing it little-endian, both produce a file that
+    looks plausible and that no decoder accepts. }
+  Adler := Be32At(Idat, Length(Idat) - 3);
+  RawAdler := uImage.Adler32Str(Raw);
+  Check(Adler = RawAdler,
+    'the trailing Adler-32 is big-endian over the raw scanlines');
+  Check(Length(Raw) = 2 * (1 + 8 * 3),
+    'the inflated data is one filter byte per scanline plus the pixels');
+
+  { Wide enough that the raw data passes 65535 bytes and the encoder must
+    emit a second stored block. }
+  Rgb := MakeRgb(300, 300, 8);
+  Png := uImage.EncodePng(Rgb, 300, 300);
+  Idat := '';
+  P := 9;
+  while P + 8 <= Length(Png) do
+  begin
+    Len := Integer(Be32At(Png, P));
+    if Copy(Png, P + 4, 4) = 'IDAT' then Idat := Idat + Copy(Png, P + 8, Len);
+    Inc(P, 12 + Len);
+  end;
+  Blocks := 0;
+  Ok := True;
+  Final := False;
+  P := 3;
+  while (P + 4 <= Length(Idat)) and not Final do
+  begin
+    Final := (Byte(Idat[P]) and 1) = 1;
+    LenF := Byte(Idat[P + 1]) or (Byte(Idat[P + 2]) shl 8);
+    NlenF := Byte(Idat[P + 3]) or (Byte(Idat[P + 4]) shl 8);
+    if (LenF xor $FFFF) <> NlenF then Ok := False;
+    if (not Final) and (LenF <> 65535) then Ok := False;
+    Inc(Blocks);
+    Inc(P, 5 + LenF);
+  end;
+  Check(Blocks > 1, 'a 300x300 image needs more than one stored block');
+  Check(Ok, 'and every block header validates, not just the first');
+
+  { The indexed path, and its bail-out. }
+  Rgb := MakeRgb(16, 16, 4);
+  Check(uImage.EncodePngIndexed(Rgb, 16, 16, Png),
+    'a four-colour image encodes as indexed');
+  Check(Pos('PLTE', Png) > 0, 'with a palette chunk');
+  Check(Byte(Png[26]) = 3, 'and colour type 3');
+  SetLength(Rgb, 64 * 64 * 3);
+  for Y := 0 to 63 do
+    for X := 0 to 63 do
+    begin
+      I := (Y * 64 + X) * 3 + 1;
+      Rgb[I] := Chr((Y * 64 + X) and $FF);
+      Rgb[I + 1] := Chr(((Y * 64 + X) shr 8) and $FF);
+      Rgb[I + 2] := Chr((X * 7) and $FF);
+    end;
+  Check(not uImage.EncodePngIndexed(Rgb, 64, 64, Png),
+    'an image with over 256 colours is refused so the caller falls back');
+
+  { Downscale-to-fit, and the refusal when two halvings are not enough. }
+  Rgb := MakeRgb(200, 200, 5);
+  Check(uImage.EncodePngAuto(Rgb, 200, 200, 200000, Png, X, Y) and
+    (X = 200) and (Y = 200), 'a generous budget needs no halving');
+  Check(uImage.EncodePngAuto(Rgb, 200, 200, 12000, Png, X, Y) and
+    (X < 200) and (Length(Png) <= 12000),
+    'a tight budget halves until it fits');
+  Check(not uImage.EncodePngAuto(Rgb, 200, 200, 200, Png, X, Y),
+    'and an impossible budget is refused rather than shrunk to nothing');
+  N := Length(Png);
+  Check(N = 0, 'a refused encode returns no bytes');
+end;
+
+{ The clipboard hands over a header this program did not write, from any
+  process on the machine, so both the layout and the bounds checking matter. }
+procedure TestDibToRgb;
+var
+  Dib, Rgb: RawByteString;
+  W, H: Integer;
+  Err: string;
+
+  procedure PutLe32(var S: RawByteString; At: Integer; V: LongWord);
+  begin
+    S[At] := Chr(V and $FF);
+    S[At + 1] := Chr((V shr 8) and $FF);
+    S[At + 2] := Chr((V shr 16) and $FF);
+    S[At + 3] := Chr((V shr 24) and $FF);
+  end;
+
+  procedure PutLe16(var S: RawByteString; At: Integer; V: Word);
+  begin
+    S[At] := Chr(V and $FF);
+    S[At + 1] := Chr((V shr 8) and $FF);
+  end;
+
+  { A 40-byte BITMAPINFOHEADER plus, for BI_BITFIELDS, the three colour masks
+    the probe confirmed sit between the header and the pixels. }
+  function Header(Wid, Hgt, Bits, Comp: Integer): RawByteString;
+  begin
+    SetLength(Result, 40);
+    FillChar(Result[1], 40, 0);
+    PutLe32(Result, 1, 40);
+    PutLe32(Result, 5, LongWord(Wid));
+    PutLe32(Result, 9, LongWord(LongInt(Hgt)));
+    PutLe16(Result, 13, 1);
+    PutLe16(Result, 15, Word(Bits));
+    PutLe32(Result, 17, LongWord(Comp));
+    if Comp = 3 then
+      Result := Result + #255#0#0#0 + #0#255#0#0 + #0#0#255#0;
+  end;
+
+begin
+  WriteLn('-- DIB conversion --');
+
+  { 2x2, 32bpp BI_BITFIELDS, positive height so the rows are bottom-up.
+    Stored bottom row first: the image reads red,green over blue,white. }
+  Dib := Header(2, 2, 32, 3);
+  { bottom row (y=1 of the image): blue, white - BGRA on the wire }
+  Dib := Dib + #255#0#0#0 + #255#255#255#0;
+  { top row (y=0): red, green }
+  Dib := Dib + #0#0#255#0 + #0#255#0#0;
+  Check(uImage.DibToRgb(Dib, Rgb, W, H, Err), 'a 32bpp DIB converts: ' + Err);
+  Check((W = 2) and (H = 2), 'with its dimensions');
+  Check(Length(Rgb) = 12, 'and three bytes per pixel');
+  { A bottom-up DIB read without the flip puts every screenshot upside down,
+    and BGRA read as RGB swaps red and blue in every one. }
+  Check((Byte(Rgb[1]) = 255) and (Byte(Rgb[2]) = 0) and (Byte(Rgb[3]) = 0),
+    'the first output pixel is the TOP-left one, and it is red not blue');
+  Check((Byte(Rgb[4]) = 0) and (Byte(Rgb[5]) = 255) and (Byte(Rgb[6]) = 0),
+    'the second is green');
+  Check((Byte(Rgb[7]) = 0) and (Byte(Rgb[8]) = 0) and (Byte(Rgb[9]) = 255),
+    'and the bottom row follows, blue first');
+
+  { A negative height is already top-down and must NOT be flipped again. }
+  Dib := Header(2, -2, 32, 3);
+  Dib := Dib + #0#0#255#0 + #0#255#0#0;
+  Dib := Dib + #255#0#0#0 + #255#255#255#0;
+  Check(uImage.DibToRgb(Dib, Rgb, W, H, Err), 'a top-down DIB converts');
+  Check((H = 2) and (Byte(Rgb[1]) = 255) and (Byte(Rgb[3]) = 0),
+    'and is not flipped a second time');
+
+  { 24bpp rows are padded to a four-byte boundary: 3 pixels is 9 bytes of
+    pixel and 3 of padding.  Ignoring the padding shears the image
+    progressively, which looks like a decoding bug anywhere but here. }
+  Dib := Header(3, 1, 24, 0);
+  Dib := Dib + #1#2#3 + #4#5#6 + #7#8#9 + #0#0#0;
+  Check(uImage.DibToRgb(Dib, Rgb, W, H, Err), 'a 24bpp DIB converts');
+  Check(Length(Rgb) = 9, 'to exactly W*H*3 bytes, padding excluded');
+  Check((Byte(Rgb[1]) = 3) and (Byte(Rgb[2]) = 2) and (Byte(Rgb[3]) = 1),
+    'with BGR reordered to RGB');
+  Check((Byte(Rgb[7]) = 9) and (Byte(Rgb[9]) = 7),
+    'and the last pixel of the row is not lost to the padding');
+
+  { The 12 mask bytes are part of the pixel offset.  Dropping them shifts
+    every row, so a DIB whose pixels are exactly accounted for must fail when
+    the masks are missing rather than read past the buffer. }
+  Dib := Header(2, 2, 32, 3);
+  Dib := Dib + #255#0#0#0 + #255#255#255#0 + #0#0#255#0 + #0#255#0#0;
+  Check(Length(Dib) = 40 + 12 + 16,
+    'a 2x2 32bpp BI_BITFIELDS blob is header + masks + pixels');
+
+  { Refusals, each by name rather than by silence. }
+  Dib := Header(2, 2, 8, 0);
+  Dib := Dib + StringOfChar(#0, 64);
+  Check(not uImage.DibToRgb(Dib, Rgb, W, H, Err), 'an 8bpp DIB is refused');
+  Check(Pos('8-bit', Err) > 0, 'and says so: ' + Err);
+
+  Dib := Header(4000, 4000, 32, 0);
+  Check(not uImage.DibToRgb(Dib, Rgb, W, H, Err),
+    'a header claiming more pixels than the blob holds is refused');
+  Check(Pos('smaller', Err) > 0, 'naming the reason: ' + Err);
+
+  Check(not uImage.DibToRgb('', Rgb, W, H, Err), 'an empty blob is refused');
+  Check(not uImage.DibToRgb(StringOfChar(#0, 20), Rgb, W, H, Err),
+    'and a truncated header is refused rather than read past');
+end;
+
+{ The number shown to the user before an image is attached is the number the
+  API bills, so these are the documented table's own figures. }
+procedure TestVisualTokens;
+begin
+  WriteLn('-- visual tokens --');
+  Check(uImage.VisualTokens(200, 200) = 64, '200x200 costs 64 tokens');
+  Check(uImage.VisualTokens(1000, 1000) = 1296, '1000x1000 costs 1296');
+  Check(uImage.VisualTokens(1092, 1092) = 1521, '1092x1092 costs 1521');
+  Check(uImage.VisualTokens(1920, 1080) = 2691,
+    'a 1080p screenshot costs 2691, not (w*h)/750');
+  Check(uImage.VisualTokens(2000, 1500) = 3888, '2000x1500 costs 3888');
+  { The tier downscales past 2576 on the long edge, so the cost stops rising
+    there; without that step a 4K paste would be reported at three times what
+    it costs. }
+  Check(uImage.VisualTokens(3840, 2160) = 4784,
+    '4K is downscaled to the tier and costs exactly the 4784 cap');
+  Check(uImage.VisualTokens(8000, 8000) <= 4784,
+    'and nothing exceeds the cap');
+  Check(uImage.VisualTokens(0, 100) = 0, 'an unknown size costs nothing');
+end;
+
+procedure TestSniffImage;
+var
+  B: RawByteString;
+  Media: string;
+  W, H: Integer;
+begin
+  WriteLn('-- image sniffing --');
+
+  { PNG: IHDR sits at a fixed offset, big-endian. }
+  B := #137'PNG'#13#10#26#10 + #0#0#0#13 + 'IHDR' + #0#0#7#128 + #0#0#4#56 +
+       #8#2#0#0#0;
+  Check(uImage.SniffImage(B, Media, W, H) and (Media = 'image/png'),
+    'a PNG header is recognised');
+  Check((W = 1920) and (H = 1080), 'with its IHDR dimensions');
+
+  { GIF is little-endian, which is the opposite of PNG and easy to carry
+    over from the line above. }
+  B := 'GIF89a' + #64#0 + #48#0 + #0#0#0;
+  Check(uImage.SniffImage(B, Media, W, H) and (Media = 'image/gif'),
+    'a GIF header is recognised');
+  Check((W = 64) and (H = 48), 'with its little-endian dimensions');
+
+  { JPEG puts HEIGHT before width in a SOF segment. }
+  B := #255#216#255#224 + #0#16 + 'JFIF' + #0#1#1#0#0#1#0#1#0#0 +
+       #255#192 + #0#17 + #8 + #2#88 + #3#32 + #3#1#17#0#2#17#1#3#17#1;
+  Check(uImage.SniffImage(B, Media, W, H) and (Media = 'image/jpeg'),
+    'a JPEG is recognised');
+  Check((H = 600) and (W = 800),
+    'with height read before width, as SOF stores them');
+
+  { WebP, lossy. }
+  B := 'RIFF' + #0#0#0#0 + 'WEBP' + 'VP8 ' + #0#0#0#0 + #0#0#0 +
+       #157#1#42 + #100#0 + #50#0 + #0#0;
+  Check(uImage.SniffImage(B, Media, W, H) and (Media = 'image/webp'),
+    'a WebP is recognised');
+  Check((W = 100) and (H = 50), 'with its 14-bit dimensions');
+
+  { A BMP must be refused: the API rejects image/bmp, so accepting it here
+    would turn a local problem into a rejected request. }
+  B := 'BM' + StringOfChar(#0, 60);
+  Check(not uImage.SniffImage(B, Media, W, H), 'a BMP is not an image type');
+  Check(not uImage.SniffImage('just some text here', Media, W, H),
+    'and neither is text');
+  Check(not uImage.SniffImage('', Media, W, H), 'nor an empty buffer');
+
+  { Truncated: the type is certain, the size is not, and reading past the
+    buffer to find out is the bug this guards. }
+  B := #137'PNG'#13#10#26#10 + #0#0#0#13;
+  Check(uImage.SniffImage(B, Media, W, H) and (Media = 'image/png'),
+    'a truncated PNG is still a PNG');
+  Check((W = 0) and (H = 0), 'reported with an unknown size, not a guess');
+end;
+
+{ The queue, the ordering inside a message, and the one place an internal
+  append must not touch it. }
+procedure TestAppendUserImages;
+var
+  A: TAgent;
+  Err, T: string;
+  Doc, Msg, Content: TJson;
+  I: Integer;
+  Ok: Boolean;
+begin
+  WriteLn('-- user images --');
+
+  A := TAgent.Create('k', 'm', 'sys');
+  try
+    Check(A.PendingImages = 0, 'nothing is queued to start with');
+    Check(A.AttachImage('image/png', 'QUJD', 8, 4, Err),
+      'an image queues: ' + Err);
+    Check(A.PendingImages = 1, 'and is counted');
+    Check(A.MessageCount = 0, 'but nothing is in the transcript yet');
+
+    A.AppendUserText('look at this');
+    Check(A.PendingImages = 0, 'appending drains the queue');
+    Check(A.MessageCount = 1, 'into exactly one message');
+
+    Doc := JsonParse(A.Transcript);
+    try
+      Msg := Doc.Item(0);
+      Check(Msg.Str('role') = 'user', 'a user message');
+      Content := Msg.Find('content');
+      Check(Content.Count = 2, 'with two blocks');
+      { The API documents that an image works best before the text asking
+        about it; text-then-image measurably degrades the answer. }
+      Check(Content.Item(0).Str('type') = 'image', 'the image comes FIRST');
+      Check(Content.Item(1).Str('type') = 'text', 'and the prose after it');
+      Check(Content.Item(0).Find('source').Str('type') = 'base64',
+        'the source is base64');
+      Check(Content.Item(0).Find('source').Str('media_type') = 'image/png',
+        'with the media type');
+      Check(Content.Item(0).Find('source').Str('data') = 'QUJD',
+        'and the data verbatim');
+    finally
+      Doc.Free;
+    end;
+  finally
+    A.Free;
+  end;
+
+  { An image with no prose is a real message.  The old unconditional
+    blank-text exit would have thrown it away without a word. }
+  A := TAgent.Create('k', 'm', 'sys');
+  try
+    Check(A.AttachImage('image/png', 'QUJD', 8, 4, Err), 'an image queues');
+    A.AppendUserText('');
+    Check(A.MessageCount = 1, 'an image with no text still makes a message');
+    Doc := JsonParse(A.Transcript);
+    try
+      Check(Doc.Item(0).Find('content').Count = 1, 'holding just the image');
+      Check(Doc.Item(0).Find('content').Item(0).Str('type') = 'image',
+        'and it is the image');
+    finally
+      Doc.Free;
+    end;
+  finally
+    A.Free;
+  end;
+
+  A := TAgent.Create('k', 'm', 'sys');
+  try
+    A.AppendUserText('');
+    Check(A.MessageCount = 0, 'blank text with an empty queue still adds nothing');
+
+    { The cap, and the fact that hitting it changes nothing else. }
+    Ok := True;
+    for I := 1 to MaxImagesPerMessage do
+      if not A.AttachImage('image/png', 'QUJD', 2, 2, Err) then Ok := False;
+    Check(Ok, 'the cap admits exactly MaxImagesPerMessage');
+    Check(not A.AttachImage('image/png', 'QUJD', 2, 2, Err),
+      'and refuses one more');
+    Check(Pos(IntToStr(MaxImagesPerMessage), Err) > 0,
+      'naming the limit: ' + Err);
+    Check(A.MessageCount = 0, 'a refused attach leaves the transcript alone');
+    Check(A.PendingImages = MaxImagesPerMessage, 'and the queue intact');
+
+    Check(not A.AttachImage('image/bmp', 'QUJD', 2, 2, Err),
+      'a media type the API will not take is refused here, not by the API');
+
+    A.ClearPendingImages;
+    Check(A.PendingImages = 0, 'the queue can be dropped');
+  finally
+    A.Free;
+  end;
+
+  { The queue survives every append that is not the user's own message.  The
+    end-to-end proof of that - a real summarise round trip that must not spend
+    the image - needs a transport and lives in loop.lpr; what is checkable
+    here is that queueing alone never writes to the transcript. }
+  A := TAgent.Create('k', 'm', 'sys');
+  try
+    A.AppendUserText('a question');
+    T := A.Transcript;
+    Check(A.AttachImage('image/png', 'QUJD', 2, 2, Err), 'an image is pending');
+    Check(A.Transcript = T, 'queueing an image changes no message');
+    Check(Pos('QUJD', A.Transcript) = 0, 'and puts nothing in the transcript');
+  finally
+    A.Free;
+  end;
+end;
+
+{ The worst outcome this feature could produce is a saved session the loader
+  then refuses.  This pins the round trip even though today's loader needs no
+  change - so that a later block-type allowlist fails here rather than in a
+  user's directory. }
+procedure TestImageTranscriptRoundTrip;
+var
+  A: TAgent;
+  Err, Path, T: string;
+  Doc, Content, Src: TJson;
+begin
+  WriteLn('-- image transcript --');
+  Path := IncludeTrailingPathDelimiter(TmpRoot) + 'img' + PathDelim +
+    'session.json';
+
+  A := TAgent.Create('k', 'some-model', 'sys');
+  try
+    Check(A.AttachImage('image/png', 'aGVsbG8=', 32, 16, Err), 'attached');
+    A.AppendUserText('what is this');
+    Check(A.SaveSession(Path, Err), 'a session with an image saves: ' + Err);
+  finally
+    A.Free;
+  end;
+
+  A := TAgent.Create('k', '', 'sys');
+  try
+    Check(A.LoadSession(Path, Err),
+      'and loads again - an image block is not rejected: ' + Err);
+    T := A.Transcript;
+    Doc := JsonParse(T);
+    try
+      Content := Doc.Item(0).Find('content');
+      Check(Content.Item(0).Str('type') = 'image', 'the image block came back');
+      Src := Content.Item(0).Find('source');
+      Check(Src.Str('media_type') = 'image/png', 'with its media type');
+      Check(Src.Str('data') = 'aGVsbG8=', 'and its data byte for byte');
+    finally
+      Doc.Free;
+    end;
+  finally
+    A.Free;
+  end;
+
+  { The existing structural rules still bite.  An image block is legal only
+    because it is an object with a non-empty type, not because it is an
+    image - so a block written without one is still refused by the loader. }
+  WriteFileText(Path, '{"version":1,"model":"m","messages":' +
+    '[{"role":"user","content":[{"source":{"type":"base64"}}]}]}');
+  A := TAgent.Create('k', '', 'sys');
+  try
+    Check(not A.LoadSession(Path, Err), 'a block with no type is still refused');
+    Check(Pos('no type', Err) > 0, 'for that reason: ' + Err);
+  finally
+    A.Free;
+  end;
+end;
+
+procedure TestEvictImages;
+var
+  A: TAgent;
+  Err, T, Path: string;
+  Blocks: TPartialBlocks;
+  Ran: Boolean;
+  Doc: TJson;
+  Before, N: Integer;
+begin
+  WriteLn('-- image eviction --');
+
+  A := TAgent.Create('k', 'm', 'sys');
+  try
+    { Four images over three user messages, with a tool call and its result in
+      between so the pairing rule is actually in play. }
+    A.AttachImage('image/png', 'b25l', 10, 10, Err);
+    A.AttachImage('image/png', 'dHdv', 20, 20, Err);
+    A.AppendUserText('first pair');
+    SetLength(Blocks, 1);
+    Blocks[0].Kind := bkToolUse;
+    Blocks[0].Id := 'call_1';
+    Blocks[0].Name := 'search';
+    Blocks[0].Text := '{"pattern":"x"}';
+    Blocks[0].Signature := '';
+    A.ApplyBlocks(Blocks, Ran);
+    A.AttachImage('image/png', 'dGhyZWU=', 30, 30, Err);
+    A.AppendUserText('third');
+    A.AttachImage('image/png', 'Zm91cg==', 40, 40, Err);
+    A.AppendUserText('fourth');
+
+    Before := A.MessageCount;
+    N := A.EvictImages(1);
+    Check(N = 3, 'three of four images are evicted, keeping the newest');
+    Check(A.MessageCount = Before, 'no message is removed');
+
+    T := A.Transcript;
+    { Oldest first: evicting newest-first would throw away the image the user
+      just pasted and keep one nobody will look at again. }
+    Check(Pos('b25l', T) = 0, 'the oldest image is gone');
+    Check(Pos('dHdv', T) = 0, 'and the second');
+    Check(Pos('dGhyZWU=', T) = 0, 'and the third');
+    Check(Pos('Zm91cg==', T) > 0, 'but the NEWEST image survives');
+    Check(CountOccurrences('[image removed', T) = 3,
+      'each evicted image left a placeholder');
+    Check(Pos('[image removed to save context: 10x10 image/png]', T) > 0,
+      'naming what it was');
+
+    { Substitution, not deletion: a deleted block could empty a content array,
+      and a zero-length content array is exactly what the loader rejects, so a
+      measure meant to save context would produce an unloadable session.  The
+      proof is the real path - save it, load it back. }
+    Doc := JsonParse(T);
+    try
+      Check(Doc.Item(0).Find('content').Count = 3,
+        'the first message still has all three of its blocks');
+      Check(Doc.Item(0).Find('content').Item(0).Str('type') = 'text',
+        'with the image replaced by text in place');
+    finally
+      Doc.Free;
+    end;
+    Path := IncludeTrailingPathDelimiter(TmpRoot) + 'evict' + PathDelim +
+      'session.json';
+    Check(A.SaveSession(Path, Err), 'an evicted transcript saves: ' + Err);
+    Check(A.LoadSession(Path, Err),
+      'and loads again - eviction left it legal: ' + Err);
+
+    Check(A.EvictImages(1) = 0, 'a second pass has nothing left to do');
+    Check(A.EvictImages(0) = 1, 'and keeping none evicts the last one');
+  finally
+    A.Free;
+  end;
+
+  { The trigger's whole point: bring the transcript back under the byte line
+    so the byte trim stops firing uselessly on every turn. }
+  A := TAgent.Create('k', 'm', 'sys');
+  try
+    A.AttachImage('image/png', StringOfChar('A', 200000), 100, 100, Err);
+    A.AppendUserText('a big one');
+    A.AttachImage('image/png', 'c21hbGw=', 10, 10, Err);
+    A.AppendUserText('a small one');
+    Check(A.TranscriptBytes > 150000, 'base64 makes the transcript large');
+    A.EvictImages(1);
+    Check(A.TranscriptBytes < 5000,
+      'and eviction brings it back down, which is what makes the byte trim ' +
+      'useful again');
+  finally
+    A.Free;
+  end;
+end;
+
+{ The cross-cutting guard.  Attaching an image is a slash command - a whole
+  line, read and then dispatched - and must never become a keystroke, because
+  the key loop that would read that keystroke is the same one AskPermission
+  uses to read y/a/n. }
+procedure TestPasteIsNotAKey;
+var
+  E: TEditState;
+  Verbs: Integer;
+begin
+  WriteLn('-- paste is not a key --');
+
+  { The enumeration is unchanged.  A new editor verb here is the first step of
+    putting a clipboard action inside ReadLineEdit, and ReadLineEdit is what
+    the permission prompt reads its answer with. }
+  Verbs := Ord(High(TEditKey)) - Ord(Low(TEditKey)) + 1;
+  Check(Verbs = 11, 'TEditKey still has exactly its eleven editing verbs');
+  Check(Ord(High(TEditKey)) = Ord(ekNewline),
+    'and ekNewline is still the last of them');
+
+  { Every verb still only edits a buffer: none submits, cancels, or reaches
+    outside the line. }
+  EditInit(E);
+  EditApply(E, ekChar, 'a');
+  EditApply(E, ekChar, 'b');
+  EditApply(E, ekHome, #0);
+  EditApply(E, ekChar, 'x');
+  Check(UTF8Encode(E.Text) = 'xab', 'ekChar still inserts at the caret');
+  EditApply(E, ekClear, #0);
+  Check(UTF8Encode(E.Text) = '', 'ekClear still clears the line');
+
+  { And the approval answer is parsed from a whole line, so a slash command
+    typed at the permission prompt is simply not an allow.  Permission
+    defaults to deny, and '/paste' is neither 'y' nor 'a'. }
+  Check(not ((LowerCase('/paste') = 'y') or (LowerCase('/paste') = 'a') or
+             (Trim('/paste') = '')),
+    'a slash-prefixed line does not parse as an approval');
+end;
+
 { --------------------------------------------------------------- mentions -- }
 
 procedure TestMentions;
@@ -1401,42 +2040,42 @@ begin
     'the notes contents'#10);
 
   { The basic case: prose stays, the file is appended, the note reports it. }
-  Out_ := ExpandMentions('please look at @notes.txt for context', Notes);
+  Out_ := ExpandMentions('please look at @notes.txt for context', nil, Notes);
   Check(Pos('please look at @notes.txt', Out_) = 1, 'the prose is unchanged');
   Check(Pos('the notes contents', Out_) > 0, 'the file contents are attached');
   Check(Pos('--- notes.txt ---', Out_) > 0, 'under a header naming the file');
   Check(Pos('attached (', Notes) > 0, 'and the user is told');
 
   { Trailing punctuation belongs to the sentence, not the path. }
-  Out_ := ExpandMentions('see @notes.txt, then decide', Notes);
+  Out_ := ExpandMentions('see @notes.txt, then decide', nil, Notes);
   Check(Pos('the notes contents', Out_) > 0,
     'a mention followed by a comma still resolves');
 
   { A missing file is a note, not an attachment and not an error. }
-  Out_ := ExpandMentions('what about @missing.txt here', Notes);
+  Out_ := ExpandMentions('what about @missing.txt here', nil, Notes);
   Check(Out_ = 'what about @missing.txt here', 'a missing file changes nothing');
   Check(Pos('no such file', Notes) > 0, 'but is reported');
 
   { An email address is not a mention. }
-  Out_ := ExpandMentions('mail bob@notes.txt about it', Notes);
+  Out_ := ExpandMentions('mail bob@notes.txt about it', nil, Notes);
   Check(Pos('--- notes.txt ---', Out_) = 0,
     'an @ inside a word does not attach anything');
 
   { The path guard applies to typed mentions exactly as to tool calls. }
-  Out_ := ExpandMentions('read @..\..\Windows\win.ini now', Notes);
+  Out_ := ExpandMentions('read @..\..\Windows\win.ini now', nil, Notes);
   Check(Pos('win.ini contents', Out_) = 0, 'an escaping mention attaches nothing');
   Check(Pos('@..', Notes) > 0, 'and the refusal is reported');
-  Out_ := ExpandMentions('read @.pasclaude\session.json now', Notes);
+  Out_ := ExpandMentions('read @.pasclaude\session.json now', nil, Notes);
   Check(Pos('--- .pasclaude', Out_) = 0, 'the session file cannot be mentioned in');
 
   { A binary file would poison the request body. }
   WriteFileText(IncludeTrailingPathDelimiter(TmpRoot) + 'blob2.bin', 'A'#0#255'B');
-  Out_ := ExpandMentions('and @blob2.bin too', Notes);
+  Out_ := ExpandMentions('and @blob2.bin too', nil, Notes);
   Check(Pos(#0, Out_) = 0, 'binary bytes never reach the prompt');
   Check(Pos('not text', Notes) > 0, 'with the reason named');
 
   { No mention, no work: the common case must pass through untouched. }
-  Out_ := ExpandMentions('a plain question', Notes);
+  Out_ := ExpandMentions('a plain question', nil, Notes);
   Check((Out_ = 'a plain question') and (Notes = ''), 'plain text passes through');
 end;
 
@@ -2966,6 +3605,14 @@ begin
     TestDenyRoundTrip;
     TestStateDirIsHidden;
     TestEditor;
+    TestImageCodec;
+    TestDibToRgb;
+    TestVisualTokens;
+    TestSniffImage;
+    TestAppendUserImages;
+    TestImageTranscriptRoundTrip;
+    TestEvictImages;
+    TestPasteIsNotAKey;
     TestMentions;
     TestMultiEdit;
     TestNotebook;
