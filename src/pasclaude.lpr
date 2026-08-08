@@ -1736,7 +1736,7 @@ var
   PngFmt: UINT;
   Drop: PByte;
   WideName: PWideChar;
-  Name: string;
+  Name, Full: string;
   F: TFileStream;
   SW, SH: Integer;
 
@@ -1809,10 +1809,22 @@ begin
           finally
             GlobalUnlock(H);
           end;
-        if (Name <> '') and FileExists(Name) then
+        { A copied file is a path argument like any other, and this is the one
+          route by which a file's bytes reach the model without a tool call.
+          ResolveInRoot is SafePath, which @-mentions, read_file and the SDK's
+          @import all go through, so /paste goes through it too: the session
+          root, the .pasclaude refusal and the deny rules mean the same thing
+          however the path arrived.  Refusing here costs a user with a
+          screenshot on the Desktop nothing - Ctrl+C on the IMAGE still works,
+          and so does --add-dir. }
+        if (Name <> '') and not uTools.ResolveInRoot(Name, Full, Err) then
+        begin
+          Exit;
+        end;
+        if (Full <> '') and FileExists(Full) then
         begin
           try
-            F := TFileStream.Create(Name, fmOpenRead or fmShareDenyNone);
+            F := TFileStream.Create(Full, fmOpenRead or fmShareDenyNone);
             try
               N := F.Size;
               if N > MaxImageFileBytes then

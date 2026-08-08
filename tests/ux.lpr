@@ -1773,7 +1773,28 @@ begin
   EditApply(E, ekWordRight, #0);
   EditApply(E, ekDelWordRight, #0);
   EditApply(E, ekDelToEnd, #0);
+  { e is in this list because it was the one that was not: WordEndFwd used to
+    answer Length-1 = -1 on an empty buffer, and the clamps that would have
+    caught it sat after the early exit.  A caret of -1 reaches SegEnd and
+    Redraw, which both index W[Caret + 1] - W[0] on a nil WideString, an
+    access violation that kills the process without running TermDone and
+    leaves the console in raw mode.  '/vim on', Esc, e was the whole
+    reproduction. }
+  EditApply(E, ekWordEnd, #0);
+  EditApply(E, ekDelWordEnd, #0);
+  EditApply(E, ekFirstNonBlank, #0);
   Check((Txt = '') and (E.Caret = 0), 'and every verb no-ops on an empty line');
+
+  { The same verb with vim OFF, where VimClamp does not run: a keys.json can
+    bind word-end to any chord, so the caret must be sane without the clamp
+    behind it - Redraw indexes it either way. }
+  EditInit(E);
+  EditApply(E, ekWordEnd, #0);
+  Check(E.Caret = 0, 'word-end on an empty line is 0 with vim off too');
+  EditApply(E, ekChar, 'a');
+  EditApply(E, ekHome, #0);
+  EditApply(E, ekWordEnd, #0);
+  Check(E.Caret = 0, 'and 0 on a one-character line, not past it');
 
   { i a I A, which only differ by where the caret lands. }
   Start('  hi');
@@ -2418,6 +2439,57 @@ begin
     Check(A.AttachImage('image/png', 'QUJD', 2, 2, Err), 'an image is pending');
     Check(A.Transcript = T, 'queueing an image changes no message');
     Check(Pos('QUJD', A.Transcript) = 0, 'and puts nothing in the transcript');
+  finally
+    A.Free;
+  end;
+
+  { width and height are ours and the API's schema does not have them.  They
+    must be in the transcript, where LoadSession and the '[image WxH]' summary
+    read them, and out of the request, which the Messages API validates
+    strictly and rejects for an unknown key - a 400 on every turn carrying an
+    image would leave the whole feature dead on first contact with a server. }
+  A := TAgent.Create('k', 'm', 'sys');
+  try
+    Check(A.AttachImage('image/png', 'QUJD', 4, 8, Err), 'an image is queued');
+    A.AppendUserText('look at this');
+    Check(Pos('"width"', A.Transcript) > 0,
+      'the transcript keeps the dimensions');
+    Check(Pos('"height"', A.Transcript) > 0, 'both of them');
+    Check(Pos('"width"', A.RequestBody) = 0,
+      'and the request carries neither: ' + A.RequestBody);
+    Check(Pos('"height"', A.RequestBody) = 0, 'nor the second');
+    Check(Pos('QUJD', A.RequestBody) > 0,
+      'while the image itself still goes out');
+  finally
+    A.Free;
+  end;
+
+  { A turn that never reached the server must not eat the attachment.  The
+    user was told the image goes with their next message; unwinding the user
+    turn under it would consume it silently, and the clipboard it came from
+    may be gone. }
+  A := TAgent.Create('k', 'm', 'sys');
+  try
+    Check(A.AttachImage('image/png', 'QUJD', 4, 8, Err), 'an image is queued');
+    A.AppendUserText('a question about it');
+    Check(A.PendingImages = 0, 'sending drains the queue');
+    Check(A.TrimUnansweredQuestion, 'the failed turn is unwound');
+    Check(A.MessageCount = 0, 'leaving nothing behind');
+    Check(A.PendingImages = 1, 'and the image is back on the queue');
+    A.AppendUserText('asking again');
+    Check(Pos('QUJD', A.Transcript) > 0, 'so the retry still carries it');
+  finally
+    A.Free;
+  end;
+
+  { The same repair through the tool-result path, which drops more than one
+    message on its way back to the last assistant turn. }
+  A := TAgent.Create('k', 'm', 'sys');
+  try
+    Check(A.AttachImage('image/png', 'QUJD', 4, 8, Err), 'an image is queued');
+    A.AppendUserText('a question about it');
+    A.UnwindUnsentTail;
+    Check(A.PendingImages = 1, 'the unwind puts the image back too');
   finally
     A.Free;
   end;

@@ -417,8 +417,12 @@ text preserves what was missing at the time. Unchecked items remain open.
   attached in print mode. **An image can carry text instructing the model that
   a person reading the transcript cannot see — the transcript shows only
   `[image 1920x1080 image/png]`. Nothing here detects that and nothing can.
-  What bounds it: an image enters only by your own `@mention` or `/paste`, the
-  mention is root-guarded exactly as a tool call is, and it lands in a user
+  What bounds it: an image enters only by your own `@mention` or `/paste`, both
+  root-guarded exactly as a tool call is — a FILE copied in Explorer goes
+  through the same resolver as `@`, so a `/paste` of one outside the session
+  root, or inside `.pasclaude\`, or under a deny rule, is refused by the same
+  message (copying the *image* rather than the file is unaffected, and
+  `--add-dir` widens both alike) — and it lands in a user
   block, so it carries the authority of text you typed and no more. A saved
   session also keeps the image on disk in plaintext under `.pasclaude\`.***
 - [x] ~~**Vim mode / keybindings** — line editing is fixed (arrows, Home/End,

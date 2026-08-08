@@ -925,7 +925,18 @@ end;
 function WordEndFwd(const W: WideString; P: Integer): Integer;
 begin
   Result := P + 1;
-  if Result >= Length(W) then Exit(Length(W) - 1);
+  if Result >= Length(W) then
+  begin
+    { The last character of an EMPTY line is 0, not -1.  The two clamps at the
+      bottom of this function never run on this path, so the arithmetic has to
+      be right here: a caret of -1 escapes into VimClamp and Redraw, both of
+      which index W[Caret + 1] and so read W[0] - a nil dereference on an empty
+      WideString, and a process death that skips TermDone and leaves the
+      console in raw mode. }
+    Result := Length(W) - 1;
+    if Result < 0 then Result := 0;
+    Exit;
+  end;
   while (Result < Length(W)) and (ClassOf(W[Result + 1]) = wcBlank) do Inc(Result);
   while (Result < Length(W) - 1) and
         (ClassOf(W[Result + 2]) = ClassOf(W[Result + 1])) do Inc(Result);
@@ -947,10 +958,16 @@ end;
 
 function SegEnd(const W: WideString; P: Integer): Integer;
 var
-  I: Integer;
+  I, From: Integer;
 begin
   Result := Length(W);
-  for I := P + 1 to Length(W) do
+  { The scan starts at P + 1, so a caret of -1 would index W[0] - outside a
+    WideString, and a nil dereference when the string is empty.  Callers are
+    supposed to hand over a caret in range; this clamp is the belt to that
+    braces, because the cost of being wrong here is the whole process. }
+  From := P + 1;
+  if From < 1 then From := 1;
+  for I := From to Length(W) do
     if W[I] = #10 then Exit(I - 1);
 end;
 

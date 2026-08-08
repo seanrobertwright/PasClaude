@@ -145,6 +145,12 @@ type
       a summarise instruction, say - must not spend the image the user just
       pasted and meant for their next question. }
     procedure AppendUserTextOnly(const S: string);
+    { Puts the image blocks of a user message that is about to be dropped back
+      on the pending queue.  AppendUserText drains the queue into the message
+      before the request goes out, so a message removed because the turn never
+      reached the server takes the attachment with it - and the clipboard the
+      user copied it from may be long gone. }
+    procedure RequeueImagesFrom(M: TJson);
   public
     OnText: TTextProc;             { streamed assistant prose }
     OnThinking: TTextProc;         { streamed reasoning, when the model emits it }
@@ -993,6 +999,10 @@ begin
   { A trailing tool_result message is a different animal: it answers the
     assistant turn before it, and dropping it would orphan that tool call. }
   if IsToolResultMessage(Last) then Exit;
+  { The question is being thrown away unanswered; anything the user attached
+    to it was never sent either, so it goes back on the queue rather than
+    vanishing with the message. }
+  RequeueImagesFrom(Last);
   FMessages.Drop(FMessages.Count - 1);
   Result := True;
 end;
@@ -1175,6 +1185,34 @@ begin
   Result := FTurns;
 end;
 
+{ width and height are ours, not the API's.  They live in FMessages so a
+  resumed session can say '[image 1920x1080 image/png]' without decoding a
+  megabyte of base64, and LoadSession reads them back - but the Messages API
+  validates content blocks strictly and rejects a block carrying a key it does
+  not know, so every one of them has to be gone from the copy that goes on the
+  wire.  Stripped here, beside the cache_control fixup, for the same reason:
+  the transcript stays free of transport concerns and the transport stays free
+  of ours.  Local-only keys added later belong in this one list. }
+procedure StripLocalImageFields(Msg: TJson);
+var
+  Content, B: TJson;
+  I, K: Integer;
+begin
+  if Msg = nil then Exit;
+  Content := Msg.Find('content');
+  if (Content = nil) or (Content.Kind <> jkArr) then Exit;
+  for I := 0 to Content.Count - 1 do
+  begin
+    B := Content.Item(I);
+    if (B = nil) or (B.Kind <> jkObj) then Continue;
+    if B.Str('type') <> 'image' then Continue;
+    K := B.IndexOf('width');
+    if K >= 0 then B.Drop(K);
+    K := B.IndexOf('height');
+    if K >= 0 then B.Drop(K);
+  end;
+end;
+
 function TAgent.BuildBody: string;
 var
   Root, Msgs, M, C: TJson;
@@ -1260,7 +1298,11 @@ begin
     begin
       M := FMessages.Item(I);
       C := JsonParse(M.ToJson);
-      if C <> nil then Msgs.Push(C);
+      if C <> nil then
+      begin
+        StripLocalImageFields(C);
+        Msgs.Push(C);
+      end;
     end;
     { A second marker on the final content block caches the conversation so
       far.  Each turn then only pays full price for what was added since the
@@ -2195,11 +2237,51 @@ begin
     TrimUnansweredQuestion;
 end;
 
+{ The queue is bounded, so an image that cannot fit is dropped rather than
+  allowed to push the count past what AttachImage would ever have permitted -
+  a silently over-long queue would fail the next request instead of this one.
+  Order within the message is preserved, which is the order the user pasted
+  them in. }
+procedure TAgent.RequeueImagesFrom(M: TJson);
+var
+  Content, B, Src: TJson;
+  I, N, Back: Integer;
+begin
+  if M = nil then Exit;
+  if M.Str('role') <> 'user' then Exit;
+  Content := M.Find('content');
+  if (Content = nil) or (Content.Kind <> jkArr) then Exit;
+  Back := 0;
+  for I := 0 to Content.Count - 1 do
+  begin
+    B := Content.Item(I);
+    if (B = nil) or (B.Kind <> jkObj) then Continue;
+    if B.Str('type') <> 'image' then Continue;
+    Src := B.Find('source');
+    if (Src = nil) or (Src.Str('data') = '') then Continue;
+    N := Length(FPendingImages);
+    if N >= MaxImagesPerMessage then Break;
+    SetLength(FPendingImages, N + 1);
+    FPendingImages[N].Media := Src.Str('media_type');
+    FPendingImages[N].Data := Src.Str('data');
+    FPendingImages[N].W := Round(B.Num('width'));
+    FPendingImages[N].H := Round(B.Num('height'));
+    Inc(Back);
+  end;
+  { Silence here would be the real damage: the user was told the image goes
+    with their next message, and without this they would send that message
+    without it and never know. }
+  if (Back > 0) and Assigned(OnNotice) then
+    OnNotice(Format('%d attached image(s) were not sent; they go with your ' +
+      'next message', [Back]));
+end;
+
 procedure TAgent.UnwindUnsentTail;
 begin
   while (FMessages.Count > 1) and
         (FMessages.Item(FMessages.Count - 1).Str('role') = 'user') do
   begin
+    RequeueImagesFrom(FMessages.Item(FMessages.Count - 1));
     FMessages.Drop(FMessages.Count - 1);
     DropUnansweredToolCalls;
   end;
