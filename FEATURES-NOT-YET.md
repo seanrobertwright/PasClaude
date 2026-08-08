@@ -421,8 +421,32 @@ text preserves what was missing at the time. Unchecked items remain open.
   mention is root-guarded exactly as a tool call is, and it lands in a user
   block, so it carries the authority of text you typed and no more. A saved
   session also keeps the image on disk in plaintext under `.pasclaude\`.***
-- [ ] **Vim mode / keybindings** — line editing is fixed (arrows, Home/End,
-  Ctrl+A/E/U); no `/vim`, no configurable keybindings.
+- [x] ~~**Vim mode / keybindings** — line editing is fixed (arrows, Home/End,
+  Ctrl+A/E/U); no `/vim`, no configurable keybindings.~~
+  *Built: two separate things. `/vim` turns on a modal editor — insert and
+  normal modes, `[I]`/`[N]` on the prompt, motions `h l w b e 0 ^ $` with
+  `j`/`k` as history, entries `i a I A`, edits `x D C S dd cc dw db de d0 d$
+  cw cb ce c0 c$`, and undo `u` / redo Ctrl+R with one insert session as one
+  step; `/vim save` keeps it. `/keys` lists the effective table.
+  `%USERPROFILE%\.pasclaude\keys.json` rebinds — `{"vim":true,"bindings":
+  {"ctrl+w":"delete-word-left"}}` — over built-in defaults Ctrl+W, Ctrl+K,
+  Alt+B, Alt+F and Ctrl+Z, which are the readline verbs the line above
+  complains are missing. Every refused entry is reported by name, never
+  ignored. Still missing, deliberately: visual mode, registers/yank/put,
+  counts (`3dw`), the `.` repeat, marks, macros, `:` commands, `/` search,
+  text objects (`ciw`), `r`/`R`/`s`, `o`/`O`, `gg`/`G` and `%`. A prompt is
+  one line — there is no buffer to write and no next line to open — and
+  `j`/`k` are worth more as history than as motion. Turning vim on costs
+  Esc-clears-the-line (Ctrl+U still clears), and text pasted while in normal
+  mode is read as commands; `/vim on` says both out loud. **A binding cannot
+  reach the permission prompt, and three separate things stop it: no chord
+  can be named without ctrl or alt, so `y`, `a` and `n` are inexpressible; an
+  action is an editor verb, so nothing bound can submit, answer or run
+  anything; and the reader every other prompt uses passes an empty profile,
+  with the binding table read in one expression a grep can audit. The file is
+  under `%USERPROFILE%` and never the project directory, so a `git clone`
+  cannot ship one. Nothing here enters the model's context: the request body
+  is byte-identical with vim on or off.***
 - [x] ~~**Output styles** — no `/output-style`.~~
   *Built: `/output-style` lists what is available and marks the current one,
   `/output-style <name>` sets it, and `--output-style <name>` works under

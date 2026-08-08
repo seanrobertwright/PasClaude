@@ -208,12 +208,12 @@ end;
 { ------------------------------------------------------------- completion -- }
 
 const
-  SlashCommands: array[0..30] of string = (
+  SlashCommands: array[0..32] of string = (
     '/help', '/clear', '/compact', '/deny', '/diff', '/hooks', '/jobs', '/mcp',
     '/memory', '/init', '/mode', '/plan', '/rewind', '/sandbox', '/sessions',
     '/skills', '/plugins', '/think', '/web', '/add-dir', '/remove-dir',
     '/resume', '/save', '/cwd', '/model', '/yolo', '/cost', '/output-style',
-    '/paste', '/exit', '/quit');
+    '/paste', '/vim', '/keys', '/exit', '/quit');
 
 { Candidates for the token being completed: slash commands when the token
   opens the line with a slash, file and directory names under the session
@@ -624,6 +624,8 @@ begin
   EmitCLn(clGrey,   '  /sandbox [lvl] off | limits | low: how confined child processes are');
   EmitCLn(clGrey,   '  /output-style [name]  how replies are written; no argument lists them');
   EmitCLn(clGrey,   '  /paste         attach the clipboard image to your next message');
+  EmitCLn(clGrey,   '  /vim [on|off|save]  modal line editing; save keeps it');
+  EmitCLn(clGrey,   '  /keys          the editing keys, and where to rebind them');
   EmitCLn(clGrey,   '  /cost          tokens used so far');
   EmitCLn(clGrey,   '  /exit          quit (Ctrl+C also works)');
   EmitLn;
@@ -654,6 +656,24 @@ begin
   Result := IncludeTrailingPathDelimiter(uTools.RootDir) + SessionDir +
     PathDelim + 'history.txt';
 end;
+
+{ Where the keybindings live - and pointedly NOT under the session root.
+  Everything in <root>\.pasclaude arrives with a git clone, and this file
+  decides what keystrokes do; a repository that could ship one would be
+  choosing how the user's keyboard behaves before they had read a line of it.
+  %USERPROFILE% rather than %LOCALAPPDATA% because this is hand-authored
+  configuration the user writes and has to be able to find, the same argument
+  as the user-level CLAUDE.md (uSdk.SdkUserContext).  LOCALAPPDATA is where
+  the program keeps state IT writes, keyed by session; bindings are neither. }
+function KeysPath: string;
+begin
+  Result := IncludeTrailingPathDelimiter(
+    GetEnvironmentVariable('USERPROFILE')) + SessionDir + PathDelim +
+    'keys.json';
+end;
+
+var
+  KeysFileFound: Boolean = False;
 
 { Standing approvals - and pointedly NOT beside the session and the history.
   Everything else under <root>\.pasclaude describes the project; this one
@@ -840,6 +860,71 @@ begin
   except
     Result := False;
   end;
+end;
+
+{ Reads keys.json if it is there, reports every refused entry, and installs
+  the result.  A missing file is the built-in defaults in silence; a broken
+  one is the built-in defaults plus notes.  Neither can fail the session, and
+  neither can widen anything: the worst a file achieves is different editing. }
+procedure LoadKeys;
+var
+  Text: string;
+  P: TKeyProfile;
+  Notes: TStringArray;
+  I: Integer;
+begin
+  Notes := nil;
+  KeysFileFound := FileExists(KeysPath);
+  if not KeysFileFound then
+  begin
+    SetPromptProfile(KeysDefault);
+    Exit;
+  end;
+  if not ReadFileText(KeysPath, Text) then
+  begin
+    HookNotice('keys.json could not be read; using the built-in bindings');
+    SetPromptProfile(KeysDefault);
+    Exit;
+  end;
+  KeysParse(Text, P, Notes);
+  for I := 0 to High(Notes) do
+    HookNotice('keys.json: ' + Notes[I]);
+  SetLength(Notes, 0);
+  SetPromptProfile(P);
+end;
+
+{ /vim save.  Read-modify-write so a hand-written bindings block survives;
+  JSON has no comments, so nothing else can be lost. }
+function SaveVimSetting(out Err: string): Boolean;
+var
+  Text, Out_: string;
+  F: TFileStream;
+begin
+  Err := '';
+  Text := '';
+  ReadFileText(KeysPath, Text);
+  Out_ := KeysToJson(PromptProfile, Text);
+  if not ForceDirectories(ExtractFilePath(KeysPath)) then
+  begin
+    Err := 'cannot create ' + ExtractFilePath(KeysPath);
+    Exit(False);
+  end;
+  try
+    F := TFileStream.Create(KeysPath, fmCreate);
+    try
+      if Out_ <> '' then F.WriteBuffer(Out_[1], Length(Out_));
+    finally
+      F.Free;
+    end;
+  except
+    on E: Exception do
+    begin
+      Err := E.Message;
+      Exit(False);
+    end;
+  end;
+  KeysFileFound := True;
+  Result := True;
 end;
 
 { Claude Code's file: {"claudeAiOauth":{"accessToken","expiresAt",...}}. }
@@ -1931,6 +2016,35 @@ begin
 end;
 
 { Returns False when the command asked to quit. }
+{ /keys.  The effective table, which is the built-in defaults with whatever
+  keys.json changed, plus where the file is and whether it was there.  Sorted
+  by nothing in particular: the profile's own order is the order the user
+  wrote, which is more useful than alphabetical. }
+procedure ShowKeys;
+var
+  P: TKeyProfile;
+  I: Integer;
+begin
+  P := PromptProfile;
+  EmitCLn(clBright, 'Keys');
+  EmitCLn(clGrey, '  ' + KeysPath +
+    Choice(KeysFileFound, '', '  (not present; built-in bindings)'));
+  EmitCLn(clGrey, '  vim mode ' + Choice(P.Vim, 'on', 'off'));
+  EmitLn;
+  for I := 0 to High(P.Binds) do
+    EmitCLn(clGrey, Format('  %-12s %s',
+      [KeyChordName(P.Binds[I].Chord), KeyActionName(P.Binds[I].Action)]));
+  if Length(P.Binds) = 0 then
+    EmitCLn(clGrey, '  no bindings');
+  EmitLn;
+  EmitCLn(clGrey, '  Bindings apply to this prompt only - not to the');
+  EmitCLn(clGrey, '  permission question, and not to the /model, /sessions or');
+  EmitCLn(clGrey, '  /rewind pickers.  Every chord must carry ctrl or alt, or');
+  EmitCLn(clGrey, '  be a named key, so a plain letter cannot be rebound at');
+  EmitCLn(clGrey, '  all; enter, tab, escape and ctrl+c are reserved.');
+  EmitCLn(clGrey, '  {"vim":true,"bindings":{"ctrl+w":"delete-word-left"}}');
+end;
+
 function HandleCommand(const Line: string; out Handled: Boolean): Boolean;
 var
   Cmd, Arg: string;
@@ -2071,6 +2185,41 @@ begin
       MdFinish;
       AtLineStart := True;
     end;
+  end
+  else if Cmd = '/keys' then
+    ShowKeys
+  else if Cmd = '/vim' then
+  begin
+    if Arg = 'save' then
+    begin
+      if SaveVimSetting(Err) then
+        EmitCLn(clGrey, '  vim ' + Choice(PromptProfile.Vim, 'on', 'off') +
+          ' written to ' + KeysPath)
+      else
+        EmitCLn(clRed, '  ' + Err);
+      Exit;
+    end;
+    if Arg = 'on' then SetPromptVim(True)
+    else if Arg = 'off' then SetPromptVim(False)
+    else if Arg = '' then SetPromptVim(not PromptProfile.Vim)
+    else
+    begin
+      EmitCLn(clRed, '  /vim takes on, off, save, or no argument');
+      Exit;
+    end;
+    if PromptProfile.Vim then
+    begin
+      EmitCLn(clGrey, '  vim mode on; [I] and [N] on the prompt say which mode');
+      { The two things that stop working, said out loud.  Both are real
+        losses, and finding them out by surprise is worse than either. }
+      EmitCLn(clGrey, '  Esc now leaves insert mode instead of clearing the');
+      EmitCLn(clGrey, '  line - Ctrl+U still clears it - and text pasted while');
+      EmitCLn(clGrey, '  in normal mode is read as commands, not as text.');
+      EmitCLn(clGrey, '  /vim save keeps it for future sessions; /keys lists');
+      EmitCLn(clGrey, '  the bindings.');
+    end
+    else
+      EmitCLn(clGrey, '  vim mode off');
   end
   else if Cmd = '/think' then
   begin
@@ -2996,6 +3145,13 @@ begin
 
       ShowBanner;
 
+      { Keybindings, from %USERPROFILE% and nowhere else - below the banner
+        because any note it prints is about a file the user wrote and belongs
+        with the other startup remarks, not above the logo.  Pointedly not
+        beside LoadPermissions: that file records what the project was
+        allowed to do, this one grants nothing at all. }
+      LoadKeys;
+
       { The honest disclosure for the half of this feature that asks nothing:
         text out of the repository is now in the model's catalogue, and here
         is the command that shows what it says. }
@@ -3061,7 +3217,10 @@ begin
       end;
 
       repeat
-        if not ReadLineEdit(ModePrompt, Line) then Break;
+        { The one call in the program that consults the binding table.  Every
+          other prompt - the permission answer above all - reads through
+          ReadLineEdit, which passes the empty profile. }
+        if not ReadPromptLine(ModePrompt, Line) then Break;
         Line := Trim(Line);
         if Line = '' then Continue;
         { Written now rather than at exit, for the same reason the session

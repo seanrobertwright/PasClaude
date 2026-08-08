@@ -9,7 +9,7 @@ program smoke;
   suite calls SysUtils' one throughout.  A later unit wins, so SysUtils has to
   come after it. }
 uses Windows, SysUtils, Classes, uJson, uHttp, uMcp, uHooks, uSandbox, uTools,
-  uAgent, uRegex, uSdk;
+  uAgent, uRegex, uSdk, uTerm;
 
 var
   Fails: Integer = 0;
@@ -3498,6 +3498,49 @@ begin
   Check(Opts.PermissionMode = '', 'and no mode name, which means "ask uTools"');
 end;
 
+{ The editor is not the model's business.  Vim mode and the keybindings exist
+  entirely below the request: nothing about them reaches BuildBody, so the
+  body a conversation produces is the same string whatever the keyboard is
+  doing.  If this ever fails, somebody decided the model should be told - and
+  that costs tokens on every single turn to say something it cannot act on,
+  or, if it went into FSystem, discards the cached prefix on every toggle. }
+procedure TestEditorNeverReachesTheRequest;
+var
+  A: TAgent;
+  Body1, Body2, Err: string;
+  P: TKeyProfile;
+  Notes: TStringArray;
+begin
+  uTools.ClearStyles;
+  uTools.ClearDenyRules;
+  uTools.SetPermMode(uTools.pmodeAsk);
+  Notes := nil;
+
+  A := TAgent.Create('sk-ant-api-key', 'm', 'sys');
+  try
+    SetPromptProfile(KeysNone);
+    SetPromptVim(False);
+    A.AppendUserText('hello');
+    Body1 := A.RequestBody;
+
+    Check(KeysParse('{"vim":true,"bindings":{"ctrl+w":"delete-line"}}',
+      P, Notes), 'a keys.json loads');
+    SetPromptProfile(P);
+    Check(PromptProfile.Vim, 'and vim is on for the prompt');
+    SetLength(Notes, 0);
+
+    Body2 := A.RequestBody;
+    Check(Body1 = Body2, 'the request body is byte-identical with vim on');
+    Check(Pos('vim', LowerCase(Body1)) = 0, 'and says nothing about vim at all');
+    Check(uTools.SessionNote = '',
+      'the uncached trailing block is still empty at defaults');
+  finally
+    A.Free;
+    SetPromptProfile(KeysNone);
+  end;
+  Err := '';
+end;
+
 var
   Schema: TJson;
 begin
@@ -3526,6 +3569,7 @@ begin
   TestStyleCapsAndEncoding;
   TestStyleGrantsNothing;
   TestStyleListing;
+  TestEditorNeverReachesTheRequest;
   TestDenyRuleParsing;
   TestRunShellContract;
   TestSandboxLevelParsingAndPersistence;

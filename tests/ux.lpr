@@ -1477,7 +1477,495 @@ begin
   EditApply(E, ekBackspace, #0);
   Check(Txt = 'caf', 'backspace removes the whole character, not one byte');
 
+  { The default state is what the permission prompt and the three pickers
+    edit in.  Vim behaviour leaking into it would change what every prompt in
+    the program does, so the absence is asserted rather than assumed. }
   HistoryClear;
+  EditInit(E);
+  Check(not E.Vim, 'a plain edit starts with vim off');
+  Check(E.Mode = vmInsert, 'and in insert mode');
+  Check(E.PendOp = #0, 'with no pending operator');
+  Check(E.UndoN = 0, 'and an empty undo stack');
+  { Every character vim would interpret is still just a character here. }
+  TypeStr('dwciAX0$');
+  Check(Txt = 'dwciAX0$', 'printable keys are inserted, never interpreted');
+  { And a profile with vim on does not reach a state built without it. }
+  SetPromptProfile(KeysDefault);
+  SetPromptVim(True);
+  EditInit(E);
+  Check(not E.Vim, 'EditInit ignores the installed profile entirely');
+  EditInitProfile(E, KeysNone);
+  Check(not E.Vim, 'and KeysNone starts a line with vim off');
+  SetPromptVim(False);
+
+  HistoryClear;
+end;
+
+{ ------------------------------------------------------- vim and bindings -- }
+
+{ The first wall: the key-name grammar.  A chord that cannot be written
+  cannot be bound, and y/a/n cannot be written. }
+procedure TestKeyGrammarRefusesPlainKeys;
+var
+  C: TKeyChord;
+  Why: string;
+
+  procedure Refused(const Name: string);
+  begin
+    Check(not KeyChordOf(Name, C, Why),
+      'a plain "' + Name + '" is not a bindable chord');
+    Check(Pos('ctrl+', Why) > 0, '  and the reason names the missing modifier');
+  end;
+
+  procedure Reserved(const Name: string);
+  begin
+    if not KeyChordOf(Name, C, Why) then
+      Check(False, Name + ' should parse so it can be refused by name')
+    else
+      Check(KeyChordReserved(C), Name + ' is reserved and cannot be rebound');
+  end;
+
+  procedure RoundTrips(const Name: string);
+  begin
+    if not KeyChordOf(Name, C, Why) then
+      Check(False, Name + ' should be a legal chord (' + Why + ')')
+    else
+      Check(KeyChordName(C) = Name, Name + ' round-trips through its name');
+  end;
+
+begin
+  WriteLn('-- key grammar --');
+
+  { These five are the whole of the permission prompt's vocabulary plus a
+    digit for the pickers.  None of them may ever become nameable. }
+  Refused('y');
+  Refused('a');
+  Refused('n');
+  Refused('1');
+  Refused('x');
+
+  Reserved('ctrl+c');
+  Reserved('enter');
+  Reserved('ctrl+enter');
+  Reserved('alt+enter');
+  Reserved('tab');
+  Reserved('escape');
+
+  RoundTrips('ctrl+w');
+  RoundTrips('alt+f');
+  RoundTrips('ctrl+[');
+  RoundTrips('home');
+  RoundTrips('ctrl+alt+shift+k');
+
+  Check(not KeyChordOf('ctrl+', C, Why), 'a modifier with no key is refused');
+  Check(not KeyChordOf('ctrl+nosuchkey', C, Why), 'an unknown key name is refused');
+end;
+
+{ The second wall: the plain reader passes KeysNone, so a fully populated
+  profile installed for the REPL is invisible to it. }
+procedure TestPlainReaderIgnoresBindings;
+var
+  P: TKeyProfile;
+  Notes: TStringArray;
+  E: TEditState;
+  K: TEditKey;
+begin
+  WriteLn('-- bindings are scoped to the prompt --');
+  Notes := nil;
+  Check(KeysParse('{"vim":true,"bindings":{"ctrl+w":"delete-line"}}', P, Notes),
+    'a well-formed keys.json parses');
+  Check(Length(Notes) = 0, 'with nothing to report');
+  Check(P.Vim, 'and vim on');
+  SetLength(Notes, 0);
+
+  { Install it exactly as the host does at startup. }
+  SetPromptProfile(P);
+
+  EditInit(E);
+  Check(DecodeKey(P, E, Ord('W'), True, False, False, #0, K) and (K = ekDelLine),
+    'the prompt profile resolves Ctrl+W to the bound verb');
+  Check(not DecodeKey(KeysNone, E, Ord('W'), True, False, False, #0, K),
+    'the empty profile resolves nothing, however loaded the module var is');
+
+  { And vim is a field of the profile, so normal mode cannot exist on a line
+    that was started without one: 'a' at the permission prompt is the
+    character a, not the append command. }
+  EditInitProfile(E, KeysNone);
+  Check(not E.Vim, 'a KeysNone line is not modal');
+  EditApply(E, ekChar, 'a');
+  EditApply(E, ekChar, 'd');
+  Check(UTF8Encode(E.Text) = 'ad', 'so vim command letters are plain text there');
+
+  SetPromptProfile(KeysDefault);
+end;
+
+{ A refused entry must be reported.  Silence would be indistinguishable from
+  a binding this build does not support. }
+procedure TestKeysParseReportsRatherThanIgnores;
+var
+  P: TKeyProfile;
+  Notes: TStringArray;
+  I, N: Integer;
+  K: TEditKey;
+  C: TKeyChord;
+  Why: string;
+
+  function Bound(const Chord: string; out Act: TEditKey): Boolean;
+  var
+    E: TEditState;
+    Ignore: string;
+  begin
+    EditInit(E);
+    Result := False;
+    if not KeyChordOf(Chord, C, Ignore) then Exit;
+    Result := DecodeKey(P, E, C.VK, C.Ctrl, C.Alt, C.Shift, #0, Act);
+  end;
+
+begin
+  WriteLn('-- keys.json reports what it refuses --');
+  Notes := nil;
+  Check(KeysParse('{"bindings":{"ctrl+w":"eat-the-line","nonsense+q":"undo",' +
+    '"ctrl+c":"undo","y":"undo","ctrl+k":"delete-to-end"}}', P, Notes),
+    'a document with bad entries still parses');
+  Check(Length(Notes) = 4, 'and every one of the four bad entries is reported');
+  { Each note has to name the entry it is about, or the user cannot find it. }
+  N := 0;
+  for I := 0 to High(Notes) do
+    if (Pos('ctrl+w', Notes[I]) > 0) or (Pos('nonsense+q', Notes[I]) > 0) or
+       (Pos('ctrl+c', Notes[I]) > 0) or (Pos('y', Notes[I]) > 0) then Inc(N);
+  Check(N = 4, 'each note names its own entry');
+  SetLength(Notes, 0);
+
+  Check(Bound('ctrl+k', K) and (K = ekDelToEnd),
+    'the one good entry took effect');
+  { The refused ctrl+w did not unbind the default it failed to replace - a
+    bad entry must change nothing at all. }
+  Check(Bound('ctrl+w', K) and (K = ekDelWordLeft),
+    'and a refused entry leaves the built-in binding standing');
+
+  { A malformed or empty file is the defaults, not an empty binding set. }
+  Notes := nil;
+  Check(not KeysParse('{ not json', P, Notes), 'a malformed file fails');
+  Check(Length(Notes) = 1, 'with one note saying so');
+  Check(Bound('ctrl+w', K) and (K = ekDelWordLeft),
+    'and leaves the built-in bindings in place');
+  SetLength(Notes, 0);
+
+  Notes := nil;
+  Check(not KeysParse('', P, Notes), 'an empty file fails');
+  Check(Length(Notes) = 1, 'with one note');
+  Check(Length(P.Binds) = Length(KeysDefault.Binds),
+    'and the profile is the built-in table');
+  SetLength(Notes, 0);
+
+  { An explicit unbind is the only way a file removes a default. }
+  Notes := nil;
+  Check(KeysParse('{"bindings":{"ctrl+w":"none"}}', P, Notes), 'none unbinds');
+  Check(Length(Notes) = 0, 'quietly, because it is not an error');
+  Check(not Bound('ctrl+w', K), 'and Ctrl+W is then unbound');
+  SetLength(Notes, 0);
+  Why := '';
+end;
+
+procedure TestVimMotionsAndOperators;
+var
+  E: TEditState;
+  P: TKeyProfile;
+  K: TEditKey;
+
+  procedure Start(const S: WideString);
+  var
+    I: Integer;
+  begin
+    EditInitProfile(E, P);
+    for I := 1 to Length(S) do
+      EditApply(E, ekChar, S[I]);
+    EditApply(E, ekNormalMode, #0);
+  end;
+
+  function Txt: string;
+  begin
+    Result := UTF8Encode(E.Text);
+  end;
+
+begin
+  WriteLn('-- vim motions and operators --');
+  HistoryClear;
+  P := KeysNone;
+  P.Vim := True;
+
+  { Motions.  An off-by-one in the word scanner is the first thing a vim
+    user notices, so each landing point is named. }
+  Start('the quick brown fox');
+  EditApply(E, ekHome, #0);
+  Check(E.Caret = 0, 'normal mode starts the walk at the line start');
+  EditApply(E, ekWordRight, #0);
+  Check(E.Caret = 4, 'w lands on the q of quick');
+  EditApply(E, ekWordRight, #0);
+  Check(E.Caret = 10, 'w again lands on the b of brown');
+  EditApply(E, ekWordRight, #0);
+  Check(E.Caret = 16, 'and again on the f of fox');
+
+  EditApply(E, ekHome, #0);
+  EditApply(E, ekWordEnd, #0);
+  Check(E.Caret = 2, 'e lands ON the last character of the word, not after it');
+
+  EditApply(E, ekEnd, #0);
+  Check(E.Caret = 18, 'in normal mode the caret clamps to the last character');
+  EditApply(E, ekWordLeft, #0);
+  Check(E.Caret = 16, 'b from the end lands on the start of fox');
+
+  { The operator parser.  'd' is absorbed; the next key resolves it. }
+  Start('the quick brown fox');
+  EditApply(E, ekHome, #0);
+  Check(not EditNormalKey(E, 'd', K), 'd alone produces no verb');
+  Check(E.PendOp = 'd', 'and is remembered as a pending operator');
+  Check(EditNormalKey(E, 'w', K) and (K = ekDelWordRight),
+    'the following w resolves it to delete-word-right');
+  Check(E.PendOp = #0, 'and clears the operator');
+  EditApply(E, K, #0);
+  Check(Txt = 'quick brown fox', 'dw removes the word and the space after it');
+  Check(E.Mode = vmNormal, 'and d leaves the editor in normal mode');
+
+  { An invalid target must clear the operator, or it fires on the next key. }
+  Start('the quick brown fox');
+  EditApply(E, ekHome, #0);
+  EditNormalKey(E, 'd', K);
+  Check(not EditNormalKey(E, 'z', K), 'dz is not a command');
+  Check(E.PendOp = #0, 'and the pending d does not survive it');
+  Check(Txt = 'the quick brown fox', 'with the line untouched');
+  Check(EditNormalKey(E, 'w', K) and (K = ekWordRight),
+    'so the next w is a motion, not a deletion');
+
+  { c is d plus insert mode - forgetting the mode change is the classic bug. }
+  Start('the quick brown fox');
+  EditApply(E, ekHome, #0);
+  EditApply(E, ekChangeWordEnd, #0);
+  Check(Txt = ' quick brown fox', 'cw removes to the end of the word');
+  Check(E.Mode = vmInsert, 'and leaves the editor in insert mode');
+
+  { dd, D and x. }
+  Start('the quick brown fox');
+  EditApply(E, ekDelLine, #0);
+  Check(Txt = '', 'dd empties the line');
+  Check(E.Caret = 0, 'with the caret at the start');
+  Start('the quick brown fox');
+  EditApply(E, ekHome, #0);
+  EditApply(E, ekWordRight, #0);
+  EditApply(E, ekDelToEnd, #0);
+  Check(Txt = 'the ', 'D removes from the caret to the end of the line');
+  Start('abc');
+  EditApply(E, ekHome, #0);
+  EditApply(E, ekDelete, #0);
+  Check(Txt = 'bc', 'x removes the character under the caret');
+
+  { Esc's step left, and the empty line, where every verb must no-op. }
+  EditInitProfile(E, P);
+  EditApply(E, ekChar, 'a');
+  EditApply(E, ekChar, 'b');
+  EditApply(E, ekChar, 'c');
+  Check(E.Caret = 3, 'insert mode leaves the caret past the last character');
+  EditApply(E, ekNormalMode, #0);
+  Check(E.Caret = 2, 'and Esc steps back onto it');
+  EditInitProfile(E, P);
+  EditApply(E, ekNormalMode, #0);
+  Check(E.Caret = 0, 'on an empty line Esc leaves the caret at 0');
+  EditApply(E, ekWordRight, #0);
+  EditApply(E, ekDelWordRight, #0);
+  EditApply(E, ekDelToEnd, #0);
+  Check((Txt = '') and (E.Caret = 0), 'and every verb no-ops on an empty line');
+
+  { i a I A, which only differ by where the caret lands. }
+  Start('  hi');
+  EditApply(E, ekHome, #0);
+  EditApply(E, ekInsertStart, #0);
+  Check((E.Caret = 2) and (E.Mode = vmInsert), 'I goes to the first non-blank');
+  Start('abc');
+  EditApply(E, ekHome, #0);
+  EditApply(E, ekAppendHere, #0);
+  Check((E.Caret = 1) and (E.Mode = vmInsert), 'a inserts after the caret');
+  Start('abc');
+  EditApply(E, ekHome, #0);
+  EditApply(E, ekInsertHere, #0);
+  Check((E.Caret = 0) and (E.Mode = vmInsert), 'i inserts at the caret');
+  Start('abc');
+  EditApply(E, ekHome, #0);
+  EditApply(E, ekAppendEnd, #0);
+  Check((E.Caret = 3) and (E.Mode = vmInsert), 'A goes past the last character');
+
+  { Non-ASCII is a word character, not a separator: a path with an accent
+    must not fragment into one word per letter. }
+  Start('caf' + WideChar($00E9) + ' na' + WideChar($00EF) + 've');
+  EditApply(E, ekHome, #0);
+  EditApply(E, ekWordRight, #0);
+  Check(E.Caret = 5, 'w skips the whole accented word, landing on the next');
+
+  { j and k are history, which is the one-line adaptation. }
+  HistoryClear;
+  HistoryAdd('an old command');
+  Start('');
+  Check(EditNormalKey(E, 'k', K) and (K = ekHistPrev), 'k is history-previous');
+  Check(EditNormalKey(E, 'j', K) and (K = ekHistNext), 'j is history-next');
+  HistoryClear;
+end;
+
+procedure TestVimUndo;
+var
+  E: TEditState;
+  P: TKeyProfile;
+  I: Integer;
+
+  procedure TypeStr(const S: WideString);
+  var
+    J: Integer;
+  begin
+    for J := 1 to Length(S) do
+      EditApply(E, ekChar, S[J]);
+  end;
+
+  function Txt: string;
+  begin
+    Result := UTF8Encode(E.Text);
+  end;
+
+begin
+  WriteLn('-- undo --');
+  HistoryClear;
+  P := KeysNone;
+  P.Vim := True;
+
+  { A word deletion is one step, and it comes back with its caret. }
+  EditInit(E);
+  TypeStr('hello world');
+  EditApply(E, ekDelWordLeft, #0);
+  Check(Txt = 'hello ', 'Ctrl+W removes the word');
+  EditApply(E, ekUndo, #0);
+  Check(Txt = 'hello world', 'undo brings it back');
+  Check(E.Caret = 11, 'with the caret where it was');
+  EditApply(E, ekRedo, #0);
+  Check(Txt = 'hello ', 'redo removes it again');
+
+  { A new edit truncates the redo tail: the abandoned branch must not come
+    back on a later Ctrl+R.  The two branches have to differ visibly or the
+    assertion would pass on either. }
+  EditApply(E, ekUndo, #0);
+  Check(Txt = 'hello world', 'undo again');
+  EditApply(E, ekHome, #0);
+  EditApply(E, ekDelWordRight, #0);
+  Check(Txt = 'world', 'a different edit from the same point');
+  EditApply(E, ekRedo, #0);
+  Check(Txt = 'world', 'redo does not resurrect the abandoned branch');
+
+  { One insert session is ONE step, which is the whole complaint every vim
+    user has about editors that undo per character. }
+  EditInitProfile(E, P);
+  EditApply(E, ekInsertHere, #0);
+  EditApply(E, ekChar, 'a'); EditApply(E, ekChar, 'b'); EditApply(E, ekChar, 'c');
+  EditApply(E, ekNormalMode, #0);
+  Check(Txt = 'abc', 'three characters typed');
+  Check(E.UndoN = 2, 'and the whole session is one step on the stack');
+  EditApply(E, ekUndo, #0);
+  Check(Txt = '', 'so one undo removes all three');
+
+  { Undo on a state that has never been edited is a no-op, not a crash. }
+  EditInit(E);
+  EditApply(E, ekUndo, #0);
+  EditApply(E, ekRedo, #0);
+  Check((Txt = '') and (E.Caret = 0), 'undo on a fresh line does nothing');
+
+  { The stack is capped.  A paste-and-delete loop must not grow without
+    bound, and the oldest entry is the one that goes. }
+  EditInit(E);
+  for I := 1 to 150 do
+  begin
+    EditApply(E, ekChar, 'a');
+    EditApply(E, ekDelWordLeft, #0);
+  end;
+  Check(E.UndoN = 100, 'the undo stack stops at a hundred entries');
+  Check(E.UndoAt = 99, 'with the newest state at the top');
+  for I := 1 to 200 do EditApply(E, ekUndo, #0);
+  Check(E.UndoAt = 0, 'and undo runs back to the oldest kept entry, no further');
+end;
+
+procedure TestKeysRoundTripAndDefaults;
+var
+  P, Q: TKeyProfile;
+  Notes: TStringArray;
+  E: TEditState;
+  C: TKeyChord;
+  K: TEditKey;
+  Doc, Why: string;
+  Root: TJson;
+
+  function DefaultIs(const Chord, Action: string): Boolean;
+  var
+    Act: TEditKey;
+  begin
+    Result := False;
+    if not KeyChordOf(Chord, C, Why) then Exit;
+    if not DecodeKey(P, E, C.VK, C.Ctrl, C.Alt, C.Shift, #0, Act) then Exit;
+    Result := KeyActionName(Act) = Action;
+  end;
+
+begin
+  WriteLn('-- default bindings and /vim save --');
+  EditInit(E);
+  P := KeysDefault;
+  Check(DefaultIs('ctrl+w', 'delete-word-left'), 'Ctrl+W deletes the word left');
+  Check(DefaultIs('ctrl+k', 'delete-to-end'),    'Ctrl+K deletes to the end');
+  Check(DefaultIs('alt+b',  'word-left'),        'Alt+B moves a word left');
+  Check(DefaultIs('alt+f',  'word-right'),       'Alt+F moves a word right');
+  Check(DefaultIs('ctrl+z', 'undo'),             'Ctrl+Z is undo');
+
+  { No default may name a reserved chord, or the editor would be fighting
+    itself before any file was read. }
+  Check(not KeyChordReserved(P.Binds[0].Chord), 'no default takes a reserved key');
+
+  { /vim save is a read-modify-write: a hand-written bindings block and any
+    field this build does not know about have to survive it. }
+  Q := KeysNone;
+  Q.Vim := True;
+  Doc := KeysToJson(Q,
+    '{"vim":false,"bindings":{"ctrl+k":"delete-to-end"},"other":42}');
+  Root := JsonParse(Doc);
+  Check(Root <> nil, 'the rewritten document is valid JSON');
+  if Root <> nil then
+  try
+    Check(Root.Bool('vim', False), 'with vim now true');
+    Check(Root.Num('other', 0) = 42, 'the unknown field survives');
+    Check(Root.IndexOf('other') = 2, 'in the position it was written in');
+    Check((Root.Find('bindings') <> nil) and
+          (Root.Find('bindings').Str('ctrl+k') = 'delete-to-end'),
+      'and the hand-written bindings are untouched');
+  finally
+    Root.Free;
+  end;
+
+  { And it re-parses into the same effective table. }
+  Notes := nil;
+  Check(KeysParse(Doc, P, Notes), 'the rewritten file parses back');
+  Check(P.Vim, 'with vim on');
+  Check(DecodeKey(P, E, Ord('K'), True, False, False, #0, K) and
+        (K = ekDelToEnd), 'and Ctrl+K still bound');
+  SetLength(Notes, 0);
+
+  { The painted lead, which is the only part of the indicator a test can
+    see - Redraw writes to a real console and nothing here can read it. }
+  EditInit(E);
+  Check(EditLead(E, '> ', True) = '> ', 'with vim off the lead is the prompt');
+  Check(EditLead(E, '> ', False) = '... ', 'and the continuation marker below it');
+  P := KeysNone;
+  P.Vim := True;
+  EditInitProfile(E, P);
+  Check(EditLead(E, '> ', True) = '[I] > ', 'with vim on the mode is shown');
+  EditApply(E, ekNormalMode, #0);
+  Check(EditLead(E, '> ', True) = '[N] > ', 'and changes with the mode');
+  Check(EditLead(E, 'plan+> ', False) = '[N] ... ',
+    'the continuation line carries the tag too');
+  { It composes with the permission indicator without either knowing about
+    the other: ModePrompt owns everything before the '> '. }
+  Check(EditLead(E, 'plan+> ', True) = '[N] plan+> ',
+    'and the permission mode keeps its place in front of the prompt');
 end;
 
 { ------------------------------------------------------------------ image -- }
@@ -2092,13 +2580,18 @@ var
 begin
   WriteLn('-- paste is not a key --');
 
-  { The enumeration is unchanged.  A new editor verb here is the first step of
-    putting a clipboard action inside ReadLineEdit, and ReadLineEdit is what
-    the permission prompt reads its answer with. }
+  { The enumeration is a closed set of BUFFER verbs.  A new one here is the
+    first step of putting a clipboard action - or an approval - inside the
+    reader the permission prompt uses, so the count is pinned and every
+    bindable name is checked to resolve back to a verb in it. }
   Verbs := Ord(High(TEditKey)) - Ord(Low(TEditKey)) + 1;
-  Check(Verbs = 11, 'TEditKey still has exactly its eleven editing verbs');
-  Check(Ord(High(TEditKey)) = Ord(ekNewline),
-    'and ekNewline is still the last of them');
+  Check(Verbs = 34, 'TEditKey has exactly its 34 editing verbs');
+  Check(Ord(High(TEditKey)) = Ord(ekRedo),
+    'and the vim verbs were appended, not interleaved');
+  Check(Ord(ekNewline) = 10, 'with the original eleven still in their places');
+  { ekChar is the only verb that can produce text, and it is deliberately
+    absent from the action table - so no keys.json can name it. }
+  Check(KeyActionName(ekChar) = '', 'no binding can name the insert verb');
 
   { Every verb still only edits a buffer: none submits, cancels, or reaches
     outside the line. }
@@ -3696,6 +4189,12 @@ begin
     TestDenyRoundTrip;
     TestStateDirIsHidden;
     TestEditor;
+    TestKeyGrammarRefusesPlainKeys;
+    TestPlainReaderIgnoresBindings;
+    TestKeysParseReportsRatherThanIgnores;
+    TestVimMotionsAndOperators;
+    TestVimUndo;
+    TestKeysRoundTripAndDefaults;
     TestImageCodec;
     TestDibToRgb;
     TestVisualTokens;
