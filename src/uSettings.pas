@@ -386,10 +386,18 @@ type
 
 var
   { The store.  Indexed [def, tier].  SettingsStore is the ONLY procedure that
-    writes it - the reviewer's check is that a grep for SettingValues shows no
-    other assignment, and a grep for TierAllowed shows exactly one call site.
-    A second writer or a second call site is the bug this design exists to
-    prevent. }
+    writes it, and that is the invariant worth auditing: a grep for
+    SettingValues must show assignments in SettingsStore and in the reset
+    beside it, and nowhere else.  A second writer is the bug this design
+    exists to prevent.
+
+    TierAllowed is the opposite case and the audit reads the other way round.
+    It is asked three times - when a value is parsed, when it is stored, and
+    when the effective tier is chosen - and every one of them REFUSES.  More
+    call sites make a project value harder to smuggle in, not easier, so a
+    reviewer counting them and deleting the "duplicates" would be removing
+    the belt and the braces to tidy up the trousers.  What would be a defect
+    is a path that stores or reads a value WITHOUT asking. }
   SettingValues: array[0..SettingCount - 1, TSettingTier] of TSettingSlot;
   RuntimeLabels: array[0..SettingCount - 1] of string;
   Refusals: TStringArray;
