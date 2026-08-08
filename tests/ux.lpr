@@ -4653,8 +4653,13 @@ begin
   Check(SettingSource('thinking_budget') = stDefault, 'and the source is default');
 end;
 
-{ ProjMax is narrow-only: a project may lower the user's cost and never raise
-  it, and a value above the ceiling is REFUSED rather than clamped - a clamp
+{ Narrow-only, and measured against the value the USER has in force - their
+  own file if it names the key, the compiled default if it does not.  What
+  shipped compared against the def's own Hi, which is not that rule at all: a
+  cloned repository could turn extended thinking on from a compiled 0, more
+  than double the tool result cap, and pull the compaction point down onto
+  every turn, while the table's comment said it could lower cost and never
+  raise it.  A value outside the rule is REFUSED rather than clamped - a clamp
   teaches the repository that the key half-works and teaches the user nothing. }
 procedure TestSettingsProjectCeiling;
 var
@@ -4663,24 +4668,146 @@ begin
   SettingsClear;
   Check(not SettingsParseTier(stProject, '{"thinking_budget":32768}', 'p', P),
     'a project may not raise thinking_budget past its ceiling');
-  Check(Mentions(P, '8192'), 'and the ceiling is named in the refusal');
   Check(not SettingIsSet('thinking_budget'), 'nothing was stored');
+
+  { The compiled default is 0 - TAgent.Create never assigns FThinkingBudget -
+    so with no user file there is no legal project value but 0.  This is the
+    case the shipped check let through: 8192 passed, and every request in that
+    checkout grew a thinking block and twice the max_tokens. }
+  SettingsClear;
+  Check(not SettingsParseTier(stProject, '{"thinking_budget":8192}', 'p', P),
+    'and may not turn thinking ON at all when the user has it off');
+  Check(Mentions(P, 'may not raise'), 'the refusal says which way it failed');
+  Check(SettingsParseTier(stProject, '{"thinking_budget":0}', 'p', P),
+    'though 0 - the value already in force - is not a raise');
 
   SettingsClear;
   Check(SettingsParseTier(stUser, '{"thinking_budget":32768}', 'u', P),
     'the user file may set the same value');
   Check(SettingInt('thinking_budget') = 32768, 'at its full range');
+  Check(SettingsParseTier(stProject, '{"thinking_budget":8192}', 'p', P),
+    'and now a project may lower it: narrowing cost is always allowed');
+  Check(SettingInt('thinking_budget') = 8192, 'and applies');
 
+  { Below ProjMax and still refused, because the user is below it too. }
   SettingsClear;
-  Check(SettingsParseTier(stProject, '{"thinking_budget":2048}', 'p', P),
-    'and a project lowering it is fine: narrowing cost is always allowed');
-  Check(SettingInt('thinking_budget') = 2048, 'and applies');
+  Check(SettingsParseTier(stUser, '{"thinking_budget":4096}', 'u', P),
+    'the user asks for 4096');
+  Check(not SettingsParseTier(stProject, '{"thinking_budget":8192}', 'p', P),
+    'a project may not double it even staying under ProjMax');
+  Check(Mentions(P, '4096'), 'and the refusal names the users own value');
+  Check(SettingInt('thinking_budget') = 4096, 'the users value still stands');
+
+  { The API floor, at every tier: a budget under 1024 is rejected by the API,
+    so a project file could otherwise make every turn in a checkout fail with
+    an HTTP 400 - from a loader whose contract is that it never stops the
+    program. }
+  SettingsClear;
+  Check(not SettingsParseTier(stUser, '{"thinking_budget":512}', 'u', P),
+    'a budget under the APIs 1024 floor is refused even in the user file');
+  Check(Mentions(P, '1024'), 'and the floor is named');
+  Check(SettingsParseTier(stUser, '{"thinking_budget":0}', 'u', P),
+    'but 0 means off and stays legal');
 
   SettingsClear;
   Check(not SettingsParseTier(stProject, '{"tool_result_bytes":131072}', 'p', P),
     'a project may not quadruple the tool result cap either');
+  Check(not SettingsParseTier(stProject, '{"tool_result_bytes":65536}', 'p', P),
+    'nor double it: 30720 is what the program does when no file says');
+  Check(SettingsParseTier(stProject, '{"tool_result_bytes":8192}', 'p', P),
+    'lowering it is fine');
   Check(SettingsParseTier(stUser, '{"tool_result_bytes":131072}', 'u', P),
-    'though the user may');
+    'though the user may raise it');
+
+  { The one key whose cheap direction is up: compaction costs an extra billed
+    request every time it fires. }
+  SettingsClear;
+  Check(not SettingsParseTier(stProject, '{"auto_compact_tokens":20000}', 'p', P),
+    'a project may not pull the compaction point down onto every turn');
+  Check(Mentions(P, 'may not lower'), 'and the refusal says which way');
+  Check(SettingsParseTier(stProject, '{"auto_compact_tokens":150000}', 'p', P),
+    'the compiled default itself is not a lowering');
+  SettingsClear;
+  Check(SettingsParseTier(stUser, '{"auto_compact_tokens":20000}', 'u', P),
+    'the user may compact as early as they like');
+  SettingsClear;
+end;
+
+{ The Dflt column duplicates a constant that lives somewhere else, and a
+  duplicated number is a number that drifts.  If uTools.MaxOutBytes moves and
+  this does not, the narrow-only rule silently starts measuring a project file
+  against a cap this program no longer uses. }
+procedure TestSettingDefaultsMatchTheProgram;
+var
+  I: Integer;
+begin
+  for I := 0 to SettingCount - 1 do
+    if SettingDefs[I].Name = 'tool_result_bytes' then
+      Check(SettingDefs[I].Dflt = uTools.MaxOutBytes,
+        'the tool_result_bytes baseline is uTools.MaxOutBytes')
+    else if SettingDefs[I].Name = 'auto_compact_tokens' then
+      Check(SettingDefs[I].Dflt = 150000,
+        'the auto_compact_tokens baseline is the hosts CompactTokens')
+    else if SettingDefs[I].Name = 'thinking_budget' then
+      Check(SettingDefs[I].Dflt = 0,
+        'and thinking is off until somebody asks for it');
+end;
+
+{ Everything this unit hands back came out of a file, and one of those files
+  is in the project tree.  Two demonstrated failures, one function: an ESC in
+  a key name drove the user's terminal at every launch - ESC[2J erased the
+  yellow security block printed immediately above it, OSC 0 renamed the window
+  - and a TAB in a value shifted the fields of the tab-separated /config row,
+  letting a project file pick the tier word that /config, /status and /bug
+  attribute its own value to. }
+procedure TestSettingsTextIsSanitised;
+var
+  P, Rows: TStringArray;
+  I, Fields, J: Integer;
+  Row: string;
+
+  function HasCtrl(const A: TStringArray): Boolean;
+  var
+    X, Y: Integer;
+  begin
+    Result := False;
+    for X := 0 to High(A) do
+      for Y := 1 to Length(A[X]) do
+        if A[X][Y] < ' ' then Exit(True);
+  end;
+
+begin
+  SettingsClear;
+  { Valid JSON and valid UTF-8, so it reaches the problem text intact. }
+  Check(not SettingsParseTier(stProject,
+    '{"' + #27 + '[2J' + #27 + '[1;31mPWNED' + #27 + ']0;hijacked' + #7 +
+    '":1}', 'p', P), 'a key of pure escape sequences is still just unknown');
+  Check(not HasCtrl(P),
+    'and no control character survives into the startup notice');
+  Check(Mentions(P, 'PWNED'), 'the printable part is still reported');
+
+  SettingsClear;
+  Check(not SettingsParseTier(stProject,
+    '{"model":"' + #27 + '[2Jx"}', 'p', P), 'a refused key with ESC in its value');
+  Check(not HasCtrl(SettingsRefusals), 'and the refusal is clean too');
+
+  { The tab, in the one place the tab means something. }
+  SettingsClear;
+  Check(SettingsParseTier(stProject, '{"output_style":"explanatory' + #9 +
+    'user"}', 'p', P), 'a tab inside a value is legal JSON and legal UTF-8');
+  Rows := SettingsReport;
+  Row := '';
+  for I := 0 to High(Rows) do
+    if Copy(Rows[I], 1, 12) = 'output_style' then Row := Rows[I];
+  Check(Row <> '', 'the row is there');
+  Fields := 1;
+  for J := 1 to Length(Row) do
+    if Row[J] = #9 then Inc(Fields);
+  Check(Fields = 4, 'and it still has exactly four fields');
+  Check(Pos(#9 + 'project', Row) > 0,
+    'the tier word is project, which is where the value came from');
+  Check(Pos(#9 + 'user', Row) = 0,
+    'and a project file cannot make /status say the user set it');
   SettingsClear;
 end;
 
@@ -5257,6 +5384,16 @@ var
 begin
   ClearDiagNotes;
   ClearDiagFacts;
+  { No --add-dir, which is the ordinary run and the one the shipped redactor
+    got wrong: it was handed uTools.WorkingDirs, which answers with the EXTRA
+    roots only, so with none of those it was handed an empty list and the
+    session root - the path that names the project - appeared verbatim in
+    every line while the banner above them said paths were redacted.  Every
+    earlier test in this suite that added a root has to be undone here or the
+    assertion below passes on somebody else's leftovers. }
+  uTools.ClearWorkingDirs;
+  uTools.RootDir := TmpRoot;
+  Check(uTools.RootCount = 1, 'the session root is the only root');
   Dir := IncludeTrailingPathDelimiter(TmpRoot) + 'reports';
   DiagReportsDirOverride := Dir;
   DiagFacts.Version := '0.1';
@@ -5285,12 +5422,20 @@ begin
     Check(Pos('sk-ant-***', Body) > 0, 'though its shape is named');
     Check(Pos('<root0>', Body) > 0, 'roots are replaced');
     Check(Pos(TmpRoot, Body) = 0, 'and no real root survives');
+    { Not a vacuous assertion: the line that leaked is in there, and what it
+      says now is the label rather than the path. }
+    Check(Pos('session root:', Body) > 0, 'the report states the session root');
 
     Opts.IncludeTranscript := True;
     Check(DiagWriteBug(A, Opts, Path, TranscriptPath, Err),
       'and again with the transcript');
     Check((TranscriptPath <> '') and FileExists(TranscriptPath),
       'the sibling file exists');
+    { A transcript that could not be written or could not be redacted must
+      leave TranscriptPath empty and Err set, never the pair that made the
+      caller print "secrets are redacted" over an unredacted file.  On the
+      path that worked, the pair is the other way round. }
+    Check(Err = '', 'and a transcript that worked says nothing');
     Body := ReadFileText(Path);
     Check(Pos('Transcript', Body) > 0, 'and the report names it');
 
@@ -5379,6 +5524,8 @@ begin
     TestSettingsAllOrNothing;
     TestSettingsPrecedence;
     TestSettingsProjectCeiling;
+    TestSettingDefaultsMatchTheProgram;
+    TestSettingsTextIsSanitised;
     TestSettingsLocalHasProjectAuthority;
     TestSettingsGrantsNothing;
     TestLogoutTouchesOnlyOurOwnCredential;

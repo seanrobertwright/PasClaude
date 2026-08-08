@@ -212,7 +212,10 @@ function DiagBugText(A: TAgent; const Opts: TBugOptions;
 function DiagBugJson(A: TAgent; const Opts: TBugOptions;
   const Status: TStatusReport; const Doctor: TDiagReport): string;
 { Writes the report.  Path is where it went; False with Err set and NOTHING
-  written anywhere when there is no home directory to write to. }
+  written anywhere when there is no home directory to write to.  True with
+  Err set and TranscriptPath empty is the transcript-only failure: the report
+  is there, the conversation file is not, and the sentence says why.  There
+  is no path on which TranscriptPath names a file that was not redacted. }
 function DiagWriteBug(A: TAgent; const Opts: TBugOptions;
   out Path, TranscriptPath, Err: string): Boolean;
 
@@ -1492,6 +1495,21 @@ begin
   Result := '';
 end;
 
+{ Every root, the primary one FIRST.  uTools.WorkingDirs answers with the
+  --add-dir extras alone, which is right for its own callers and wrong here:
+  the session root is the path that names the project and the client, and in
+  the ordinary run with no --add-dir it is the ONLY path there is.  Handing
+  WorkingDirs to the redactor produced a report whose banner said paths were
+  redacted while every line of it carried the project directory. }
+function AllRoots: TStringArray;
+var
+  I: Integer;
+begin
+  Result := nil;
+  SetLength(Result, uTools.RootCount);
+  for I := 0 to uTools.RootCount - 1 do Result[I] := uTools.RootAt(I);
+end;
+
 function RedactAll(const S: string; const Opts: TBugOptions): string;
 begin
   { Secrets always, unconditionally, with no flag that turns it off.  Paths
@@ -1499,7 +1517,7 @@ begin
     and often the person. }
   Result := DiagRedactSecrets(S);
   if not Opts.RealPaths then
-    Result := DiagRedactPaths(Result, uTools.WorkingDirs,
+    Result := DiagRedactPaths(Result, AllRoots,
       SysUtils.GetEnvironmentVariable('USERPROFILE'),
       SysUtils.GetEnvironmentVariable('LOCALAPPDATA'));
 end;
@@ -1678,8 +1696,7 @@ var
   Dir, Stamp, Base, Text, Body: string;
   Status: TStatusReport;
   Doctor: TDiagReport;
-  SaveErr: string;
-  Rewritten: Boolean;
+  SaveErr, TransErr: string;
 begin
   Path := '';
   TranscriptPath := '';
@@ -1707,26 +1724,43 @@ begin
   Doctor := DiagBuildDoctor(A, False);
   { The transcript first, so its name can be stated inside the report the
     user is about to read. }
+  TransErr := '';
   if Opts.IncludeTranscript and (A <> nil) then
   begin
     TranscriptPath := Base + '-transcript.json';
     if A.SaveSession(TranscriptPath, SaveErr) then
     begin
+      { Secrets only.  Redaction cannot redact meaning, and the console says
+        so in yellow: a transcript is the conversation.
+
+        Read-back or rewrite can fail - a virus scanner or a backup agent
+        holding the file it has just seen appear is the ordinary case - and
+        what is on disk at that moment is the UNREDACTED session.  It is
+        deleted and the name withdrawn, because the caller announces this
+        file to the user with the sentence "secrets are redacted", and a file
+        that contradicts that sentence is worse than no file: the user has
+        been told in yellow that a key they pasted into the conversation is
+        not in it. }
       if ReadAllText(TranscriptPath, Text) then
       begin
-        { Secrets only.  Redaction cannot redact meaning, and the console
-          says so in yellow: a transcript is the conversation. }
-        Rewritten := WriteAllText(TranscriptPath,
-          DiagRedactSecrets(Text), SaveErr);
-        if not Rewritten then
-          Err := 'the transcript was written but could not be redacted: ' +
-            SaveErr;
+        if not WriteAllText(TranscriptPath, DiagRedactSecrets(Text),
+             SaveErr) then
+          TransErr := 'the transcript could not be redacted (' + SaveErr +
+            ') and was deleted; nothing unredacted was left behind';
+      end
+      else
+        TransErr := 'the transcript could not be read back to redact it ' +
+          'and was deleted; nothing unredacted was left behind';
+      if TransErr <> '' then
+      begin
+        SysUtils.DeleteFile(TranscriptPath);
+        TranscriptPath := '';
       end;
     end
     else
     begin
       TranscriptPath := '';
-      Err := 'the transcript could not be written: ' + SaveErr;
+      TransErr := 'the transcript could not be written: ' + SaveErr;
     end;
   end;
   if Opts.AsJson then
@@ -1744,6 +1778,12 @@ begin
   end;
   Result := WriteAllText(Path, Body, Err);
   if not Result then Path := '';
+  { WriteAllText clears Err as its first statement, so a transcript failure
+    reported before this call would vanish exactly when the report itself
+    succeeded - success with no transcript and no explanation.  The report's
+    own error wins when there is one; otherwise the transcript's is carried
+    out even though Result is True, and the caller prints it. }
+  if Result and (TransErr <> '') then Err := TransErr;
 end;
 
 initialization

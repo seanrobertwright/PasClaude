@@ -507,9 +507,18 @@ text preserves what was missing at the time. Unchecked items remain open.
   scope, and one function consulted from one place enforces it, so a value at
   a tier its key does not permit is never stored rather than stored and
   overruled. A project or local file may set four keys: `output_style`,
-  `thinking_budget`, `tool_result_bytes` and `auto_compact_tokens` — and only
-  ever downward on the last three, because a repository may lower your cost
-  and never raise it. `model` and the model-routing and telemetry keys are
+  `thinking_budget`, `tool_result_bytes` and `auto_compact_tokens` — and on
+  the last three only in the direction that costs you less, measured against
+  the value **you** have in force: your own settings file if it names the key,
+  the compiled default if it does not. So a project may lower
+  `thinking_budget` and `tool_result_bytes` and may never raise either, and
+  since the compiled default for thinking is off, a repository cannot turn
+  extended thinking on at all. `auto_compact_tokens` is the one that runs the
+  other way — each compaction is an extra billed request, so a project may
+  push the compaction point later and never earlier. A `thinking_budget`
+  between 1 and 1023 is refused at every tier: the API's floor is 1024 and it
+  rejects the request, so the number would otherwise fail every turn in a
+  checkout. `model` and the model-routing and telemetry keys are
   user-scope only; a project value is refused by name. Every key somebody
   might paste out of Claude Code's `settings.json` — `permissions`,
   `allow_edits`, `deny`, `sandbox`, `permission_mode`, `env`, `apiKey`,
@@ -518,7 +527,15 @@ text preserves what was missing at the time. Unchecked items remain open.
   because a user believing a pasted file took effect is worse than any wrong
   default. A file with any problem in it contributes **nothing** and every
   problem is named in yellow at startup, like a bad deny rule; it never halts,
-  because a project file is attacker-controlled. `/config` prints the three
+  because a project file is attacker-controlled. Those yellow lines are
+  suppressed under `--output-format json` and `stream-json`, where stdout
+  carries the protocol and nothing else — a project file must not be able to
+  put prose in front of a driver's JSON — and every one of them is in the
+  diagnostic ledger that `/doctor` prints regardless. Control characters are
+  stripped from every string this unit hands back: a key name of `ESC[2J` in a
+  cloned repository would otherwise erase the security warnings printed above
+  it, and a TAB inside a value would shift the fields of the tab-separated
+  `/config` row and let the file choose the tier word `/status` blames. `/config` prints the three
   absolute paths and a table of key, value and tier with an "overruled:" line
   under anything shadowed; `/config get` shows the whole chain, `/config set
   [--local]` writes the user file or `settings.local.json` and never the
@@ -553,7 +570,13 @@ text preserves what was missing at the time. Unchecked items remain open.
   `/bug` writes a redacted markdown or JSON report to
   `%LOCALAPPDATA%\pasclaude\reports\` and **uploads nothing** — there is no
   upload path, not a disabled one — refusing outright rather than falling
-  back into the project when there is no home. `--status` and `--doctor` are
+  back into the project when there is no home. Path redaction covers the
+  session root itself, not just the `--add-dir` extras, which is the whole
+  point of it: the session root is the path that names the project. With
+  `--transcript`, a conversation file that could not be read back or could not
+  be rewritten redacted is **deleted** and the failure said out loud, because
+  the alternative is a file on disk full of whatever you pasted into the
+  conversation with the console telling you in yellow that it is redacted. `--status` and `--doctor` are
   also top-level flags that take `--output-format json|stream-json`, exit 1
   on a problem, and are the only two modes that continue past a missing
   credential — safe because they cannot run a turn.
@@ -660,7 +683,12 @@ text preserves what was missing at the time. Unchecked items remain open.
   lowerCamelCase keys, enums as integers, int64 as decimal strings, DELTA
   temporality so a process that dies owes nothing. Five counters go out and
   nothing else: turns, tokens by kind and model, tool calls by name and
-  ok/error, API requests by HTTP status, and total request milliseconds. The
+  ok/error, API requests by HTTP status, and total request milliseconds.
+  Tokens are a delta against a baseline that starts at zero — where a fresh
+  agent starts — and is moved by the host only when a session is *loaded*, so
+  the first turn of a session counts and a resumed session never reports
+  somebody else's totals as its own. That matters most where it is least
+  visible: a `-p` run has exactly one turn. The
   two strings that could carry text are filtered rather than trusted — a tool
   name must be in a compile-time list of built-ins or it becomes `mcp` or
   `other`, and a model name must match `claude-[a-z0-9._-]*` or it becomes

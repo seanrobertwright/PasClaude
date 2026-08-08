@@ -138,6 +138,14 @@ function  TelemState: TTelemState;
   rather than by putting a negative counter on the wire. }
 procedure TelemRecordTurn(TokensIn, TokensOut, CacheRead, CacheWrite: Int64;
   const Model: string);
+{ The baseline the deltas are measured from, moved by the HOST at the moment a
+  session's counters change without a turn happening - immediately after
+  LoadSession or SdkResumeInto and nowhere else.  A fresh session starts at
+  zero and needs no call: that is why TelemInit sets the baseline rather than
+  the first TelemRecordTurn: baselining lazily on the first record threw away
+  the first turn of every session, and a -p run has exactly one turn, so
+  scripted runs reported no tokens at all, forever. }
+procedure TelemBaseline(TokensIn, TokensOut, CacheRead, CacheWrite: Int64);
 procedure TelemRecordTool(const Name: string; IsError: Boolean);
 procedure TelemRecordRequest(StatusCode, ElapsedMs: Integer);
 
@@ -437,9 +445,10 @@ end;
 
 var
   { The baselines TelemRecordTurn differences against.  Not part of the buffer
-    - a flush must not make the next turn look like the whole session. }
+    - a flush must not make the next turn look like the whole session.  Set at
+    init to zero, which is where a fresh agent's counters start, and moved
+    only by TelemBaseline. }
   BaseIn, BaseOut, BaseCR, BaseCW: Int64;
-  BaseSet: Boolean = False;
 
 procedure TelemInit(const C: TTelemConfig);
 var
@@ -457,7 +466,6 @@ begin
   ConsecFail := 0;
   LastStatus := 0;
   LastError := '';
-  BaseSet := False;
   BaseIn := 0; BaseOut := 0; BaseCR := 0; BaseCW := 0;
   ResetBuffer;
 
@@ -516,14 +524,6 @@ var
   I, N: Integer;
 begin
   if not Active then Exit;
-  if not BaseSet then
-  begin
-    { The first call baselines rather than reporting the whole of a resumed
-      session as one turn's usage. }
-    BaseIn := TokensIn; BaseOut := TokensOut;
-    BaseCR := CacheRead; BaseCW := CacheWrite;
-    BaseSet := True;
-  end;
   DIn := TokensIn - BaseIn;
   DOut := TokensOut - BaseOut;
   DCR := CacheRead - BaseCR;
@@ -569,6 +569,15 @@ begin
   Inc(TokenRows[N].TokOut, DOut);
   Inc(TokenRows[N].CacheRead, DCR);
   Inc(TokenRows[N].CacheWrite, DCW);
+end;
+
+procedure TelemBaseline(TokensIn, TokensOut, CacheRead, CacheWrite: Int64);
+begin
+  { Unconditional, and it runs whether or not telemetry is on: a session
+    loaded while telemetry is off must not become the first turn's usage if
+    telemetry is switched on later in the same process. }
+  BaseIn := TokensIn; BaseOut := TokensOut;
+  BaseCR := CacheRead; BaseCW := CacheWrite;
 end;
 
 procedure TelemRecordTool(const Name: string; IsError: Boolean);

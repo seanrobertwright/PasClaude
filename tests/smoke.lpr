@@ -4454,18 +4454,22 @@ var
 
 begin
   TelemInit(TelemOnConfig);
+  { The first turn COUNTS.  Baselining on the first record instead threw it
+    away, and a -p run has exactly one turn - every scripted run reported its
+    token usage as nothing at all, permanently. }
   TelemRecordTurn(100, 50, 0, 0, 'claude-sonnet-4-5');
-  Check(SumOfKind('input') = 0,
-    'the first turn baselines rather than reporting a resumed total');
+  Check(SumOfKind('input') = 100,
+    'a fresh session reports its first turn rather than baselining on it');
+  Check(SumOfKind('output') = 50, 'output too');
   TelemRecordTurn(250, 90, 10, 5, 'claude-sonnet-4-5');
-  Check(SumOfKind('input') = 150, 'the second turn reports the delta, not 250');
-  Check(SumOfKind('output') = 40, 'and 40 output, not 90');
+  Check(SumOfKind('input') = 250, 'the second turn adds the delta, not 250');
+  Check(SumOfKind('output') = 90, 'and 40 more output, not 90 more');
   Check(SumOfKind('cache_read') = 10, 'and the cache read delta');
   Check(SumOfKind('cache_write') = 5, 'and the cache write delta');
 
   { A saved session restoring the counters downward. }
   TelemRecordTurn(10, 5, 0, 0, 'claude-sonnet-4-5');
-  Check(SumOfKind('input') = 150, 'a decrease adds nothing rather than a negative');
+  Check(SumOfKind('input') = 250, 'a decrease adds nothing rather than a negative');
   Doc := JsonParse(TelemBuildPayload(False));
   try
     { Not a substring test on the whole document - a model id is full of
@@ -4478,7 +4482,18 @@ begin
     Doc.Free;
   end;
   TelemRecordTurn(60, 25, 0, 0, 'claude-sonnet-4-5');
-  Check(SumOfKind('input') = 200, 'and the next turn measures from the new base');
+  Check(SumOfKind('input') = 300, 'and the next turn measures from the new base');
+
+  { The resumed session, which is what the lazy baseline was reaching for and
+    got wrong.  The host moves the baseline at the LoadSession call site, so
+    a session restored with 5000 tokens already spent contributes the turn and
+    not the file. }
+  TelemInit(TelemOnConfig);
+  TelemBaseline(5000, 4000, 900, 100);
+  TelemRecordTurn(5100, 4050, 900, 100, 'claude-sonnet-4-5');
+  Check(SumOfKind('input') = 100,
+    'a resumed session reports the turn, never the totals it loaded');
+  Check(SumOfKind('output') = 50, 'output the same way');
   TelemInit(TelemDefaultConfig);
 end;
 

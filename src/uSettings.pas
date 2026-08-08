@@ -74,18 +74,39 @@ type
   { Shape checks that a Lo..Hi range cannot express.  Table-driven for the same
     reason the scope is: a validation written at the call site is a validation
     somebody adds a key without. }
-  TSettingShape = (shNone, shEndpoint, shServiceName, shHeaderMap, shAliasMap);
+  TSettingShape = (shNone, shEndpoint, shServiceName, shHeaderMap, shAliasMap,
+    { 0 or at least 1024, nothing between.  The API's own floor is 1024 and it
+      REJECTS a smaller budget, so a thinking_budget of 512 in a project file
+      was every turn in that checkout failing with an HTTP 400 - a loader
+      whose stated contract is that a hostile project file can never stop the
+      program, stopping it.  0 stays legal because 0 means off. }
+    shThinkBudget);
+
+  { Which direction of a number costs the user money.  The narrow-only rule is
+    stated against the value the USER has in force, and this column says which
+    way "narrow" points; without it the rule cannot be written down, and what
+    was written instead - a comparison against the def's own Hi - was not the
+    rule at all. }
+  TSettingCheap = (chNone, chLower, chHigher);
 
   TSettingDef = record
     Name: string;
     Kind: TSettingKind;
     Scope: TSettingScope;
     Lo, Hi: Integer;        { skInt range; ignored otherwise }
-    { Ceiling for a project-class tier; 0 means "same as Hi".  Narrow-only: a
-      project may lower the user's cost, never raise it.  A value above it is
-      a refusal, not a silent clamp - a clamp teaches the repository that the
-      key half-works, and teaches the user nothing at all. }
+    { Absolute ceiling for a project-class tier; 0 means "same as Hi".  It is
+      a cap and NOT the invariant: the invariant is Dflt/Cheap below, and a
+      value that satisfies this one still has to satisfy that one. }
     ProjMax: Integer;
+    { What this program does when NO file names the key - the compiled default,
+      copied here because a project-class tier is measured against the user's
+      position and the user's position is this number until they write it down.
+      Comparing against Hi instead let a cloned repository turn extended
+      thinking on from a compiled 0 and more than double the tool result cap,
+      both of which the table's own comment said were impossible.  A test pins
+      each of these to the constant it duplicates. }
+    Dflt: Integer;
+    Cheap: TSettingCheap;
     Shape: TSettingShape;
     { scRefused: the sentence the user reads, naming the file that owns it.
       Other scopes: a short description for /config. }
@@ -111,16 +132,29 @@ const
   SettingDefs: array[0..SettingCount - 1] of TSettingDef = (
     { ---- scAny: display and economy.  A project may set these. ---- }
     (Name: 'output_style'; Kind: skStr; Scope: scAny;
-     Lo: 0; Hi: 0; ProjMax: 0; Shape: shNone;
+     Lo: 0; Hi: 0; ProjMax: 0; Dflt: 0; Cheap: chNone; Shape: shNone;
      Note: 'name of an output style; the same trust class as CLAUDE.md'),
+    { Dflt 0: TAgent.Create never assigns FThinkingBudget, so thinking is OFF
+      until somebody asks for it.  chLower therefore means a project-class file
+      can say nothing but 0 unless the USER turned thinking on first. }
     (Name: 'thinking_budget'; Kind: skInt; Scope: scAny;
-     Lo: 0; Hi: 32768; ProjMax: 8192; Shape: shNone;
+     Lo: 0; Hi: 32768; ProjMax: 8192; Dflt: 0; Cheap: chLower;
+     Shape: shThinkBudget;
      Note: 'extended thinking budget in tokens'),
+    { Dflt 30720: uTools.MaxOutBytes, and TestSettingDefaultsMatchTheProgram
+      fails the build if the two ever disagree. }
     (Name: 'tool_result_bytes'; Kind: skInt; Scope: scAny;
-     Lo: 4096; Hi: 131072; ProjMax: 65536; Shape: shNone;
+     Lo: 4096; Hi: 131072; ProjMax: 65536; Dflt: 30720; Cheap: chLower;
+     Shape: shNone;
      Note: 'cap on any single tool result'),
+    { The one key whose cheap direction is UP.  Compaction is not free: each
+      firing is an extra billed request that summarises the transcript, so a
+      project file setting 20000 makes nearly every turn in a long session pay
+      for one.  A project may therefore push the compaction point later and
+      never earlier, and ProjMax still caps how much later. }
     (Name: 'auto_compact_tokens'; Kind: skInt; Scope: scAny;
-     Lo: 20000; Hi: 180000; ProjMax: 150000; Shape: shNone;
+     Lo: 20000; Hi: 180000; ProjMax: 150000; Dflt: 150000; Cheap: chHigher;
+     Shape: shNone;
      Note: 'prompt size at which the transcript is trimmed'),
 
     { ---- scUserOnly: the model.  A project setting this spends the user's
@@ -131,16 +165,16 @@ const
       bounded set of commands the user can read, model choice is unbounded and
       recurring. ---- }
     (Name: 'model'; Kind: skStr; Scope: scUserOnly;
-     Lo: 0; Hi: 0; ProjMax: 0; Shape: shNone;
+     Lo: 0; Hi: 0; ProjMax: 0; Dflt: 0; Cheap: chNone; Shape: shNone;
      Note: 'preferred model; ANTHROPIC_MODEL and /model both beat it'),
     (Name: 'model.alias'; Kind: skMap; Scope: scUserOnly;
-     Lo: 0; Hi: 0; ProjMax: 0; Shape: shAliasMap;
+     Lo: 0; Hi: 0; ProjMax: 0; Dflt: 0; Cheap: chNone; Shape: shAliasMap;
      Note: 'short names for models'),
     (Name: 'model.route.subagent'; Kind: skStr; Scope: scUserOnly;
-     Lo: 0; Hi: 0; ProjMax: 0; Shape: shNone;
+     Lo: 0; Hi: 0; ProjMax: 0; Dflt: 0; Cheap: chNone; Shape: shNone;
      Note: 'model the task tool uses'),
     (Name: 'model.route.compaction'; Kind: skStr; Scope: scUserOnly;
-     Lo: 0; Hi: 0; ProjMax: 0; Shape: shNone;
+     Lo: 0; Hi: 0; ProjMax: 0; Dflt: 0; Cheap: chNone; Shape: shNone;
      Note: 'model that writes the compaction summary'),
 
     { ---- scUserOnly: telemetry.  Outbound by definition, so the endpoint is
@@ -149,129 +183,129 @@ const
       User scope only is what makes the load position above the print-mode
       halt safe for these too. ---- }
     (Name: 'telemetry.enabled'; Kind: skBool; Scope: scUserOnly;
-     Lo: 0; Hi: 0; ProjMax: 0; Shape: shNone;
+     Lo: 0; Hi: 0; ProjMax: 0; Dflt: 0; Cheap: chNone; Shape: shNone;
      Note: 'send metrics; off unless both this and the endpoint are set'),
     (Name: 'telemetry.endpoint'; Kind: skStr; Scope: scUserOnly;
-     Lo: 0; Hi: 0; ProjMax: 0; Shape: shEndpoint;
+     Lo: 0; Hi: 0; ProjMax: 0; Dflt: 0; Cheap: chNone; Shape: shEndpoint;
      Note: 'OTLP/HTTP endpoint; https, or http for loopback only'),
     (Name: 'telemetry.headers'; Kind: skMap; Scope: scUserOnly;
-     Lo: 0; Hi: 0; ProjMax: 0; Shape: shHeaderMap;
+     Lo: 0; Hi: 0; ProjMax: 0; Dflt: 0; Cheap: chNone; Shape: shHeaderMap;
      Note: 'extra request headers for the endpoint'),
     (Name: 'telemetry.interval_turns'; Kind: skInt; Scope: scUserOnly;
-     Lo: 1; Hi: 100; ProjMax: 0; Shape: shNone;
+     Lo: 1; Hi: 100; ProjMax: 0; Dflt: 0; Cheap: chNone; Shape: shNone;
      Note: 'turns between flushes'),
     (Name: 'telemetry.timeout_ms'; Kind: skInt; Scope: scUserOnly;
-     Lo: 250; Hi: 5000; ProjMax: 0; Shape: shNone;
+     Lo: 250; Hi: 5000; ProjMax: 0; Dflt: 0; Cheap: chNone; Shape: shNone;
      Note: 'how long a flush may block'),
     (Name: 'telemetry.service_name'; Kind: skStr; Scope: scUserOnly;
-     Lo: 0; Hi: 0; ProjMax: 0; Shape: shServiceName;
+     Lo: 0; Hi: 0; ProjMax: 0; Dflt: 0; Cheap: chNone; Shape: shServiceName;
      Note: 'service.name resource attribute'),
 
     { ---- scRefused.  Every one of these is a key somebody will paste from
       Claude Code's settings.json.  Honoured at no tier; each says where the
       thing it names actually lives. ---- }
     (Name: 'permissions'; Kind: skStr; Scope: scRefused;
-     Lo: 0; Hi: 0; ProjMax: 0; Shape: shNone;
+     Lo: 0; Hi: 0; ProjMax: 0; Dflt: 0; Cheap: chNone; Shape: shNone;
      Note: 'permissions are answered by you, per tool, and recorded outside ' +
        'the project tree; no file in a repository can grant one'),
     (Name: 'allow_edits'; Kind: skBool; Scope: scRefused;
-     Lo: 0; Hi: 0; ProjMax: 0; Shape: shNone;
+     Lo: 0; Hi: 0; ProjMax: 0; Dflt: 0; Cheap: chNone; Shape: shNone;
      Note: 'standing approvals live in the approvals file under ' +
        '%LOCALAPPDATA%\pasclaude; answer the prompt with "a"'),
     (Name: 'allow_bash'; Kind: skBool; Scope: scRefused;
-     Lo: 0; Hi: 0; ProjMax: 0; Shape: shNone;
+     Lo: 0; Hi: 0; ProjMax: 0; Dflt: 0; Cheap: chNone; Shape: shNone;
      Note: 'standing approvals live in the approvals file under ' +
        '%LOCALAPPDATA%\pasclaude; answer the prompt with "a"'),
     (Name: 'allow_fetch'; Kind: skBool; Scope: scRefused;
-     Lo: 0; Hi: 0; ProjMax: 0; Shape: shNone;
+     Lo: 0; Hi: 0; ProjMax: 0; Dflt: 0; Cheap: chNone; Shape: shNone;
      Note: 'standing approvals live in the approvals file under ' +
        '%LOCALAPPDATA%\pasclaude; answer the prompt with "a"'),
     (Name: 'bash_programs'; Kind: skStr; Scope: scRefused;
-     Lo: 0; Hi: 0; ProjMax: 0; Shape: shNone;
+     Lo: 0; Hi: 0; ProjMax: 0; Dflt: 0; Cheap: chNone; Shape: shNone;
      Note: 'approved bash programs are recorded when you answer "a", in the ' +
        'approvals file under %LOCALAPPDATA%\pasclaude'),
     (Name: 'trusted'; Kind: skStr; Scope: scRefused;
-     Lo: 0; Hi: 0; ProjMax: 0; Shape: shNone;
+     Lo: 0; Hi: 0; ProjMax: 0; Dflt: 0; Cheap: chNone; Shape: shNone;
      Note: 'trust fingerprints are recorded in the approvals file under ' +
        '%LOCALAPPDATA%\pasclaude when you answer a trust prompt'),
     (Name: 'deny'; Kind: skStr; Scope: scRefused;
-     Lo: 0; Hi: 0; ProjMax: 0; Shape: shNone;
+     Lo: 0; Hi: 0; ProjMax: 0; Dflt: 0; Cheap: chNone; Shape: shNone;
      Note: 'deny rules come from %LOCALAPPDATA%\pasclaude\deny.json and the ' +
        'approvals file only; /deny add <rule>'),
     (Name: 'sandbox'; Kind: skStr; Scope: scRefused;
-     Lo: 0; Hi: 0; ProjMax: 0; Shape: shNone;
+     Lo: 0; Hi: 0; ProjMax: 0; Dflt: 0; Cheap: chNone; Shape: shNone;
      Note: 'the sandbox level comes from --sandbox or /sandbox, never a file ' +
        'in a repository'),
     (Name: 'permission_mode'; Kind: skStr; Scope: scRefused;
-     Lo: 0; Hi: 0; ProjMax: 0; Shape: shNone;
+     Lo: 0; Hi: 0; ProjMax: 0; Dflt: 0; Cheap: chNone; Shape: shNone;
      Note: 'the permission mode comes from --permission-mode or /mode, never ' +
        'a file in a repository'),
     (Name: 'add_dir'; Kind: skStr; Scope: scRefused;
-     Lo: 0; Hi: 0; ProjMax: 0; Shape: shNone;
+     Lo: 0; Hi: 0; ProjMax: 0; Dflt: 0; Cheap: chNone; Shape: shNone;
      Note: 'reach comes from --add-dir or /add-dir, never a file'),
     (Name: 'additionalDirectories'; Kind: skStr; Scope: scRefused;
-     Lo: 0; Hi: 0; ProjMax: 0; Shape: shNone;
+     Lo: 0; Hi: 0; ProjMax: 0; Dflt: 0; Cheap: chNone; Shape: shNone;
      Note: 'reach comes from --add-dir or /add-dir, never a file'),
     (Name: 'env'; Kind: skStr; Scope: scRefused;
-     Lo: 0; Hi: 0; ProjMax: 0; Shape: shNone;
+     Lo: 0; Hi: 0; ProjMax: 0; Dflt: 0; Cheap: chNone; Shape: shNone;
      Note: 'pasclaude never sets environment variables for you; a file that ' +
        'could would be choosing what every child process sees'),
     (Name: 'apiKey'; Kind: skStr; Scope: scRefused;
-     Lo: 0; Hi: 0; ProjMax: 0; Shape: shNone;
+     Lo: 0; Hi: 0; ProjMax: 0; Dflt: 0; Cheap: chNone; Shape: shNone;
      Note: 'the credential comes from ANTHROPIC_API_KEY or a Claude ' +
        'subscription; no settings key names one'),
     (Name: 'apiKeyHelper'; Kind: skStr; Scope: scRefused;
-     Lo: 0; Hi: 0; ProjMax: 0; Shape: shNone;
+     Lo: 0; Hi: 0; ProjMax: 0; Dflt: 0; Cheap: chNone; Shape: shNone;
      Note: 'the credential comes from ANTHROPIC_API_KEY or a Claude ' +
        'subscription; no settings key runs a program to fetch one'),
     (Name: 'auth'; Kind: skStr; Scope: scRefused;
-     Lo: 0; Hi: 0; ProjMax: 0; Shape: shNone;
+     Lo: 0; Hi: 0; ProjMax: 0; Dflt: 0; Cheap: chNone; Shape: shNone;
      Note: 'the credential comes from ANTHROPIC_API_KEY or a Claude ' +
        'subscription; no settings key names one'),
     (Name: 'credential'; Kind: skStr; Scope: scRefused;
-     Lo: 0; Hi: 0; ProjMax: 0; Shape: shNone;
+     Lo: 0; Hi: 0; ProjMax: 0; Dflt: 0; Cheap: chNone; Shape: shNone;
      Note: 'the credential comes from ANTHROPIC_API_KEY or a Claude ' +
        'subscription; no settings key names one'),
     (Name: 'login'; Kind: skStr; Scope: scRefused;
-     Lo: 0; Hi: 0; ProjMax: 0; Shape: shNone;
+     Lo: 0; Hi: 0; ProjMax: 0; Dflt: 0; Cheap: chNone; Shape: shNone;
      Note: 'the credential comes from ANTHROPIC_API_KEY or a Claude ' +
        'subscription; no settings key names one'),
     (Name: 'mcpServers'; Kind: skStr; Scope: scRefused;
-     Lo: 0; Hi: 0; ProjMax: 0; Shape: shNone;
+     Lo: 0; Hi: 0; ProjMax: 0; Dflt: 0; Cheap: chNone; Shape: shNone;
      Note: 'MCP servers are declared in .mcp.json at the project root, where ' +
        'you can read them, and each spawn is approved by name'),
     (Name: 'plugins'; Kind: skStr; Scope: scRefused;
-     Lo: 0; Hi: 0; ProjMax: 0; Shape: shNone;
+     Lo: 0; Hi: 0; ProjMax: 0; Dflt: 0; Cheap: chNone; Shape: shNone;
      Note: 'plugin enablement lives in .pasclaude\plugins.json and is ' +
        'written by /plugins, in both directions'),
     (Name: 'vim'; Kind: skStr; Scope: scRefused;
-     Lo: 0; Hi: 0; ProjMax: 0; Shape: shNone;
+     Lo: 0; Hi: 0; ProjMax: 0; Dflt: 0; Cheap: chNone; Shape: shNone;
      Note: 'keybindings live in %USERPROFILE%\.pasclaude\keys.json only; a ' +
        'git clone cannot choose what your keyboard does'),
     (Name: 'bindings'; Kind: skStr; Scope: scRefused;
-     Lo: 0; Hi: 0; ProjMax: 0; Shape: shNone;
+     Lo: 0; Hi: 0; ProjMax: 0; Dflt: 0; Cheap: chNone; Shape: shNone;
      Note: 'keybindings live in %USERPROFILE%\.pasclaude\keys.json only; a ' +
        'git clone cannot choose what your keyboard does'),
     (Name: 'hooks'; Kind: skStr; Scope: scRefused;
-     Lo: 0; Hi: 0; ProjMax: 0; Shape: shNone;
+     Lo: 0; Hi: 0; ProjMax: 0; Dflt: 0; Cheap: chNone; Shape: shNone;
      Note: 'hooks live in .pasclaude\hooks.json, which is fingerprinted and ' +
        'trusted by hand; settings.json is not, so it may not carry them'),
     (Name: 'telemetry'; Kind: skStr; Scope: scRefused;
-     Lo: 0; Hi: 0; ProjMax: 0; Shape: shNone;
+     Lo: 0; Hi: 0; ProjMax: 0; Dflt: 0; Cheap: chNone; Shape: shNone;
      Note: 'the telemetry keys are dotted: telemetry.enabled, ' +
        'telemetry.endpoint and the rest, and all are user scope'),
     (Name: 'report_dir'; Kind: skStr; Scope: scRefused;
-     Lo: 0; Hi: 0; ProjMax: 0; Shape: shNone;
+     Lo: 0; Hi: 0; ProjMax: 0; Dflt: 0; Cheap: chNone; Shape: shNone;
      Note: 'a settable report path is somewhere for a diagnostic to be ' +
        'written that you did not choose; reports go under %LOCALAPPDATA%'),
     (Name: 'redact'; Kind: skStr; Scope: scRefused;
-     Lo: 0; Hi: 0; ProjMax: 0; Shape: shNone;
+     Lo: 0; Hi: 0; ProjMax: 0; Dflt: 0; Cheap: chNone; Shape: shNone;
      Note: 'redaction is not a switch a file may flip'),
     (Name: 'doctor'; Kind: skStr; Scope: scRefused;
-     Lo: 0; Hi: 0; ProjMax: 0; Shape: shNone;
+     Lo: 0; Hi: 0; ProjMax: 0; Dflt: 0; Cheap: chNone; Shape: shNone;
      Note: 'diagnostics are commands, not configuration'),
     (Name: 'bug'; Kind: skStr; Scope: scRefused;
-     Lo: 0; Hi: 0; ProjMax: 0; Shape: shNone;
+     Lo: 0; Hi: 0; ProjMax: 0; Dflt: 0; Cheap: chNone; Shape: shNone;
      Note: 'diagnostics are commands, not configuration')
   );
 
@@ -281,8 +315,9 @@ function TierAllowed(const D: TSettingDef; T: TSettingTier): Boolean;
 function TierName(T: TSettingTier): string;
 
 { Parse ONE tier from BYTES.  All or nothing: not valid JSON, not an object,
-  an unknown key, a wrong type, an out-of-range int, a value above a
-  project-class ceiling, or a key at a tier it may not use, and the document
+  an unknown key, a wrong type, an out-of-range int, a project-class value
+  that moves a number away from where the USER has it in the direction that
+  costs money, or a key at a tier it may not use, and the document
   contributes NOTHING.  Partial application is how a typo silently changes
   half a configuration.  False means nothing was stored and Problems is never
   empty; Label names the file in the problem text and is display only. }
@@ -327,7 +362,10 @@ function SettingsWrite(const Path, Name, Value: string; Remove: Boolean;
   out Err: string): Boolean;
 
 { Rows for /config, tab-separated: name, effective value, tier word, shadowed
-  summary.  Built here so the host only colours them. }
+  summary.  Built here so the host only colours them.  Every field that came
+  out of a file has had its control characters removed, the TAB among them:
+  the separator is in the data's reach otherwise, and a value carrying one
+  moves the tier word one field along. }
 function SettingsReport: TStringArray;
 { Every refusal recorded during the last SettingsLoad, one sentence each. }
 function SettingsRefusals: TStringArray;
@@ -393,6 +431,38 @@ begin
   else
     Result := 'default';
   end;
+end;
+
+{ Every string this unit hands out that came from a FILE goes through here
+  first, and the reason is that one of those files is in the project tree.
+
+  Two failures, both demonstrated: a key name of ESC[2J erased the yellow
+  security block printed immediately above it and OSC 0 renamed the user's
+  window, because uTerm writes a string through verbatim; and a TAB inside a
+  value shifted every field of the tab-separated /config row after it, letting
+  a project file dictate the tier word that /config, /status and /bug
+  attribute its own value to.  Stripping control characters answers both at
+  once, which is why it is one function and not two.
+
+  Removed rather than escaped, exactly as uDiag.DiagClean does it - a report
+  that says ^[ where the file said ESC is a report about a different file.
+  The cap is on top: a 200KB one-line value is not a row, it is a way to push
+  the rest of the screen out of the scrollback. }
+function SettingClean(const S: string): string;
+var
+  I, N: Integer;
+  T: string;
+begin
+  SetLength(T, Length(S));
+  N := 0;
+  for I := 1 to Length(S) do
+    if S[I] >= ' ' then
+    begin
+      Inc(N);
+      T[N] := S[I];
+    end;
+  SetLength(T, N);
+  Result := Utf8Cut(T, 240);
 end;
 
 procedure NoteAdd(var A: TStringArray; const S: string);
@@ -508,14 +578,18 @@ function SettingsParseTier(Tier: TSettingTier; const Bytes, Where: string;
 var
   Root, V, Sub: TJson;
   Err, Name, Raw, Why: string;
-  I, J, Idx, N, Ceiling: Integer;
+  I, J, Idx, N, Ceiling, Base: Integer;
   D: TSettingDef;
   MK, MV: TStringArray;
   BoolVal: Boolean;
 
+  { The single choke point for every complaint this parser makes.  Key names
+    and values are interpolated into most of them and both come out of the
+    file, so the cleaning happens once here rather than at thirty call sites
+    where the thirty-first would forget. }
   procedure Bad(const Msg: string);
   begin
-    NoteAdd(Problems, Where + ': ' + Msg);
+    NoteAdd(Problems, SettingClean(Where + ': ' + Msg));
   end;
 
 begin
@@ -568,7 +642,8 @@ begin
       if D.Scope = scRefused then
       begin
         Bad('"' + Name + '" is not a settings key. ' + D.Note);
-        NoteAdd(Refusals, Where + ': "' + Name + '" - ' + D.Note);
+        NoteAdd(Refusals,
+          SettingClean(Where + ': "' + Name + '" - ' + D.Note));
         Continue;
       end;
       if not TierAllowed(D, Tier) then
@@ -578,7 +653,8 @@ begin
         Bad('"' + Name + '" may only be set in the user settings file ' +
           '(%USERPROFILE%\.pasclaude\' + SettingsFileName + '), not by a ' +
           TierName(Tier) + ' file');
-        NoteAdd(Refusals, Where + ': "' + Name + '" = ' + V.AsString +
+        NoteAdd(Refusals, SettingClean(Where + ': "' + Name + '" = ' +
+          V.AsString) +
           ' - ' + D.Note + '; a ' + TierName(Tier) +
           ' file may not set it, copy it into %USERPROFILE%\.pasclaude\' +
           SettingsFileName);
@@ -607,18 +683,57 @@ begin
               if (N < D.Lo) or (N > D.Hi) then
                 Bad(Format('"%s" must be between %d and %d, not %d',
                   [Name, D.Lo, D.Hi, N]))
+              else if (D.Shape = shThinkBudget) and (N > 0) and (N < 1024) then
+                { At every tier, not just the project one.  This is not a cost
+                  rule; it is the API's floor, and a value under it makes every
+                  request fail. }
+                Bad(Format('"%s" = %d: the API rejects a thinking budget ' +
+                  'under 1024; use 0 to turn thinking off', [Name, N]))
               else if SettingIsProjectClass(Tier) then
               begin
                 Ceiling := D.ProjMax;
                 if Ceiling = 0 then Ceiling := D.Hi;
-                { Narrow only.  A project may lower the user's cost and never
-                  raise it, and a value above the ceiling is refused rather
-                  than clamped so the repository does not learn that the key
-                  half-works. }
-                if N > Ceiling then
-                  Bad(Format('"%s" = %d: a %s file may not raise this above ' +
-                    '%d (only the user settings file may)',
-                    [Name, N, TierName(Tier), Ceiling]));
+                { The user's position: their own file if it names the key, the
+                  compiled default if it does not.  stLocal is measured against
+                  the same position as stProject and never against the project
+                  value, because stLocal has project AUTHORITY - a repository
+                  that can commit settings.json can commit settings.local.json
+                  beside it, and letting one raise the baseline for the other
+                  would give a clone two moves where the rule allows none. }
+                Base := D.Dflt;
+                if SettingValues[Idx, stUser].Present then
+                  Base := SettingValues[Idx, stUser].IntVal;
+                { Narrow only, and now actually narrow: a project may move the
+                  number toward the cheap side of where the user has it and
+                  never away from it.  Refused rather than clamped, so the
+                  repository does not learn that the key half-works and the
+                  user is told which file said what. }
+                case D.Cheap of
+                  chLower:
+                    begin
+                      if Base < Ceiling then Ceiling := Base;
+                      if N > Ceiling then
+                        Bad(Format('"%s" = %d: a %s file may not raise this ' +
+                          'above %d (only the user settings file may)',
+                          [Name, N, TierName(Tier), Ceiling]));
+                    end;
+                  chHigher:
+                    begin
+                      if N > Ceiling then
+                        Bad(Format('"%s" = %d: a %s file may not raise this ' +
+                          'above %d (only the user settings file may)',
+                          [Name, N, TierName(Tier), Ceiling]))
+                      else if N < Base then
+                        Bad(Format('"%s" = %d: a %s file may not lower this ' +
+                          'below %d (only the user settings file may)',
+                          [Name, N, TierName(Tier), Base]));
+                    end;
+                else
+                  if N > Ceiling then
+                    Bad(Format('"%s" = %d: a %s file may not raise this ' +
+                      'above %d (only the user settings file may)',
+                      [Name, N, TierName(Tier), Ceiling]));
+                end;
               end;
             end;
           end;
@@ -712,7 +827,7 @@ begin
           (D.Name = 'thinking_budget')) then
       begin
         if EconomyNote <> '' then EconomyNote := EconomyNote + ', ';
-        EconomyNote := EconomyNote + D.Name + ' = ' + Raw +
+        EconomyNote := EconomyNote + D.Name + ' = ' + SettingClean(Raw) +
           ' (' + TierName(Tier) + ')';
       end;
     end;
@@ -928,14 +1043,21 @@ begin
     if SettingDefs[I].Scope = scRefused then Continue;
     if not SettingIsSet(SettingDefs[I].Name) then Continue;
     Src := SettingSource(SettingDefs[I].Name);
-    Eff := SettingStr(SettingDefs[I].Name);
+    { Cleaned, and the tab is the whole point.  The row is tab-separated and
+      the value comes out of a file: an output_style of  explanatory<TAB>user
+      in the PROJECT tree made /status print  output_style = explanatory
+      (user)  - a project file choosing the tier word that /status attributes
+      its own value to, in the one surface whose contract is "what is true
+      right now".  SettingClean removes the separator along with the ESC. }
+    Eff := SettingClean(SettingStr(SettingDefs[I].Name));
     Shadow := '';
     for T := High(TSettingTier) downto Low(TSettingTier) do
     begin
       if (T = Src) or (T = stDefault) then Continue;
       if not SettingValues[I, T].Present then Continue;
       if Shadow <> '' then Shadow := Shadow + ', ';
-      Shadow := Shadow + TierName(T) + '=' + SettingValues[I, T].Value;
+      Shadow := Shadow + TierName(T) + '=' +
+        SettingClean(SettingValues[I, T].Value);
     end;
     Row := SettingDefs[I].Name + #9 + Eff + #9;
     if Src = stRuntime then

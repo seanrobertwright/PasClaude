@@ -768,7 +768,12 @@ begin
   { Guarded on IsSet rather than assigned unconditionally: a settings file
     that never mentions thinking must not switch it off, and /think later in
     the session records itself as the runtime source so this reads back the
-    typed value rather than the file's. }
+    typed value rather than the file's.
+
+    No clamp here, and deliberately: the API's 1024 floor and the narrow-only
+    rule are both enforced in uSettings' table, where a value that fails them
+    is never stored at all.  A clamp in this procedure would be a second
+    opinion about the same question, and the two would drift. }
   if (Agent <> nil) and uSettings.SettingIsSet('thinking_budget') then
     Agent.ThinkingBudget := uSettings.SettingInt('thinking_budget');
 end;
@@ -1066,6 +1071,20 @@ end;
 procedure TelemRequestDone(StatusCode, ElapsedMs: Integer; const Model: string);
 begin
   uTelem.TelemRecordRequest(StatusCode, ElapsedMs);
+end;
+
+{ A session load moves the agent's cumulative counters without a turn having
+  happened, so the telemetry baseline moves with it or the whole of somebody
+  else's session is reported as this one's first turn.  Every LoadSession and
+  SdkResumeInto call site calls this; a fresh session needs no call, because
+  TelemInit baselines at the zero a fresh TAgent starts from.  That is the
+  point: baselining on the first RECORD instead threw the first turn of every
+  session away, and a -p run has exactly one turn. }
+procedure TelemRebaseline;
+begin
+  if Agent = nil then Exit;
+  uTelem.TelemBaseline(Agent.TokensIn, Agent.TokensOut,
+    Agent.CacheReadTokens, Agent.CacheWriteTokens);
 end;
 
 { One flush.  Synchronous, because this program has no threads: the honest
@@ -2020,6 +2039,7 @@ begin
   if Agent.LoadSession(Dir + Names[Pick - 1], Err) then
   begin
     DropCheckpoints;
+    TelemRebaseline;
     EmitCLn(clGrey, Format('  resumed %s: %d messages (%d turns)',
       [Names[Pick - 1], Agent.MessageCount, Agent.TurnCount]));
   end
@@ -2937,6 +2957,9 @@ begin
     Exit;
   end;
   EmitCLn(clGreen, '  wrote ' + Path);
+  { The report can succeed while the transcript does not.  Silence there
+    would leave the user believing --transcript did what they asked. }
+  if Err <> '' then EmitCLn(clYellow, '  ' + Err);
   if TranscriptPath <> '' then
   begin
     EmitCLn(clGrey, '  and ' + TranscriptPath);
@@ -3219,6 +3242,7 @@ begin
     if Agent.LoadSession(SessionPath(uTools.RootDir), Err) then
     begin
       DropCheckpoints;
+      TelemRebaseline;
       EmitCLn(clGrey, Format('  resumed %d messages (%d turns)',
         [Agent.MessageCount, Agent.TurnCount]));
     end
@@ -3356,6 +3380,24 @@ type
 var
   DiagMode: TDiagMode = dmNone;
   DiagOnline: Boolean = False;
+
+{ The yellow startup block: deny rules that are not in force, settings
+  problems, the project economy line, an --add-dir that came with a caveat.
+  All of it is prose, and prose on stdout ahead of a JSON object breaks the
+  driver parsing it - with --output-format json or stream-json this program's
+  stdout carries the protocol and nothing else, which is what the manual
+  promises for --status and --doctor and what a scripted -p needs to be worth
+  using.  Nothing is lost by the guard: every one of these lines is also put
+  in the diagnostic ledger, which is exactly what --doctor prints and what
+  /bug includes.
+
+  It is a guard on the OUTPUT FORMAT rather than on -p because the trigger is
+  a settings.json in the project tree: a cloned repository must not be able to
+  put a byte on a driver's stdout. }
+procedure StartupNote(C: TColor; const S: string);
+begin
+  if OutFormat = uSdk.sfText then EmitCLn(C, S);
+end;
 
 { Every early exit goes through here.  Hint is the human's extra context and
   is printed only in text mode - the machine gets the one line it can act on. }
@@ -3844,8 +3886,8 @@ begin
         FailStart('--add-dir ' + AddDirs[ArgI] + ': ' + SaveErr, '', 2)
       else
       begin
-        if not PrintMode then EmitCLn(clGrey, '  + ' + AddArg);
-        if SaveErr <> '' then EmitCLn(clYellow, '  ' + SaveErr);
+        if not PrintMode then StartupNote(clGrey, '  + ' + AddArg);
+        if SaveErr <> '' then StartupNote(clYellow, '  ' + SaveErr);
       end;
     { Resolved with the same guard the tools use, and only now, because
       --add-dir is what makes  --add-dir %TEMP% --session-file %TEMP%\s.json
@@ -3867,7 +3909,7 @@ begin
     BadRules := uTools.BadDenyRules;
     for ArgI := 0 to High(BadRules) do
     begin
-      EmitCLn(clYellow, '  deny rule not understood, NOT in force: ' +
+      StartupNote(clYellow, '  deny rule not understood, NOT in force: ' +
         BadRules[ArgI] + ' (/deny)');
       { And into the ledger beside the print, so /doctor can report it
         without re-reading deny.json.  Every one of these five sites prints
@@ -3884,7 +3926,7 @@ begin
       would hand a clone a way to stop the program. }
     for ArgI := 0 to High(SettingNotes) do
     begin
-      EmitCLn(clYellow, '  settings: ' + SettingNotes[ArgI]);
+      StartupNote(clYellow, '  settings: ' + SettingNotes[ArgI]);
       uDiag.DiagNote('settings', uDiag.dlWarn, SettingNotes[ArgI],
         '/config shows every key, its value and the tier it came from');
     end;
@@ -3892,7 +3934,7 @@ begin
       size of every tool result, or moved the compaction point, has changed
       what this session costs and the user did not type it. }
     if uSettings.SettingsProjectEconomyNote <> '' then
-      EmitCLn(clYellow, '  settings: this project sets ' +
+      StartupNote(clYellow, '  settings: this project sets ' +
         uSettings.SettingsProjectEconomyNote + ' (/config)');
     { Beside LoadIgnoreRules and therefore BEFORE the print-mode halt below,
       on purpose: a scripted run honours an enablement the user already made
@@ -4219,7 +4261,9 @@ begin
             uTelem.TelemShutdown;
             TermDone;
             Halt(2);
-          end;
+          end
+          else
+            TelemRebaseline;
 
         MdReset;
         if Agent.Send(PrintPrompt, Err) then
@@ -4256,7 +4300,10 @@ begin
         its own model and the banner should report the one actually in use. }
       ResumeErr := '';
       if Resume then
+      begin
         Resumed := Agent.LoadSession(SessionPath(uTools.RootDir), ResumeErr);
+        if Resumed then TelemRebaseline;
+      end;
 
       { Up-arrow reaching last week's build command is the whole point of
         history; in-memory only, it died with the window. }
@@ -4312,12 +4359,19 @@ begin
         StyleErr := '';
         if not uTools.SetOutputStyle(Trim(uSettings.SettingStr('output_style')),
              StyleErr) then
-          EmitCLn(clYellow, '  settings: output_style ' +
-            uSettings.SettingStr('output_style') + ': ' + StyleErr)
+          { Cleaned and format-guarded like the rest of the settings notices:
+            the name is a string out of a file in the project tree, and this
+            is the one place it reaches the console unquoted.  --status and
+            --doctor run the whole of startup and reach here, so a JSON run
+            would otherwise carry it too. }
+          StartupNote(clYellow, '  settings: output_style ' +
+            uDiag.DiagClean(uSettings.SettingStr('output_style')) + ': ' +
+            uDiag.DiagClean(StyleErr))
         else if uSettings.SettingSource('output_style') <> uSettings.stUser then
           { Named, because the voice the replies are written in is now coming
             out of a file that arrived with the clone. }
-          EmitCLn(clGrey, '  output style ' + uTools.OutputStyleName +
+          StartupNote(clGrey, '  output style ' +
+            uDiag.DiagClean(uTools.OutputStyleName) +
             ' comes from this project''s settings (/config)');
       end;
       { And the residual risk stated out loud on every launch that hits it:

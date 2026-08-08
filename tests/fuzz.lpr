@@ -3764,7 +3764,7 @@ procedure TestSettingsHostile;
 var
   P: TStringArray;
   Big, Deep, Key: string;
-  I: Integer;
+  I, CtlI: Integer;
   Ok: Boolean;
 
   procedure Refuses(const Doc, What: string);
@@ -3807,6 +3807,24 @@ begin
   Refuses('{"thinking_budget":-1}', 'a negative budget is refused');
   Refuses('{"telemetry.endpoint":"http://evil.example"}',
     'a non-loopback http endpoint is refused');
+  { The API's floor.  A value the API rejects is worse than a wrong one: it
+    fails every turn in the checkout, from a loader whose whole contract is
+    that a project file can never stop the program. }
+  Refuses('{"thinking_budget":1}', 'a budget under the API floor is refused');
+  Refuses('{"thinking_budget":1023}', 'one short of it too');
+
+  { Control characters are legal in a JSON string once escaped, legal UTF-8,
+    and drive the terminal of whoever launches this in a cloned repository.
+    They must not survive into the sentence the user reads. }
+  uSettings.SettingsClear;
+  uSettings.SettingsParseTier(uSettings.stProject,
+    '{"' + #27 + '[2J' + #27 + ']0;hijacked' + #7 + '":1}', 'p.json', P);
+  Ok := True;
+  for I := 0 to High(P) do
+    for CtlI := 1 to Length(P[I]) do
+      if P[I][CtlI] < ' ' then Ok := False;
+  Check(Ok, 'no control character out of a project settings file reaches ' +
+    'the startup notice');
 
   { A duplicate key is legal JSON and the parser keeps both.  What matters is
     that the loader does not crash and does not end up in a half-applied

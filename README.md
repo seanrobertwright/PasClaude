@@ -1903,8 +1903,14 @@ Paths are redacted to `%USERPROFILE%`, `%LOCALAPPDATA%` and `<root0>`,
 `--add-dir` root is replaced whole rather than left half-substituted, and
 case-insensitively because Windows paths arrive in three different cases.
 It is substring matching and the report says so: read the file before you
-share it. `--transcript` writes your conversation to a sibling file with a
-yellow warning that secrets are redacted and meaning is not. Reports are
+share it. `<root0>` is the session root - the path that names the project - and the
+`--add-dir` extras follow it. `--transcript` writes your conversation to a
+sibling file with a yellow warning that secrets are redacted and meaning is
+not. That file is written, read back and rewritten redacted; if the read-back
+or the rewrite fails - a scanner or a backup agent holding a file it has just
+seen appear is the ordinary way - the transcript is **deleted** and the
+failure printed, because the alternative is an unredacted conversation on disk
+under a console message promising the opposite. Reports are
 never deleted automatically - `/doctor` counts them past twenty and leaves
 them alone, because a program that silently removes your evidence is worse
 than one that accumulates files.
@@ -1917,7 +1923,12 @@ a skipped check are not failures), so `pasclaude --doctor || setup` works in a
 batch file. With `--output-format json` the payload is the object; with
 `stream-json` it is one `{"type":"diagnostic","kind":"status"|"doctor",…}`
 line, and the banner and startup notices are suppressed so stdout carries only
-the protocol. Both modes refuse to combine with `-p`, a prompt, `--resume` or
+the protocol. That suppression is a property of the *output format* and not of
+these two modes: any run that asks for `json` or `stream-json`, `-p` included,
+gets the protocol and nothing else, because the loudest of those notices come
+from a `settings.json` in the project tree and a cloned repository must not be
+able to put a byte in front of a driver's parser. Nothing is lost - every
+suppressed line is in the ledger `--doctor` prints. Both modes refuse to combine with `-p`, a prompt, `--resume` or
 a driver, and neither approves or connects an MCP server: approving a spawn is
 a permission answer, and a health check must not be a way to obtain one. They
 are also the only two modes that continue past a missing credential or a
