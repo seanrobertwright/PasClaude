@@ -4304,6 +4304,75 @@ begin
   SettingsClear;
 end;
 
+{ The authority boundary this feature touches, end to end rather than at the
+  loader alone: the four model keys are the ones that spend money, and a
+  cloned repository must not be able to move any of them.  ApplyModelSettings
+  in the host does exactly the three reads below, so what they answer here is
+  what it would apply. }
+procedure TestModelSettingsAreUserScopeEndToEnd;
+var
+  P, Keys, Vals: TStringArray;
+  A: TAgent;
+  Err, Sonnet, Haiku: string;
+  Kind: TModelAliasKind;
+  Doc: string;
+begin
+  ResolveModelAlias('sonnet', Sonnet, Kind);
+  ResolveModelAlias('haiku', Haiku, Kind);
+  Doc := '{"model.alias":{"fast":"claude-haiku-4-5"},' +
+         '"model.route.subagent":"fast"}';
+
+  SettingsClear;
+  Check(not SettingsParseTier(stProject, Doc, 'proj.json', P),
+    'a project file may not set model.alias or a route');
+  Check(not SettingMap('model.alias', Keys, Vals),
+    'and the alias map is not readable afterwards');
+  Check(not SettingIsSet('model.route.subagent'),
+    'and neither is the route');
+  Check(SettingTierValue('model.route.subagent', stProject) = '',
+    'the project tier holds nothing: it was never stored, not overridden');
+
+  SettingsClear;
+  Check(not SettingsParseTier(stLocal, Doc, 'settings.local.json', P),
+    'and settings.local.json may not either - it carries project authority');
+  Check(not SettingIsSet('model.route.subagent'), 'nothing stored from it');
+
+  { The same document from the user's own file does take effect, which is
+    what makes the refusal above a scope rule rather than a missing feature. }
+  SettingsClear;
+  Check(SettingsParseTier(stUser, Doc, 'user.json', P),
+    'the same document at the user tier is honoured');
+  Check(SettingMap('model.alias', Keys, Vals) and (Length(Keys) = 1) and
+    (Keys[0] = 'fast') and (Vals[0] = 'claude-haiku-4-5'),
+    'and the alias map reads back');
+  Check(SettingStr('model.route.subagent') = 'fast', 'and the route');
+
+  { And applying what the user file said actually moves the wire. }
+  A := TAgent.Create('k', 'claude-opus-4-5', 'sys');
+  try
+    Check(A.EffectiveModel(mrSubagent) = Sonnet,
+      'the subagent starts on the shipped route');
+    SetModelAlias(Keys[0], Vals[0], Err);
+    SetModelRoute(mrSubagent, SettingStr('model.route.subagent'));
+    Check(A.EffectiveModel(mrSubagent) = 'claude-haiku-4-5',
+      'and a user-set alias and route move it (' +
+      A.EffectiveModel(mrSubagent) + ')');
+  finally
+    A.Free;
+    SetModelRoute(mrSubagent, 'sonnet');
+  end;
+
+  { An alias name that could shadow a real id is refused by the loader too,
+    at either tier - the same rule SetModelAlias enforces, so a settings file
+    cannot walk around it. }
+  SettingsClear;
+  Check(not SettingsParseTier(stUser, '{"model.alias":{"my-model":"x"}}',
+    'user.json', P), 'an alias name with a dash is refused in settings.json');
+  Check(not SettingsParseTier(stUser, '{"model.alias":{"claude5":"x"}}',
+    'user.json', P), 'and one beginning with claude');
+  SettingsClear;
+end;
+
 { The realistic failure is a user pasting Claude Code's settings.json and
   believing it took effect.  Every name they would paste is refused BY NAME,
   and afterwards nothing that decides authority has moved. }
@@ -4648,6 +4717,7 @@ begin
     TestSandboxAnnotatesFailure;
     TestForegroundTimeoutKillsTree;
     TestSettingsScopeTable;
+    TestModelSettingsAreUserScopeEndToEnd;
     TestSettingsRefusedKeys;
     TestSettingsAllOrNothing;
     TestSettingsPrecedence;

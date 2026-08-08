@@ -3643,6 +3643,87 @@ begin
   Check(Ok, 'and after all of it not one setting is in force');
 end;
 
+{ Hostile model configuration.  Whatever survives here is copied verbatim
+  into the "model" field of a request, so the interesting failure is not a
+  crash: it is a target that leaves the wire and gets there. }
+procedure TestModelSettingsHostile;
+var
+  P: TStringArray;
+  Err, Got: string;
+  A: TAgent;
+  N: Integer;
+
+  procedure UserRefuses(const Doc, What: string);
+  var
+    Probs: TStringArray;
+  begin
+    uSettings.SettingsClear;
+    Check(not uSettings.SettingsParseTier(uSettings.stUser, Doc, 'u.json',
+      Probs) and (Length(Probs) > 0), What);
+  end;
+
+begin
+  uSettings.SettingsClear;
+  N := uAgent.ModelAliasCount;
+
+  UserRefuses('{"model.alias":{"my-model":"claude-opus-4-5"}}',
+    'an alias name with a dash is refused even from the user file');
+  UserRefuses('{"model.alias":{"claude5":"claude-opus-4-5"}}',
+    'and one beginning with claude');
+  UserRefuses('{"model.alias":{"":"claude-opus-4-5"}}',
+    'and an empty alias name');
+  UserRefuses('{"model.alias":{"a":1}}',
+    'and a non-string target');
+  UserRefuses('{"model.alias":"opus"}',
+    'and a string where the alias map belongs');
+  UserRefuses('{"model.alias":{"bad":"' + #$C3 + '"}}',
+    'and a target that is not valid UTF-8');
+
+  { The same values driven straight at the setter, which is what the host
+    calls: the loader's refusal must not be the only thing standing between
+    a control byte and the request body. }
+  Check(not SetModelAlias('x', 'nul'#0'byte', Err) and (Err <> ''),
+    'SetModelAlias refuses a NUL in the target on its own account');
+  Check(not SetModelAlias('x', StringOfChar('z', 4096), Err),
+    'and a 4 KB target');
+  Check(not SetModelAlias('x', 'has space', Err), 'and one with a space');
+  Check(not SetModelAlias('x', #$C3#$28, Err), 'and invalid UTF-8');
+  Check(uAgent.ModelAliasCount = N,
+    'and the table did not grow through any of it');
+
+  { A route naming an alias that names a profile whose halves name aliases:
+    resolution must terminate at a sendable string rather than recurse. }
+  Check(SetModelAlias('r1', 'r2', Err), 'a route may name an alias');
+  Check(SetModelAlias('r2', 'opusplan', Err), 'which names a profile');
+  SetModelRoute(mrSubagent, 'r1');
+  A := TAgent.Create('k', 'claude-opus-4-5', 'sys');
+  try
+    Got := A.EffectiveModel(mrSubagent);
+    Check(Got <> '', 'and it resolves to something sendable: ' + Got);
+    Check(Pos(#0, Got) = 0, 'with no NUL in it');
+  finally
+    A.Free;
+    SetModelRoute(mrSubagent, 'sonnet');
+  end;
+
+  { An enormous route string is not refused - /model has always taken a name
+    verbatim so a model newer than the list stays pickable - but it must not
+    be able to make the resolver misbehave. }
+  SetModelRoute(mrCompact, StringOfChar('m', 100 * 1024));
+  A := TAgent.Create('k', 'claude-opus-4-5', 'sys');
+  try
+    Check(Length(A.EffectiveModel(mrCompact)) = 100 * 1024,
+      'a 100 KB route is passed through rather than truncated or resolved');
+  finally
+    A.Free;
+    SetModelRoute(mrCompact, 'sonnet');
+  end;
+
+  uSettings.SettingsClear;
+  Check(not uSettings.SettingIsSet('model.alias'), 'and nothing was left set');
+  P := nil;
+end;
+
 begin
   TestImageDecodersHostile;
   TestBinaryFileDoesNotCorruptBody;
@@ -3693,6 +3774,7 @@ begin
   TestSandboxScratchOutOfTree;
   TestSandboxEnvBlock;
   TestSettingsHostile;
+  TestModelSettingsHostile;
   uTools.ClearWorkingDirs;
   uSandbox.SandboxShutdown;
 

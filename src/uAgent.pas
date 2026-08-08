@@ -54,6 +54,20 @@ type
   end;
   TModelList = array of TModelInfo;
 
+  { What a request is for, which is the only thing that decides which model
+    carries it.  mrMain is the user's own turn and is never routed anywhere:
+    the model they picked is the model that answers them. }
+  TModelRole = (mrMain, mrSubagent, mrCompact);
+  { makProfile is an alias that is not an id at all - it names one model for
+    one situation and another for the rest, and is resolved at request time
+    rather than when it is set. }
+  TModelAliasKind = (makNone, makModel, makProfile);
+  TModelUsage = record
+    Model: string;
+    TokensIn, TokensOut, CacheRead, CacheWrite: Int64;
+  end;
+  TModelUsageList = array of TModelUsage;
+
   { bkServerToolUse is a tool the API runs for us: same shape as bkToolUse,
     but no RunTool ever sees it.  bkResult is a verbatim passthrough of a
     block this client does not interpret and must nevertheless echo back on
@@ -84,6 +98,22 @@ type
     FMaxTokens: Integer;
     FTotalIn, FTotalOut: Int64;
     FCacheWrite, FCacheRead: Int64;
+    { Per-model rows behind the scalar totals above.  The scalars stay the
+      truth about this session's tokens; these say which model spent them,
+      which the scalars stopped being able to say the moment a role could be
+      routed somewhere else. }
+    FModelUsage: TModelUsageList;
+    { What this agent's next request is for.  A field rather than a parameter
+      threaded through BuildBody, because BuildBody is reached from the retry
+      loop, the compaction path and the test seam, and a parameter would have
+      to be correct at all three. }
+    FRole: TModelRole;
+    { What the last request actually carried, and the name it was resolved
+      from.  The pair exists for the 404: a bare not_found_error cannot say
+      that an alias produced the id, and the first turn is the worst possible
+      moment to be told nothing. }
+    FLastRequestModel: string;
+    FLastRequestSource: string;
     FTurns: Integer;
     { From the last failed response's Retry-After header, for the retry loop.
       Zero when the server named no wait. }
@@ -114,6 +144,16 @@ type
       reports what the turn actually cost rather than what the parent alone
       spent. }
     procedure AbsorbUsage(Sub: TAgent);
+    { Adds one response's usage to the row for Model, creating it if this is
+      the first request that model carried. }
+    procedure BumpModelUsage(const AModel: string;
+      InTok, OutTok, CW, CR: Int64);
+    { The model a usage row should be filed under.  FLastRequestModel is empty
+      only on the recorded-stream seam, which never went near a transport. }
+    function UsageModelKey: string;
+    { What the role's model was resolved FROM - the alias name when there is
+      one, so a failure can name it. }
+    function RoleSource(Role: TModelRole): string;
 
     function BuildBody: string;
     { Turns web search off after the server refused the declaration, so the
@@ -238,6 +278,20 @@ type
     function CacheWriteTokens: Int64;
     function CacheReadTokens: Int64;
     function TurnCount: Integer;
+    { The one place a model string is produced.  Every request path goes
+      through it, so there is exactly one answer to "what will this carry",
+      and a profile is expanded here - at request time - rather than when it
+      was set, which is what lets /mode change the model with no new state to
+      keep consistent. }
+    function EffectiveModel(Role: TModelRole): string;
+    { What the last request actually carried; '' before the first one. }
+    function LastRequestModel: string;
+    { Per-model token rows, with any subagent's already folded in.  A copy:
+      the caller must not be able to edit the counters. }
+    function UsageByModel: TModelUsageList;
+    { May now hold an alias or a profile name rather than an id.  Deliberately
+      unexpanded: /resume round-trips the profile, not a snapshot of whichever
+      half happened to be active when the session was saved. }
     property Model: string read FModel write FModel;
     { Asks the API which models this key can use.  Empty with Err set when
       the endpoint could not be reached or the answer was not understood. }
@@ -314,6 +368,54 @@ const
   SessionDir  = '.pasclaude';
   SessionFile = 'session.json';
 
+{ ------------------------------------------------------------- aliases -- }
+
+{ Short names for models, and the two routes.  This is a table of strings
+  asserting things about a namespace this program does not own, which is
+  exactly the mistake that produced the retired-default 404 recorded in the
+  README - so three properties keep it from being that mistake twice:
+
+    * every built-in target is a DATELESS family alias, the same class of
+      string DefaultModel already is, and the server resolves it to whatever
+      snapshot is current;
+    * GET /v1/models stays the only authority - a bare /model annotates this
+      table against the live list rather than the other way round;
+    * any entry is overridable from %USERPROFILE%\.pasclaude\settings.json,
+      so a stale table is an annoyance rather than a rebuild.
+
+  An alias name may not contain '-' and may not begin with 'claude'.  Every
+  model id Anthropic has shipped has hyphens and begins with 'claude', so no
+  legal id can be captured by an alias and the resolution order stays
+  readable.  It is a rule about someone else's naming convention, which is
+  why it is stated here rather than assumed. }
+
+{ True when Name is in the table.  Kind says whether Target is an id
+  (makModel) or the two halves of a profile joined ' / ' (makProfile). }
+function ResolveModelAlias(const Name: string; out Target: string;
+  out Kind: TModelAliasKind): Boolean;
+function ModelAliasCount: Integer;
+function ModelAliasName(I: Integer): string;
+{ For a profile: 'opus / sonnet'. }
+function ModelAliasTarget(I: Integer): string;
+{ Adds or replaces an entry.  False with Err set when the name breaks the
+  no-hyphen/no-'claude' rule or the target is not something that could be a
+  model id - a target with a control byte or invalid UTF-8 would go straight
+  into the "model" field of a request. }
+function SetModelAlias(const Name, Target: string; out Err: string): Boolean;
+procedure SetModelRoute(Role: TModelRole; const NameOrId: string);
+function ModelRoute(Role: TModelRole): string;
+{ Resolves aliases and profiles to a concrete id, with a hop limit so a
+  table a user pointed at itself terminates instead of looping. }
+function ExpandModelName(const Name: string): string;
+{ ' - the model came from alias "opus" (-> claude-opus-4-5); /model lists
+  what this key can actually use', or '' when Name was typed literally. }
+function ModelSourceNote(const Name: string): string;
+{ True when Target names, or is named by, one of the ids the live list
+  returned - a dateless alias against a dated snapshot, in either direction.
+  The boundary must be a '-' or 'claude-opus-4' would match
+  'claude-opus-40'. }
+function ModelListMatches(const Target: string; const List: TModelList): Boolean;
+
 { The default save location under Root. }
 function SessionPath(const Root: string): string;
 
@@ -370,6 +472,211 @@ function SessionPath(const Root: string): string;
 begin
   Result := IncludeTrailingPathDelimiter(Root) + SessionDir +
     PathDelim + SessionFile;
+end;
+
+{ ------------------------------------------------------------- aliases -- }
+
+type
+  TModelAlias = record
+    Name: string;
+    Kind: TModelAliasKind;
+    Target: string;              { makModel }
+    PlanHalf, ExecHalf: string;  { makProfile }
+  end;
+
+var
+  { Built in the initialization section from the compiled-in defaults, then
+    mutable, because SetModelAlias is how the user's settings file overrides
+    a target that retired without waiting for a new build. }
+  Aliases: array of TModelAlias;
+  { Empty means "this role is not routed anywhere": it falls back to the main
+    model, which is the only fallback that cannot spend the user's quality
+    budget without being asked.  Falling back to DefaultModel instead would
+    route a user who opted into nothing onto sonnet. }
+  Routes: array[TModelRole] of string;
+
+{ The hop ceiling for alias resolution.  A user can define a -> b and b -> a
+  in settings.json; the loop has to end at a value that can be sent rather
+  than at a stack overflow. }
+const
+  MaxAliasHops = 8;
+
+function AliasIndex(const Name: string): Integer;
+var
+  I: Integer;
+begin
+  Result := -1;
+  if Name = '' then Exit;
+  for I := 0 to High(Aliases) do
+    if Aliases[I].Name = Name then Exit(I);
+end;
+
+function ModelAliasCount: Integer;
+begin
+  Result := Length(Aliases);
+end;
+
+function ModelAliasName(I: Integer): string;
+begin
+  Result := '';
+  if (I >= 0) and (I <= High(Aliases)) then Result := Aliases[I].Name;
+end;
+
+function ModelAliasTarget(I: Integer): string;
+begin
+  Result := '';
+  if (I < 0) or (I > High(Aliases)) then Exit;
+  if Aliases[I].Kind = makProfile then
+    Result := Aliases[I].PlanHalf + ' / ' + Aliases[I].ExecHalf
+  else
+    Result := Aliases[I].Target;
+end;
+
+function ResolveModelAlias(const Name: string; out Target: string;
+  out Kind: TModelAliasKind): Boolean;
+var
+  I: Integer;
+begin
+  Target := '';
+  Kind := makNone;
+  I := AliasIndex(Name);
+  Result := I >= 0;
+  if not Result then Exit;
+  Kind := Aliases[I].Kind;
+  Target := ModelAliasTarget(I);
+end;
+
+{ Model ids are printable ASCII with no spaces.  The check is on the bytes
+  rather than on intent because whatever passes here is copied verbatim into
+  the "model" field of a request: a NUL truncates the JSON, a control byte
+  makes it unparseable, and an invalid UTF-8 sequence breaks the rule that
+  everything sent to the model is valid UTF-8.  Restricting to ASCII settles
+  all three at once and costs nothing - no id has ever needed more. }
+function ModelTargetOk(const S: string): Boolean;
+var
+  I: Integer;
+begin
+  Result := False;
+  if (S = '') or (Length(S) > 128) then Exit;
+  for I := 1 to Length(S) do
+    if (S[I] < #33) or (S[I] > #126) then Exit;
+  Result := True;
+end;
+
+function SetModelAlias(const Name, Target: string; out Err: string): Boolean;
+var
+  I: Integer;
+begin
+  Err := '';
+  Result := False;
+  if Name = '' then
+  begin
+    Err := 'an alias needs a name';
+    Exit;
+  end;
+  if Pos('-', Name) > 0 then
+  begin
+    Err := 'an alias name may not contain a dash: every model id has one, ' +
+      'and an alias that looked like an id would shadow it';
+    Exit;
+  end;
+  if CompareText(Copy(Name, 1, 6), 'claude') = 0 then
+  begin
+    Err := 'an alias name may not begin with "claude": that is the shape of ' +
+      'a real model id';
+    Exit;
+  end;
+  if not ModelTargetOk(Target) then
+  begin
+    Err := 'the target must be printable ASCII with no spaces, at most 128 ' +
+      'characters - it goes straight into the request as the model';
+    Exit;
+  end;
+  I := AliasIndex(Name);
+  if I < 0 then
+  begin
+    I := Length(Aliases);
+    SetLength(Aliases, I + 1);
+  end;
+  { An override always lands as a plain model entry.  A profile is a shape
+    this program defines, not a string a settings file can name, so
+    overriding 'opusplan' with an id turns it into an ordinary alias rather
+    than half-rewriting a profile. }
+  Aliases[I].Name := Name;
+  Aliases[I].Kind := makModel;
+  Aliases[I].Target := Target;
+  Aliases[I].PlanHalf := '';
+  Aliases[I].ExecHalf := '';
+  Result := True;
+end;
+
+procedure SetModelRoute(Role: TModelRole; const NameOrId: string);
+begin
+  { mrMain is not a route.  The user's own turn carries the model the user
+    chose, and a "route" for it would be a second, invisible way to set the
+    session model. }
+  if Role = mrMain then Exit;
+  Routes[Role] := Trim(NameOrId);
+end;
+
+function ModelRoute(Role: TModelRole): string;
+begin
+  Result := Routes[Role];
+end;
+
+function ExpandModelName(const Name: string): string;
+var
+  Hops, I: Integer;
+begin
+  Result := Name;
+  for Hops := 1 to MaxAliasHops do
+  begin
+    I := AliasIndex(Result);
+    if I < 0 then Exit;
+    if Aliases[I].Kind = makProfile then
+    begin
+      { Read per request, not remembered.  uTools.PlanMode is derived state
+        the permission round already maintains, so a profile costs one
+        boolean test and no callback: /mode plan changes the model on the
+        next request with nothing to keep in step. }
+      if uTools.PlanMode then Result := Aliases[I].PlanHalf
+      else Result := Aliases[I].ExecHalf;
+    end
+    else
+      Result := Aliases[I].Target;
+  end;
+  { Out of hops: the table points at itself.  Whatever we hold is a string
+    the API can reject cleanly, which is a better end than a hang. }
+end;
+
+function ModelSourceNote(const Name: string): string;
+var
+  Target: string;
+  Kind: TModelAliasKind;
+begin
+  Result := '';
+  if not ResolveModelAlias(Name, Target, Kind) then Exit;
+  Result := ' - the model came from alias "' + Name + '" (-> ' +
+    ExpandModelName(Name) + '); /model lists what this key can actually use';
+end;
+
+function ModelListMatches(const Target: string; const List: TModelList): Boolean;
+var
+  I: Integer;
+  Id: string;
+begin
+  Result := False;
+  if Target = '' then Exit;
+  for I := 0 to High(List) do
+  begin
+    Id := List[I].Id;
+    if Id = Target then Exit(True);
+    { The '-' is the whole of the check.  Without it 'claude-opus-4' matches
+      'claude-opus-40', and the warning this feeds would never fire for the
+      case it exists for. }
+    if Copy(Id, 1, Length(Target) + 1) = Target + '-' then Exit(True);
+    if Copy(Target, 1, Length(Id) + 1) = Id + '-' then Exit(True);
+  end;
 end;
 
 { ---------------------------------------------------------------- mentions -- }
@@ -834,8 +1141,11 @@ begin
   FMaxTokens := 8192;
   FMaxRounds := MaxToolRounds;
   { Stated rather than left to the zero value, because "off" is a decision
-    here and not an accident of initialisation. }
+    here and not an accident of initialisation.  The same applies to the
+    role: every agent answers a user until something says otherwise, and a
+    subagent's role stays mrMain because it was handed a resolved id. }
   FWebSearch := False;
+  FRole := mrMain;
 end;
 
 function TAgent.WantsCancel: Boolean;
@@ -843,13 +1153,81 @@ begin
   Result := ForceCancel or (Assigned(ShouldCancel) and ShouldCancel());
 end;
 
+procedure TAgent.BumpModelUsage(const AModel: string;
+  InTok, OutTok, CW, CR: Int64);
+var
+  I, N: Integer;
+begin
+  if AModel = '' then Exit;
+  for I := 0 to High(FModelUsage) do
+    if FModelUsage[I].Model = AModel then
+    begin
+      Inc(FModelUsage[I].TokensIn, InTok);
+      Inc(FModelUsage[I].TokensOut, OutTok);
+      Inc(FModelUsage[I].CacheWrite, CW);
+      Inc(FModelUsage[I].CacheRead, CR);
+      Exit;
+    end;
+  N := Length(FModelUsage);
+  SetLength(FModelUsage, N + 1);
+  FModelUsage[N].Model := AModel;
+  FModelUsage[N].TokensIn := InTok;
+  FModelUsage[N].TokensOut := OutTok;
+  FModelUsage[N].CacheWrite := CW;
+  FModelUsage[N].CacheRead := CR;
+end;
+
+function TAgent.UsageModelKey: string;
+begin
+  Result := FLastRequestModel;
+  if Result = '' then Result := EffectiveModel(FRole);
+end;
+
+function TAgent.UsageByModel: TModelUsageList;
+var
+  I: Integer;
+begin
+  Result := nil;
+  SetLength(Result, Length(FModelUsage));
+  for I := 0 to High(FModelUsage) do Result[I] := FModelUsage[I];
+end;
+
+function TAgent.LastRequestModel: string;
+begin
+  Result := FLastRequestModel;
+end;
+
+function TAgent.RoleSource(Role: TModelRole): string;
+begin
+  Result := FModel;
+  if (Role <> mrMain) and (Routes[Role] <> '') then Result := Routes[Role];
+end;
+
+function TAgent.EffectiveModel(Role: TModelRole): string;
+begin
+  Result := ExpandModelName(RoleSource(Role));
+  { Cannot happen with a model set at Create, but a caller that cleared the
+    property must still produce something sendable rather than an empty
+    "model" the API rejects with a message about the wrong thing. }
+  if Result = '' then Result := DefaultModel;
+end;
+
 procedure TAgent.AbsorbUsage(Sub: TAgent);
+var
+  I: Integer;
 begin
   if Sub = nil then Exit;
   Inc(FTotalIn, Sub.FTotalIn);
   Inc(FTotalOut, Sub.FTotalOut);
   Inc(FCacheWrite, Sub.FCacheWrite);
   Inc(FCacheRead, Sub.FCacheRead);
+  { The rows have to come across too, or a routed subagent's tokens appear in
+    the scalar totals and in no row at all, and the per-model block silently
+    under-reports the thing it exists to report. }
+  for I := 0 to High(Sub.FModelUsage) do
+    BumpModelUsage(Sub.FModelUsage[I].Model,
+      Sub.FModelUsage[I].TokensIn, Sub.FModelUsage[I].TokensOut,
+      Sub.FModelUsage[I].CacheWrite, Sub.FModelUsage[I].CacheRead);
 end;
 
 function TAgent.LastAssistantText: string;
@@ -1096,7 +1474,8 @@ function TAgent.CompactWithSummary(out Err: string): Boolean;
 var
   Backup, StopReason, Summary: string;
   Blocks: TPartialBlocks;
-  Cancelled: Boolean;
+  Cancelled, Sent: Boolean;
+  SavedRole: TModelRole;
   Restored, Msg, Arr, B: TJson;
   I: Integer;
 
@@ -1128,7 +1507,19 @@ begin
     'made and their reasons, and anything still unfinished. Omit pleasantries ' +
     'and dead ends.');
 
-  if not SendWithRetry(Blocks, StopReason, Err, Cancelled) then
+  { Summarising text the model already produced is mechanical work, so it is
+    one of the two things routed off the main model.  The role is set around
+    the request alone and restored in a finally: a compaction that failed or
+    was cancelled must not strand the rest of the session on the compaction
+    model, and every exit below this point is an early one. }
+  SavedRole := FRole;
+  FRole := mrCompact;
+  try
+    Sent := SendWithRetry(Blocks, StopReason, Err, Cancelled);
+  finally
+    FRole := SavedRole;
+  end;
+  if not Sent then
   begin
     Restore;
     Exit;
@@ -1222,7 +1613,12 @@ var
 begin
   Root := TJson.NewObj;
   try
-    Root.AddStr('model', FModel);
+    { The single production point for a model string.  Recorded as it is
+      produced, together with the name it came from, because by the time a
+      404 comes back the only thing that can explain it is what was sent. }
+    FLastRequestModel := EffectiveModel(FRole);
+    FLastRequestSource := RoleSource(FRole);
+    Root.AddStr('model', FLastRequestModel);
     { Thinking spends from the same max_tokens pot as the reply, so the
       ceiling rises with the budget or a long think would starve the
       answer that follows it. }
@@ -1411,6 +1807,8 @@ begin
     Inc(FCacheWrite, St.CacheWrite);
     Inc(FCacheRead, St.CacheRead);
     Inc(FTotalOut, St.OutTok);
+    BumpModelUsage(UsageModelKey, St.InTok, St.OutTok,
+      St.CacheWrite, St.CacheRead);
     FLastPromptTokens := St.InTok + St.CacheWrite + St.CacheRead;
     Blocks := St.Blocks;
     StopReason := 'cancelled';
@@ -1438,6 +1836,13 @@ begin
       else
         Err := Err + ' - ' + Copy(Res.Body, 1, 500);
     end;
+    { A model the account cannot use is a 404 on the first turn, which is the
+      worst possible moment to be told nothing.  When the id came from an
+      alias, say so and name it: the alternative is an opaque
+      not_found_error about a string the user never typed.  Nothing is
+      printed here - uAgent has no console - the text is returned. }
+    if (Res.Status = 404) or (Copy(Err, 1, 8) = 'HTTP 404') then
+      Err := Err + ModelSourceNote(FLastRequestSource);
     Exit(False);
   end;
 
@@ -1451,6 +1856,8 @@ begin
   Inc(FCacheWrite, St.CacheWrite);
   Inc(FCacheRead, St.CacheRead);
   Inc(FTotalOut, St.OutTok);
+  BumpModelUsage(UsageModelKey, St.InTok, St.OutTok,
+    St.CacheWrite, St.CacheRead);
   FLastPromptTokens := St.InTok + St.CacheWrite + St.CacheRead;
   Blocks := St.Blocks;
   StopReason := St.StopReason;
@@ -1633,6 +2040,8 @@ begin
   Inc(FTotalOut, St.OutTok);
   Inc(FCacheWrite, St.CacheWrite);
   Inc(FCacheRead, St.CacheRead);
+  BumpModelUsage(UsageModelKey, St.InTok, St.OutTok,
+    St.CacheWrite, St.CacheRead);
   StopReason := St.StopReason;
   Err := St.ErrText;
   Result := St.Blocks;
@@ -2432,7 +2841,14 @@ begin
   if Trim(SystemExtra) <> '' then
     SysText := SysText + #10#10 + SystemExtra;
 
-  Sub := TAgent.Create(Parent.FApiKey, Parent.FModel, SysText);
+  { Routed rather than inherited.  A read-only investigator with three tools
+    and nobody watching it spend is the clearest case in the program for a
+    cheaper model - RunSubagent already declines to give it a thinking budget
+    for the same reason.  The child is handed a concrete id and its own role
+    stays mrMain, so its resolution is a plain passthrough and it cannot
+    route again. }
+  Sub := TAgent.Create(Parent.FApiKey, Parent.EffectiveModel(mrSubagent),
+    SysText);
   try
     Sub.MaxRounds := uTools.SubagentMaxRounds;
     { Nil by construction rather than by omission: nothing a subagent can call
@@ -2481,7 +2897,51 @@ begin
   Result := ForceCancel or (Assigned(ActiveAgent) and ActiveAgent.WantsCancel);
 end;
 
+procedure AddBuiltinAlias(const Name, Target: string);
+var
+  I: Integer;
+begin
+  I := Length(Aliases);
+  SetLength(Aliases, I + 1);
+  Aliases[I].Name := Name;
+  Aliases[I].Kind := makModel;
+  Aliases[I].Target := Target;
+end;
+
+procedure AddBuiltinProfile(const Name, PlanHalf, ExecHalf: string);
+var
+  I: Integer;
+begin
+  I := Length(Aliases);
+  SetLength(Aliases, I + 1);
+  Aliases[I].Name := Name;
+  Aliases[I].Kind := makProfile;
+  Aliases[I].PlanHalf := PlanHalf;
+  Aliases[I].ExecHalf := ExecHalf;
+end;
+
 initialization
+  { Dateless on purpose, every one of them.  A dated snapshot id is a promise
+    about a date this program does not control, and one of those has already
+    expired under this codebase - a live 404 on a hardcoded default, which is
+    why DefaultModel is 'claude-sonnet-4-5' and not a snapshot.  The server
+    resolves a family alias to whatever is current; a table of snapshots
+    would have to be re-shipped to stay true. }
+  AddBuiltinAlias('opus',   'claude-opus-4-5');
+  AddBuiltinAlias('sonnet', 'claude-sonnet-4-5');
+  AddBuiltinAlias('haiku',  'claude-haiku-4-5');
+  { Not an id: a profile.  Plan mode refuses every changing tool, so under
+    opusplan the expensive model only ever reads and the cheap one does the
+    work - which is the whole argument for the alias existing. }
+  AddBuiltinProfile('opusplan', 'opus', 'sonnet');
+  { The shipped routes.  On the shipped default model these are a no-op -
+    'sonnet' expands to exactly DefaultModel - so out of the box every
+    request carries the same string it carried before routing existed.  The
+    feature only bites once the user has deliberately chosen a stronger main
+    model, which is the moment they asked for it. }
+  Routes[mrSubagent] := 'sonnet';
+  Routes[mrCompact]  := 'sonnet';
+
   { The ladder crossing: uTools declares the hole because it is the unit that
     needs a way to run one, and the unit that knows what an agent is fills it.
     The same shape uHttp uses for the network transport. }

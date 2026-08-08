@@ -734,6 +734,41 @@ begin
     Agent.ThinkingBudget := uSettings.SettingInt('thinking_budget');
 end;
 
+{ The alias table and the two routes, from the USER settings file only.
+  model, model.alias, model.route.subagent and model.route.compaction are
+  scUserOnly in uSettings.SettingDefs, and TierAllowed means a project value
+  for one of them is never stored - so this reads what a project tree cannot
+  have written, and there is no scope test to get wrong here.
+
+  A repository choosing the model was refused rather than prompted.  It
+  spends the user's money recurrently with no ceiling, and it can quietly
+  downgrade the reviewer of its own code - a repo that names the weakest id
+  gets a worse audit of itself and nothing in the output says so.  A prompt
+  is the wrong shape for that: the question is cheap to answer yes to and the
+  cost recurs.  A project file that tries is already named in yellow by the
+  settings loader, which voids the whole file, so nothing is added here.
+
+  Refusals are notes, never fatal.  An unresolvable alias is not a startup
+  error either: there is deliberately no preflight against /v1/models - it
+  would add a round trip to every start including -p and could still only
+  answer "this key's list mentions it".  A bad id surfaces as a 404 on the
+  first turn with the alias named in the message. }
+procedure ApplyModelSettings;
+var
+  Keys, Vals: TStringArray;
+  I: Integer;
+  Err: string;
+begin
+  if uSettings.SettingMap('model.alias', Keys, Vals) then
+    for I := 0 to High(Keys) do
+      if not SetModelAlias(Keys[I], Vals[I], Err) then
+        EmitCLn(clYellow, '  settings: model.alias "' + Keys[I] + '": ' + Err);
+  if uSettings.SettingIsSet('model.route.subagent') then
+    SetModelRoute(mrSubagent, uSettings.SettingStr('model.route.subagent'));
+  if uSettings.SettingIsSet('model.route.compaction') then
+    SetModelRoute(mrCompact, uSettings.SettingStr('model.route.compaction'));
+end;
+
 var
   KeysFileFound: Boolean = False;
 
@@ -1785,6 +1820,34 @@ begin
   end;
 end;
 
+{ /model <name>.  An alias is resolved and said out loud; anything else is
+  set verbatim and unvalidated, exactly as it always was, so a model newer
+  than the list this key returns is still pickable.  The alias NAME is what
+  is stored, never its target: a profile has to survive /resume as a profile,
+  and freezing it here would leave the model and the mode disagreeing after
+  the next /mode. }
+procedure SetModelByName(const Name: string);
+var
+  Target: string;
+  Kind: TModelAliasKind;
+begin
+  Agent.Model := Name;
+  if not ResolveModelAlias(Name, Target, Kind) then
+  begin
+    EmitCLn(clGrey, '  model set to ' + Name);
+    Exit;
+  end;
+  if Kind = makProfile then
+  begin
+    EmitCLn(clGrey, '  model set to ' + Name + '  (a profile: ' + Target + ')');
+    EmitCLn(clGrey, '  the first half applies in plan mode, the second ' +
+      'everywhere else (/mode)');
+    EmitCLn(clGrey, '  right now: ' + Agent.EffectiveModel(mrMain));
+  end
+  else
+    EmitCLn(clGrey, '  alias ' + Name + ' -> ' + Target);
+end;
+
 { A bare /model lists what the key can actually use and takes a number.
   Typing a model id from memory is guesswork about a namespace that changes
   under you - the retired-default 404 was exactly that - so the list comes
@@ -1793,8 +1856,9 @@ procedure PickModel;
 var
   Models: TModelList;
   Err, Line: string;
-  I, Pick: Integer;
-  Mark: string;
+  I, Pick, N: Integer;
+  Mark, Target: string;
+  Kind: TModelAliasKind;
 begin
   EmitCLn(clGrey, '  fetching the model list...');
   Models := Agent.ListModels(Err);
@@ -1806,12 +1870,36 @@ begin
     Exit;
   end;
 
+  { The live rows keep numbers 1..N verbatim.  Aliases are appended below
+    with continued numbering, so nothing documented moves and a number still
+    picks the thing it always picked. }
   for I := 0 to High(Models) do
   begin
     if Models[I].Id = Agent.Model then Mark := ' (current)' else Mark := '';
     EmitC(clGrey, Format('  %2d  ', [I + 1]));
     EmitC(clBright, Models[I].DisplayName);
     EmitCLn(clGrey, '  ' + Models[I].Id + Mark);
+  end;
+
+  N := Length(Models);
+  if ModelAliasCount > 0 then
+  begin
+    EmitCLn(clGrey, '  aliases');
+    for I := 0 to ModelAliasCount - 1 do
+    begin
+      if ModelAliasName(I) = Agent.Model then Mark := ' (current)'
+      else Mark := '';
+      EmitC(clGrey, Format('  %2d  ', [N + I + 1]));
+      EmitC(clBright, ModelAliasName(I));
+      EmitCLn(clGrey, '  ' + ModelAliasTarget(I) + Mark);
+      { The live list is the authority and this table is only a hint over it,
+        so the table is annotated against the list rather than trusted.  A
+        profile is skipped: its halves are aliases, and each is checked on
+        its own row. }
+      ResolveModelAlias(ModelAliasName(I), Target, Kind);
+      if (Kind = makModel) and not ModelListMatches(Target, Models) then
+        EmitCLn(clYellow, '      not in the list this key returned');
+    end;
   end;
 
   EmitC(clYellow, '  pick a number, or Enter to keep ' + Agent.Model + ' > ');
@@ -1823,13 +1911,18 @@ begin
     Exit;
   end;
   Pick := StrToIntDef(Line, 0);
-  if (Pick < 1) or (Pick > Length(Models)) then
+  if (Pick >= 1) and (Pick <= N) then
   begin
-    EmitCLn(clRed, '  not a listed number: ' + Line);
+    Agent.Model := Models[Pick - 1].Id;
+    EmitCLn(clGrey, '  model set to ' + Agent.Model);
     Exit;
   end;
-  Agent.Model := Models[Pick - 1].Id;
-  EmitCLn(clGrey, '  model set to ' + Agent.Model);
+  if (Pick > N) and (Pick <= N + ModelAliasCount) then
+  begin
+    SetModelByName(ModelAliasName(Pick - N - 1));
+    Exit;
+  end;
+  EmitCLn(clRed, '  not a listed number: ' + Line);
 end;
 
 procedure RecordCheckpoint(const Prompt: string);
@@ -2267,7 +2360,8 @@ end;
   mark, small enough that the banner is still a banner. }
 procedure ShowBanner;
 var
-  Auth: string;
+  Auth, AliasTarget: string;
+  AliasKind: TModelAliasKind;
   I: Integer;
 begin
   EmitLn;
@@ -2281,8 +2375,25 @@ begin
   EmitLn;
   EmitLn;
   Auth := Agent.Model;
+  { A profile is not an id, so the banner has to say what it means or the
+    user is reading a word where they expect a model.  An ordinary alias is
+    left alone: it resolves to one thing and /model already said so. }
+  if ResolveModelAlias(Agent.Model, AliasTarget, AliasKind) and
+     (AliasKind = makProfile) then
+    Auth := Auth + ' (' + AliasTarget + ' - the first in plan mode)';
   if BannerAuth <> '' then Auth := Auth + ' (' + BannerAuth + ')';
   EmitCLn(clGrey, '  ' + Auth);
+  { Only when a route is not what shipped.  Routing costs the user quality on
+    work they cannot see - the parent only ever reads a subagent's final
+    message - so a session that routes says so once, up front, rather than
+    leaving it to be discovered in /cost. }
+  if (ModelRoute(mrSubagent) <> 'sonnet') or
+     (ModelRoute(mrCompact) <> 'sonnet') then
+    EmitCLn(clGrey, Format('  routes: subagent %s, compaction %s (/config)',
+      [Agent.EffectiveModel(mrSubagent), Agent.EffectiveModel(mrCompact)]))
+  else if Agent.EffectiveModel(mrSubagent) <> Agent.EffectiveModel(mrMain) then
+    EmitCLn(clGrey, '  subagents and compaction run on ' +
+      Agent.EffectiveModel(mrSubagent));
   EmitCLn(clGrey, '  ' + uTools.RootDir);
   for I := 1 to uTools.RootCount - 1 do
     EmitCLn(clGrey, '  + ' + uTools.RootAt(I));
@@ -2342,6 +2453,8 @@ var
   Sp: Integer;
   Dropped: Integer;
   Err: string;
+  Rows: TModelUsageList;
+  ArgI: Integer;
 begin
   Result := True;
   Handled := False;
@@ -2605,10 +2718,7 @@ begin
   else if Cmd = '/model' then
   begin
     if Arg <> '' then
-    begin
-      Agent.Model := Arg;
-      EmitCLn(clGrey, '  model set to ' + Arg);
-    end
+      SetModelByName(Arg)
     else
       PickModel;
   end
@@ -2678,6 +2788,21 @@ begin
     if Agent.ContextTokens > 0 then
       EmitCLn(clGrey, Format('  context: %d tokens in the last request',
         [Agent.ContextTokens]));
+    { Only above one model, so a session that never routed anywhere prints
+      exactly what it printed before this existed.  When there IS more than
+      one, the totals above have stopped being comparable - a thousand tokens
+      of opus and a thousand of haiku are not the same money - and this block
+      is the only thing that says so.  Still no prices: this program has no
+      price table, for the same reason the SDK omits total_cost_usd. }
+    Rows := Agent.UsageByModel;
+    if Length(Rows) > 1 then
+    begin
+      EmitCLn(clGrey, '  by model:');
+      for ArgI := 0 to High(Rows) do
+        EmitCLn(clGrey, Format('    %s: %d in, %d out, %d cache read, %d written',
+          [Rows[ArgI].Model, Rows[ArgI].TokensIn, Rows[ArgI].TokensOut,
+           Rows[ArgI].CacheRead, Rows[ArgI].CacheWrite]));
+    end;
   end
   else
     { Not one of ours.  Left unhandled so the caller can try the custom
@@ -3195,6 +3320,13 @@ begin
       WriteLn(StdErr, 'pasclaude: --dangerously-skip-permissions: every tool ' +
         'is approved without asking. Deny rules and the session root still ' +
         'apply; nothing else does.');
+
+    { Above the print-mode halt with the rest of settings, and legal there for
+      the same one reason: a model key cannot grant anything.  It cannot widen
+      a permission, add a root, lower the sandbox or admit a tool - all it can
+      do is change which model answers, and only from the user's own file.
+      Before the model name is read below, because that name may BE an alias. }
+    ApplyModelSettings;
 
     ApiKey := GetEnvironmentVariable('ANTHROPIC_API_KEY');
     UsingSubscription := False;

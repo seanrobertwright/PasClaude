@@ -97,7 +97,12 @@ function SdkCommandNames: TStringArray;
 function SdkExpandCustomCommand(const Line: string; out Ok: Boolean): string;
 
 { ---- pure encoders: each returns one complete NDJSON line ---- }
-function SdkInitLine(const Opts: TSdkOptions; const AModel: string): string;
+{ AModel is the LITERAL session model, which may now be an alias or a
+  profile name; AResolved is what the next main request would actually carry.
+  Both, because a driver has to be able to report the user's choice and the
+  string on the wire, and after a /mode those two differ. }
+function SdkInitLine(const Opts: TSdkOptions;
+  const AModel, AResolved: string): string;
 function SdkUserLine(const Text: string): string;
 function SdkDeltaLine(const Kind, Text: string): string;
 function SdkToolUseLine(const Id, Name, InputJson: string): string;
@@ -106,8 +111,12 @@ function SdkNoticeLine(const Text: string): string;
 function SdkHookLine(const Event, ToolName, Detail: string; Blocked: Boolean): string;
 function SdkErrorLine(const Text: string): string;
 function SdkPermissionRequestLine(const Id, ToolName, Title, Detail: string): string;
+{ Models is additive: 'usage' and 'total_usage' keep exactly their present
+  meaning, and the new 'models' array says which model spent what - which the
+  two scalars stopped being able to say once a role could be routed. }
 function SdkResultLine(const Subtype, ErrText, FinalText: string;
-  DurationMs: Int64; Turns: Integer; const Usage, Total: TSdkUsage): string;
+  DurationMs: Int64; Turns: Integer; const Usage, Total: TSdkUsage;
+  const Models: TModelUsageList): string;
 
 { ---- plumbing ---- }
 procedure SdkEmit(const Line: string);
@@ -523,7 +532,8 @@ begin
     end;
 end;
 
-function SdkInitLine(const Opts: TSdkOptions; const AModel: string): string;
+function SdkInitLine(const Opts: TSdkOptions;
+  const AModel, AResolved: string): string;
 var
   Root, Arr, Ent: TJson;
   Schema: TJson;
@@ -545,6 +555,7 @@ begin
       Arr.Push(TJson.NewStr(Safe(uTools.RootAt(I))));
     Root.Add('working_dirs', Arr);
     Root.AddStr('model', Safe(AModel));
+    Root.AddStr('model_resolved', Safe(AResolved));
     { A caller that says nothing gets the truth rather than a blank: a driver
       that cannot see the mode cannot explain a refusal to whoever is reading
       its log. }
@@ -729,9 +740,11 @@ begin
 end;
 
 function SdkResultLine(const Subtype, ErrText, FinalText: string;
-  DurationMs: Int64; Turns: Integer; const Usage, Total: TSdkUsage): string;
+  DurationMs: Int64; Turns: Integer; const Usage, Total: TSdkUsage;
+  const Models: TModelUsageList): string;
 var
-  Root: TJson;
+  Root, Arr, Ent: TJson;
+  I: Integer;
 begin
   Root := TJson.NewObj;
   Root.AddStr('type', 'result');
@@ -743,6 +756,21 @@ begin
   Root.AddNum('num_turns', Turns);
   Root.Add('usage', UsageJson(Usage));
   Root.Add('total_usage', UsageJson(Total));
+  { Always present, even empty and even with one row: a driver that has to
+    branch on a missing key is a driver that will get it wrong on the run
+    where nothing was routed. }
+  Arr := TJson.NewArr;
+  for I := 0 to High(Models) do
+  begin
+    Ent := TJson.NewObj;
+    Ent.AddStr('model', Safe(Models[I].Model));
+    Ent.AddNum('tokens_in', Models[I].TokensIn);
+    Ent.AddNum('tokens_out', Models[I].TokensOut);
+    Ent.AddNum('cache_read', Models[I].CacheRead);
+    Ent.AddNum('cache_write', Models[I].CacheWrite);
+    Arr.Push(Ent);
+  end;
+  Root.Add('models', Arr);
   { Deliberately no total_cost_usd.  This program has no price table - /cost
     reports tokens for the same reason - and a hardcoded one drifts into a
     lie the first time a model is repriced.  A driver that wants money
@@ -1010,7 +1038,7 @@ begin
     end;
 
   SdkEmit(SdkResultLine(Subtype, Err, A.LastAssistantText,
-    Int64(GetTickCount64 - T0), A.TurnCount, Delta, After));
+    Int64(GetTickCount64 - T0), A.TurnCount, Delta, After, A.UsageByModel));
 end;
 
 function SdkRun(A: TAgent; const Opts: TSdkOptions;
@@ -1072,12 +1100,12 @@ begin
       FillChar(Zero, SizeOf(Zero), 0);
       if Opts.Format = sfStreamJson then
       begin
-        SdkEmit(SdkInitLine(RunOpts, A.Model));
+        SdkEmit(SdkInitLine(RunOpts, A.Model, A.EffectiveModel(mrMain)));
         SdkEmit(SdkErrorLine('cannot resume ' + RunOpts.SessionFile +
           ': ' + Err));
       end;
       SdkEmit(SdkResultLine('error', Err, '', 0, A.TurnCount, Zero,
-        SdkSnapshotUsage(A)));
+        SdkSnapshotUsage(A), A.UsageByModel));
       Exit(2);
     end
     else
@@ -1088,7 +1116,8 @@ begin
 
   { Once, for the whole run.  A driver reads this line to learn what this
     build can do before it sends anything. }
-  if Opts.Format = sfStreamJson then SdkEmit(SdkInitLine(RunOpts, A.Model));
+  if Opts.Format = sfStreamJson then
+    SdkEmit(SdkInitLine(RunOpts, A.Model, A.EffectiveModel(mrMain)));
 
   if Trim(FirstPrompt) <> '' then
     if not OneTurn(A, FirstPrompt) then AnyFail := True;

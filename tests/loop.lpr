@@ -2240,6 +2240,212 @@ begin
   end;
 end;
 
+{ The "model" field of a recorded request body. }
+function BodyModel(const Body: string): string;
+var
+  Doc: TJson;
+begin
+  Result := '';
+  Doc := JsonParse(Body);
+  if Doc = nil then Exit;
+  try
+    Result := Doc.Str('model');
+  finally
+    Doc.Free;
+  end;
+end;
+
+{ /cost prints its per-model block only above one row, so a session that
+  routed nowhere must produce exactly one - otherwise the default session's
+  output changes for a feature nobody enabled. }
+procedure TestSingleModelHasOneUsageRow;
+var
+  A: TAgent;
+  Err: string;
+begin
+  ResetScript;
+  uTools.RootDir := SessionDir;
+  SetLength(Replies, 2);
+  Replies[0] := TextReply('one');
+  Replies[1] := TextReply('two');
+
+  A := MakeAgent;
+  try
+    A.Send('hi', Err);
+    A.Send('again', Err);
+    Check(Length(A.UsageByModel) = 1,
+      Format('two turns on one model make exactly one row (%d)',
+        [Length(A.UsageByModel)]));
+    if Length(A.UsageByModel) = 1 then
+    begin
+      Check(A.UsageByModel[0].Model = A.EffectiveModel(mrMain),
+        'filed under the model that was actually sent');
+      Check(A.UsageByModel[0].TokensIn = A.TokensIn,
+        'and holding every input token the scalar total does');
+      Check(A.UsageByModel[0].TokensOut = A.TokensOut, 'and every output one');
+    end;
+  finally
+    A.Free;
+  end;
+end;
+
+{ Routing's primary case: a user who chose a stronger main model gets the
+  cheap one for the read-only investigator, and their own turns are
+  untouched.  The main model is deliberately not the default, or the two
+  would be the same string and the assertion would prove nothing. }
+procedure TestSubagentRoutedModel;
+var
+  A: TAgent;
+  Err, Sonnet: string;
+  Kind: TModelAliasKind;
+begin
+  ResetScript;
+  uTools.RootDir := SessionDir;
+  ResolveModelAlias('sonnet', Sonnet, Kind);
+
+  SetLength(Replies, 3);
+  Replies[0] := ToolReply('t1', 'task', '{"prompt":"look"}');
+  Replies[1] := TextReply('the answer');
+  Replies[2] := TextReply('relaying it');
+
+  A := MakeAgent;
+  try
+    A.Model := 'claude-opus-4-5';
+    A.Send('ask a helper', Err);
+    Check(Length(Requests) = 3, 'three requests were made');
+    if Length(Requests) < 3 then Exit;
+    Check(BodyModel(Requests[0]) = 'claude-opus-4-5',
+      'the parent turn carries the main model (' + BodyModel(Requests[0]) + ')');
+    Check(BodyModel(Requests[1]) = Sonnet,
+      'the subagent turn carries the routed model (' + BodyModel(Requests[1]) + ')');
+    Check(BodyModel(Requests[2]) = 'claude-opus-4-5',
+      'and the parent is back on its own model afterwards');
+
+    { Two rows, and they must account for every token the scalars hold - a
+      subagent whose usage lands in the totals and in no row makes the
+      per-model block under-report exactly what it exists to report. }
+    Check(Length(A.UsageByModel) = 2,
+      Format('usage is filed under two models (%d)', [Length(A.UsageByModel)]));
+    if Length(A.UsageByModel) = 2 then
+    begin
+      Check(A.UsageByModel[0].TokensIn + A.UsageByModel[1].TokensIn = A.TokensIn,
+        'and the rows'' input tokens sum to the total');
+      Check(A.UsageByModel[0].TokensOut + A.UsageByModel[1].TokensOut = A.TokensOut,
+        'and their output tokens');
+    end;
+  finally
+    A.Free;
+  end;
+end;
+
+{ Compaction is the other routed role, and the role field must be restored
+  even when the request fails: without the finally, one failed /compact full
+  strands every later turn on the compaction model. }
+procedure TestCompactionRoutedModel;
+var
+  A: TAgent;
+  Err, Sonnet: string;
+  Kind: TModelAliasKind;
+begin
+  ResetScript;
+  uTools.RootDir := SessionDir;
+  ResolveModelAlias('sonnet', Sonnet, Kind);
+
+  SetLength(Replies, 3);
+  Replies[0] := TextReply('hello there');
+  Replies[1] := TextReply('a summary of it all');
+  Replies[2] := TextReply('carrying on');
+
+  A := MakeAgent;
+  try
+    A.Model := 'claude-opus-4-5';
+    A.Send('hi', Err);
+    Check(A.CompactWithSummary(Err), 'the summary compaction ran: ' + Err);
+    Check(Length(Requests) = 2, 'two requests so far');
+    if Length(Requests) < 2 then Exit;
+    Check(BodyModel(Requests[1]) = Sonnet,
+      'the compaction request carries the compaction route (' +
+      BodyModel(Requests[1]) + ')');
+    A.Send('and now?', Err);
+    Check(BodyModel(Requests[High(Requests)]) = 'claude-opus-4-5',
+      'and the next ordinary turn is back on the main model');
+  finally
+    A.Free;
+  end;
+
+  { The same again, with the compaction made to fail. }
+  ResetScript;
+  SetLength(Replies, 2);
+  Replies[0] := TextReply('hello there');
+  Replies[1] := TextReply('carrying on');
+
+  A := MakeAgent;
+  try
+    A.Model := 'claude-opus-4-5';
+    A.Send('hi', Err);
+    FailAfter := 1;
+    FailUntil := 99;
+    FailStatus := 400;
+    Check(not A.CompactWithSummary(Err), 'a failed compaction reports failure');
+    FailAfter := -1;
+    A.Send('and now?', Err);
+    Check(BodyModel(Requests[High(Requests)]) = 'claude-opus-4-5',
+      'and the session is NOT stranded on the compaction model');
+  finally
+    A.Free;
+  end;
+end;
+
+{ The worst-timed failure in the feature: a model the account cannot use is a
+  404 on the first turn.  When the id came from an alias, the message has to
+  name it - and when it did not, it must not claim one. }
+procedure Test404NamesTheAlias;
+var
+  A: TAgent;
+  Err: string;
+begin
+  ResetScript;
+  uTools.RootDir := SessionDir;
+  SetLength(Replies, 1);
+  Replies[0] := TextReply('unused');
+  FailAfter := 0;
+  FailUntil := 99;
+  FailStatus := 404;
+  FailBody := '{"type":"error","error":{"type":"not_found_error",' +
+              '"message":"model: claude-opus-4-5"}}';
+
+  A := MakeAgent;
+  try
+    A.Model := 'opus';
+    A.Send('hello', Err);
+    Check(Pos('not_found_error', Err) > 0,
+      'the API''s own message survives: ' + Err);
+    Check(Pos('alias "opus"', Err) > 0, 'and the alias that produced the id');
+    Check(Pos('/model', Err) > 0, 'and the command that lists what works');
+  finally
+    A.Free;
+  end;
+
+  ResetScript;
+  SetLength(Replies, 1);
+  Replies[0] := TextReply('unused');
+  FailAfter := 0;
+  FailUntil := 99;
+  FailStatus := 404;
+  FailBody := '{"type":"error","error":{"type":"not_found_error",' +
+              '"message":"model: claude-typo-9"}}';
+  A := MakeAgent;
+  try
+    A.Model := 'claude-typo-9';
+    A.Send('hello', Err);
+    Check(Pos('not_found_error', Err) > 0, 'a typed id still gets the message');
+    Check(Pos('alias', Err) = 0,
+      'and is NOT told it came from an alias it never used: ' + Err);
+  finally
+    A.Free;
+  end;
+end;
+
 { Esc during a subagent must stop both agents.  The host's cancel flag is
   consume-on-read, so this stand-in is too: without the latch the subagent
   eats the abort and the parent carries on as though nothing happened. }
@@ -3543,6 +3749,10 @@ begin
   TestSubagent;
   TestSubagentAgentType;
   TestSubagentCost;
+  TestSingleModelHasOneUsageRow;
+  TestSubagentRoutedModel;
+  TestCompactionRoutedModel;
+  Test404NamesTheAlias;
   TestSubagentCancel;
   TestSubagentRoundCap;
   TestMcpTurn;

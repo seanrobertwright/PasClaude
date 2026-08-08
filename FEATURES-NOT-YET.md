@@ -543,8 +543,46 @@ text preserves what was missing at the time. Unchecked items remain open.
 - [ ] **/login, /logout** — cannot authenticate on its own; it reuses the
   token Claude Code or Jcode wrote (read-only, never refreshed) or
   `ANTHROPIC_API_KEY`.
-- [ ] **Model aliases / routing** — `/model` lists and sets models, but
-  there are no aliases like `opusplan` or per-task model routing.
+- [x] ~~**Model aliases / routing** — `/model` lists and sets models, but
+  there are no aliases like `opusplan` or per-task model routing.~~
+  *Built: four built-in aliases — `opus`, `sonnet`, `haiku` and the compound
+  `opusplan` — plus two routes, in one table in `uAgent` with one resolution
+  point. Every built-in target is a **dateless** family id, the same class of
+  string `DefaultModel` already is, because a dated snapshot in this table
+  would be the retired-default 404 all over again; the live `GET /v1/models`
+  stays the only authority and a bare `/model` now annotates each alias
+  against it, marking in yellow any target the key's own list does not
+  mention. An alias name may not contain a dash or begin with `claude`, so no
+  real model id can ever be shadowed by one. `opusplan` is a profile rather
+  than an id: it resolves to `opus` while plan mode is on and `sonnet`
+  otherwise, **evaluated per request**, so `/mode plan` changes the model
+  with no extra state — and `Agent.Model` keeps the literal word, so
+  `/resume` round-trips the profile and not a snapshot of whichever half was
+  live at save time. Two roles are routed — the read-only subagent and the
+  compaction summary — and both default to `sonnet`, which on the shipped
+  default model is a **no-op**: every request carries exactly the string it
+  carried before. Routing only bites once a stronger main model was chosen
+  deliberately, and the banner says so. The user's own turn is never routed.
+  When a turn fails with HTTP 404 and its id came from an alias, the API's
+  own message gains a clause naming the alias, its target and `/model` —
+  there is deliberately no startup preflight, which would cost a round trip
+  on every start including `-p` and still could not be authoritative for a
+  dateless name. Aliases and routes come from the **user** settings file only
+  (`model.alias`, `model.route.subagent`, `model.route.compaction`); a
+  project or local file is refused by name, because a repository choosing the
+  model spends the user's money recurrently and can quietly downgrade the
+  reviewer of its own code. `/cost` keeps its existing lines and adds a
+  `by model:` block only when more than one model was actually used, since
+  totals across models are no longer comparable.
+  **What is narrower than Claude Code's:** there are no per-agent-definition
+  or per-command model overrides, no `--model` flag (the model comes from
+  `/model`, `ANTHROPIC_MODEL` or user settings), no `[1m]` context variants
+  or effort suffixes, and no fallback model on overload. Still no prices, so
+  the per-model block reports tokens and never money. A profile has exactly
+  one axis — plan mode — so there is no way to say "haiku for this tool loop"
+  or to route by prompt length. The alias table remains a table of strings
+  about a namespace this program does not own; a retired target is answered
+  by overriding it in `settings.json` rather than by anything automatic.*
 - [ ] **Telemetry** — no OpenTelemetry/usage metrics export.
 
 ## Completed since this list was compiled

@@ -3412,6 +3412,180 @@ end;
   because ToolsSchema is walked, not because this encoder was updated.  The
   suite runs under -gh, so the walk not freeing the schema array is caught as
   an unfreed block rather than as a failed assertion. }
+{ The alias table.  Every built-in target must be a DATELESS family alias: a
+  dated snapshot id is a promise about a date this program does not control,
+  and one of those has already expired under this codebase.  The shape of
+  that mistake is a trailing -YYYYMMDD, so that is what is checked. }
+function LooksDated(const S: string): Boolean;
+var
+  I, Digits: Integer;
+begin
+  Digits := 0;
+  for I := Length(S) downto 1 do
+    if S[I] in ['0'..'9'] then Inc(Digits) else Break;
+  Result := Digits >= 8;
+end;
+
+procedure TestModelAliases;
+var
+  Target, Err, Saved: string;
+  Kind: TModelAliasKind;
+  N: Integer;
+  List: TModelList;
+begin
+  Check(ResolveModelAlias('opus', Target, Kind), 'opus is an alias');
+  Check(Kind = makModel, 'and it names a model, not a profile');
+  Check(not LooksDated(Target), 'whose target is dateless (' + Target + ')');
+  Saved := Target;
+  Check(ResolveModelAlias('sonnet', Target, Kind) and (Kind = makModel) and
+    not LooksDated(Target), 'sonnet likewise (' + Target + ')');
+  Check(ResolveModelAlias('haiku', Target, Kind) and (Kind = makModel) and
+    not LooksDated(Target), 'haiku likewise (' + Target + ')');
+  Check(ResolveModelAlias('opusplan', Target, Kind) and (Kind = makProfile),
+    'opusplan is a profile, not an id');
+  Check(Target = 'opus / sonnet', 'showing both halves (' + Target + ')');
+
+  { A real model id must fall straight through.  If the table swallowed one, a
+    user typing an id would be silently redirected somewhere else. }
+  Check(not ResolveModelAlias('claude-sonnet-4-5', Target, Kind),
+    'a real model id is not an alias');
+  Check(Kind = makNone, 'and resolves to nothing');
+  Check(not ResolveModelAlias('wombat', Target, Kind),
+    'and neither is an unknown bare word');
+
+  { The guard that stops an alias shadowing a real id.  Every shipped id has
+    a dash and begins with claude, so both halves of the rule matter. }
+  Check(not SetModelAlias('my-model', 'claude-opus-4-5', Err) and (Err <> ''),
+    'an alias name with a dash is refused with a reason');
+  Check(not SetModelAlias('claude5', 'claude-opus-4-5', Err) and (Err <> ''),
+    'and one beginning with claude');
+  Check(not SetModelAlias('', 'claude-opus-4-5', Err) and (Err <> ''),
+    'and an empty name');
+  Check(not ResolveModelAlias('my-model', Target, Kind) and
+        not ResolveModelAlias('claude5', Target, Kind),
+    'and the table is unchanged by any of them');
+
+  { A target that could not be a model id is refused too: whatever passes
+    here is copied verbatim into the "model" field of a request. }
+  Check(not SetModelAlias('bad', 'has space', Err) and (Err <> ''),
+    'a target with a space is refused');
+  Check(not SetModelAlias('bad', 'nul'#0'byte', Err) and (Err <> ''),
+    'and one carrying a NUL');
+  Check(not SetModelAlias('bad', 'caf'#$C3#$A9, Err) and (Err <> ''),
+    'and one that is not plain ASCII');
+  Check(not SetModelAlias('bad', StringOfChar('x', 4096), Err) and (Err <> ''),
+    'and a four-kilobyte one');
+  Check(not SetModelAlias('bad', '', Err) and (Err <> ''),
+    'and an empty one');
+  Check(not ResolveModelAlias('bad', Target, Kind),
+    'and none of them entered the table');
+
+  { The override, which is what makes a stale built-in an annoyance rather
+    than a rebuild. }
+  N := ModelAliasCount;
+  Check(SetModelAlias('opus', 'claude-opus-9-9', Err) and (Err = ''),
+    'a user may override a built-in target');
+  Check(ResolveModelAlias('opus', Target, Kind) and
+    (Target = 'claude-opus-9-9'), 'and the new target takes effect');
+  Check(ModelAliasCount = N, 'without growing the table');
+  SetModelAlias('opus', Saved, Err);
+  Check(ResolveModelAlias('opus', Target, Kind) and (Target = Saved),
+    'restored for the tests that follow');
+
+  { Prefix matching, in both directions, with the boundary that stops
+    claude-opus-4 matching claude-opus-40. }
+  SetLength(List, 1);
+  List[0].Id := 'claude-sonnet-4-5-20250929';
+  Check(ModelListMatches('claude-sonnet-4-5', List),
+    'a dateless alias matches a dated snapshot in the list');
+  List[0].Id := 'claude-sonnet-4-5';
+  Check(ModelListMatches('claude-sonnet-4-5-20250929', List),
+    'and a dated id matches a dateless listing');
+  List[0].Id := 'claude-opus-40';
+  Check(not ModelListMatches('claude-opus-4', List),
+    'but claude-opus-4 does NOT match claude-opus-40');
+  SetLength(List, 0);
+  Check(not ModelListMatches('claude-opus-4-5', List),
+    'and an empty list matches nothing');
+
+  { An alias naming an alias naming the first must terminate at something
+    sendable rather than recurse forever. }
+  Check(SetModelAlias('loopa', 'loopb', Err), 'an alias may name an alias');
+  Check(SetModelAlias('loopb', 'loopa', Err), 'even circularly');
+  Target := ExpandModelName('loopa');
+  Check((Target = 'loopa') or (Target = 'loopb'),
+    'and a circular one ends at a name rather than hanging (' + Target + ')');
+end;
+
+procedure TestModelRouting;
+var
+  A: TAgent;
+  SavedMode: TPermMode;
+  Opus, Sonnet: string;
+  Kind: TModelAliasKind;
+begin
+  ResolveModelAlias('opus', Opus, Kind);
+  ResolveModelAlias('sonnet', Sonnet, Kind);
+  SavedMode := CurrentPermMode;
+  A := TAgent.Create('sk-ant-test', 'claude-opus-4-5', 'sys');
+  try
+    Check(A.EffectiveModel(mrMain) = 'claude-opus-4-5',
+      'a plain id passes straight through as the main model');
+    { The shipped routes.  On a stronger main model the two cheap roles go
+      elsewhere - that is the whole of the routing feature. }
+    Check(A.EffectiveModel(mrSubagent) = Sonnet,
+      'the subagent takes the shipped route (' + A.EffectiveModel(mrSubagent) + ')');
+    Check(A.EffectiveModel(mrCompact) = Sonnet, 'and so does compaction');
+
+    { An emptied route falls back to the MAIN model, never to DefaultModel: a
+      fallback to the default would route a user who opted out of routing
+      straight back onto sonnet. }
+    SetModelRoute(mrSubagent, '');
+    Check(A.EffectiveModel(mrSubagent) = 'claude-opus-4-5',
+      'an empty route falls back to the main model, not the default');
+    SetModelRoute(mrSubagent, 'claude-future-9');
+    Check(A.EffectiveModel(mrSubagent) = 'claude-future-9',
+      'and a route naming an unknown id is used verbatim');
+    SetModelRoute(mrSubagent, 'sonnet');
+
+    { mrMain is not routable at all: the user's own turn carries the model
+      the user chose, and a route for it would be a second invisible way to
+      set the session model. }
+    SetModelRoute(mrMain, 'haiku');
+    Check(A.EffectiveModel(mrMain) = 'claude-opus-4-5',
+      'mrMain refuses to be routed anywhere');
+
+    { The profile, resolved per request against the live mode.  Freezing it
+      when /model was typed would leave the model and the mode disagreeing
+      after the next /mode - checked within ONE agent, with no /model. }
+    A.Model := 'opusplan';
+    SetPermMode(pmodePlan);
+    Check(A.EffectiveModel(mrMain) = Opus,
+      'opusplan is the opus half in plan mode');
+    SetPermMode(pmodeAsk);
+    Check(A.EffectiveModel(mrMain) = Sonnet,
+      'and the sonnet half out of it, with no /model in between');
+    Check(A.Model = 'opusplan',
+      'and the session model is still the literal profile name');
+  finally
+    A.Free;
+    SetPermMode(SavedMode);
+  end;
+end;
+
+procedure TestModelSourceNote;
+var
+  Note: string;
+begin
+  Note := ModelSourceNote('opus');
+  Check(Pos('alias "opus"', Note) > 0, 'the 404 clause names the alias');
+  Check(Pos('claude-opus', Note) > 0, 'and the id it produced');
+  Check(Pos('/model', Note) > 0, 'and points at /model');
+  Check(ModelSourceNote('claude-opus-4-5') = '',
+    'and says nothing about a literally-typed id');
+  Check(ModelSourceNote('') = '', 'or about no model at all');
+end;
+
 procedure TestSdkInitInventory;
 var
   Opts: uSdk.TSdkOptions;
@@ -3429,13 +3603,17 @@ begin
     Format('a fresh session id is a 36-character GUID (%d)',
       [Length(Opts.SessionId)]));
 
-  Doc := JsonParse(uSdk.SdkInitLine(Opts, 'some-model'));
+  Doc := JsonParse(uSdk.SdkInitLine(Opts, 'some-model', 'some-model-4-5'));
   Check(Doc <> nil, 'the init line parses');
   if Doc = nil then Exit;
   try
     Check(Doc.Str('type') = 'system', 'it is a system message');
     Check(Doc.Str('subtype') = 'init', 'of subtype init');
     Check(Doc.Str('model') = 'some-model', 'naming the model in use');
+    { The literal choice and the string on the wire are different questions
+      the moment the choice is an alias or a profile. }
+    Check(Doc.Str('model_resolved') = 'some-model-4-5',
+      'and what the next request would actually carry');
     Check(Doc.Str('permission_mode') = 'deny', 'and the permission mode');
 
     Arr := Doc.Find('tools');
@@ -3500,7 +3678,7 @@ begin
   Opts.Resumed := True;
   Opts.ResumedMessages := 7;
   Opts.SessionFile := 'C:\x\s.json';
-  Doc := JsonParse(uSdk.SdkInitLine(Opts, 'some-model'));
+  Doc := JsonParse(uSdk.SdkInitLine(Opts, 'some-model', 'some-model-4-5'));
   if Doc = nil then Exit;
   try
     Check((Doc.Find('resumed') <> nil) and Doc.Find('resumed').AsBoolean,
@@ -3637,6 +3815,9 @@ begin
   TestHookConfig;
   TestHookDispatch;
   TestHookPermission;
+  TestModelAliases;
+  TestModelRouting;
+  TestModelSourceNote;
   TestSdkInitInventory;
   TestSdkDefaultOptionsZeroes;
   Schema := ToolsSchema;
