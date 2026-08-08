@@ -45,6 +45,7 @@ bin\pasclaude.exe [directory] [--resume] [--web] [--add-dir <dir>]
                   [--output-style <name>]
                   [-p "prompt"] [--session-file <path>]
                   [--output-format text|json|stream-json] [--input-format text|stream-json]
+                  [--status] [--doctor [--online]]
 ```
 
 Without a key, a Claude subscription works instead: if Claude Code has been
@@ -52,7 +53,9 @@ signed in on the machine, its OAuth token
 (`%USERPROFILE%\.claude\.credentials.json`) is picked up automatically and
 the banner says `(subscription)`. The token is read, never written -
 refreshing it is Claude Code's job, and this program does not touch another
-program's state. An explicit `ANTHROPIC_API_KEY` always wins, because
+program's state. There are six sources in all and `/login` chooses among
+them; see **Credentials** below for the order and the boundary. An explicit
+`ANTHROPIC_API_KEY` always wins, because
 setting a variable is a deliberate act and borrowing a token is not. Under
 OAuth the request authenticates with a Bearer header and its beta flag, and
 the system prompt opens with Claude Code's identity line, which the API
@@ -134,6 +137,10 @@ contents are appended to the system prompt as binding instructions.
 | `/yolo` | approve every tool for the rest of the session (bypass mode) |
 | `/sandbox [level]` | `off`, `limits` or `low`: how confined child processes are |
 | `/cost` | turns and tokens used |
+| `/config` | settings and the tier each came from; `get`, `set [--local]`, `unset`, `reload` |
+| `/telemetry` | metrics state; `preview` shows the exact JSON, `send` flushes now |
+| `/login [key]` | which credential answers; `key` stores one of pasclaude's own |
+| `/logout` | remove that stored credential, and only that one |
 | `/status` | what is true right now: model, credential, mode, roots, MCP, hooks, style, tokens |
 | `/doctor [--online]` | what is wrong or might be, with a remedy each; offline unless `--online` |
 | `/bug [--transcript] [--paths] [--json]` | write a redacted report to a file; nothing is uploaded |
@@ -1816,6 +1823,354 @@ That unit is also where the system prompt now lives. It was lifted out of
 specifically that user memory loads *before* the project's own instruction
 files, so nearer still wins.
 
+## Settings, and the scope table
+
+```
+%USERPROFILE%\.pasclaude\settings.json        user
+<root>\.pasclaude\settings.json               project
+<root>\.pasclaude\settings.local.json         local
+```
+
+Three files, one flat JSON object each, read once at startup. Nearer wins per
+key: local, then project, then user, then the compiled default - the rule
+`ScanSkillDir` already uses for skills, styles, commands and agents. Keys are
+literal flat strings; `model.alias` is a key whose name contains a dot, not an
+object to walk into, so this loader has no traversal of an unknown object at
+all. The user file is in `%USERPROFILE%` rather than `%LOCALAPPDATA%` for the
+reason `keys.json` is: `%LOCALAPPDATA%` is where the program keeps state *it*
+writes, and this is hand-authored configuration a person has to be able to
+find.
+
+The charter is one sentence: **settings.json carries display and economy keys
+only; authority stays where it is.** This is the fifth round in a row that
+principle has been defended - approvals out of the repository, deny rules from
+`%LOCALAPPDATA%` only, `keys.json` user-scope only, `--add-dir` from argv only -
+and it now has a name and a table instead of an argument repeated per feature.
+
+| key | who may set it | range | default |
+| --- | --- | --- | --- |
+| `output_style` | any tier | a style name | the built-in |
+| `thinking_budget` | any tier | 0, or 1024..32768; project ..8192 | 0 |
+| `tool_result_bytes` | any tier | 4096..131072; project ..65536 | 30720 |
+| `auto_compact_tokens` | any tier | 20000..180000; project ..150000 | 150000 |
+| `model` | **user file only** | a model id, alias or profile | `claude-sonnet-4-5` |
+| `model.alias` | **user file only** | name -> id | four built-ins |
+| `model.route.subagent`, `model.route.compaction` | **user file only** | a model name | `sonnet` |
+| `telemetry.enabled`, `.endpoint`, `.headers`, `.interval_turns`, `.timeout_ms`, `.service_name` | **user file only** | | off |
+
+Fourteen keys, four of which a project may set. The three economy numbers are
+**narrow-only** from a project or local file, measured against the value *you*
+have in force - your own settings file if it names the key, the compiled
+default if it does not. A project may lower `thinking_budget` and
+`tool_result_bytes` and never raise either, and because the compiled thinking
+budget is 0, a repository cannot turn extended thinking on at all.
+`auto_compact_tokens` runs the other way: each compaction is an extra billed
+request, so a project may push the point later and never earlier. The
+comparison is against your position rather than against the key's own maximum,
+which is the fix for the version that let a clone raise a compiled 0 to 8192
+while the table's comment said it could not. A value past the ceiling is
+refused, not clamped - a clamp teaches the repository that the key half-works
+and teaches you nothing. A `thinking_budget` between 1 and 1023 is refused at
+every tier, because the API's floor is 1024 and it rejects the request, so the
+number would fail every turn in that checkout.
+
+`model` is user scope because a project that picks the model does not merely
+spend your money on its own say-so: it can name the weakest available id to
+review its own code, and nothing in the output would say so. There is
+deliberately no fingerprint-and-prompt path of the kind `hooks.json` has. Hook
+trust is a one-time question about a bounded set of commands you can read in
+full; model choice is unbounded and recurring.
+
+**`settings.local.json` carries project authority, not user authority.**
+`.gitignore` is a convention rather than a guard - a repository can simply
+commit one - so treating the filename as a security property would hand a
+clone back everything three rounds of work took away from it. Local is nearer
+than project in *precedence* and identical to it in *authority*; the escape
+hatch from a project value is `/config set --local`, not an inverted hierarchy.
+
+**The one mechanism.** `TierAllowed(Def, Tier)` is a function in
+`src/uSettings.pas` with exactly one call site: `SettingsStore`, which is the
+only procedure in the unit that writes the value array. A value at a tier its
+key does not permit is **never stored** - not stored and later overruled, and
+there is no second `if` anywhere for a refactor to drop. Two greps are the
+review: `SettingValues` must be written only inside `SettingsStore`, and
+`TierAllowed` must have one caller. Every reader funnels through one
+`SettingLookup`, so the reader side is trivially safe: it can only see what the
+writer admitted. `uSettings` uses `uJson`, `SysUtils` and `Classes` and nothing
+else, and `SettingsParseTier` takes **bytes**, never a path - the
+`uTerm.KeysParse` rule - so the unit can never learn a configuration location
+and every suite drives it with no filesystem.
+
+Twenty-seven more names are in the same table as refusals, honoured at no tier
+including the user one: `permissions`, `allow_edits`, `allow_bash`,
+`allow_fetch`, `bash_programs`, `trusted`, `deny`, `sandbox`,
+`permission_mode`, `add_dir`, `additionalDirectories`, `env`, `apiKey`,
+`apiKeyHelper`, `auth`, `credential`, `login`, `mcpServers`, `plugins`, `vim`,
+`bindings`, `hooks`, bare `telemetry`, `report_dir`, `redact`, `doctor`, `bug`.
+They are there on purpose. The realistic failure is not an attack, it is
+somebody pasting Claude Code's `settings.json` and believing it took effect, so
+each one produces a sentence naming the file that really owns it - `vim` and
+`bindings` point at `keys.json`, `hooks` at `.pasclaude\hooks.json`, `deny` at
+`deny.json`, `permissions` at the approvals file under `%LOCALAPPDATA%`.
+`report_dir` and `redact` are pre-refused so that adding them later is a
+review conflict rather than a one-line insertion.
+
+A file with **any** problem in it contributes **nothing** - bad JSON, not an
+object, an unknown key, a wrong type, an out-of-range integer, a key at a tier
+it may not use - and every problem is named in yellow at startup beside the bad
+deny rules. Partial application is how a typo silently changes half a
+configuration. It never halts: a project file is attacker-controlled, and a
+startup refusal would be denial of service via config. Those yellow lines are
+suppressed under `--output-format json` and `stream-json`, where stdout carries
+the protocol and nothing else, and every one of them is in the ledger `/doctor`
+prints regardless. Control characters are stripped and every string is cut to
+240 bytes on the way out: a key named `ESC[2J` in a cloned repository would
+otherwise erase the security warnings printed above it, and a TAB inside a
+value would shift the fields of the tab-separated `/config` row and let the
+file choose the tier word `/status` blames.
+
+The load sits immediately after the session root is known and **above** the
+print-mode halt, so a `-p` run honours it. That is legal only because nothing
+in the table can grant - not a permission, not a root, not a sandbox level, not
+a mode, not a tool. The authority split is what buys the load position. If a
+future key can grant, it does not belong in settings.json; if it somehow must,
+the load splits and the granting half moves below the halt beside
+`LoadPermissions`.
+
+`/config` prints the three absolute paths, then key, effective value and tier,
+with an `overruled:` line under anything shadowed. Absolute paths rather than
+tier words because `SafePath` refuses everything under `.pasclaude` in every
+root: the model's own `read_file` cannot look at a settings file even when you
+ask it to, so `/config` is the whole debugging surface. `/config get <k>` shows
+the chain, `/config set [--local] <k> <v>` writes the user file or
+`settings.local.json`, `/config unset` removes and `/config reload` re-reads.
+`/config set` never writes `<root>\.pasclaude\settings.json` - pasclaude
+committing configuration into somebody's repository on their behalf is not a
+convenience. The writer is read-modify-write over the parsed document, so every
+other key survives including the refused ones, and an unparseable target file
+refuses the write rather than being replaced; that is the direct answer to
+`SavePermissions`, which rewrites wholesale and destroys any key its loader
+does not understand.
+
+Only three of the four keys re-apply on `/config reload`. The system prompt is
+frozen at `TAgent.Create` for prompt-cache reasons, so a reloaded
+`output_style` needs `/output-style` and a reloaded `model` needs `/model`.
+`keys.json` and `plugins.json` were deliberately not folded in: one is
+`%USERPROFILE%`-only by design, and the other is program-written in both
+directions, where a hand-authored file would recreate `SavePermissions`'
+silent-loss hazard in a new place.
+
+## Model aliases and routing
+
+`opus`, `sonnet` and `haiku` are short names for the current family ids, and
+`opusplan` is a profile rather than an id: opus while plan mode is on, sonnet
+the rest of the time. Every built-in target is **dateless** -
+`claude-opus-4-5`, not a snapshot - because a dated id in a table this program
+ships is the retired-default 404 that has already happened here once. The
+server resolves a family name to whatever is current; a table of snapshots
+would have to be re-shipped to stay true. The live list is still the authority:
+a bare `/model` fetches `GET /v1/models`, numbers it exactly as before, then
+prints the aliases below with continued numbering, marking in yellow any whose
+target the key's own list does not mention. An alias name may not contain a
+dash or begin with `claude`, so no real model id can ever be captured by one,
+and any built-in target can be overridden from the user settings file without a
+rebuild - which is what makes a stale table an annoyance rather than a
+breakage.
+
+Two roles run somewhere other than the model you picked: the read-only
+subagent, which has three tools and nobody watching it spend, and the
+compaction summary, which is mechanical work on text the model already wrote.
+Both default to `sonnet`. On the shipped default model that is a **no-op** -
+every request carries exactly the string it carried before routing existed - so
+the feature costs nothing until you deliberately choose a stronger main model,
+and when you do the banner says which models the routed roles are on. Your own
+turns are never routed.
+
+The profile is resolved per request rather than when you type `/model
+opusplan`, so `/mode plan` and `/mode ask` switch the model mid-session with
+nothing to keep in step, and `Agent.Model` keeps the literal word so `/resume`
+restores the profile and not a snapshot of whichever half was live at save
+time. The cost is real and worth stating: changing model mid-session
+invalidates the cache breakpoint on the system block and re-bills the prefix.
+
+When a turn fails with HTTP 404 and its id came from an alias, the API's own
+`not_found_error` message gains a clause naming the alias, the id it produced
+and `/model`. There is deliberately no startup preflight against `/v1/models`:
+it would add a round trip to every start including `-p`, and it could only ever
+answer "this key's list mentions it", which is not the same question for a
+dateless name.
+
+**Precedence, highest first:** `/model` typed this session, then the model a
+resumed session restores, then `ANTHROPIC_MODEL`, then user-scope `model` in
+settings.json, then the compiled default. `/cost` keeps its existing lines and
+adds a `by model:` block only when more than one model was actually used -
+tokens from different models are not comparable, and the block is the only
+thing that says so. Still no prices, which is the same reason the SDK omits
+`total_cost_usd`. The SDK's init line keeps `model` as the literal session
+model, which may now be an alias or a profile, and gains `model_resolved`, what
+the next main request would actually carry; the result line gains an additive
+`models` array.
+
+## Credentials
+
+pasclaude authenticates with whatever this machine already has, in one order it
+will tell you on request:
+
+```
+1  ANTHROPIC_API_KEY
+2  ANTHROPIC_AUTH_TOKEN
+3  a stored preference, if it names a source that is actually live
+4  pasclaude's own store   %LOCALAPPDATA%\pasclaude\credential.json
+5  Claude Code             %USERPROFILE%\.claude\.credentials.json
+6  Jcode                   %USERPROFILE%\.jcode\auth.json
+7  the ant CLI profile     %APPDATA%\Anthropic\credentials\<profile>.json
+```
+
+The two environment variables always win, because exporting a variable is a
+deliberate act for one invocation and reading another program's token is not. A
+preference can only *choose among* sources this machine already has; it can
+never introduce one and never outranks the environment. If you never type
+`/login`, this is exactly the behaviour of every earlier version with two more
+places looked in.
+
+**It cannot log you in, and that is the honest answer rather than a missing
+feature.** The API documents three ways to authenticate: a static `sk-ant-api…`
+key, Workload Identity Federation (an org-configured OIDC assertion exchanged
+at a token endpoint - a CI mechanism needing a federation rule and a service
+account, not a human at a terminal), and App Attest on Apple platforms. There
+is no published authorization endpoint, no device-code grant, no PKCE flow and
+no public client id available to a third-party program. `ant auth login` is
+Anthropic's own CLI authenticating as itself and Claude Code's client identity
+is Claude Code's, so a browser sign-in here could only be built by borrowing
+one of those - this program claiming to be one it is not. pasclaude is a
+credential *manager* and never a credential *issuer*, and that is written down
+here so the next reader does not reopen it.
+
+`/login` with no argument lists every source with its file and a hint of the
+form `sk-ant-...4f2a` - never the value - marks the one in use, and takes a
+number to record a preference. `/login key` reads a pasted key with **nothing
+echoed at all**, not even asterisks, because the length of a key is worth
+hiding too, and stores it at `%LOCALAPPDATA%\pasclaude\credential.json`
+encrypted with Win32 DPAPI at current-user scope. If the encryption fails
+nothing is written: there is no plaintext path and no flag that talks one into
+existing. If the file later cannot be decrypted - a different Windows account,
+different hardware - it is treated as absent and the note says which of those
+it was rather than merely "log in again", and it is not deleted, because you
+may simply be signed in as the wrong user.
+
+**`/logout` removes that file and nothing else.** Claude Code's, Jcode's and
+`ant`'s are read forever and written never: refreshing them is their owner's
+job, and deleting one would break a program you did not ask us to touch. When
+the credential in force came from one of those, `/logout` refuses, names the
+file, and tells you to log out of that program instead. The guarantee is
+structural rather than remembered - **no function in `uAuth` that opens a file
+for writing takes a path parameter**, so it can name no file but its own.
+
+No file in your project decides any of this. The store and the preference live
+under `%LOCALAPPDATA%`, the three foreign sources under `%USERPROFILE%` and
+`%APPDATA%`, `SafePath` refuses every path outside the session roots so the
+model's own `read_file` and `bash` cannot reach a credential either, and
+`apiKey`, `apiKeyHelper`, `auth`, `credential` and `login` are all refused
+settings keys. A repository cannot ship one, cannot pick which one is used, and
+cannot make `/login` run.
+
+A refused credential now produces a sentence rather than `HTTP 401 -
+authentication_error`: which of the six sources it came from, which file,
+whether it has expired since the session started, and what to do. A token the
+owning program refreshed on disk mid-session is picked up automatically -
+re-reading is not writing - once per request, only on 401, and only when the
+new credential actually differs from the one just refused; 401 is still not a
+retryable status. A credential expiring within fifteen minutes is announced at
+startup instead of discovered mid-turn. `/login` and `/logout` are refused
+under `-p` and in SDK modes, which have nobody to answer them; a stored
+credential is still used there.
+
+## What leaves the machine
+
+Telemetry is off. It stays off until you write two keys into your own settings
+file:
+
+```
+%USERPROFILE%\.pasclaude\settings.json
+{"telemetry.enabled": true,
+ "telemetry.endpoint": "http://localhost:4318"}
+```
+
+Both are needed; either alone sends nothing. A project file cannot set either,
+because all six `telemetry.*` keys are user scope in the table above and a
+project value is refused by name with the whole file discarded.
+`OTEL_EXPORTER_OTLP_ENDPOINT` is not honoured either, and that is the less
+obvious half: environment is inherited from whatever launched us, so honouring
+the standard variable would have handed a repository the endpoint through a
+wrapper script. There is no `--telemetry` flag. A project-configurable
+telemetry URL is an exfiltration channel wearing a respectable name.
+
+The wire format is OTLP/HTTP with the JSON encoding, POSTed to `/v1/metrics`
+with `Content-Type: application/json`, lowerCamelCase keys, enums as integers,
+64-bit values as decimal strings, DELTA temporality so a process that dies owes
+nothing. Protobuf would mean hand-writing a wire encoder, which is the same
+class of thing as the SHA-256 and paszlib refusals, so your collector has to
+accept OTLP/JSON. The standard Collector does, on the same port as protobuf;
+some vendor endpoints do not, and that shows up as an opaque 400 or 415 which
+`/telemetry` reports by status.
+
+Exactly this leaves the machine, and nothing else:
+
+```
+service.name, service.version          resource attributes
+pasclaude.turns                        {turn}
+pasclaude.tokens                       {token}    type, model
+pasclaude.tool.calls                   {call}     tool, status
+pasclaude.api.requests                 {request}  status
+pasclaude.api.duration                 ms
+```
+
+`type` is one of input, output, cache_read, cache_write; `status` is ok/error
+on a tool call and an HTTP code or `transport` on a request. That is the whole
+list. Not sent: prompt text, reply text, thinking, tool arguments, tool output,
+file names or paths, cwd or roots, project or repository name, host name, OS
+user, command line, environment, error strings, deny rules, hook or skill or
+MCP server names, changed-file counts, a session identifier, and no credential
+in any form. `session.id` was cut rather than defaulted off - its only use is
+letting a collector operator count distinct sessions, and a random id is
+exactly the field that later grows into a stable one.
+
+The two strings that could carry text are filtered rather than trusted. `tool`
+must be in a compile-time list of built-in tool names or it becomes `mcp` -
+naming no server - or `other`; `model` must look like `claude-[a-z0-9._-]*` or
+it becomes `other`. Both filters exist because both strings arrive from files
+that come with a clone: MCP tool names from `.mcp.json`, the model from
+`session.json`. A comment asking people not to put a secret in a tool name
+would not be enforcement. A test walks the live `ToolsSchema` and fails the
+build if a fourteenth built-in tool is added without being added to the
+allowlist, so the failure is a compile-time one rather than a dashboard quietly
+reporting `other`.
+
+`/telemetry` shows the state. `/telemetry preview` prints the exact JSON that
+would go out, from the same function the sender calls, with any collector token
+redacted to its length. `/telemetry send` flushes now and reports the status.
+
+Sending is synchronous, because this program has no threads. The flush happens
+at the end of a turn, after the answer is on screen and before the next prompt
+is drawn, and only every `telemetry.interval_turns` turns (default ten). The
+honest price is at worst `telemetry.timeout_ms` of quiet - 2 seconds by
+default, capped at 5 - once per interval. A failed batch is discarded rather
+than queued, so a collector that is down cannot grow a buffer, and after three
+consecutive failures telemetry stops for the rest of the session with one
+yellow note. A startup that never reached a turn sends nothing at all. Token
+counts are a delta against a baseline that starts at zero, where a fresh agent
+starts, and is moved by the host only when a session is *loaded* - so the first
+turn of a session counts, which matters most where it is least visible: a `-p`
+run has exactly one.
+
+`http://` is accepted only for `127.0.0.1` and `localhost`, on an exact host
+test, because a local collector is the one case where there is no network to be
+in the clear on. `uHttp.SplitUrl` is unchanged - https only, as it always was -
+and the loopback exception lives in a new `SplitUrlEx` with an `out Secure`, so
+the edit cannot reach the contract the Anthropic request path already depends
+on. `localhost` resolves through the hosts file, which needs administrator
+rights to edit; that caveat is stated rather than pretended away.
+
 ## Status, doctor and bug reports
 
 ```
@@ -1903,8 +2258,8 @@ Paths are redacted to `%USERPROFILE%`, `%LOCALAPPDATA%` and `<root0>`,
 `--add-dir` root is replaced whole rather than left half-substituted, and
 case-insensitively because Windows paths arrive in three different cases.
 It is substring matching and the report says so: read the file before you
-share it. `<root0>` is the session root - the path that names the project - and the
-`--add-dir` extras follow it. `--transcript` writes your conversation to a
+share it. `<root0>` is the session root - the path that names the project -
+and the `--add-dir` extras follow it. `--transcript` writes your conversation to a
 sibling file with a yellow warning that secrets are redacted and meaning is
 not. That file is written, read back and rewritten redacted; if the read-back
 or the rewrite fails - a scanner or a backup agent holding a file it has just
@@ -1928,9 +2283,10 @@ these two modes: any run that asks for `json` or `stream-json`, `-p` included,
 gets the protocol and nothing else, because the loudest of those notices come
 from a `settings.json` in the project tree and a cloned repository must not be
 able to put a byte in front of a driver's parser. Nothing is lost - every
-suppressed line is in the ledger `--doctor` prints. Both modes refuse to combine with `-p`, a prompt, `--resume` or
-a driver, and neither approves or connects an MCP server: approving a spawn is
-a permission answer, and a health check must not be a way to obtain one. They
+suppressed line is in the ledger `--doctor` prints. Both modes refuse to
+combine with `-p`, a prompt, `--resume` or a driver, and neither approves or
+connects an MCP server: approving a spawn is a permission answer, and a health
+check must not be a way to obtain one. They
 are also the only two modes that continue past a missing credential or a
 missing `winhttp.dll` and report it as one problem among thirteen instead of
 exiting 2 - safe only because the branch ends in `Halt` and cannot reach a
@@ -2517,6 +2873,96 @@ the schema. So no keyless test can say anything about whether the API accepts a
 transcript's *shape*; that is why the structural rules are enforced in
 `LoadSession` and asserted offline rather than inferred from a live response.
 
+The configuration round is spread across four suites on the same rule as
+everything else - anything that asserts on a request body or drives a full turn
+goes in `loop`, hostile documents go in `fuzz`, startup notes and whole reports
+go in `ux`, and pure parsers and renderers go in `smoke`. `smoke` carries the
+settings scope table, the DPAPI round trip (a blob that does not contain its
+plaintext, a two-byte tail tamper refused, a value that was never a blob
+refused), the six-source resolution order driven through a probe override, the
+`ant` profile's five expiry encodings, the OTLP envelope a collector actually
+validates - one `resourceMetrics`, exactly two resource attributes, every key
+lowerCamelCase by recursive walk, every sum DELTA as the *number* 1, every
+`asInt` a JSON string - the two telemetry filters, the endpoint rules with
+`uAgent.ApiUrl` still parsing `Secure=True` on 443, and both diagnostic
+redactors. `ux` carries the whole reports against driven state: `/status`
+values asserted by *equality* against `uTools.PermModeName`,
+`uTools.DenyRuleCount`, `uSandbox.SandboxLevelName` and `uTools.OutputStyleName`
+rather than by string match, so a reimplementation in `uDiag` fails rather than
+drifts; `/config`'s provenance rows; the writer preserving a hand-written
+`permissions` block it is not allowed to honour; and a `/bug` end to end.
+`fuzz` carries ten hostile settings documents, eleven hostile telemetry
+configurations, a hostile credential file per malformed shape, 5000 tool calls
+with 5000 distinct hostile names, and ESC/NUL/BEL/8 KB/truncated-UTF-8 strings
+driven into every field a diagnostic renders. `loop` carries the parts only a
+scripted transport can see: which model string each request actually carried,
+the 401 refresh hook, `OnRequestDone`, and the assertion that building either
+diagnostic report leaves the request count unchanged.
+
+Four tests exist because they are the authority boundary rather than the
+feature. `TestSettingsGrantsNothing` iterates `SettingDefs` and, for every
+project-settable key, builds a synthetic project document setting only that key
+and checks six authority variables are unmoved - so a new project-settable key
+is covered the day somebody adds one.
+`TestSettingsLocalHasProjectAuthority` pins that `settings.local.json` is
+project class. `TestLogoutTouchesOnlyOurOwnCredential` writes real Claude
+Code-, Jcode- and ant-shaped files, stores one of our own, clears it, and
+asserts all three foreign files are byte-identical *and* were not even
+rewritten with the same bytes (`FileAge` unchanged).
+`TestDiagTakesNothingFromTheProject` refuses a project document naming `report_dir`, `redact`, `doctor` and `bug`,
+and asserts the reports directory is outside every root by `uTools.WithinRoot`.
+
+Mutation-checked in the usual form. Making `model` project-settable fails 10
+assertions across `ux` and `smoke`; defeating the all-or-nothing gate so a file
+with one bad value still stores the good ones fails 12; giving the local tier
+user authority - the regression the design flagged as most likely - fails 5.
+Dropping the `-` boundary from `ModelListMatches`, so `claude-opus-4` matches
+`claude-opus-40`, fails 1; reverting the subagent to the parent's own model
+fails 2; removing the `try/finally` that restores the role after a compaction
+request fails 2, one of them the assertion that a *failed* compaction does not
+strand the session on the compaction model. Widening `IsUnauthorized` from
+`HTTP 401` to any 4xx fails 4; making `AuthClear` also delete Claude Code's
+credential file - the single worst defect available in this feature - fails 4.
+Emitting `aggregationTemporality` as the spec's enum *name* instead of the
+integer fails 1, which is the failure a collector answers with an opaque 400
+that nothing else would explain; dropping `TelemSafeModel`'s length and
+`claude-` prefix tests fails 2; widening the loopback host test from exact
+equality to a prefix match in both `SplitUrlEx` and `TelemValidEndpoint`, which
+is the mutation that turns a narrow exception into a real vulnerability, fails
+1. Removing the longest-first sort from `DiagRedactPaths` fails 2; replacing
+`DiagLevelRank` with the raw enum ordinal in `DiagWorstLevel` - the mutant that
+would make `--doctor` exit 1 for a check nobody ran - fails 1; anchoring the
+`sk-ant-` pattern to position 1 fails 3.
+
+Two of those exposed tests that passed for the wrong reason, and both are worth
+recording. Making `AuthStore` skip `CryptProtectData` and store the key itself
+- the exact silent fallback to unprotected storage the design forbids - was
+**not** caught the first time, because base64 of a plaintext is not the
+plaintext and the assertion was `Pos(Secret, Body) = 0`. It now asserts that
+storing the same key twice produces a *different* file, because real ciphertext
+is salted per call, and that the stored value is far longer than any encoding
+of the key; the mutant then fails 1 deterministically. Anchoring the `sk-ant-`
+pattern still did not put the planted token on disk, because the long-`sk-`
+rule caught it as defence in depth - so the three failing assertions are the
+ones about the key's *shape* surviving, which is the useful part of a redacted
+report.
+
+One mutation caught nothing and is reported rather than quietly dropped:
+deleting the `if FAuthRefreshed then Exit` cap on the 401 refresh changes no
+observable behaviour today, because 401 is not in `Transient()` and
+`SendWithRetry` exits after the second `SendOnce` with or without it. The guard
+is defence in depth against a future refactor that makes 401 retryable, and it
+has no test because there is nothing yet to observe.
+
+Two things in this round were verified against the built binary rather than a
+suite, and say so. `/model opusplan` followed by `/mode plan` changing the live
+model needs a real REPL. And `/bug --transcript`'s *failure* branch - where the
+conversation file cannot be read back or cannot be rewritten redacted, and is
+therefore deleted - needs a locked or unwritable file mid-call; forcing that
+deterministically would need a filesystem seam in `uDiag` or a race against the
+report's own timestamp, and a nondeterministic test is worse than none. What is
+pinned instead is that the success path leaves the error string empty.
+
 ## Design notes
 
 | Unit | Responsibility |
@@ -2531,14 +2977,26 @@ transcript's *shape*; that is why the structural rules are enforced in
 | `uMcp` | MCP stdio client: two pipes, JSON-RPC, a deadline on every wait |
 | `uHooks` | a child process with a deadline, the hook table, hook dispatch |
 | `uSandbox` | the one spawn: job object, integrity level, scratch `%TEMP%` |
+| `uSettings` | the key table, the scope question, the one writer |
+| `uAuth` | which credential answers, and the file we alone may write |
+| `uTelem` | OTLP counters, the two filters, the flush |
 | `uTools` | the tool implementations, path guard, permission gate |
 | `uAgent` | request building, SSE decoding, the tool loop |
+| `uDiag` | status and doctor as records, both renderers, the redactors |
 | `uSdk` | system prompt assembly, the NDJSON line protocol, the facade |
 | `pasclaude.lpr` | REPL, slash commands, rendering |
 
 The ladder is strict: `uSandbox` -> `uJson` -> `uHttp`/`uDiff`/`uRegex`/
-`uNotebook`/`uMcp`/`uHooks` -> `uTools` -> `uAgent` -> `uSdk` ->
-`pasclaude.lpr`. Nothing at or below `uAgent` knows the console exists.
+`uNotebook`/`uMcp`/`uHooks`/`uSettings`/`uAuth`/`uTelem` -> `uTools` ->
+`uAgent` -> `uDiag` -> `uSdk` -> `pasclaude.lpr`. Nothing at or below `uAgent`
+knows the console exists. `uSettings`, `uAuth` and `uTelem` are leaves for the
+same class of reason `uImage` is: each takes `uJson` and `SysUtils` and nothing
+else of ours, so the scope table, the credential resolver and the payload
+builder are all exercisable with no console, no network and - because
+`SettingsParseTier` and `TelemParse` take bytes rather than paths - no
+filesystem. `uDiag` sits above `uAgent` because it reads live counters, and
+below `uSdk` so that `uSdk.SdkDiagnosticLine` adopts an already-built JSON
+string the way `SdkToolUseLine` does and `uSdk` gains no dependency on it.
 `uHooks` sits below `uTools` and so cannot call it, which is why the UTF-8
 family - `IsValidUtf8` and `OemToUtf8` - moved down into `uJson` beside
 `Utf8Cut`, with one-line forwards left in `uTools` so every existing reference
@@ -2815,6 +3273,65 @@ Details worth knowing if you touch this code:
   `SafePath` refuses that directory by design, so the substitute guard is the
   established one and no feature may invent a second: filter the bare name for
   `\ / : .` and control characters, then construct the directory part.
+* **`SettingsStore` is the only writer of a setting, and `TierAllowed` is the
+  only question it asks.** A second writer, or a second call site, is the
+  entire bug this design exists to prevent - the reader side is safe only
+  because it cannot see anything the writer refused. The tier walk starts at
+  each key's *lowest permitted* tier, so a project value for a user-scope key
+  is unreachable rather than merely unread; there is no filter for a later
+  refactor to drop. New keys are added by growing `SettingDefs`, which is
+  exactly why the `Scope` column has to be filled in at the same moment: the
+  load position above the print-mode halt is legal only because nothing in
+  that table can grant.
+* **A project-class tier may only move a number toward the cheap side of the
+  value the *user* has in force.** `Dflt` and `Cheap` are columns in the table
+  rather than a comparison written at the call site, because the version that
+  compared against the key's own maximum was not the rule at all: it let a
+  clone raise a compiled `thinking_budget` of 0 to 8192 and more than double
+  the tool-result cap. `ProjMax` is a cap on top of that invariant and is not
+  the invariant. There is deliberately no clamp in `ApplySettings` - a second
+  opinion on the same question drifts.
+* **No function in `uAuth` that opens a file for writing takes a path
+  parameter.** `AuthStore` and `AuthClear` compute `CredentialStorePath`
+  internally, so they can name no file but pasclaude's own. Claude Code's,
+  Jcode's and the `ant` CLI's credential files are read forever and written
+  never, and that is enforced by the signatures rather than remembered by the
+  bodies. If a store path cannot be computed out of tree, the answer is to
+  store nothing, never to fall back into a root.
+* **The token is never placed in the diagnostic record.** `DiagFacts` carries
+  the source word, whether it is an OAuth token, whether one is present and
+  when it expires - and nothing else - so `/bug` could not leak a credential
+  even if every redactor failed. Redaction is defence in depth on top of that,
+  not the mechanism.
+* **Both diagnostic renderers are pure in their record and take nothing
+  else.** `DiagStatusText`/`DiagDoctorText` and `DiagStatusJsonObj`/
+  `DiagDoctorJsonObj` cannot reach `TAgent`, `uTools`, the filesystem or the
+  console, which is what makes it impossible for the console view and the JSON
+  view to disagree - the classic way a bug report drifts from the status it
+  claims to quote. `/doctor` replays a note ledger rather than re-reading
+  configuration for the same class of reason: `LoadMcpConfig` calls
+  `ClearMcpServers` as its first statement, so "checking" `.mcp.json` would
+  tear down every live server.
+* **`SplitUrl` is unchanged and https-only; the loopback exception lives in
+  `SplitUrlEx`.** Every request in the program goes through that parse, and a
+  wrongly-derived flag would mean an Anthropic request attempted without
+  `WINHTTP_FLAG_SECURE`. The safest form of the edit is one that cannot reach
+  the existing contract at all, and a test asserts `uAgent.ApiUrl` still parses
+  as secure on 443. `HttpTimeoutMs = 0` must keep the 300-second receive
+  default, or a streamed turn starts timing out mid-answer.
+* **Anything a settings file or a `.mcp.json` can name is filtered before it
+  is sent or printed.** `TelemBucketTool` and `TelemSafeModel` collapse a tool
+  or model name to a compile-time vocabulary because both arrive from files
+  that come with a clone; `SettingClean` strips control characters and cuts to
+  240 bytes because a key name of `ESC[2J` would erase the security warnings
+  printed above it and a TAB would shift the fields of a tab-separated row.
+  Neither is a comment asking people not to do it.
+* **Startup notices go through `StartupNote` and are text-format only.** Under
+  `--output-format json` or `stream-json`, stdout carries the protocol and
+  nothing else - the loudest of those notices come from a `settings.json` in
+  the project tree, and a cloned repository must not be able to put a byte in
+  front of a driver's parser. Nothing is lost: every suppressed line is in the
+  ledger `/doctor` prints.
 
 ## License
 

@@ -48,6 +48,30 @@ optionally at low integrity. Approvals remain per-program for bash and
 per-server for MCP; nothing in a project directory can set a mode, add a
 directory, remove a deny rule or lower the sandbox.
 
+Configuration and diagnostics is now covered too, and it is the round where a
+principle defended four times separately finally got written down as a table.
+`settings.json` exists in three tiers — user, project and local — and one
+column in `uSettings` says which tier may set each key, enforced by one
+function with one call site: a value at a tier its key does not permit is
+never stored rather than stored and overruled. A project may set four display
+and economy keys and may only ever move a number in the direction that costs
+you less; `model`, the two routing keys and the six telemetry keys are the
+user's alone, and `settings.local.json` carries project authority despite its
+name, because `.gitignore` is a convention rather than a guard. Every key
+somebody might paste out of Claude Code's `settings.json` is in the same table
+as a refusal naming the file that really owns it. On top of that: `/login` and
+`/logout` manage credentials without ever issuing one, and never write another
+program's credential file — enforced by the writers taking no path argument;
+`/model` gained dateless aliases and two routed roles, both user-scope only;
+opt-in OTLP metrics send five counters and no text at all; and `/status`,
+`/doctor` and `/bug` report what is true, what is wrong and what a maintainer
+needs, built once as a record and rendered twice so the two views cannot
+disagree.
+
+That leaves **Integrations** as the only section here with anything unchecked
+in it: IDE extensions, GitHub Actions, and the PR workflow commands. Every
+other section is complete.
+
 Checked items have been built since this list was compiled; the strikethrough
 text preserves what was missing at the time. Unchecked items remain open.
 
@@ -499,7 +523,8 @@ text preserves what was missing at the time. Unchecked items remain open.
 - [x] ~~**settings.json** — no hierarchical user/project/local config, no
   `/config`.~~
   *Built: three files — `%USERPROFILE%\.pasclaude\settings.json`,
-  `<root>\.pasclaude\settings.json` and `<root>\.pasclaude\settings.local.json`
+  `<root>\.pasclaude\settings.json` and
+  `<root>\.pasclaude\settings.local.json`
   — resolved per key by the same "nearer wins" rule skills and styles already
   use: local, then project, then user, then the built-in default. The charter
   is one sentence: **settings.json carries display and economy keys only;
@@ -535,12 +560,13 @@ text preserves what was missing at the time. Unchecked items remain open.
   stripped from every string this unit hands back: a key name of `ESC[2J` in a
   cloned repository would otherwise erase the security warnings printed above
   it, and a TAB inside a value would shift the fields of the tab-separated
-  `/config` row and let the file choose the tier word `/status` blames. `/config` prints the three
+  `/config` row and let the file choose the tier word `/status` blames.
+  `/config` prints the three
   absolute paths and a table of key, value and tier with an "overruled:" line
   under anything shadowed; `/config get` shows the whole chain, `/config set
   [--local]` writes the user file or `settings.local.json` and never the
-  project file, and `/config reload` re-reads. The writer is read-modify-write,
-  so a hand-written block survives — including refused keys.
+  project file, and `/config reload` re-reads. The writer is
+  read-modify-write, so a hand-written block survives — including refused keys.
   **What is narrower than Claude Code's: `settings.local.json` carries
   PROJECT authority, not user authority, because `.gitignore` is a convention
   and a repository can simply commit one.** There is no `permissions` block,
@@ -576,7 +602,8 @@ text preserves what was missing at the time. Unchecked items remain open.
   `--transcript`, a conversation file that could not be read back or could not
   be rewritten redacted is **deleted** and the failure said out loud, because
   the alternative is a file on disk full of whatever you pasted into the
-  conversation with the console telling you in yellow that it is redacted. `--status` and `--doctor` are
+  conversation with the console telling you in yellow that it is redacted.
+  `--status` and `--doctor` are
   also top-level flags that take `--output-format json|stream-json`, exit 1
   on a problem, and are the only two modes that continue past a missing
   credential — safe because they cannot run a turn.
@@ -670,7 +697,7 @@ text preserves what was missing at the time. Unchecked items remain open.
   or to route by prompt length. The alias table remains a table of strings
   about a namespace this program does not own; a retired target is answered
   by overriding it in `settings.json` rather than by anything automatic.*
-- [x] **Telemetry** — ~~no OpenTelemetry/usage metrics export.~~
+- [x] ~~**Telemetry** — no OpenTelemetry/usage metrics export.~~
   *Built: opt-in OTLP/HTTP metrics with the JSON encoding, off by default and
   turned on only by `telemetry.enabled` plus `telemetry.endpoint` in
   `%USERPROFILE%\.pasclaude\settings.json` — both keys are user scope in the
@@ -905,6 +932,51 @@ text preserves what was missing at the time. Unchecked items remain open.
   counters and nothing else, so it can never come back more permissive than a
   fresh one. (Nothing is compacted on this path, and two processes sharing
   one file race with last writer winning.)
+- **settings.json and a scope table** — three tiers (user, project, local),
+  fourteen keys, and one `TierAllowed` question asked from one place:
+  `SettingsStore`, the only writer of a value. A project may set
+  `output_style` and three economy numbers, and only in the direction that
+  costs less than the value the user has in force; `model`, the routing keys
+  and the telemetry keys are user scope, and a project value is never stored.
+  Twenty-seven pasted-from-Claude-Code names are refused by name with a
+  sentence saying where the thing really lives. Any problem voids the whole
+  file, loudly and never fatally. `/config` shows every key, its value and its
+  tier; `/config set [--local]` writes the user file or the local one and
+  never the project file, read-modify-write so a hand-written block survives.
+- **Model aliases and routing** — `opus`, `sonnet`, `haiku` and the
+  `opusplan` profile, all dateless, plus two routed roles (the read-only
+  subagent and the compaction summary) that default to `sonnet` and are
+  therefore a no-op on the shipped model. The profile is resolved per request,
+  so `/mode plan` changes the model with no extra state. A 404 whose id came
+  from an alias says which alias. Aliases and routes come from the user
+  settings file only. `/cost` gains a `by model:` block once more than one
+  model was used.
+- **/login and /logout** — six credential sources in one documented order,
+  environment first; `/login` lists them with a hint and never the value and
+  can record a preference among the ones this machine already has; `/login
+  key` stores one of pasclaude's own, DPAPI-protected under `%LOCALAPPDATA%`,
+  with no plaintext path if the encryption fails. `/logout` removes that file
+  and refuses when the credential in force belongs to Claude Code, Jcode or
+  the `ant` CLI — enforced by the writers taking no path argument at all. A
+  401 names the source, the file and the remedy. There is still no login that
+  logs in: no public grant is documented, and borrowing another program's
+  client identity was refused.
+- **Telemetry** — opt-in OTLP/HTTP metrics with the JSON encoding, off unless
+  both `telemetry.enabled` and `telemetry.endpoint` are in the *user*
+  settings file; `OTEL_EXPORTER_OTLP_*` is deliberately not honoured. Five
+  counters and two filtered attribute strings leave the machine and nothing
+  else — no text of any kind, no paths, no host or session id. `/telemetry
+  preview` prints the exact payload from the sender's own builder. Synchronous
+  end-of-turn flush, discard on failure, self-disabling after three.
+- **/status, /doctor and /bug** — one unit holding all three as records with
+  renderers pure in their record, so the console and JSON views cannot
+  disagree. `/status` borrows every word from the unit that owns it;
+  `/doctor` runs thirteen checks with a stated cost each, sends nothing
+  without `--online`, and replays a startup note ledger rather than
+  re-reading configuration; `/bug` writes a redacted report out of tree and
+  uploads nothing. `--status` and `--doctor` are also flags, honour
+  `--output-format`, exit 1 on a problem, and are the only modes that
+  continue past a missing credential.
 
 *Compiled from `README.md` and the `src/` units at
 `E:\Projects\pascal\pasclaude`, compared against the public Claude Code
