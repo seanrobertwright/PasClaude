@@ -42,7 +42,8 @@ set ANTHROPIC_MODEL=claude-sonnet-4-5          :: optional
 bin\pasclaude.exe [directory] [--resume] [--web] [--add-dir <dir>]
                   [--permission-mode ask|plan|accept-edits]
                   [--dangerously-skip-permissions] [--sandbox off|limits|low]
-                  [-p "prompt"]
+                  [--output-style <name>]
+                  [-p "prompt"] [--session-file <path>]
                   [--output-format text|json|stream-json] [--input-format text|stream-json]
 ```
 
@@ -115,6 +116,10 @@ contents are appended to the system prompt as binding instructions.
 | `/sessions` | list saved sessions and resume one |
 | `/skills` | the skills this project offers; also rescans for new ones |
 | `/plugins` | installed plugins; `/plugins enable\|disable <name>` |
+| `/output-style [name]` | how replies are written; bare, it lists them |
+| `/paste` | attach the clipboard image to your next message; `drop` cancels |
+| `/vim [on\|off\|save]` | modal line editing; `save` keeps it for future sessions |
+| `/keys` | the editing keys in force, and where to rebind them |
 | `/think [n]` | extended thinking: on, off, or a token budget |
 | `/web [on\|off]` | let the model search the web (off by default) |
 | `/resume` | reload the saved conversation |
@@ -171,9 +176,12 @@ word. Built-ins cannot be shadowed; the lookup runs only after they decline.
 `pasclaude -p "question"` is print mode: one prompt in, one answer out,
 exit code 0 on success. Piped stdin becomes context under the prompt
 (`type build.log | pasclaude -p "why did this fail?"`), or is the prompt
-itself when `-p` has no argument. No banner, no session save - a script's
-throwaway question should not disturb the directory's saved conversation -
-and no permission prompts: stdin may be a pipe, so asking would hang.
+itself when `-p` has no argument. No banner, and no session save unless
+`--session-file <path>` asks for one by name - a script's throwaway question
+should not disturb the directory's saved conversation, and guessing which file
+it meant is exactly what `-p` declines to do, so `--resume` there is a startup
+error without it. No permission prompts either: stdin may be a pipe, so asking
+would hang.
 Read-only tools work; a run that needed an edit approved says so in its
 output instead of stalling. Deny rules do load, before the halt that stops
 the approvals file being read, so a scripted run inherits every refusal and
@@ -209,7 +217,11 @@ giving up, not by an unkillable hour-long sleep.
 
 At the prompt, the arrow keys move the caret and walk the command history,
 `Home`/`End` (or `Ctrl+A`/`Ctrl+E`) jump to either end, and `Ctrl+U` clears
-the line.
+the line. `Ctrl+W`, `Ctrl+K`, `Alt+B`, `Alt+F` and `Ctrl+Z` are the readline
+verbs it was missing; `/vim` turns on a modal editor and
+`%USERPROFILE%\.pasclaude\keys.json` rebinds any of it. See *Editing the
+prompt* below, which also records why nothing in that file can reach a
+permission prompt.
 
 History persists in `.pasclaude\history.txt`, so Up-arrow reaches last
 week's build command in a fresh window. One command per line, multi-line
@@ -241,8 +253,10 @@ instead of firing a request per line, and `Ctrl+Enter` inserts a break by hand.
 `@path` in a prompt attaches that file to it: the model starts with the
 contents instead of spending a tool round reading them. Mentions face the same
 path guard as tool calls - no escaping the root, no reaching the session state
-- and a binary or oversized file is reported rather than attached. Tab
-completes paths after the `@` too.
+- and an oversized file is reported rather than attached. A binary file is
+still reported rather than attached, unless it is one of the four image types
+the API takes, which is where *Images* below picks the story up. Tab completes
+paths after the `@` too.
 
 Replies render markdown as they stream: headings and **bold** brighten,
 `inline code` and fenced blocks colour cyan, fence lines are swallowed. The
@@ -1337,6 +1351,295 @@ description each, 128 KB per `SKILL.md`, 16 plugins. A supporting file that is
 not valid UTF-8 is refused rather than hex-dumped - that is a mistake in the
 skill, not a binary the model asked to see.
 
+## Output styles
+
+`/output-style` with no argument lists what is available and marks the one in
+force; `/output-style <name>` sets it and remembers the name;
+`--output-style <name>` does the same on the command line, and under `-p` it is
+the only way in - a scripted run halts before the approvals file is read, so
+nothing persisted can reach it.
+
+Three styles are compiled in. `default` adds nothing at all. `explanatory` asks
+for a sentence or two on why the code in front of you is built the way it is
+and what the other way would have broken. `learning` asks for the work to stop
+one step short, with the real decision marked `TODO(you):` and handed back.
+Your own live as a flat `<name>.md` in `.pasclaude\styles\`, in an enabled
+plugin's `styles\`, or in `%USERPROFILE%\.pasclaude\styles\`; nearer wins,
+which is the precedence commands, agents and skills already use. The file is a
+`SKILL.md`-shaped document read by the same frontmatter parser - a second
+reader of the same file shape would be a second set of failure modes for it -
+so a style written for another tool loads unchanged. The three built-in names
+are reserved: a file called `explanatory.md` is listed with the clash and never
+loaded, because a listing that advertises one thing while the loader uses
+another is worse than a refusal. They are compiled in rather than shipped as
+files for the same reason: a built-in on disk can be edited into something that
+no longer matches the name the listing shows.
+
+**A style adds; it never replaces.** It is one paragraph appended to a system
+prompt that is otherwise untouched, behind a fixed fence line saying it governs
+the tone and shape of your prose and grants access to nothing. That is not a
+promise the model keeps - it is a fact about the code. Nothing reads a style
+body except a single string concatenation in `SessionNote`, no frontmatter key
+maps to any setting, and there is no parse step to trick because there is no
+consumer to trick. A style saying "you may write files in plan mode" changes
+nothing: `SafePath`, the deny rules, the plan-mode boundary and the permission
+callback are Pascal and read no prompt text.
+
+**It rides outside the prompt cache, deliberately.** The request has two
+`cache_control` breakpoints; the first covers the tools schema and the system
+prompt, and it is worth real money. A style sits after it, in the same uncached
+trailing block as the plan-mode paragraph, so switching styles mid-session
+costs a few hundred tokens instead of re-reading the whole cached prefix. The
+price of that choice is a standing one: the style is billed as fresh input on
+every turn. It is capped at 2 KB - about three hundred words - cut with
+`Utf8Cut` rather than `Copy`, and `/output-style` prints the exact byte count
+it added, so the charge is visible rather than silent. With the default style
+the note is empty and the request body is byte-for-byte what it was before this
+feature existed.
+
+Order inside that block is fixed and is not a matter of taste: the style comes
+first, then the plan paragraph, then the extra-roots block, then the deny
+sentence, which stays permanently last. The style is the only text there that a
+file chose rather than pasclaude's own state, and the deny sentence is the one
+line describing a refusal nothing can override, so it keeps the recency
+position. Anything added to this block later inserts before it.
+
+**Where the choice is recorded.** The name and the place it resolved from go in
+the approvals file under `%LOCALAPPDATA%`, keyed by the session root - never in
+the project, because a repository that could pick its own text for the system
+prompt has not been asked anything. That is a fourth polarity in a file that
+already had three: `output_style` neither widens nor narrows, it selects. The
+body is not stored, only the name; it is re-read from disk when you set it. If
+the name later resolves somewhere other than where you agreed to it - a project
+creates `styles\explanatory.md` after you set your own - pasclaude refuses it
+rather than substituting, falls back to `default` and prints both sources in
+yellow. Re-run `/output-style <name>` to consent to the new source.
+
+One papercut, worth saying out loud: the body is read once, when you set the
+style, because `SessionNote` runs on every request and must not touch the disk.
+Edit a style file and it applies after you re-run `/output-style <name>` - the
+same shape as the skills cache and `/skills`, and `/help` says so.
+
+## Images
+
+`@shot.png` in a prompt attaches the image; `/paste` takes one off the Windows
+clipboard, and `/paste drop` cancels it before you send. Both print what you
+are about to spend - dimensions, bytes, and the token cost - because an image
+is expensive and, unlike prose, you cannot skim it back later in the
+transcript. The figure is the API's own patch formula, `ceil(w/28) x
+ceil(h/28)` after the model's downscale, so a 1080p screenshot reports 2691
+tokens and a 4K one 4784.
+
+The clipboard needed an encoder. Windows offers CF_DIB - raw pixels - and the
+API takes png, jpeg, gif and webp but not BMP. FPC's paszlib is a package, not
+the RTL, so it is off limits here; the way through is that a zlib stream may
+legally be made of *stored* deflate blocks, which need only CRC-32 and
+Adler-32. That was verified with a compiled probe before any of it was designed
+around: Windows Imaging Component decoded the result and Python's zlib inflated
+it with every chunk CRC validating. The price is that such a PNG is about the
+size of its raw pixels, which is why `uImage` writes a palette when an image
+has 256 colours or fewer - a terminal or dialog screenshot almost always does,
+and that is the difference between a paste fitting in the 2 MB budget and not.
+Past that it halves and retries, at most twice, then refuses and names the
+size. A quarter-scale screenshot is still readable; a sixteenth is not, and an
+honest refusal beats an image you cannot check.
+
+Files you mention are never re-encoded - they are already compressed properly -
+so they go up untouched under a 5 MB cap, and a JPEG cannot be resized without
+a decoder anyway, which is what makes an oversize file a refusal rather than a
+shrink. Eight images per message: the API allows more, but past twenty blocks
+it imposes a stricter per-image dimension rule, and eight keeps a turn clear of
+it. `uImage` is a leaf beside `uJson` - `SysUtils` only, no Win32, no console,
+no JSON - so the awkward cases (a bottom-up DIB, a truncated header, a header
+claiming 40000x40000) are testable without a clipboard.
+
+A copied *file* goes through `ResolveInRoot`, which is `SafePath`, the same
+resolver `@`-mentions, `read_file` and `@import` use. `/paste` of a file
+outside the session root, inside `.pasclaude\`, or under a deny rule is refused
+by the same message it would get as a tool argument; copying the *image* rather
+than the file is unaffected, and `--add-dir` widens both alike.
+
+### What a message holds now
+
+A message content array can carry an `image` block, and one shape covers every
+part of the program:
+
+```json
+{"type":"image","source":{"type":"base64","media_type":"image/png","data":"..."}}
+```
+
+Base64 sources only. A `url` source would have the API fetch a host nobody
+here can vet, and the Files API needs a beta header and an upload round trip.
+Images appear only in `user` messages, only where your own `@mention`,
+`/paste`, or a stream-json driver's own message put them; a `tool_result` may
+not carry one, and `RunTool` still returns a `string`. That is a prohibition
+rather than a scoping choice - three units would have to move in lockstep, and
+a tool result has no human in the loop to see what arrived.
+
+`TBlockKind` gained nothing and the streaming decoder was not touched. The
+model does not emit image blocks; if the API ever does, the existing `bkResult`
+passthrough already captures it whole and replays it verbatim, which is the
+correct behaviour and must not be "improved" into a typed kind.
+
+Two local keys, `width` and `height`, live beside the block in `FMessages` so a
+resumed session can print `[image 1920x1080 image/png]` without decoding a
+megabyte of base64. They are stripped from the copy that goes on the wire,
+beside the existing `cache_control` fixup, because the Messages API validates
+content blocks strictly and rejects a key it does not know. The transcript
+keeps our concerns and the transport keeps the API's.
+
+`ValidTranscript` was not modified and `SessionVersion` is still 1: its only
+type-sensitive rule is that a `tool_use` needs a matching `tool_result`, and an
+image block satisfies everything else by being an object with a non-empty
+`type`. So image sessions round-trip today, and nobody may add a block-type
+allowlist - it would make already-saved sessions unloadable, which under `-p`
+is a hard exit 2.
+
+**What images cost you over time.** Base64 is re-sent in full on every turn, so
+one screenshot puts the transcript permanently over the compaction threshold,
+and `TranscriptBytes` counts it honestly because that is the real cost of the
+next request. The byte trim cannot help by itself, because the image sits in
+the tail it is trying to keep. So the trigger block first calls
+`EvictImages(2)`: it walks the transcript oldest-first and replaces all but the
+two newest image blocks with `[image removed to save context: 1920x1080
+image/png]`. It substitutes rather than deletes - an emptied content array is
+exactly what the session loader rejects, and a measure meant to save context
+must not leave you with a session that will not load. Two survive because that
+is the image you are discussing plus one for a before/after pair. Eviction
+rewrites memory only; a file already saved keeps the bytes until it is
+overwritten.
+
+An image can also be consumed by a turn that never happened. `AppendUserText`
+drains the pending queue into the message before the request goes out, and both
+tail repairs - the failed-turn unwind and the unanswered-question trim - drop
+that message. `RequeueImagesFrom` reads the base64 blocks back onto the queue
+at both sites and says so in a notice; silence was the real damage, since you
+had already been told the image goes with your next message.
+
+**What an image can do that text cannot.** It can carry instructions painted
+into its pixels that a person reading the transcript will never see - the
+transcript shows only `[image 1920x1080 image/png]`. Nothing here detects that
+and nothing can. What bounds it is the same instinct as the permission system:
+an image gets in only by your own `@mention` or `/paste`, both root-guarded by
+the check a tool call goes through, and it lands in a user block, so it carries
+the authority of text you typed and no more. It cannot answer a permission
+prompt: those are read from the real keyboard, and the model has no channel to
+it. Note also that a saved session keeps the image on disk in plaintext under
+`.pasclaude\`.
+
+**Not done:** `read_file` on an image still returns its hex dump - a tool
+result has no human in the loop, and `uNotebook` and `uMcp` already refuse to
+sail base64 into context unexamined - tool results cannot carry images at all,
+and only base64 sources are used. Print mode's plain `-p` never expands
+`@mentions`, so an image cannot be attached that way; a `--input-format
+stream-json` driver can send image blocks in its own `user` message, under the
+same caps and the same four media types.
+
+## Editing the prompt
+
+The line editor has always had arrows, Home/End and Ctrl+A/E/U. It now also has
+the readline verbs it was missing - Ctrl+W deletes the word to the left, Ctrl+K
+to the end of the line, Alt+B and Alt+F move by words, Ctrl+Z undoes - and both
+halves of those are rebindable.
+
+`/vim` turns on a modal editor. A line always starts in insert mode, so
+forgetting the setting is on costs nothing; Esc (or Ctrl+[) enters normal mode
+and the prompt says which one you are in, `[I]` or `[N]`, in front of whatever
+the permission mode already puts there. Normal mode has `h l w b e 0 ^ $` for
+motion, `j` and `k` for history - a prompt is one line, so those are worth more
+as history than as motion - `i a I A` to insert, `x D C S` and the `d` and `c`
+compounds (`dw db de d0 d$ dd`, and the same with `c`) to edit, and `u` and
+Ctrl+R for undo and redo. A whole insert session undoes in one step rather than
+one character at a time.
+
+What vim mode is not: no visual mode, no registers and no put, no counts, no
+`.` repeat, no marks, no macros, no `:` commands, no search, no text objects,
+no `r`/`R`/`s`, no `o`/`O`, no `gg`/`G`, no `%`. Most of those exist to move
+around a buffer, and there is no buffer here. Two things do get worse when you
+turn it on, and `/vim on` says so: Esc stops clearing the line (Ctrl+U still
+does), and a paste that arrives while you are in normal mode is read as
+commands. `/vim save` keeps the setting; `/keys` prints the current table.
+
+**Rebinding.** `%USERPROFILE%\.pasclaude\keys.json`:
+
+```json
+{"vim": true, "bindings": {"ctrl+w": "delete-word-left",
+                           "alt+d": "delete-word-right",
+                           "ctrl+k": "none"}}
+```
+
+An action is one of a closed list of editor verbs, `none` unbinds, and anything
+the file gets wrong is printed at startup naming the entry - an unknown action
+or an unparsable key is never silently dropped, and a refused entry leaves the
+built-in binding standing. A missing or broken file is the built-in bindings
+and a working session.
+
+**Why that file is not in your project directory.** Everything else under
+`.pasclaude\` describes the project and arrives with a `git clone`. Keybindings
+decide what your keyboard does, and a repository that could ship them would be
+choosing that for you before you had read a line. So keys.json is read from
+`%USERPROFILE%` only, the same place the user-level `CLAUDE.md` lives - this is
+configuration you write by hand, not state the program keeps, which is what
+`%LOCALAPPDATA%` is for.
+
+### The key-dispatch boundary
+
+The approval question is read with the keyboard, so "configuration can reach
+the line editor and nothing else" has to be a property of the code rather than
+a convention. It is written down here because it is the invariant a maintainer
+is most likely to break without noticing: every one of the changes that would
+break it looks like tidying.
+
+Three separate things stop a rebound key answering a permission prompt, and any
+one of them would be enough.
+
+**The shape.** `ReadLineCore(Prompt, P: TKeyProfile, Line)` is
+implementation-only and takes the profile as a required parameter; there is no
+module-var read inside it. Two interface wrappers supply one:
+`ReadPromptLine` passes `PromptProfile`, and `ReadLineEdit` passes the constant
+`KeysNone`. `ReadLineEdit` kept its exact old signature, so the default action
+for any prompt added later - calling the function that already exists - is the
+safe one. The permission prompt, `/model`, `/sessions` and `/rewind` all go
+through it, and under `KeysNone` `Vim` is false, so normal mode cannot exist
+there and `a` is always the character `a`.
+
+**The grammar.** `KeyChordOf` cannot construct a chord for an unmodified
+character. A bindable chord is `[ctrl+][alt+][shift+]base` where base is a
+named non-character key, or a letter or digit that must carry ctrl or alt. `y`,
+`a` and `n` have no spelling at all. `enter`, `tab`, `escape`, `ctrl+c`,
+`ctrl+enter` and `alt+enter` do parse and are then refused by name as reserved.
+
+**The action set.** Bindings map onto `TEditKey` and nothing else. No action
+submits a line, cancels, answers a question, emits text or runs anything -
+`KeyActionName(ekChar)` returns `''`, so the one verb that produces text cannot
+even be named in the file. The worst a fully hostile keys.json achieves is
+annoying editing, recoverable with Ctrl+U.
+
+Matching is on virtual-key code plus modifier flags, never on the synthesised
+control character, which dissolves the "Ctrl arrives two ways" problem: Ctrl+W
+is VK $57 with `LEFT_CTRL_PRESSED` whatever `UnicodeChar` holds. The literal
+control-character chain stays as a fixed fallback inside `ReadLineCore`,
+outside the binding table.
+
+The audit is one grep, and it is written in `uTerm`'s interface beside the
+declarations:
+
+```
+grep -n "ReadPromptLine\|PromptProfile\|KeysNone" src/*.pas src/*.lpr
+```
+
+`ReadPromptLine` - one declaration, one body, one call, the REPL.
+`PromptProfile` - one declaration, one body, one setter, and exactly one read
+in a reader, `ReadPromptLine`'s argument expression. `KeysNone` - one
+declaration, one body, one use in `ReadLineEdit`. A second `ReadPromptLine`
+call site, or a read of `PromptProfile` inside `ReadLineCore`, is the defect.
+
+None of this reaches the model. There is no change to the request body, to the
+system prompt, or to either cache breakpoint: the body a conversation produces
+is the same string with vim on or off, and a smoke test asserts it. Telling the
+model you pressed `dw` would cost tokens on every turn to say something it
+cannot act on.
+
 ## Driving pasclaude from another program
 
 `-p` answers a single prompt, and two flags change what that answer looks like
@@ -1421,6 +1724,76 @@ for line in p.stdout:
     if msg["type"] == "result":
         break
 ```
+
+### Scripted sessions
+
+`-p` answers one question and exits, and by default it leaves no trace: the
+directory's saved conversation is not read, not written and not backed up. A
+throwaway question should not disturb a conversation somebody is in the middle
+of, and that has been true since print mode existed.
+
+A multi-turn agent built out of repeated subprocess calls needs the opposite,
+so it asks for it by name:
+
+```
+pasclaude -p "start on the parser" --session-file work\agent.json
+pasclaude -p "now the error cases" --session-file work\agent.json --resume
+```
+
+The file is the ordinary session file - same format, same version, same
+validation - so one written by a script opens in the REPL with `/resume`, and a
+conversation started at the keyboard can be continued by a script. There is no
+second serialisation, because two serialisations of the same data are how two
+serialisations drift apart.
+
+The path is checked with the same guard the tools use: it lives in the session
+root, or in a directory named with `--add-dir`. `--session-file` without `-p`
+is a startup error - interactive sessions already have `/resume` and the
+session picker, and a second way to name one file is a second thing to keep
+consistent. `--resume` under `-p` without `--session-file` is a startup error
+too, and that one is the point of the design: guessing the directory's session
+file is exactly what `-p` has always declined to do.
+
+On turn one there is no file yet, and that is not an error - the driver passes
+the same arguments every time and the first call simply starts fresh, tested
+with `FileExists` rather than by sniffing the loader's reason string. A file
+that IS there and cannot be read stops the run with exit 2. That differs from
+interactive `--resume`, which prints its reason and carries on, and the
+difference is deliberate: a person reads the warning and decides, a script does
+not. A run that quietly got a blank conversation would do work on absent
+context and then save over the file it could not read.
+
+The save happens before the `result` line, not after. That ordering is a
+contract: when a driver reads `result`, the transcript is already on disk, so
+it can spawn the next process immediately without polling for the file. If the
+save fails it gets an `error` line and the process exits 1 - but the `result`
+line still says the turn succeeded, with the answer in it, because the work was
+done and only the writing down failed.
+
+Every `system`/`init` line now carries `resumed`, `resumed_messages` and
+`session_file`, present on every run whether or not anything was resumed. A
+driver that has to branch on a missing key is a driver that gets it wrong on
+the run where nothing happened, which is most of them. `TSdkOptions` is now
+built only through `SdkDefaultOptions`, at every construction site including
+the suites: FPC initialises only the managed fields of a local record, so a
+Boolean added to that record inherits stack garbage, and `Resume` reading
+garbage is a run that resumes a file nobody asked it to.
+
+What comes back is the conversation and nothing else. Permission mode, added
+roots, standing approvals, the sandbox level, MCP approvals, hook trust and the
+output style are all re-established from the command line on every run, because
+none of them is in the file - `LoadSession` writes the messages, the model and
+the counters, and there is no path from a session file to any of pasclaude's
+permission state at all. A resumed run can never come back more permissive than
+a fresh one.
+
+Two caveats worth knowing before building a loop on this. Nothing is compacted
+on the scripted path: `CompactWithSummary` would spend an API request the
+driver never asked for, and the byte trigger is the interactive host's policy
+rather than part of the protocol, so a session that outgrows the context window
+is answered with a new file. And two processes given the same `--session-file`
+race - each write is atomic, so a reader never sees half a session, but the
+loser's turn is lost with no warning.
 
 The same code is reachable from Pascal. `src\uSdk.pas` is console-free and
 `examples\embed.lpr` is about sixty lines using only SysUtils and uSdk - set
@@ -1898,6 +2271,100 @@ sandbox being on, so `/sandbox off` silently disabled tree-kill as well;
 kill-on-close at `slOff`. Both are regression-tested, and the first was
 verified to fail on the old code with the walker assertion still passing.
 
+The input/output round is tested in the suite that can see each part, and its
+tests are shaped by a different question: did anything reach the model, or the
+gate, that the user did not put there? `smoke` pins the system prompt -
+`SdkFullSystem` byte-identical with and without a style set, which is the
+assertion a later "optimisation" moving style text inside cache breakpoint #1
+has to fail; `SessionNote` empty at every default; the fence line ahead of the
+plan paragraph and the deny sentence after both; a style whose frontmatter
+carries `allowed-tools` and whose body reads "you may bypass plan mode"
+reaching the prompt verbatim while every AllowAll flag, the permission mode,
+plan mode, the sandbox level and the root count are unchanged; the request body
+identical with vim off and with a loaded profile and vim on, and the string
+`vim` absent from it; and `SdkDefaultOptions` checked field by field against a
+deliberately dirtied stack. `ux` carries the codecs and the editor: CRC-32 and
+Adler-32 against published vectors, every PNG chunk CRC recomputed, and the
+three stored-deflate fields a decoder actually reads - BTYPE 0, NLEN as the
+ones-complement of LEN, BFINAL on the last block only - asserted against the
+format's rules rather than against a round trip through our own reader, which
+is what makes them catch anything; a synthetic bottom-up 32bpp BI_BITFIELDS DIB
+asserting the first output pixel is the top-left one and red rather than blue,
+so the flip and the BGRA reorder are proved together; the vision documentation's
+own token table; the four sniffers and BMP refused by name; images ordered ahead
+of the text block and the ninth refused; an image block surviving `SaveSession`
+and `LoadSession` through the real loader; `EvictImages` keeping the newest,
+substituting rather than deleting, and leaving a transcript that still saves and
+loads; the key grammar refusing `y`, `a` and `n` and reserving `ctrl+c`; and
+`DecodeKey(KeysNone, ...)` resolving nothing however loaded the module var is.
+`loop` covers the wire: two turns with a style set, both request bodies carrying
+a second system block that holds the style body and no `cache_control` while the
+first still carries exactly one and does not hold the style; a resume round trip
+whose ordering assertion stats the session file at the instant the `result` line
+is emitted; a corrupt transcript producing exactly `system;error;result`, exit
+2, no turn run and the file on disk byte-identical; and a compaction with an
+image queued, which had to move here from `ux` because the drain happens before
+the request goes out. `fuzz` covers the hostile half: forty seeded random-byte
+style files plus the usual truncations, each leaving `StyleNote` and
+`SessionNote` valid UTF-8 and inside the cap; ~2400 truncations and bit
+mutations of PNG, GIF, JPEG, WebP and DIB headers, where `DibToRgb` must either
+refuse with a reason or return exactly `W*H*3` bytes inside `MaxImageDim` - the
+guard against a clipboard header claiming 40000x40000; and nine session files,
+one per `ValidTranscript` rule, each refused with the live conversation intact,
+followed by the assertion that a `type:"image"` block is *accepted*, which is
+what catches anyone adding a block-type allowlist to the load path.
+
+Mutation-checked in the usual form. Reordering `SessionNote` to put the plan
+paragraph before the style fails 1; replacing `Utf8Cut` with `Copy` at the style
+cap fails 1 in `smoke` and 2 in `fuzz` on the euro-sign case; appending the
+style to `SdkFullSystem` - moving it inside cache breakpoint #1 - fails 1, and
+`loop` survives it, which is expected and by design, since `loop` builds its
+agent with its own system string and never calls `SdkFullSystem`; dropping the
+style from `SessionNote` entirely fails 6 across both turns of `loop`. Writing
+NLEN as a copy of LEN fails 2, removing the DIB bottom-up flip fails 3, making
+`EvictImages` keep the oldest fails 5, letting `CompactWithSummary` drain the
+pending queue fails 2, and emitting the text block before the images fails 3.
+Removing the plain-key refusal from `KeyChordOf` - the change that would let a
+keys.json rebind `y`, `a` and `n` - fails 12; making `DecodeKey` read the module
+var instead of its `P` parameter fails 2; making `WordEndFwd` land after the
+word rather than on its last character fails 2; adding `ekChar` to `UndoWorthy`
+failed only 1, which was a test too weak to be worth having, so it now asserts
+the step count and fails 2. Turning `SdkResumeInto` into "a corrupt file is a
+fresh start" fails 24 across three suites, and moving the session save from
+before the `result` line to after it fails exactly 1 - the assertion written for
+it and nothing else, which is what makes it a targeted test rather than an
+incidental one.
+
+Reviewing that round found four real defects, all in the half that touches the
+outside world rather than in the arithmetic. `WordEndFwd` returned -1 on an
+empty buffer through an early `Exit` that skipped its own clamps, and
+`VimClamp` then indexed `W[0]` on a nil WideString; the empty-line answer is 0,
+and `SegEnd` gained a defensive clamp so a negative caret from any future caller
+cannot reach that index either. `/paste` of a copied *file* put the name from
+the DROPFILES structure straight into a `TFileStream`, with no resolver at all -
+it now goes through `ResolveInRoot`, the exported wrapper around the same
+`SafePath` every `@`-mention uses. The local `width` and `height` keys were
+being copied onto the request body by `BuildBody`'s deep copy, so
+`StripLocalImageFields` now runs beside the `cache_control` fixup. And an image
+was consumed by a turn that failed, because the queue is drained before the
+request and both tail repairs then drop the message; `RequeueImagesFrom` puts
+the blocks back and emits a notice, since silence was the real damage. Only the
+`/paste` fix has no regression test, and it says so: `ClipboardImage` needs a
+real clipboard and has no seam, and exporting the DROPFILES parse to get one
+would be more surface than the fix.
+
+The stored-deflate PNG and the DIB conversion were also verified out of suite,
+against things a suite cannot reach. A probe emitted a 200x200 truecolour image
+spanning two stored blocks; Windows Imaging Component decoded it at the right
+size with the corner pixels matching the generated gradient, and Python's zlib
+inflated all 120200 bytes with every chunk CRC validating. Then the real
+clipboard: PowerShell's `SetImage` sets CF_BITMAP only, and the probe found
+CF_DIB available anyway - confirming Windows synthesises it - with `biHeight`
+positive, `biCompression` 3 and `GlobalSize` exactly 40 + 12 + pixels, which is
+what pins the 12 mask bytes into the pixel offset. The encoded result decoded
+through WIC with red top-left and blue top-right, so the flip and the reorder
+are proved against a real clipboard rather than against a fixture we wrote.
+
 The one place with no regression test says so. The argument loop that parses
 `-p` and the format flags is inline in `pasclaude.lpr`'s main block,
 interleaved with `FailStart`, `Halt` and `SetCurrentDir`, and no suite spawns
@@ -1932,8 +2399,9 @@ transcript's *shape*; that is why the structural rules are enforced in
 | Unit | Responsibility |
 | --- | --- |
 | `uJson` | JSON DOM: parse, build, serialise |
+| `uImage` | image sniffing, visual-token cost, the stored-deflate PNG encoder |
 | `uHttp` | WinHTTP POST with the body delivered in chunks |
-| `uTerm` | UTF-8 console output, colour, line editor |
+| `uTerm` | UTF-8 console output, colour, line editor, key bindings |
 | `uDiff` | line diff used to preview a change before it is approved |
 | `uRegex` | NFA regex: compile a pattern, match a line, spend a budget |
 | `uNotebook` | `.ipynb` cell view, cell edits, nbformat's exact layout |
@@ -1956,7 +2424,12 @@ imports `Windows` and `SysUtils` and nothing else, because a spawn shared by
 `uHooks`, `uMcp` and `uTools` is only expressible below all three - which is
 exactly why the job-object declarations used to be copied verbatim into each
 of them. Adding `uses uJson` there creates the cycle the ladder exists to
-prevent.
+prevent. `uImage` is a leaf for the same class of reason from the other
+direction: it imports `SysUtils` and nothing else, so every parser in it is
+exercisable without a clipboard, a console or a DOM, and `uAgent` is the first
+unit that knows both what an image is and what a message is. `uTerm` now uses
+`uJson` in its *implementation* only, to parse `keys.json`; `KeysParse` takes
+bytes rather than a path, so `uTerm` still reads nothing off disk but history.
 
 Details worth knowing if you touch this code:
 
@@ -2146,14 +2619,75 @@ Details worth knowing if you touch this code:
   the network, so a boundary that stops writes and stops nothing else cannot
   buy an approval discount.
 * **`SessionNote` is one function, one trailing block, and empty by default.**
-  Plan mode, the extra roots and the deny sentence are appended in that fixed
-  order as a second `system` content block carrying no `cache_control` marker
-  of its own, after the marked one - so turning any of them on costs a few
-  dozen tokens rather than the whole cached prefix. With one root, `ask` mode
-  and no rules it returns `''`, no second block is emitted, and the request
-  body is byte-identical to what it was before this round. The deny *patterns*
-  and the sandbox level are deliberately absent: naming `.env` advertises a
-  target, and a model told it is sandboxed routes around the sandbox.
+  The output style, plan mode, the extra roots and the deny sentence are
+  appended in that fixed order as a second `system` content block carrying no
+  `cache_control` marker of its own, after the marked one - so turning any of
+  them on costs a few dozen tokens rather than the whole cached prefix. With
+  the default style, one root, `ask` mode and no rules it returns `''`, no
+  second block is emitted, and the request body is byte-identical to what it
+  was before this round. The style is first because it is the only text here a
+  file chose rather than pasclaude's own state; the deny sentence is
+  permanently last because it is the one line describing an unbypassable
+  refusal, and anything added later inserts before it rather than after. The
+  deny *patterns* and the sandbox level are deliberately absent: naming `.env`
+  advertises a target, and a model told it is sandboxed routes around the
+  sandbox.
+* **An output style is text with no consumer, and that is the enforcement.**
+  Nothing reads a style body but one string concatenation in `SessionNote`, and
+  no frontmatter key maps to any setting, so there is no parse step for a
+  hostile file to aim at. The corollary is a rule rather than an observation:
+  nobody may make a style key mean something. The name and the source it
+  resolved from are both persisted, so a project file appearing later cannot
+  inherit consent given to a user file of the same name.
+* **`TAgent` still has no setter for its system prompt.** Its immutability is
+  what makes cache breakpoint #1 worth having, and it is the seam every feature
+  that wants to change the prompt mid-session will reach for. Anything session-
+  mutable goes in `SessionNote`'s uncached block instead. Anyone adding one
+  revisits that decision explicitly rather than inheriting it.
+* **An image block is a plain object in `FMessages`, not a block kind.** The
+  decoder was not taught about images because the model does not emit them;
+  `bkResult`'s passthrough already handles a type this client does not
+  understand. Images live only in `user` messages, never in a `tool_result` -
+  `RunTool` returns a `string`, and lifting that is three units moving in
+  lockstep for a result no human is looking at.
+* **`width` and `height` are ours and must never reach the wire.** They exist
+  so a resumed transcript can be described without decoding base64, and the
+  Messages API rejects a content block carrying a key it does not know, so
+  `StripLocalImageFields` removes them from `BuildBody`'s copy beside the
+  `cache_control` fixup. Any local-only key added later goes in that one list.
+* **`ValidTranscript` has no block-type allowlist and `SessionVersion` stays
+  1.** An image block passes today because the rules are structural - an object
+  with a non-empty `type`, and a `tool_use` answered by a `tool_result`. Adding
+  a type whitelist would make already-saved image sessions unloadable, which
+  under `--session-file` is a hard exit 2 for a script.
+* **Eviction substitutes, it never deletes.** `EvictImages` replaces an image
+  block with a text placeholder rather than removing it, because an emptied
+  content array is exactly what the session loader refuses, and a measure that
+  saves context by producing an unloadable session has made things worse. It
+  runs before both compaction branches: base64 is re-sent in full every turn, so
+  without it the byte trigger fires forever against a transcript it cannot trim.
+* **A drained image queue has to be put back when the turn is dropped.**
+  `AppendUserText` drains before the request, and both tail repairs delete that
+  message, so `RequeueImagesFrom` runs at both sites and emits a notice. Silence
+  was the defect: the user had been told the image goes with their next message.
+* **A `TSdkOptions` is only ever built by `SdkDefaultOptions`.** FPC initialises
+  only the managed fields of a local record, so a Boolean added to that record
+  reads stack garbage at every hand-rolled construction site - and the field
+  most likely to be added next is another one that means "resume" or "trust".
+* **`ReadLineCore` takes its key profile as a parameter and reads no module
+  var.** `ReadPromptLine` supplies `PromptProfile` and is called once, by the
+  REPL; `ReadLineEdit` supplies the constant `KeysNone` and is what every other
+  prompt in the program uses, permission included. That plus the chord grammar
+  (no plain character is nameable) and the action set (`TEditKey` only, and
+  `ekChar` has no name) is why a `keys.json` cannot answer a permission
+  question. A non-editing action added to the name table breaks the third
+  mechanism; such a chord belongs in `ReadLineCore`'s fixed key section and in
+  `KeyChordReserved`, so no file can shadow it.
+* **`Redraw`'s `PrevLen` is total painted width, not text length.** The vim
+  indicator is painted by `EditLead` ahead of the prompt, so the erase loop has
+  to clear a four-character lead that disappeared; the append fast path is
+  `Inc(PrevLen)`. Anything else ever added to the painted line goes through
+  `EditLead` and respects that meaning.
 * **Every new path under `.pasclaude` bypasses `SafePath` and must say so.**
   `SafePath` refuses that directory by design, so the substitute guard is the
   established one and no feature may invent a second: filter the bare name for

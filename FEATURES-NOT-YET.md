@@ -13,6 +13,18 @@ compaction, prompt caching with cost counters, retry with Retry-After,
 extended thinking, `.gitignore`-aware listing/search, git status in the
 system prompt, and reuse of Claude Code's or Jcode's OAuth credentials.
 
+The input and output surface is now most of one too. A prompt can carry an
+image — `@shot.png` or `/paste` off the Windows clipboard, priced in visual
+tokens before you send it — and the transcript, the session file and
+compaction all know what an image block is. `/output-style` chooses how
+replies are written, from three built-ins or a `<name>.md` of your own, as a
+paragraph ADDED to the system prompt and never one replacing it. `/vim` and
+`%USERPROFILE%\.pasclaude\keys.json` make the line editor modal and
+rebindable, walled off from every other prompt in the program. And `-p`
+gained the one thing a multi-turn driver needed: `--session-file <path>`,
+opt-in by name, so repeated subprocess calls continue one conversation while
+a bare `-p` still touches nothing on disk.
+
 It now also covers the extensibility surface: MCP servers over stdio behind a
 per-command-line spawn prompt, lifecycle hooks at five points in a turn behind
 a fingerprint prompt, skills and plugins discovered from disk, a dynamic tool
@@ -422,9 +434,9 @@ text preserves what was missing at the time. Unchecked items remain open.
   through the same resolver as `@`, so a `/paste` of one outside the session
   root, or inside `.pasclaude\`, or under a deny rule, is refused by the same
   message (copying the *image* rather than the file is unaffected, and
-  `--add-dir` widens both alike) — and it lands in a user
-  block, so it carries the authority of text you typed and no more. A saved
-  session also keeps the image on disk in plaintext under `.pasclaude\`.***
+  `--add-dir` widens both alike) — and it lands in a user block, so it carries
+  the authority of text you typed and no more. A saved session also keeps the
+  image on disk in plaintext under `.pasclaude\`.***
 - [x] ~~**Vim mode / keybindings** — line editing is fixed (arrows, Home/End,
   Ctrl+A/E/U); no `/vim`, no configurable keybindings.~~
   *Built: two separate things. `/vim` turns on a modal editor — insert and
@@ -630,6 +642,63 @@ text preserves what was missing at the time. Unchecked items remain open.
   stops writes and registry persistence and nothing else — not reads, not the
   network — which is why it changes nothing about what you are asked to
   approve. `/sandbox off` keeps kill-on-close.)
+
+- **Output styles** — `/output-style` lists what is available and marks the
+  one in force, `/output-style <name>` sets it, `--output-style <name>` does
+  it from the command line and is the only way in under `-p`. Three built-ins
+  compiled in, plus a flat `<name>.md` in `.pasclaude\styles\`, an enabled
+  plugin's `styles\` or `%USERPROFILE%\.pasclaude\styles\`, nearer winning,
+  read by the same frontmatter parser `SKILL.md` uses. A style ADDS one
+  paragraph to the system prompt and can never replace one: the body has
+  exactly one reader, a string concatenation in `SessionNote`, and no
+  frontmatter key maps to a setting. It rides in the uncached trailing block
+  ahead of the plan paragraph and behind nothing, with the deny sentence
+  permanently last, capped at 2 KB and cut on a character boundary. The name
+  and the source it resolved from persist under `%LOCALAPPDATA%`, never in
+  the project; a name that now resolves somewhere else falls back to
+  `default` with a yellow line. (The body is read once at set time, so an
+  edited file applies after re-running `/output-style <name>`.)
+- **Image input** — `@shot.png` attaches an image instead of refusing it as a
+  binary, and `/paste` takes one off the clipboard (`/paste drop` cancels).
+  Both report dimensions, bytes and the real token cost from the documented
+  patch formula. png, jpeg, gif and webp, base64 only, 8 per message;
+  mentioned files go up untouched under 5 MB, clipboard pixels are encoded
+  here over STORED deflate blocks because paszlib is a package and the API
+  takes no BMP. Pasted images are capped at 2 MB and downscaled at most twice
+  before an honest refusal. Images live only in user messages and never in a
+  tool result; `width`/`height` are local keys stripped from the request
+  body; `ValidTranscript` and `SessionVersion` were not touched, so they
+  round-trip through save, load and `--resume`; and compaction evicts all but
+  the two newest by substituting a placeholder rather than deleting a block.
+  (An image can carry instructions a transcript reader cannot see. Nothing
+  detects that; what bounds it is that only your own `@mention` or `/paste`
+  can put one in, both through the same path guard a tool call goes through.)
+- **Vim mode and keybindings** — `/vim` turns on a modal editor with `[I]`
+  and `[N]` on the prompt, motions, the `d`/`c` compounds, and undo with a
+  whole insert session as one step; `/vim save` keeps it and `/keys` lists
+  the table. `%USERPROFILE%\.pasclaude\keys.json` rebinds over built-in
+  Ctrl+W, Ctrl+K, Alt+B, Alt+F and Ctrl+Z, with every refused entry reported
+  by name. No project scope, ever: a `git clone` cannot choose what your
+  keyboard does. A binding cannot reach a permission prompt, and three
+  independent things stop it — the chord grammar cannot spell `y`, `a` or
+  `n`; an action is a buffer-editing verb and `ekChar` has no name at all;
+  and every prompt but the REPL reads through `ReadLineEdit`, which passes
+  the empty profile. Nothing here enters the model's context.
+- **Session resume under `-p`** — `--session-file <path>` names the
+  transcript a scripted run saves to after every turn, before the `result`
+  line so a driver may spawn the next process the moment it reads one, and
+  with `--resume` continues it. It is the whole opt-in: without it `-p`
+  writes nothing and the directory's own conversation is untouched, and
+  `--resume` under `-p` without it is a startup error rather than a guess.
+  The path goes through the tools' own root guard and the file is the
+  ordinary session file, so a script's transcript opens in the REPL and back.
+  An absent file is a fresh start; an unreadable one stops the run with exit
+  2 rather than doing work on absent context and then overwriting the
+  evidence. The init line reports `resumed`, `resumed_messages` and
+  `session_file` on every run. A resumed run restores messages, model and
+  counters and nothing else, so it can never come back more permissive than a
+  fresh one. (Nothing is compacted on this path, and two processes sharing
+  one file race with last writer winning.)
 
 *Compiled from `README.md` and the `src/` units at
 `E:\Projects\pascal\pasclaude`, compared against the public Claude Code
