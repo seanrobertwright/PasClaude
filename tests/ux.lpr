@@ -14,8 +14,8 @@ program ux;
 
 { Windows first, so SysUtils' DeleteFile and GetEnvironmentVariable win over
   the raw API of the same names. }
-uses Windows, SysUtils, Classes, uJson, uSettings, uDiff, uHooks, uSandbox,
-  uTools, uImage, uAgent, uTerm, uNotebook, uSdk;
+uses Windows, SysUtils, Classes, DateUtils, uJson, uSettings, uAuth, uDiff,
+  uHooks, uSandbox, uTools, uImage, uAgent, uTerm, uNotebook, uSdk;
 
 var
   Fails: Integer = 0;
@@ -4281,6 +4281,186 @@ end;
 { The Scope column is the whole feature.  A project document setting the model
   must not merely lose a precedence race - the value must never be stored, and
   the user must be told it was refused and where it would work. }
+
+{ ---------------------------------------------------------- the boundary -- }
+
+function SetEnvVarU(Name, Value: PChar): LongBool; stdcall;
+  external 'kernel32' name 'SetEnvironmentVariableA';
+
+procedure PutFileU(const Path, Text: string);
+var
+  F: TFileStream;
+begin
+  ForceDirectories(ExtractFilePath(Path));
+  F := TFileStream.Create(Path, fmCreate);
+  try
+    if Text <> '' then F.WriteBuffer(Text[1], Length(Text));
+  finally
+    F.Free;
+  end;
+end;
+
+function SlurpU(const Path: string): string;
+var
+  L: TStringList;
+begin
+  Result := '';
+  if not FileExists(Path) then Exit;
+  L := TStringList.Create;
+  try
+    L.LoadFromFile(Path);
+    Result := L.Text;
+  finally
+    L.Free;
+  end;
+end;
+
+{ THE assertion this whole feature is built around.  /logout removes
+  pasclaude's own credential and nothing else; Claude Code's file, Jcode's
+  and the ant profile's are read forever and written never.  The single
+  worst defect available here would be a /logout that deleted or rewrote one
+  of them, breaking a program the user did not ask us to touch - and the
+  structural guarantee is that AuthClear takes NO path argument, so it can
+  name no file but its own.  This proves the guarantee holds in bytes as
+  well as in signature. }
+procedure TestLogoutTouchesOnlyOurOwnCredential;
+var
+  Home, Ant, SavedHome, SavedLocal, SavedDir, SavedProfile, Err: string;
+  CcPath, JcPath, AntPath: string;
+  CcBefore, JcBefore, AntBefore: string;
+  CcAge, JcAge, AntAge: LongInt;
+  Info: TAuthInfo;
+begin
+  Home := IncludeTrailingPathDelimiter(TmpRoot) + 'authhome';
+  Ant := IncludeTrailingPathDelimiter(TmpRoot) + 'authant';
+  SavedHome := SysUtils.GetEnvironmentVariable('USERPROFILE');
+  SavedLocal := SysUtils.GetEnvironmentVariable('LOCALAPPDATA');
+  SavedDir := SysUtils.GetEnvironmentVariable('ANTHROPIC_CONFIG_DIR');
+  SavedProfile := SysUtils.GetEnvironmentVariable('ANTHROPIC_PROFILE');
+  try
+    ForceDirectories(Home);
+    SetEnvVarU('USERPROFILE', PChar(Home));
+    SetEnvVarU('LOCALAPPDATA', PChar(Home));
+    SetEnvVarU('ANTHROPIC_CONFIG_DIR', PChar(Ant));
+    SetEnvVarU('ANTHROPIC_PROFILE', PChar('default'));
+    SetEnvVarU('ANTHROPIC_API_KEY', PChar(''));
+    SetEnvVarU('ANTHROPIC_AUTH_TOKEN', PChar(''));
+
+    CcPath := Home + PathDelim + '.claude' + PathDelim + '.credentials.json';
+    JcPath := Home + PathDelim + '.jcode' + PathDelim + 'auth.json';
+    AntPath := Ant + PathDelim + 'credentials' + PathDelim + 'default.json';
+    PutFileU(CcPath,
+      '{"claudeAiOauth":{"accessToken":"sk-ant-oat01-claudecodes000"}}');
+    PutFileU(JcPath,
+      '{"anthropic_accounts":[{"access":"sk-ant-oat01-jcodesown00000"}]}');
+    PutFileU(AntPath, '{"access_token":"sk-ant-oat01-antsownvalue00"}');
+    CcBefore := SlurpU(CcPath);
+    JcBefore := SlurpU(JcPath);
+    AntBefore := SlurpU(AntPath);
+    CcAge := FileAge(CcPath);
+    JcAge := FileAge(JcPath);
+    AntAge := FileAge(AntPath);
+
+    Check(uAuth.AuthStore('sk-ant-api03-ourownstoredkey000', Err),
+      'a credential of our own stores');
+    Check(uAuth.AuthResolve(Info) and (Info.Source = asStored),
+      'and answers ahead of the three foreign ones');
+
+    Check(uAuth.AuthClear(Err), '/logout removes it');
+    Check(not FileExists(uAuth.CredentialStorePath), 'the store is gone');
+
+    Check(SlurpU(CcPath) = CcBefore,
+      'and Claude Code''s credentials are byte-identical');
+    Check(SlurpU(JcPath) = JcBefore, 'and so are Jcode''s');
+    Check(SlurpU(AntPath) = AntBefore, 'and so is the ant profile''s');
+    Check(FileAge(CcPath) = CcAge,
+      'Claude Code''s file was not even rewritten with the same bytes');
+    Check(FileAge(JcPath) = JcAge, 'nor was Jcode''s');
+    Check(FileAge(AntPath) = AntAge, 'nor was the ant profile''s');
+
+    { And with our own gone, a foreign one answers again - which is what
+      makes the refusal safe rather than merely polite. }
+    Check(uAuth.AuthResolve(Info) and (Info.Source = asClaudeCode),
+      'resolution falls back to Claude Code afterwards');
+    Check(Info.Token = 'sk-ant-oat01-claudecodes000',
+      'reading it, as it always has');
+  finally
+    SetEnvVarU('USERPROFILE', PChar(SavedHome));
+    SetEnvVarU('LOCALAPPDATA', PChar(SavedLocal));
+    SetEnvVarU('ANTHROPIC_CONFIG_DIR', PChar(SavedDir));
+    SetEnvVarU('ANTHROPIC_PROFILE', PChar(SavedProfile));
+  end;
+end;
+
+{ The near-expiry warning fires on minutes, not on milliseconds mistaken for
+  them.  A threshold wired to the wrong unit would either warn on every
+  single startup or never warn at all, and neither failure announces itself.
+  AuthExpiresInMs is what the startup note tests, so it is what is tested. }
+procedure TestNearExpiryThreshold;
+var
+  I: TAuthInfo;
+  NowMs: Int64;
+  Threshold: Int64;
+begin
+  Threshold := 15 * 60 * 1000;
+  NowMs := Round((LocalTimeToUniversal(Now) - EncodeDate(1970, 1, 1)) *
+    MSecsPerDay);
+  I.Source := asClaudeCode;
+  I.Token := 'sk-ant-oat01-expirycheck0000';
+  I.Path := 'C:\nowhere';
+  I.Hint := '';
+  I.Why := '';
+  I.Present := True;
+  I.Decryptable := True;
+
+  I.ExpiresMs := NowMs + 14 * 60 * 1000;
+  Check(uAuth.AuthExpiresInMs(I) < Threshold,
+    'a credential expiring in 14 minutes trips the warning');
+  Check(uAuth.AuthExpiresInMs(I) >= 0, 'and is not reported as already gone');
+
+  I.ExpiresMs := NowMs + 60 * 60 * 1000;
+  Check(uAuth.AuthExpiresInMs(I) >= Threshold,
+    'one expiring in an hour does not');
+
+  { The unparseable case is -1 and must not read as "expired an eternity
+    ago", which would warn on every startup for every source with no expiry
+    field - that is most of them. }
+  I.ExpiresMs := 0;
+  Check(uAuth.AuthExpiresInMs(I) = -1,
+    'and a credential with no known expiry reports no expiry at all');
+  Check(not (uAuth.AuthExpiresInMs(I) < Threshold) or
+        (uAuth.AuthExpiresInMs(I) < 0),
+    'which the startup test excludes by asking for a non-negative value');
+
+  { The 401 diagnosis names the source and says whether it has expired, and
+    carries no part of the token. }
+  I.ExpiresMs := NowMs - 60 * 1000;
+  Check(Pos('expired', uAuth.AuthDiagnose401(I)) > 0,
+    'the 401 diagnosis says an expired credential expired');
+  Check(Pos('claude code', uAuth.AuthDiagnose401(I)) > 0,
+    'and names the source it came from');
+  Check(Pos('C:\nowhere', uAuth.AuthDiagnose401(I)) > 0, 'and the file');
+  Check(Pos(I.Token, uAuth.AuthDiagnose401(I)) = 0,
+    'and never the credential itself');
+end;
+
+{ A scripted run has nobody to type a secret, and a reader that blocked there
+  would hang the run forever.  This suite's stdin is not a console, so the
+  refusal is testable exactly as a -p run would meet it. }
+procedure TestSecretReaderRefusesOffConsole;
+var
+  S: string;
+begin
+  if uTerm.StdinIsConsole then
+  begin
+    Check(True, 'stdin is a console here; the off-console read is not testable');
+    Exit;
+  end;
+  S := 'not overwritten';
+  Check(not uTerm.ReadSecretLine('  key: ', S),
+    'the secret reader refuses immediately when stdin is not a console');
+  Check(S = '', 'and hands back nothing rather than leaving a stale value');
+end;
 procedure TestSettingsScopeTable;
 var
   Problems: TStringArray;
@@ -4724,6 +4904,9 @@ begin
     TestSettingsProjectCeiling;
     TestSettingsLocalHasProjectAuthority;
     TestSettingsGrantsNothing;
+    TestLogoutTouchesOnlyOurOwnCredential;
+    TestNearExpiryThreshold;
+    TestSecretReaderRefusesOffConsole;
     TestConfigShowsProvenance;
     TestConfigSetPreservesUnknownKeys;
     TestConfigSetWritesUserTier;

@@ -8,8 +8,8 @@ program smoke;
 { Windows first, deliberately: it exports a DeleteFile taking a PChar, and this
   suite calls SysUtils' one throughout.  A later unit wins, so SysUtils has to
   come after it. }
-uses Windows, SysUtils, Classes, uJson, uSettings, uHttp, uMcp, uHooks,
-  uSandbox, uTools, uAgent, uRegex, uSdk, uTerm;
+uses Windows, SysUtils, Classes, uJson, uSettings, uAuth, uHttp, uMcp,
+  uHooks, uSandbox, uTools, uAgent, uRegex, uSdk, uTerm;
 
 var
   Fails: Integer = 0;
@@ -2615,6 +2615,353 @@ begin
   HomeMoved := False;
 end;
 
+{ ------------------------------------------------------------ credentials -- }
+
+{ The synthetic source table the resolution-order tests drive.  Installed
+  through uAuth.AuthProbeOverride, the HttpTransport seam pattern, and
+  restored to nil in a finally so no later test inherits it. }
+var
+  FakeSources: TAuthInfoArray;
+
+procedure FakeProbe(out Sources: TAuthInfoArray);
+begin
+  Sources := Copy(FakeSources, 0, Length(FakeSources));
+end;
+
+procedure AddFake(S: TAuthSource; const Token: string);
+var
+  N: Integer;
+begin
+  N := Length(FakeSources);
+  SetLength(FakeSources, N + 1);
+  FakeSources[N].Source := S;
+  FakeSources[N].Token := Token;
+  FakeSources[N].Path := '';
+  FakeSources[N].Hint := AuthHint(Token);
+  FakeSources[N].ExpiresMs := 0;
+  FakeSources[N].Present := Token <> '';
+  FakeSources[N].Decryptable := True;
+  if Token = '' then FakeSources[N].Why := 'nothing here'
+  else FakeSources[N].Why := '';
+end;
+
+{ DPAPI is what makes a stored credential inert on another account or
+  machine, and every claim this feature makes about at-rest protection rests
+  on this test. }
+procedure TestAuthDpapi;
+const
+  Secret = 'sk-ant-api03-roundtriptestvalue4f2a';
+var
+  Blob, Back, Tampered: string;
+begin
+  Check(AuthProtect(Secret, Blob), 'DPAPI protects a credential');
+  Check(Blob <> '', 'and produces a blob');
+  { The specific failure this catches: an implementation that, when
+    CryptProtectData is unavailable or fails, quietly stores the plaintext
+    (or a base64 of it) and reports success.  A blob that still CONTAINS the
+    secret is exactly that failure wearing a success return. }
+  Check(Pos(Secret, Blob) = 0, 'that does not contain the plaintext');
+  Check(Length(Blob) > Length(Secret),
+    'and is a real ciphertext rather than a copy');
+  Check(AuthUnprotect(Blob, Back), 'and unprotects it again');
+  Check(Back = Secret, 'byte for byte');
+  { Two bytes flipped at the end.  Verified against the real API to come back
+    as ERROR_INVALID_DATA rather than as garbage plaintext. }
+  Tampered := Blob;
+  Tampered[Length(Tampered)] := Chr(Byte(Tampered[Length(Tampered)]) xor 255);
+  Tampered[Length(Tampered) - 1] :=
+    Chr(Byte(Tampered[Length(Tampered) - 1]) xor 255);
+  Check(not AuthUnprotect(Tampered, Back), 'a tampered blob is refused');
+  Check(Back = '', 'and yields nothing');
+  Check(not AuthUnprotect('not a blob at all', Back),
+    'and so is a value that was never a blob');
+end;
+
+{ '' from CredentialStorePath means STORE NOTHING.  The failure this pins is
+  a home-directory fallback that lands inside the project tree, which would
+  put a credential where a git clone and the model's own read_file can see
+  it - the exact hole ApprovalsPath was moved out of the tree to close. }
+procedure TestAuthStorePathDegrades;
+var
+  SavedLocal, SavedProfile, Err, P: string;
+begin
+  SavedLocal := SysUtils.GetEnvironmentVariable('LOCALAPPDATA');
+  SavedProfile := SysUtils.GetEnvironmentVariable('USERPROFILE');
+  try
+    SetEnvironmentVariable('LOCALAPPDATA', PChar(''));
+    SetEnvironmentVariable('USERPROFILE', PChar(''));
+    P := CredentialStorePath;
+    Check(P = '', 'with no home at all there is no credential store');
+    Check(not AuthStore('sk-ant-api03-neverwritten1234', Err),
+      'and storing a credential is refused');
+    Check(Pos('nothing was stored', Err) > 0, 'saying so plainly');
+    { Stated as its own assertion because it is the whole point: not merely
+      "some other path" but specifically never one under the session root. }
+    Check((P = '') or (Pos(UpperCase(uTools.RootDir), UpperCase(P)) <> 1),
+      'and the store is never a path inside the project');
+  finally
+    SetEnvironmentVariable('LOCALAPPDATA', PChar(SavedLocal));
+    SetEnvironmentVariable('USERPROFILE', PChar(SavedProfile));
+  end;
+end;
+
+{ Resolution order, driven off the seam so no real credential is consulted.
+  The failure this catches is prefer being honoured above the environment: a
+  stale stored key silently shadowing an ANTHROPIC_API_KEY the user exported
+  on purpose for this one invocation. }
+procedure TestAuthResolutionOrder;
+var
+  Info: TAuthInfo;
+  SavedLocal, Err: string;
+begin
+  SavedLocal := SysUtils.GetEnvironmentVariable('LOCALAPPDATA');
+  AuthProbeOverride := @FakeProbe;
+  try
+    { A store of our own, so the preference has somewhere to live that is not
+      the developer's real one. }
+    ForceDirectories(SkillRoot + PathDelim + 'cred');
+    SetEnvironmentVariable('LOCALAPPDATA',
+      PChar(SkillRoot + PathDelim + 'cred'));
+    AuthClear(Err);
+
+    FakeSources := nil;
+    AddFake(asApiKeyEnv, 'sk-ant-api03-fromtheenvironment');
+    AddFake(asAuthTokenEnv, 'sk-ant-oat01-fromauthtokenvar');
+    AddFake(asStored, 'sk-ant-api03-fromourownstore00');
+    AddFake(asClaudeCode, 'sk-ant-oat01-fromclaudecode000');
+    AddFake(asJcode, 'sk-ant-oat01-fromjcode00000000');
+    AddFake(asAntProfile, 'sk-ant-oat01-fromantprofile000');
+
+    Check(AuthSetPrefer('claude_code', Err), 'a preference can be recorded');
+    Check(AuthPrefer = 'claude_code', 'and read back');
+    Check(AuthResolve(Info) and (Info.Source = asApiKeyEnv),
+      'ANTHROPIC_API_KEY outranks a preference for another source');
+
+    FakeSources[0].Present := False;
+    FakeSources[0].Token := '';
+    Check(AuthResolve(Info) and (Info.Source = asAuthTokenEnv),
+      'and ANTHROPIC_AUTH_TOKEN is next, still above the preference');
+
+    FakeSources[1].Present := False;
+    FakeSources[1].Token := '';
+    Check(AuthResolve(Info) and (Info.Source = asClaudeCode),
+      'with the environment empty the preference selects');
+
+    Check(AuthSetPrefer('ant_profile', Err), 'the preference can be changed');
+    Check(AuthResolve(Info) and (Info.Source = asAntProfile),
+      'and the new one selects');
+
+    { A preference naming a source that is not live falls through the
+      documented order rather than failing: prefer chooses among what was
+      discovered, it never introduces or forces one. }
+    FakeSources[5].Present := False;
+    Check(AuthResolve(Info) and (Info.Source = asStored),
+      'a preference for an absent source falls through to stored');
+    FakeSources[2].Present := False;
+    Check(AuthResolve(Info) and (Info.Source = asClaudeCode),
+      'then claude code');
+    FakeSources[3].Present := False;
+    Check(AuthResolve(Info) and (Info.Source = asJcode), 'then jcode');
+    FakeSources[4].Present := False;
+    Check(not AuthResolve(Info),
+      'and with nothing live there is no credential');
+    Check(Info.Source = asNone,
+      'reported as no source rather than a stale one');
+  finally
+    { Restored here rather than at the end of the suite: a later test that
+      resolved a credential through this table would be asserting on
+      fiction. }
+    AuthProbeOverride := nil;
+    FakeSources := nil;
+    AuthClear(Err);
+    SetEnvironmentVariable('LOCALAPPDATA', PChar(SavedLocal));
+  end;
+end;
+
+procedure WriteText(const Path, Text: string);
+var
+  F: TFileStream;
+begin
+  ForceDirectories(ExtractFilePath(Path));
+  F := TFileStream.Create(Path, fmCreate);
+  try
+    if Text <> '' then F.WriteBuffer(Text[1], Length(Text));
+  finally
+    F.Free;
+  end;
+end;
+
+{ The real store, end to end: protect, write, read back, the preference
+  preserved across a re-store, and /logout's delete. }
+procedure TestAuthStoreRoundTrip;
+const
+  Secret = 'sk-ant-api03-storedroundtrip4f2a';
+var
+  SavedLocal, Err, Body: string;
+  L: TStringList;
+begin
+  SavedLocal := SysUtils.GetEnvironmentVariable('LOCALAPPDATA');
+  try
+    ForceDirectories(SkillRoot + PathDelim + 'cred2');
+    SetEnvironmentVariable('LOCALAPPDATA',
+      PChar(SkillRoot + PathDelim + 'cred2'));
+    AuthClear(Err);
+    Check(AuthSetPrefer('jcode', Err), 'a preference alone can be stored');
+    Check(AuthStore(Secret, Err), 'a credential stores');
+    Check(AuthPrefer = 'jcode',
+      'and storing one does not throw the preference away');
+    Check(AuthStore(Secret, Err) and (AuthPrefer = 'jcode'),
+      'nor does storing it a second time');
+
+    { The file itself: the secret must not be findable in it. }
+    L := TStringList.Create;
+    try
+      L.LoadFromFile(CredentialStorePath);
+      Body := L.Text;
+    finally
+      L.Free;
+    end;
+    Check(Pos(Secret, Body) = 0, 'the file on disk does not contain the key');
+    Check(Pos('"protected":"dpapi"',
+      StringReplace(Body, ' ', '', [rfReplaceAll])) > 0,
+      'and says how it is protected');
+    { Absence of the plaintext is not enough on its own: an implementation
+      that base64'd the key and called it stored would pass that too.  Two
+      properties separate real ciphertext from an encoding.  DPAPI salts
+      every call, so storing the same key twice must produce a DIFFERENT
+      file; and the blob is a few hundred bytes of header around a key of
+      about thirty, so the value cannot be the length of an encoding of it. }
+    Check(AuthStore(Secret, Err), 'the same credential stores again');
+    L := TStringList.Create;
+    try
+      L.LoadFromFile(CredentialStorePath);
+      Check(L.Text <> Body,
+        'and the file differs, because real ciphertext is salted per call');
+      Check(Length(L.Text) > 4 * Length(Secret),
+        'and is far longer than any encoding of the key could be');
+    finally
+      L.Free;
+    end;
+
+    Check(AuthClear(Err), 'and /logout removes it');
+    Check(not FileExists(CredentialStorePath), 'the file is gone');
+    Check(not AuthClear(Err),
+      'removing it twice is refused rather than silently succeeding');
+  finally
+    SetEnvironmentVariable('LOCALAPPDATA', PChar(SavedLocal));
+  end;
+end;
+
+{ The ant CLI profile store: which profile is chosen, and the shapes
+  expires_at might arrive in.  The failure this catches is rejecting a
+  perfectly live token because its expiry field was not a number - a false
+  negative that looks to the user like pasclaude cannot see a credential
+  every other Anthropic client can. }
+procedure TestAuthAntProfile;
+var
+  Dir, SavedDir, SavedProfile: string;
+  List: TAuthInfoArray;
+  I: Integer;
+
+  function AntInfo: TAuthInfo;
+  var
+    J: Integer;
+  begin
+    Result.Source := asNone;
+    Result.Token := '';
+    Result.Present := False;
+    Result.Why := '';
+    Result.Hint := '';
+    Result.Path := '';
+    List := AuthList;
+    for J := 0 to High(List) do
+      if List[J].Source = asAntProfile then Exit(List[J]);
+  end;
+
+begin
+  Dir := SkillRoot + PathDelim + 'ant';
+  SavedDir := SysUtils.GetEnvironmentVariable('ANTHROPIC_CONFIG_DIR');
+  SavedProfile := SysUtils.GetEnvironmentVariable('ANTHROPIC_PROFILE');
+  try
+    SetEnvironmentVariable('ANTHROPIC_CONFIG_DIR', PChar(Dir));
+    SetEnvironmentVariable('ANTHROPIC_PROFILE', PChar(''));
+
+    WriteText(Dir + PathDelim + 'credentials' + PathDelim + 'default.json',
+      '{"version":1,"access_token":"sk-ant-oat01-thedefaultprofile"}');
+    Check(AntInfo.Token = 'sk-ant-oat01-thedefaultprofile',
+      'with no active_config the default profile is read');
+
+    WriteText(Dir + PathDelim + 'active_config', 'work');
+    WriteText(Dir + PathDelim + 'credentials' + PathDelim + 'work.json',
+      '{"version":1,"access_token":"sk-ant-oat01-theworkprofile00"}');
+    Check(AntInfo.Token = 'sk-ant-oat01-theworkprofile00',
+      'active_config beats the literal default');
+
+    WriteText(Dir + PathDelim + 'credentials' + PathDelim + 'other.json',
+      '{"version":1,"access_token":"sk-ant-oat01-theotherprofile0"}');
+    SetEnvironmentVariable('ANTHROPIC_PROFILE', PChar('other'));
+    Check(AntInfo.Token = 'sk-ant-oat01-theotherprofile0',
+      'and ANTHROPIC_PROFILE beats active_config');
+
+    { A profile name that is a path is refused rather than followed. }
+    SetEnvironmentVariable('ANTHROPIC_PROFILE', PChar('..\..\secrets'));
+    Check(not AntInfo.Present, 'a profile name carrying a path is refused');
+    SetEnvironmentVariable('ANTHROPIC_PROFILE', PChar('other'));
+
+    { The expiry shapes.  Only a numeric expiry genuinely in the past may
+      reject a token. }
+    WriteText(Dir + PathDelim + 'credentials' + PathDelim + 'other.json',
+      '{"access_token":"sk-ant-oat01-secondsexpiry000",' +
+      '"expires_at":4102444800}');
+    Check(AntInfo.Present, 'an epoch-seconds expiry in the future is usable');
+    WriteText(Dir + PathDelim + 'credentials' + PathDelim + 'other.json',
+      '{"access_token":"sk-ant-oat01-msexpiry00000000",' +
+      '"expires_at":4102444800000}');
+    Check(AntInfo.Present, 'and an epoch-milliseconds one');
+    WriteText(Dir + PathDelim + 'credentials' + PathDelim + 'other.json',
+      '{"access_token":"sk-ant-oat01-isoexpiry0000000",' +
+      '"expires_at":"2099-01-01T00:00:00Z"}');
+    Check(AntInfo.Present, 'and an ISO-8601 string');
+    WriteText(Dir + PathDelim + 'credentials' + PathDelim + 'other.json',
+      '{"access_token":"sk-ant-oat01-nullexpiry000000","expires_at":null}');
+    Check(AntInfo.Present, 'a null expiry means no expiry, not a dead token');
+    WriteText(Dir + PathDelim + 'credentials' + PathDelim + 'other.json',
+      '{"access_token":"sk-ant-oat01-soonexpiry000000","expires_at":"soon"}');
+    Check(AntInfo.Present,
+      'and an expiry nobody can parse still yields a usable token');
+    WriteText(Dir + PathDelim + 'credentials' + PathDelim + 'other.json',
+      '{"access_token":"sk-ant-oat01-pastexpiry000000",' +
+      '"expires_at":1000000000}');
+    Check(not AntInfo.Present,
+      'only an expiry that is genuinely past rejects');
+    Check(Pos('expired', AntInfo.Why) > 0, 'and says it expired');
+
+    { Nothing in the listing may carry the secret in a display field.  This
+      is the assertion the /login listing and the 401 diagnosis rest on. }
+    WriteText(Dir + PathDelim + 'credentials' + PathDelim + 'other.json',
+      '{"access_token":"sk-ant-oat01-hintcheck00000000"}');
+    List := AuthList;
+    for I := 0 to High(List) do
+    begin
+      Check(Pos('sk-ant-oat01-hintcheck00000000', List[I].Hint) = 0,
+        'the hint is not the token');
+      Check(Pos('sk-ant-oat01-hintcheck00000000', List[I].Why) = 0,
+        'and neither is the reason');
+      Check(Pos('sk-ant-oat01-hintcheck00000000', AuthDescribe(List[I])) = 0,
+        'and neither is the description');
+      Check(Pos('sk-ant-oat01-hintcheck00000000', AuthDiagnose401(List[I])) = 0,
+        'and neither is the 401 diagnosis');
+    end;
+    Check(AuthHint('sk-ant-oat01-hintcheck00000000') = 'sk-ant-...0000',
+      'the hint is seven characters, an ellipsis and four');
+    Check(AuthHint('short') = '(hidden)',
+      'and a value too short to split shows nothing at all');
+  finally
+    SetEnvironmentVariable('ANTHROPIC_CONFIG_DIR', PChar(SavedDir));
+    SetEnvironmentVariable('ANTHROPIC_PROFILE', PChar(SavedProfile));
+  end;
+end;
+
 { Byte-exact, because a SKILL.md body's line endings are part of what the
   parser must hand back untouched and TStringList would rewrite them. }
 procedure PutFile(const Path, Body: string);
@@ -3820,6 +4167,11 @@ begin
   TestModelSourceNote;
   TestSdkInitInventory;
   TestSdkDefaultOptionsZeroes;
+  TestAuthDpapi;
+  TestAuthStorePathDegrades;
+  TestAuthResolutionOrder;
+  TestAuthStoreRoundTrip;
+  TestAuthAntProfile;
   Schema := ToolsSchema;
   try
     Check(Pos('"input_schema"', Schema.ToJson) > 0, 'the schema serialises');

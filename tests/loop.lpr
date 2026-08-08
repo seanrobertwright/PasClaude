@@ -1713,6 +1713,159 @@ begin
   end;
 end;
 
+
+{ ------------------------------------------------------ credential refresh -- }
+
+{ What the 401 hook hands back, and how often it was asked.  Module-level
+  because TAuthRefreshFn is a plain function variable, the same shape as
+  uHttp.HttpTransport. }
+var
+  RefreshKey: string = '';
+  RefreshCalls: Integer = 0;
+  { When set, every call hands back a DIFFERENT key - two dead credentials
+    alternating, which is the shape an unbounded refresh loop would need. }
+  RefreshVary: Boolean = False;
+
+function FakeRefresh: string;
+begin
+  Inc(RefreshCalls);
+  if RefreshVary then
+    Result := RefreshKey + IntToStr(RefreshCalls)
+  else
+    Result := RefreshKey;
+end;
+
+{ A rejected credential is not a busy server.  401 stays out of Transient(),
+  so the ONLY way a request is ever sent twice for it is the auth hook, and
+  the hook is capped at one use per request.
+
+  Two failures this pins.  First an unbounded refresh loop: two dead sources
+  alternating would, without the cap, produce request after request forever.
+  Second a widened test - if the retry ever fired on any 4xx it would replay
+  a rejected request against a permission error, which is both useless and
+  the wrong thing to do to a 403. }
+procedure TestAuthRefreshOn401;
+
+  { One turn with a scripted 401 on the first call.  Returns how many
+    requests the transport saw. }
+  function RunTurn(const StartKey, NewKey: string; Wire: Boolean;
+    Status, FailFor: Integer): Integer;
+  var
+    A: TAgent;
+    Err: string;
+  begin
+    ResetScript;
+    uTools.RootDir := SessionDir;
+    RefreshKey := NewKey;
+    RefreshCalls := 0;
+    SetLength(Replies, 2);
+    Replies[0] := TextReply('never reached');
+    Replies[1] := TextReply('second time lucky');
+    FailAfter := 0;
+    FailUntil := FailFor;
+    FailStatus := Status;
+    FailBody := '{"type":"error","error":{"type":"authentication_error",' +
+                '"message":"invalid x-api-key"}}';
+    A := TAgent.Create(StartKey, 'm', 'sys');
+    A.OnText := @CapText;
+    A.OnNotice := @CapNotice;
+    if Wire then A.OnAuthRefresh := @FakeRefresh;
+    try
+      A.Send('hello', Err);
+      Result := Length(Requests);
+    finally
+      A.Free;
+      FailAfter := -1;
+      FailUntil := 0;
+      FailStatus := 529;
+      FailBody := '';
+    end;
+  end;
+
+var
+  N: Integer;
+begin
+  N := RunTurn('sk-ant-api03-dead', 'sk-ant-api03-live', True, 401, 1);
+  Check(N = 2, 'a 401 with a different key available is retried exactly once');
+  Check(RefreshCalls = 1, 'and the hook was consulted exactly once');
+  Check(Pos('x-api-key: sk-ant-api03-live', ReqHeaders[1]) > 0,
+    'the second request carries the new credential');
+  Check(Pos('x-ant', Prose) = 0, 'and no key reaches the visible output');
+
+  { The three ways the hook can decline.  Each must leave exactly one
+    request: a retry with the same key would fail identically, and a retry
+    with no key would fail worse. }
+  N := RunTurn('sk-ant-api03-dead', 'sk-ant-api03-dead', True, 401, 1);
+  Check(N = 1, 'a hook returning the same key does not cause a second request');
+  N := RunTurn('sk-ant-api03-dead', '', True, 401, 1);
+  Check(N = 1, 'nor does one returning nothing');
+  N := RunTurn('sk-ant-api03-dead', 'sk-ant-api03-live', False, 401, 1);
+  Check(N = 1, 'nor does an unwired hook');
+  Check(RefreshCalls = 0, 'which is never called at all');
+
+  { Not every 4xx.  A 403 is a permission error and a 400 is a bad request;
+    replaying either against a fresh credential is meaningless. }
+  N := RunTurn('sk-ant-api03-dead', 'sk-ant-api03-live', True, 403, 1);
+  Check(N = 1, 'a 403 is not an authentication failure and is not retried');
+  Check(RefreshCalls = 0, 'and the hook is not even consulted');
+  N := RunTurn('sk-ant-api03-dead', 'sk-ant-api03-live', True, 400, 1);
+  Check(N = 1, 'and neither is a 400');
+  Check(RefreshCalls = 0, 'nor is the hook consulted for one');
+
+  { The bound itself.  Every request 401s and the hook hands back a fresh,
+    equally dead key each time - the exact shape that would loop if the cap
+    were ever lost in a refactor.  Two requests, no more, and the hook asked
+    once. }
+  RefreshVary := True;
+  try
+    N := RunTurn('sk-ant-api03-dead', 'sk-ant-api03-alsodead', True, 401, 99);
+    Check(N = 2, 'endlessly rotating dead credentials still cost two requests');
+    Check(RefreshCalls = 1, 'because the hook is asked once per request');
+  finally
+    RefreshVary := False;
+  end;
+end;
+
+{ The credential must never reach the project tree.  session.json lives in
+  <root>\.pasclaude, where SafePath does not protect it and git might carry
+  it - so a future SaveSession that helpfully recorded the key beside the
+  model, to make /resume "just work", would be putting a secret in a
+  repository. }
+procedure TestSessionCarriesNoCredential;
+const
+  Secret = 'sk-ant-api03-mustnotbesavedanywhere';
+var
+  A: TAgent;
+  Err, Path, Body: string;
+  L: TStringList;
+begin
+  ResetScript;
+  uTools.RootDir := SessionDir;
+  SetLength(Replies, 1);
+  Replies[0] := TextReply('saved');
+  A := TAgent.Create(Secret, 'm', 'sys');
+  A.OnText := @CapText;
+  try
+    A.Send('remember this', Err);
+    Path := IncludeTrailingPathDelimiter(SessionDir) + 'cred-session.json';
+    Check(A.SaveSession(Path, Err), 'the session saves');
+    L := TStringList.Create;
+    try
+      L.LoadFromFile(Path);
+      Body := L.Text;
+    finally
+      L.Free;
+    end;
+    Check(Pos(Secret, Body) = 0,
+      'and the saved file contains no part of the credential');
+    Check(Pos('sk-ant', Body) = 0, 'not even the prefix');
+    Check(Pos(Secret, A.Transcript) = 0,
+      'and neither does the transcript that was written');
+    SysUtils.DeleteFile(Path);
+  finally
+    A.Free;
+  end;
+end;
 { A subscription OAuth token changes how a request authenticates and what
   its system prompt opens with; everything else must stay identical. }
 procedure TestOauthRequestShape;
@@ -3742,6 +3895,8 @@ begin
   TestContextTokens;
   TestThinkingBudgetInRequest;
   TestOauthRequestShape;
+  TestAuthRefreshOn401;
+  TestSessionCarriesNoCredential;
   TestWebSearchDeclaration;
   TestPauseTurnResumes;
   TestWebSearchRejectionSelfHeals;

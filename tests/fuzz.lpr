@@ -8,8 +8,8 @@ program fuzz;
 
 {$mode objfpc}{$H+}
 
-uses SysUtils, Classes, Windows, uJson, uSettings, uMcp, uHooks, uSandbox,
-  uTools, uImage, uAgent, uHttp, uSdk;
+uses SysUtils, Classes, Windows, uJson, uSettings, uAuth, uMcp, uHooks,
+  uSandbox, uTools, uImage, uAgent, uHttp, uSdk;
 
 var
   Fails: Integer = 0;
@@ -3574,6 +3574,192 @@ end;
   leave no block behind - the last of which is what -gh is here for, because
   the parser has an early exit on nearly every line and each one has to get
   past the same Root.Free. }
+
+{ ---------------------------------------------------- hostile credentials -- }
+
+function SetEnvVar(Name, Value: PChar): LongBool; stdcall;
+  external 'kernel32' name 'SetEnvironmentVariableA';
+
+procedure PutFile(const Path, Text: string);
+var
+  F: TFileStream;
+begin
+  ForceDirectories(ExtractFilePath(Path));
+  F := TFileStream.Create(Path, fmCreate);
+  try
+    if Text <> '' then F.WriteBuffer(Text[1], Length(Text));
+  finally
+    F.Free;
+  end;
+end;
+
+{ Anyone who can write %LOCALAPPDATA% could hand-write a credential file.
+  The loader accepts exactly one shape - version 1, protected "dpapi", a
+  base64 value DPAPI itself will decrypt - and everything else degrades to
+  "no stored credential" rather than to a credential of the attacker's
+  choosing.  The protected:"none" case is the one that matters most: a
+  loader that read the value when it was not protected would let a
+  hand-written file inject any key at all. }
+procedure TestHostileCredentialFile;
+var
+  Base, SavedLocal, Err: string;
+  Info: TAuthInfo;
+  I: Integer;
+
+  procedure Stored(const Body, What: string);
+  var
+    List: TAuthInfoArray;
+    J: Integer;
+  begin
+    PutFile(Base + PathDelim + 'pasclaude' + PathDelim + 'credential.json',
+      Body);
+    List := uAuth.AuthList;
+    for J := 0 to High(List) do
+      if List[J].Source = asStored then
+      begin
+        Check(not List[J].Present, What);
+        Check(List[J].Token = '', What + ' - and hands back no token');
+        Exit;
+      end;
+    Check(False, What + ' - the stored source was not in the listing');
+  end;
+
+begin
+  Base := IncludeTrailingPathDelimiter(SessionDir) + 'credhome';
+  SavedLocal := SysUtils.GetEnvironmentVariable('LOCALAPPDATA');
+  try
+    ForceDirectories(Base);
+    SetEnvVar('LOCALAPPDATA', PChar(Base));
+
+    Stored('', 'an empty credential file yields nothing');
+    Stored('{', 'a truncated one yields nothing');
+    Stored('not json at all', 'and one that is not JSON');
+    Stored('[1,2,3]', 'and one that is not even an object');
+    Stored('{"version":99,"protected":"dpapi","value":"AAAA"}',
+      'a version this build does not understand is refused');
+    Stored('{"version":1,"protected":"none","value":"c2stYW50LWluamVjdGVk"}',
+      'an UNPROTECTED value is never used as a key');
+    Stored('{"version":1,"value":"c2stYW50LWluamVjdGVk"}',
+      'and neither is one with no protection field at all');
+    Stored('{"version":1,"protected":"dpapi","value":"not base64 !!!"}',
+      'a value that is not base64 is refused');
+    Stored('{"version":1,"protected":"dpapi","value":"AAAAAAAAAAAA"}',
+      'and base64 that DPAPI will not decrypt is treated as absent');
+
+    { Oversized: four megabytes of value.  It must be refused on size rather
+      than decoded and handed to the crypto layer. }
+    Err := '';
+    SetLength(Err, 4 * 1024 * 1024);
+    for I := 1 to Length(Err) do Err[I] := 'A';
+    Stored('{"version":1,"protected":"dpapi","value":"' + Err + '"}',
+      'and a four-megabyte value is refused rather than decoded');
+    Err := '';
+
+    { A file that is nothing but a preference is legal and must not be read
+      as a broken credential. }
+    PutFile(Base + PathDelim + 'pasclaude' + PathDelim + 'credential.json',
+      '{"version":1,"prefer":"jcode"}');
+    Check(uAuth.AuthPrefer = 'jcode', 'a preference-only file still parses');
+    PutFile(Base + PathDelim + 'pasclaude' + PathDelim + 'credential.json',
+      '{"version":1,"prefer":"../../elsewhere"}');
+    Check(uAuth.AuthPrefer = '',
+      'and a preference naming no real source is no preference');
+
+    { Nothing above may have crashed resolution. }
+    uAuth.AuthResolve(Info);
+    Check(True, 'and resolution survives every one of them');
+  finally
+    SetEnvVar('LOCALAPPDATA', PChar(SavedLocal));
+  end;
+end;
+
+{ The three foreign files.  A corrupt one must degrade to "no credential from
+  this source" and let resolution continue: a mangled .claude\.credentials.json
+  must not make pasclaude claim no credential exists when Jcode or the ant
+  profile would have worked.  These readers were unreachable from every suite
+  until they moved into uAuth; this test only exists because they did. }
+procedure TestHostileForeignCredentials;
+var
+  Home, Ant, SavedHome, SavedLocal, SavedDir, SavedProfile: string;
+
+  function Src(S: TAuthSource): TAuthInfo;
+  var
+    List: TAuthInfoArray;
+    J: Integer;
+  begin
+    Result.Source := asNone;
+    Result.Present := False;
+    Result.Token := '';
+    Result.Why := '';
+    List := uAuth.AuthList;
+    for J := 0 to High(List) do
+      if List[J].Source = S then Exit(List[J]);
+  end;
+
+begin
+  Home := IncludeTrailingPathDelimiter(SessionDir) + 'foreignhome';
+  Ant := IncludeTrailingPathDelimiter(SessionDir) + 'foreignant';
+  SavedHome := SysUtils.GetEnvironmentVariable('USERPROFILE');
+  SavedLocal := SysUtils.GetEnvironmentVariable('LOCALAPPDATA');
+  SavedDir := SysUtils.GetEnvironmentVariable('ANTHROPIC_CONFIG_DIR');
+  SavedProfile := SysUtils.GetEnvironmentVariable('ANTHROPIC_PROFILE');
+  try
+    ForceDirectories(Home);
+    SetEnvVar('USERPROFILE', PChar(Home));
+    SetEnvVar('LOCALAPPDATA', PChar(Home));
+    SetEnvVar('ANTHROPIC_CONFIG_DIR', PChar(Ant));
+    SetEnvVar('ANTHROPIC_PROFILE', PChar('default'));
+
+    PutFile(Home + PathDelim + '.claude' + PathDelim + '.credentials.json',
+      '{"claudeAiOauth":');
+    Check(not Src(asClaudeCode).Present,
+      'a truncated Claude Code file yields no credential');
+    Check(Src(asClaudeCode).Why <> '', 'and says why');
+    PutFile(Home + PathDelim + '.claude' + PathDelim + '.credentials.json',
+      '{"somethingElse":{"accessToken":"sk-ant-oat01-wrongshape0000"}}');
+    Check(not Src(asClaudeCode).Present, 'and neither does the wrong shape');
+    PutFile(Home + PathDelim + '.claude' + PathDelim + '.credentials.json',
+      '{"claudeAiOauth":{"expiresAt":4102444800000}}');
+    Check(not Src(asClaudeCode).Present,
+      'nor an OAuth entry with no token in it');
+    PutFile(Home + PathDelim + '.claude' + PathDelim + '.credentials.json',
+      '{"claudeAiOauth":{"accessToken":"sk-ant-oat01-x","expiresAt":1}}');
+    Check(not Src(asClaudeCode).Present, 'nor an expired one');
+    Check(Pos('expired', Src(asClaudeCode).Why) > 0, 'which says so');
+
+    PutFile(Home + PathDelim + '.jcode' + PathDelim + 'auth.json',
+      #$C3#$28'not utf-8 and not json');
+    Check(not Src(asJcode).Present, 'a Jcode file of raw bytes yields nothing');
+    PutFile(Home + PathDelim + '.jcode' + PathDelim + 'auth.json',
+      '{"anthropic_accounts":[]}');
+    Check(not Src(asJcode).Present, 'and neither does an empty account list');
+    PutFile(Home + PathDelim + '.jcode' + PathDelim + 'auth.json',
+      '{"anthropic_accounts":"not an array"}');
+    Check(not Src(asJcode).Present, 'nor an accounts field of the wrong type');
+
+    PutFile(Ant + PathDelim + 'credentials' + PathDelim + 'default.json',
+      '{"access_token":');
+    Check(not Src(asAntProfile).Present,
+      'a truncated ant profile yields nothing');
+    PutFile(Ant + PathDelim + 'credentials' + PathDelim + 'default.json',
+      '{"version":1}');
+    Check(not Src(asAntProfile).Present, 'and neither does one with no token');
+
+    { The whole point: with two of the three corrupt, the third still
+      answers.  A single bad file must not abort the chain. }
+    PutFile(Ant + PathDelim + 'credentials' + PathDelim + 'default.json',
+      '{"access_token":"sk-ant-oat01-thesurvivor0000"}');
+    Check(Src(asAntProfile).Present,
+      'with two foreign files corrupt the third is still found');
+    Check(Src(asAntProfile).Token = 'sk-ant-oat01-thesurvivor0000',
+      'and hands back its token');
+  finally
+    SetEnvVar('USERPROFILE', PChar(SavedHome));
+    SetEnvVar('LOCALAPPDATA', PChar(SavedLocal));
+    SetEnvVar('ANTHROPIC_CONFIG_DIR', PChar(SavedDir));
+    SetEnvVar('ANTHROPIC_PROFILE', PChar(SavedProfile));
+  end;
+end;
 procedure TestSettingsHostile;
 var
   P: TStringArray;
@@ -3775,6 +3961,8 @@ begin
   TestSandboxEnvBlock;
   TestSettingsHostile;
   TestModelSettingsHostile;
+  TestHostileCredentialFile;
+  TestHostileForeignCredentials;
   uTools.ClearWorkingDirs;
   uSandbox.SandboxShutdown;
 

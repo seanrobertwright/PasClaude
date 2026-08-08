@@ -66,6 +66,20 @@ function MdMidLine: Boolean;
   is a safety property and not an oversight. }
 function ReadLineEdit(const Prompt: string; out Line: string): Boolean;
 
+{ Reads one line WITHOUT echoing anything at all - not the characters, not
+  asterisks.  A mask is not free: it publishes the secret's length to anyone
+  looking at the screen or at a terminal recording, and length is most of
+  what an attacker wants to know about a key.  The prompt therefore has to
+  say that typing is not shown, because a terminal that prints nothing looks
+  like a terminal that has hung, and a user who thinks it hung pastes twice.
+
+  False on Esc, on Ctrl+C, and immediately when stdin is not a console - a
+  scripted run has nobody to type, and a reader that blocked there would hang
+  the run forever.  Nothing read here reaches the history: this reader does
+  not call HistoryAdd and does not go through the prompt profile, so no
+  binding table can be pointed at it. }
+function ReadSecretLine(const Prompt: string; out Secret: string): Boolean;
+
 { True when a key is waiting; used to let the user interrupt a stream. }
 function EscPressed: Boolean;
 
@@ -2018,6 +2032,80 @@ function ReadPromptLine(const Prompt: string; out Line: string): Boolean;
 begin
   { THE one read of PromptProfile in the program. }
   Result := ReadLineCore(Prompt, PromptProfile, Line);
+end;
+
+function ReadSecretLine(const Prompt: string; out Secret: string): Boolean;
+var
+  Mode: DWORD;
+  Rec: INPUT_RECORD;
+  NRead: DWORD = 0;
+  Ch: WideChar;
+  Ctrl: Boolean;
+  W: WideString;
+begin
+  Secret := '';
+  Result := False;
+  { Refused rather than attempted off a pipe.  ReadLineCore falls back to
+    ReadLn there; this must not, because the fallback would echo the secret
+    into whatever is reading the console's output and because a -p run has
+    nobody to answer. }
+  if not StdinIsConsole then Exit;
+  EmitC(clCyan, Prompt);
+  GetConsoleMode(HIn, Mode);
+  { Raw, for the same reason the editor is: cooked mode would echo. }
+  SetConsoleMode(HIn, 0);
+  try
+    W := '';
+    repeat
+      if not ReadConsoleInputW(HIn, Rec, 1, NRead) or (NRead = 0) then Exit;
+      if (Rec.EventType <> KEY_EVENT) or not Rec.Event.KeyEvent.bKeyDown then
+        Continue;
+      Ctrl := (Rec.Event.KeyEvent.dwControlKeyState and
+               (LEFT_CTRL_PRESSED or RIGHT_CTRL_PRESSED)) <> 0;
+      case Rec.Event.KeyEvent.wVirtualKeyCode of
+        VK_RETURN:
+          begin
+            Emit(#10);
+            Secret := UTF8Encode(W);
+            Exit(True);
+          end;
+        VK_ESCAPE:
+          begin
+            Emit(#10);
+            Exit(False);
+          end;
+        VK_BACK:
+          begin
+            if Length(W) > 0 then SetLength(W, Length(W) - 1);
+            Continue;
+          end;
+      end;
+      Ch := WideChar(Rec.Event.KeyEvent.UnicodeChar);
+      { Ctrl+C quits, Ctrl+U clears - the two the plain editor also honours,
+        so muscle memory does not produce a key with a stray control
+        character wedged into it. }
+      if Ctrl and ((Ch = #3) or (Ch = 'c') or (Ch = 'C')) then
+      begin
+        Emit(#10);
+        Exit(False);
+      end;
+      if Ctrl and ((Ch = #21) or (Ch = 'u') or (Ch = 'U')) then
+      begin
+        W := '';
+        Continue;
+      end;
+      { Everything below space is a control code, and a key never contains
+        one; dropping them here is also what keeps a bracketed-paste burst
+        from wedging escape sequences into the middle of the value. }
+      if Ch < ' ' then Continue;
+      W := W + Ch;
+      { Deliberately no Emit.  This is the whole point of the reader. }
+    until False;
+  finally
+    { Restored even on Esc, on Ctrl+C and on an exception, or a cancelled
+      /login would leave the console in raw mode for the rest of the run. }
+    SetConsoleMode(HIn, Mode);
+  end;
 end;
 
 end.

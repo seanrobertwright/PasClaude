@@ -37,6 +37,11 @@ type
   TToolProc = procedure(const Name, Detail: string);
   { Polled while a response streams; True abandons the request. }
   TCancelProc = function: Boolean;
+  { Asked for a credential after one was refused.  Returns '' when there is
+    no better one - this unit never treats that as an error, only as "do not
+    retry".  A plain function variable, not a method pointer, so the host can
+    wire a top-level function the way it wires HttpTransport. }
+  TAuthRefreshFn = function: string;
   { Fires in RunTools with the tool's id and its effective input JSON - what
     RunTool will actually be given, after this unit's own repair of an
     unparseable argument stream.  The console never needed the id, because a
@@ -134,6 +139,11 @@ type
       every Send, so it always describes the most recent turn and never a
       stale one. }
     FTurnCancelled: Boolean;
+    { Whether this request has already spent its one auth retry.  Reset per
+      SendWithRetry call rather than per turn, which is the strictly tighter
+      bound: two dead sources alternating cannot loop, because the second
+      attempt is the last one this request gets. }
+    FAuthRefreshed: Boolean;
 
     { The cancel test every poll site uses.  ShouldCancel is consume-on-read
       in the host (CtrlCPressed clears the flag as it answers), so a subagent
@@ -154,6 +164,17 @@ type
     { What the role's model was resolved FROM - the alias name when there is
       one, so a failure can name it. }
     function RoleSource(Role: TModelRole): string;
+
+    { True when the credential in hand is a subscription OAuth token rather
+      than an API key.  Extracted because the same Copy() test used to be
+      written out at three call sites - the messages request, the models
+      request and the system-block builder - and a fourth request path would
+      have had to remember all three.  One function means it cannot drift. }
+    function IsOauth: Boolean;
+    { Consults OnAuthRefresh after a 401, at most once per request, and
+      installs a genuinely different key.  True when it did, meaning the
+      caller should try the same request again. }
+    function TryAuthRefresh(const Err: string): Boolean;
 
     function BuildBody: string;
     { Turns web search off after the server refused the declaration, so the
@@ -212,6 +233,17 @@ type
     Ask: TAskProc;
     { Polled between chunks so the user can abandon a long reply. }
     ShouldCancel: TCancelProc;
+    { Consulted ONLY on an HTTP 401, and at most once per request.  Nil by
+      default and never assigned by this unit - the uHttp.HttpTransport
+      pattern.  The host wires it to a credential re-resolve, so a token the
+      owning program refreshed on disk mid-session is picked up without a
+      restart; re-reading another program's file is not writing it.
+
+      401 is deliberately NOT added to Transient(): a rejected credential is
+      not a busy server, and retrying the same key would fail identically.
+      The retry happens only when the callback hands back a non-empty key
+      that DIFFERS from the one that was just refused. }
+    OnAuthRefresh: TAuthRefreshFn;
 
     constructor Create(const ApiKey, AModel, SystemPrompt: string);
     destructor Destroy; override;
@@ -293,6 +325,16 @@ type
       unexpanded: /resume round-trips the profile, not a snapshot of whichever
       half happened to be active when the session was saved. }
     property Model: string read FModel write FModel;
+    { Write-only, and uAuth is its only legitimate source.  It exists so
+      /login takes effect without a restart - before it, FApiKey was set once
+      in Create and a user who logged in mid-session would have gone on
+      401ing until they restarted.  Write-only because nothing outside the
+      credential layer has any business READING the key back out of the
+      agent, and a getter is exactly the accessor a future feature would
+      reach for on its way to putting the secret somewhere it does not
+      belong.  Anything that plumbs a project-derived string in here has
+      defeated the whole of uAuth. }
+    property ApiKey: string write FApiKey;
     { Asks the API which models this key can use.  Empty with Err set when
       the endpoint could not be reached or the answer was not understood. }
     function ListModels(out Err: string): TModelList;
@@ -1148,6 +1190,11 @@ begin
   FRole := mrMain;
 end;
 
+function TAgent.IsOauth: Boolean;
+begin
+  Result := Copy(FApiKey, 1, Length(OauthKeyPrefix)) = OauthKeyPrefix;
+end;
+
 function TAgent.WantsCancel: Boolean;
 begin
   Result := ForceCancel or (Assigned(ShouldCancel) and ShouldCancel());
@@ -1310,7 +1357,7 @@ begin
   Result := nil;
   Err := '';
 
-  if Copy(FApiKey, 1, Length(OauthKeyPrefix)) = OauthKeyPrefix then
+  if IsOauth then
     Headers :=
       'authorization: Bearer ' + FApiKey + #13#10 +
       'anthropic-beta: ' + OauthBeta + #13#10 +
@@ -1645,7 +1692,7 @@ begin
       { Under an OAuth token the API insists the system prompt open with
         Claude Code's own identity line, exactly.  It goes in as its own
         block ahead of ours, which continues unchanged. }
-      if Copy(FApiKey, 1, Length(OauthKeyPrefix)) = OauthKeyPrefix then
+      if IsOauth then
       begin
         SysBlock := TJson.NewObj;
         SysBlock.AddStr('type', 'text');
@@ -1776,7 +1823,7 @@ begin
 
   { A subscription OAuth token authenticates as a Bearer with its beta flag;
     an API key rides the x-api-key header.  Same endpoint either way. }
-  if Copy(FApiKey, 1, Length(OauthKeyPrefix)) = OauthKeyPrefix then
+  if IsOauth then
     Headers :=
       'authorization: Bearer ' + FApiKey + #13#10 +
       'anthropic-beta: ' + OauthBeta + #13#10 +
@@ -2068,7 +2115,12 @@ end;
 { A saved session is the transcript plus enough context to tell whether
   resuming it makes sense.  The API key is deliberately not stored: it belongs
   in the environment, and writing it into a file inside the user's project is
-  how secrets end up committed. }
+  how secrets end up committed.  Still true now that a credential can also
+  come from uAuth's own store - MORE true, since the whole point of that
+  store is that the secret lives out of tree under DPAPI, and a copy of it in
+  <root>\.pasclaude\session.json would be one SafePath does not protect and
+  git might.  There is a test pinning this; the field this comment describes
+  is the one that must never be added. }
 function TAgent.SaveSession(const Path: string; out Err: string): Boolean;
 var
   Root, Msgs, M: TJson;
@@ -2320,16 +2372,60 @@ begin
             (Pos('HTTP 503', Err) > 0) or (Pos('HTTP 504', Err) > 0);
 end;
 
+{ True for an authentication failure and nothing else.  A 403 is a
+  permission error and a 400 is a bad request; replaying either against a new
+  credential would just fail again, and widening this test is the specific
+  mistake that turns one clear refusal into a retry storm. }
+function IsUnauthorized(const Err: string): Boolean;
+begin
+  { The status alone, deliberately.  Matching the API's error TYPE as well
+    would look more generous and be wrong: the body is attacker-adjacent
+    text that arrives with any status, so an error_type test would let a 403
+    or a 400 carrying the word authentication_error trigger a replay. }
+  Result := Pos('HTTP 401', Err) > 0;
+end;
+
+function TAgent.TryAuthRefresh(const Err: string): Boolean;
+var
+  NewKey: string;
+begin
+  Result := False;
+  if FAuthRefreshed then Exit;
+  if not IsUnauthorized(Err) then Exit;
+  if not Assigned(OnAuthRefresh) then Exit;
+  { Marked spent BEFORE the callback runs, so a callback that throws or that
+    keeps handing back fresh-but-dead keys still cannot produce a third
+    request. }
+  FAuthRefreshed := True;
+  NewKey := OnAuthRefresh();
+  { A key identical to the one just refused would fail identically; an empty
+    one means the host found nothing better. }
+  if (NewKey = '') or (NewKey = FApiKey) then Exit;
+  FApiKey := NewKey;
+  if Assigned(OnNotice) then
+    OnNotice('the credential was refused; retrying with a newly resolved one');
+  Result := True;
+end;
+
 { Sends one request, retrying transient failures with a widening delay. }
 function TAgent.SendWithRetry(out Blocks: TPartialBlocks;
   out StopReason, Err: string; out Cancelled: Boolean): Boolean;
 var
   Attempt, Wait: Integer;
 begin
+  FAuthRefreshed := False;
   for Attempt := 0 to MaxRetries do
   begin
     Result := SendOnce(Blocks, StopReason, Err, Cancelled);
     if Result or Cancelled then Exit;
+    { Before the Transient test, because 401 is not transient and must not
+      become so.  This is an immediate re-send with a different credential,
+      not a backoff: there is nothing to wait for. }
+    if TryAuthRefresh(Err) then
+    begin
+      Result := SendOnce(Blocks, StopReason, Err, Cancelled);
+      if Result or Cancelled then Exit;
+    end;
     if not Transient(Err) then Exit;
     if Attempt = MaxRetries then Exit;
 

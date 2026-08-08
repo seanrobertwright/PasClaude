@@ -10,8 +10,8 @@ program pasclaude;
 {$mode objfpc}{$H+}
 
 uses
-  Windows, SysUtils, Classes, DateUtils, uTerm, uJson, uSettings, uHttp, uMcp,
-  uHooks, uSandbox, uTools, uImage, uAgent, uSdk;
+  Windows, SysUtils, Classes, DateUtils, uTerm, uJson, uSettings, uAuth,
+  uHttp, uMcp, uHooks, uSandbox, uTools, uImage, uAgent, uSdk;
 
 const
   Version = '0.1';
@@ -51,6 +51,22 @@ var
   { What the banner says about how the session authenticates; '' for a
     plain API key, which is the unremarkable case. }
   BannerAuth: string = '';
+  { The credential in force, as uAuth resolved it at startup or as /login
+    re-resolved it since.  Its Token field is the one copy this file holds
+    and it is never printed, never written and never put in a message - only
+    Source, Path and Hint are display material.  It exists so a 401 can say
+    which of six sources was refused instead of leaving the user to guess. }
+  ActiveAuth: TAuthInfo;
+  { Set by /logout when it removed the only credential there was.  Every
+    request path has to honour it, or the same session produces three
+    different confusing errors - a main turn, a subagent and /model would
+    each 401 separately - where one local refusal is the honest answer. }
+  NoCredential: Boolean = False;
+  { True for -p and for every SDK output format: a run with no human at the
+    keyboard.  Set beside PrintMode in the argv loop and declared up here
+    rather than in the main block, because the two commands that must refuse
+    in a scripted run are defined long before that block is. }
+  ScriptedRun: Boolean = False;
   { True once /yolo ran.  The permissions save skips these sessions
     wholesale, because yolo's blanket flags and real per-answer approvals
     are the same variables, and only the latter deserve to persist. }
@@ -211,12 +227,13 @@ end;
 { ------------------------------------------------------------- completion -- }
 
 const
-  SlashCommands: array[0..33] of string = (
+  SlashCommands: array[0..35] of string = (
     '/help', '/clear', '/compact', '/config', '/deny', '/diff', '/hooks',
     '/jobs', '/mcp', '/memory', '/init', '/mode', '/plan', '/rewind',
     '/sandbox', '/sessions', '/skills', '/plugins', '/think', '/web',
     '/add-dir', '/remove-dir', '/resume', '/save', '/cwd', '/model', '/yolo',
-    '/cost', '/output-style', '/paste', '/vim', '/keys', '/exit', '/quit');
+    '/cost', '/output-style', '/paste', '/vim', '/keys', '/login', '/logout',
+    '/exit', '/quit');
 
 { Candidates for the token being completed: slash commands when the token
   opens the line with a slash, file and directory names under the session
@@ -632,6 +649,10 @@ begin
   EmitCLn(clGrey,   '  /config        settings and where each value came from;');
   EmitCLn(clGrey,   '                 get <k>, set [--local] <k> <v>, unset, reload');
   EmitCLn(clGrey,   '  /cost          tokens used so far');
+  EmitCLn(clGrey,   '  /login [key]   which credential answers; key stores one of');
+  EmitCLn(clGrey,   '                 pasclaude''s own, encrypted, out of the project');
+  EmitCLn(clGrey,   '  /logout        remove that stored credential (only that one:');
+  EmitCLn(clGrey,   '                 Claude Code''s and Jcode''s are read, never written)');
   EmitCLn(clGrey,   '  /exit          quit (Ctrl+C also works)');
   EmitLn;
   EmitCLn(clGrey,   '  Esc during a reply stops it.');
@@ -926,17 +947,13 @@ begin
   end;
 end;
 
-{ A Claude subscription can stand in for an API key.  Two programs on this
-  machine may hold its OAuth token: Claude Code (~\.claude\.credentials.json)
-  and Jcode (~\.jcode\auth.json).  Whichever has a live token wins; both
-  files are read-only here - refreshing is their owner's job, and this
-  program must never write into another program's state.  Returns '' when
-  no usable token exists anywhere, with Why saying what was found. }
-
-function NowUnixMs: Int64;
-begin
-  Result := Round((LocalTimeToUniversal(Now) - EncodeDate(1970, 1, 1)) * MSecsPerDay);
-end;
+{ Credentials live in uAuth now.  Lifting the readers out of this file is
+  most of what /login is worth: while TokenFromClaudeCode and TokenFromJcode
+  lived here they were unreachable from all five suites, so two parsers for
+  two other programs' JSON - expiry handling included - had no coverage at
+  all.  The Why strings they produced are preserved word for word in uAuth,
+  because they are the one thing a user with no working credential ever
+  reads. }
 
 function ReadFileText(const Path: string; out Text: string): Boolean;
 var
@@ -958,6 +975,8 @@ begin
     Result := False;
   end;
 end;
+
+
 
 { Reads keys.json if it is there, reports every refused entry, and installs
   the result.  A missing file is the built-in defaults in silence; a broken
@@ -1023,106 +1042,6 @@ begin
   KeysFileFound := True;
   Result := True;
 end;
-
-{ Claude Code's file: {"claudeAiOauth":{"accessToken","expiresAt",...}}. }
-function TokenFromClaudeCode(out Why: string): string;
-var
-  Text: string;
-  Root, OAuth: TJson;
-  ExpiresMs: Int64;
-begin
-  Result := '';
-  Why := 'no Claude Code credentials';
-  if not ReadFileText(IncludeTrailingPathDelimiter(
-    GetEnvironmentVariable('USERPROFILE')) + '.claude' + PathDelim +
-    '.credentials.json', Text) then Exit;
-  Root := JsonParse(Text);
-  if Root = nil then
-  begin
-    Why := 'Claude Code credentials are not valid JSON';
-    Exit;
-  end;
-  try
-    OAuth := Root.Find('claudeAiOauth');
-    if OAuth = nil then
-    begin
-      Why := 'no OAuth entry in the Claude Code credentials';
-      Exit;
-    end;
-    ExpiresMs := Round(OAuth.Num('expiresAt', 0));
-    if (ExpiresMs > 0) and (NowUnixMs > ExpiresMs) then
-    begin
-      Why := 'the Claude Code token has expired';
-      Exit;
-    end;
-    Result := OAuth.Str('accessToken');
-    if Result = '' then Why := 'the Claude Code credentials hold no token';
-  finally
-    Root.Free;
-  end;
-end;
-
-{ Jcode's file: {"anthropic_accounts":[{"access","expires",...}]}. }
-function TokenFromJcode(out Why: string): string;
-var
-  Text: string;
-  Root, Accts, A: TJson;
-  I: Integer;
-  ExpiresMs: Int64;
-begin
-  Result := '';
-  Why := 'no Jcode credentials';
-  if not ReadFileText(IncludeTrailingPathDelimiter(
-    GetEnvironmentVariable('USERPROFILE')) + '.jcode' + PathDelim +
-    'auth.json', Text) then Exit;
-  Root := JsonParse(Text);
-  if Root = nil then
-  begin
-    Why := 'Jcode credentials are not valid JSON';
-    Exit;
-  end;
-  try
-    Accts := Root.Find('anthropic_accounts');
-    if (Accts = nil) or (Accts.Kind <> jkArr) or (Accts.Count = 0) then
-    begin
-      Why := 'no accounts in the Jcode credentials';
-      Exit;
-    end;
-    { The first account with a live token; expired ones are skipped rather
-      than reported, since a later account may still work. }
-    for I := 0 to Accts.Count - 1 do
-    begin
-      A := Accts.Item(I);
-      if A.Str('access') = '' then Continue;
-      ExpiresMs := Round(A.Num('expires', 0));
-      if (ExpiresMs > 0) and (NowUnixMs > ExpiresMs) then Continue;
-      Exit(A.Str('access'));
-    end;
-    Why := 'every Jcode token has expired';
-  finally
-    Root.Free;
-  end;
-end;
-
-function SubscriptionToken(out Why: string): string;
-var
-  WhyCc, WhyJc: string;
-begin
-  Result := TokenFromClaudeCode(WhyCc);
-  if Result <> '' then
-  begin
-    Why := '';
-    Exit;
-  end;
-  Result := TokenFromJcode(WhyJc);
-  if Result <> '' then
-  begin
-    Why := '';
-    Exit;
-  end;
-  Why := WhyCc + '; ' + WhyJc;
-end;
-
 
 { What this session changed.  git diff --stat is the richer answer when
   there is a repository - it also sees compiler output and hand edits - so
@@ -2447,6 +2366,225 @@ begin
   EmitCLn(clGrey, '  {"vim":true,"bindings":{"ctrl+w":"delete-word-left"}}');
 end;
 
+{ ------------------------------------------------------------ credential -- }
+
+{ Re-resolves and installs whatever uAuth now says should answer.  Called
+  after /login and /logout so a change takes effect on the next turn instead
+  of the next run, and wired to Agent.OnAuthRefresh so a token another
+  program refreshed on disk is picked up after a 401.  Re-reading another
+  program's file is not writing it: the hard boundary is untouched. }
+function ReResolveAuth: Boolean;
+begin
+  Result := uAuth.AuthResolve(ActiveAuth);
+  NoCredential := not Result;
+  if Result then
+    Agent.ApiKey := ActiveAuth.Token
+  else
+    Agent.ApiKey := '';
+end;
+
+{ The 401 hook.  Returns '' when nothing better exists, which uAgent reads as
+  "do not retry" rather than as an error. }
+function AuthRefreshHook: string;
+begin
+  Result := '';
+  if uAuth.AuthResolve(ActiveAuth) then
+  begin
+    Result := ActiveAuth.Token;
+    NoCredential := False;
+  end;
+end;
+
+{ One row per source, in the order they are consulted, so the listing itself
+  explains why a pasted key is being ignored in favour of an exported
+  variable.  Six sources is a lot of surface for one question, and a listing
+  that does not make the order legible would have made auth harder to reason
+  about rather than easier.
+
+  It prints the hint and never the value.  A listing that showed the token to
+  help the user identify it would be putting a secret on the screen, in the
+  scrollback, and in any terminal recording of the session. }
+procedure ShowLoginList;
+var
+  List: uAuth.TAuthInfoArray;
+  I: Integer;
+  Mark, Pref: string;
+begin
+  List := uAuth.AuthList;
+  Pref := uAuth.AuthPrefer;
+  EmitCLn(clBright, 'Credential sources, in the order they are consulted');
+  for I := 0 to High(List) do
+  begin
+    if List[I].Source = ActiveAuth.Source then Mark := '*' else Mark := ' ';
+    if List[I].Present then
+      EmitCLn(clGrey, Format('  %s%d. %-16s %s', [Mark, I + 1,
+        uAuth.AuthSourceName(List[I].Source), List[I].Hint]))
+    else
+      EmitCLn(clGrey, Format('   %d. %-16s -', [I + 1,
+        uAuth.AuthSourceName(List[I].Source)]));
+    if List[I].Path <> '' then
+      EmitCLn(clGrey, '        ' + List[I].Path);
+    if List[I].Why <> '' then
+      EmitCLn(clYellow, '        ' + List[I].Why);
+  end;
+  EmitLn;
+  if ActiveAuth.Source <> uAuth.asNone then
+    EmitCLn(clGrey, '  * in use: ' + uAuth.AuthDescribe(ActiveAuth));
+  if Pref <> '' then
+    EmitCLn(clGrey, '  preferred: ' + Pref);
+  EmitCLn(clGrey, '  The two environment variables always win - a preference');
+  EmitCLn(clGrey, '  can only choose among sources this machine already has,');
+  EmitCLn(clGrey, '  never introduce one.  A number sets the preference,');
+  EmitCLn(clGrey, '  Enter keeps the current source, and /login key stores a');
+  EmitCLn(clGrey, '  key of pasclaude''s own under %LOCALAPPDATA%.');
+end;
+
+{ Stores a pasted key.  Nothing is echoed while it is typed, nothing reaches
+  the history, and nothing is written unless DPAPI protected it. }
+procedure LoginWithKey;
+var
+  Key, Err: string;
+begin
+  EmitCLn(clGrey, '  Paste an API key.  Typing is NOT shown - not even as');
+  EmitCLn(clGrey, '  asterisks, because the length of a key is worth hiding');
+  EmitCLn(clGrey, '  too.  Esc cancels.');
+  if not uTerm.ReadSecretLine('  key: ', Key) then
+  begin
+    EmitCLn(clGrey, '  cancelled; nothing was stored');
+    Exit;
+  end;
+  Key := Trim(Key);
+  if Key = '' then
+  begin
+    EmitCLn(clGrey, '  nothing entered; nothing was stored');
+    Exit;
+  end;
+  { Shape only.  A key this program cannot recognise may still be one the API
+    accepts, so an unfamiliar prefix is a warning and not a refusal - the
+    control characters are, because those cannot travel in a header at all. }
+  if Pos('sk-ant-', Key) <> 1 then
+    EmitCLn(clYellow, '  that does not look like an Anthropic key ' +
+      '(no sk-ant- prefix); storing it anyway');
+  if uAuth.AuthStore(Key, Err) then
+  begin
+    EmitCLn(clGrey, '  stored, DPAPI-protected, in ' + uAuth.CredentialStorePath);
+    EmitCLn(clGrey, '  hint ' + uAuth.AuthHint(Key) +
+      ' - only this Windows user on this machine can decrypt it');
+    if ReResolveAuth then
+      EmitCLn(clGrey, '  now using ' + uAuth.AuthDescribe(ActiveAuth));
+  end
+  else
+    EmitCLn(clRed, '  ' + Err);
+  { The local copy goes as soon as it has been handed over.  It still exists
+    in Agent.FApiKey and in the outbound header, which is unavoidable, but
+    there is no reason for a second copy to sit in this procedure's frame. }
+  Key := '';
+end;
+
+procedure DoLogin(const Arg: string);
+var
+  List: uAuth.TAuthInfoArray;
+  Choice_, Err: string;
+  N: Integer;
+begin
+  if ScriptedRun then
+  begin
+    EmitCLn(clYellow, '  /login is interactive; a scripted run has nobody ' +
+      'to answer it. Set ANTHROPIC_API_KEY, or run pasclaude ' +
+      'interactively once to store a credential.');
+    Exit;
+  end;
+  if LowerCase(Arg) = 'key' then
+  begin
+    LoginWithKey;
+    Exit;
+  end;
+  if Arg <> '' then
+  begin
+    EmitCLn(clRed, '  /login takes "key" or no argument');
+    Exit;
+  end;
+  ShowLoginList;
+  List := uAuth.AuthList;
+  EmitLn;
+  if not ReadLineEdit('  source (number, "key", or Enter to keep): ',
+    Choice_) then Exit;
+  Choice_ := Trim(Choice_);
+  if Choice_ = '' then Exit;
+  if LowerCase(Choice_) = 'key' then
+  begin
+    LoginWithKey;
+    Exit;
+  end;
+  N := StrToIntDef(Choice_, 0);
+  if (N < 1) or (N > Length(List)) then
+  begin
+    EmitCLn(clRed, '  not one of the numbers listed');
+    Exit;
+  end;
+  if uAuth.AuthSetPrefer(uAuth.AuthSourceName(List[N - 1].Source), Err) then
+  begin
+    EmitCLn(clGrey, '  preference recorded: ' +
+      uAuth.AuthSourceName(List[N - 1].Source));
+    if not List[N - 1].Present then
+      EmitCLn(clYellow, '  that source has nothing usable right now, so ' +
+        'another one answers until it does')
+    else if ReResolveAuth then
+      EmitCLn(clGrey, '  now using ' + uAuth.AuthDescribe(ActiveAuth));
+  end
+  else
+    EmitCLn(clRed, '  ' + Err);
+end;
+
+{ Removes pasclaude's OWN credential and nothing else.  When the credential
+  in force came from Claude Code, Jcode or the ant profile this refuses and
+  names the file: deleting or rewriting it would break a program the user did
+  not ask us to touch, and "log out" of somebody else's session is not a
+  sentence this program is entitled to say. }
+procedure DoLogout;
+var
+  Err: string;
+begin
+  if ScriptedRun then
+  begin
+    EmitCLn(clYellow, '  /logout is interactive; a scripted run has nobody ' +
+      'to answer it.');
+    Exit;
+  end;
+  case ActiveAuth.Source of
+    uAuth.asApiKeyEnv, uAuth.asAuthTokenEnv:
+      begin
+        EmitCLn(clYellow, '  the credential in use comes from the ' +
+          uAuth.AuthDescribe(ActiveAuth) + ' environment variable.');
+        EmitCLn(clGrey, '  Unset it in your shell; pasclaude does not ' +
+          'change your environment.');
+      end;
+    uAuth.asClaudeCode, uAuth.asJcode, uAuth.asAntProfile:
+      begin
+        EmitCLn(clYellow, '  the credential in use belongs to another ' +
+          'program:');
+        EmitCLn(clGrey, '  ' + ActiveAuth.Path);
+        EmitCLn(clGrey, '  pasclaude reads that file and never writes it, ' +
+          'so /logout will not');
+        EmitCLn(clGrey, '  touch it. Log out of that program instead.');
+      end;
+  end;
+  { The store is removed whatever was in force: a stored credential the user
+    wants gone should go even when an environment variable is currently
+    shadowing it. }
+  if uAuth.AuthClear(Err) then
+  begin
+    EmitCLn(clGrey, '  removed ' + uAuth.CredentialStorePath);
+    if ReResolveAuth then
+      EmitCLn(clGrey, '  now using ' + uAuth.AuthDescribe(ActiveAuth))
+    else
+      EmitCLn(clYellow, '  no credential remains; the next turn will be ' +
+        'refused here rather than sent. /login stores one.');
+  end
+  else
+    EmitCLn(clGrey, '  ' + Err);
+end;
+
 function HandleCommand(const Line: string; out Handled: Boolean): Boolean;
 var
   Cmd, Arg: string;
@@ -2734,6 +2872,10 @@ begin
     ShowHooks(Arg)
   else if Cmd = '/mcp' then
     ShowMcp(Arg)
+  else if Cmd = '/login' then
+    DoLogin(Arg)
+  else if Cmd = '/logout' then
+    DoLogout
   else if Cmd = '/config' then
     ShowConfig(Arg)
   else if Cmd = '/deny' then
@@ -2866,8 +3008,9 @@ var
   Dropped: Integer;
   Resume: Boolean = False;
   Resumed: Boolean = False;
+  AuthList: uAuth.TAuthInfoArray;
+  ExpiryMs: Int64;
   SaveWarned: Boolean = False;
-  UsingSubscription: Boolean = False;
   ArgI: Integer;
   PrintPrompt: string = '';
   PrintMode: Boolean = False;
@@ -2981,6 +3124,7 @@ begin
       else if (Arg = '-p') or (Arg = '--print') then
       begin
         PrintMode := True;
+        ScriptedRun := True;
         { A leading '-' means the next token is another flag, not this one's
           value.  Taking it unconditionally made every flag after -p unusable
           in the order --help showed: "-p --output-format json" sent
@@ -3063,6 +3207,10 @@ begin
         if not uSdk.SdkParseFormat(ParamStr(ArgI + 1), OutFormat) then
           FailStart('unknown output format: ' + ParamStr(ArgI + 1),
             'text, json or stream-json', 2);
+        { A protocol on stdout is a driver, not a person: the interactive
+          credential commands refuse there for the same reason the permission
+          prompt does. }
+        if OutFormat <> uSdk.sfText then ScriptedRun := True;
         SkipNext := True;
       end
       else if Arg = '--session-file' then
@@ -3328,22 +3476,47 @@ begin
       Before the model name is read below, because that name may BE an alias. }
     ApplyModelSettings;
 
-    ApiKey := GetEnvironmentVariable('ANTHROPIC_API_KEY');
-    UsingSubscription := False;
-    if Trim(ApiKey) = '' then
+    { One call for all six sources, in uAuth's documented order: the two
+      environment variables, then a stored preference if it names a source
+      that is actually live, then pasclaude's own store, Claude Code, Jcode
+      and the ant profile.  Same position in startup as the old two-source
+      read - above the print-mode halt - because a credential is not a
+      project-supplied capability: it is machine-scoped, out of tree, and the
+      same class of thing as ANTHROPIC_API_KEY.  Moving it below the halt
+      would silently strip a -p run of the credential the user configured. }
+    if uAuth.AuthResolve(ActiveAuth) then
+      ApiKey := ActiveAuth.Token
+    else
     begin
-      { No key in the environment; a Claude subscription can stand in.
-        The explicit key wins when both exist, because setting a variable
-        is a deliberate act and reading another program's token is not. }
-      ApiKey := SubscriptionToken(SaveErr);
-      if Trim(ApiKey) <> '' then
-        UsingSubscription := True
-      else
-      begin
-        FailStart('ANTHROPIC_API_KEY is not set, and no subscription token was usable',
-          '(' + SaveErr + ')'#10 +
-          'set ANTHROPIC_API_KEY=sk-ant-..., or sign in to Claude Code once', 2);
-      end;
+      ApiKey := '';
+      { Every source that was probed and why each one had nothing, rather
+        than the old two-clause sentence.  With six places to look, "no
+        subscription token was usable" would leave the user guessing which
+        of them they were supposed to fix. }
+      SaveErr := '';
+      AuthList := uAuth.AuthList;
+      for ArgI := 0 to High(AuthList) do
+        if AuthList[ArgI].Why <> '' then
+          SaveErr := SaveErr + uAuth.AuthSourceName(AuthList[ArgI].Source) +
+            ': ' + AuthList[ArgI].Why + #10;
+      FailStart('no usable credential was found',
+        SaveErr +
+        'set ANTHROPIC_API_KEY=sk-ant-..., sign in to Claude Code once, ' +
+        'or run pasclaude and type /login', 2);
+    end;
+    if not PrintMode then
+    begin
+      { Near-expiry, said before the first turn rather than discovered
+        halfway through one.  Fifteen minutes because that is long enough to
+        act on and short enough not to fire on every startup; a source with
+        no parseable expiry says nothing at all, which is the honest answer
+        when the field's type is another program's business. }
+      ExpiryMs := uAuth.AuthExpiresInMs(ActiveAuth);
+      if (ExpiryMs >= 0) and (ExpiryMs < 15 * 60 * 1000) then
+        EmitCLn(clYellow, Format(
+          '  the %s credential expires in %d minutes; renew it in that ' +
+          'program before it does', [uAuth.AuthDescribe(ActiveAuth),
+          ExpiryMs div 60000]));
     end;
     if not HttpAvailable then
     begin
@@ -3359,7 +3532,16 @@ begin
       repository that could pick the model would be spending the user's money
       on its own say-so, and could pick a weaker one to review its own code. }
     if Trim(ModelName) = '' then ModelName := uSettings.SettingStr('model');
-    if UsingSubscription then BannerAuth := 'subscription';
+    { The banner names the source when it is anything other than a plain
+      exported API key.  'subscription' is preserved for the two OAuth
+      sources because that is what the word means to the user and what the
+      banner has always said. }
+    case ActiveAuth.Source of
+      uAuth.asApiKeyEnv: BannerAuth := '';
+      uAuth.asClaudeCode, uAuth.asJcode: BannerAuth := 'subscription';
+    else
+      BannerAuth := uAuth.AuthDescribe(ActiveAuth);
+    end;
 
     { Hooks, before the agent exists, because SessionStart's output can only
       reach the model through the string Create is handed - TAgent has no
@@ -3413,6 +3595,12 @@ begin
         thinking_budget.  The other two keys were applied at the load point
         because they had to be right before anything could read them. }
       ApplySettings;
+      { Consulted only on a 401 and only once per request.  It re-reads the
+        sources - it never writes one - so a token Claude Code refreshed on
+        disk while this session was running is picked up without a restart,
+        instead of the session dying on a credential that was stale for
+        thirty seconds. }
+      Agent.OnAuthRefresh := @AuthRefreshHook;
       Agent.OnText := @OnText;
       Agent.OnThinking := @OnThinking;
       Agent.OnToolStart := @OnToolStart;
@@ -3862,11 +4050,31 @@ begin
           Again := False;
           { The moment before the turn runs is what /rewind returns to. }
           RecordCheckpoint(Line);
+          { Refused here rather than sent with an empty key.  /logout can
+            leave a session with nothing to authenticate with, and one local
+            sentence beats a 401 from the API - which would arrive again from
+            the subagent and again from /model, three different confusing
+            errors for one condition. }
+          if NoCredential then
+          begin
+            NeedNewLine;
+            EmitCLn(clRed, '  no credential: /login stores one, or set ' +
+              'ANTHROPIC_API_KEY and restart');
+            Break;
+          end;
           TurnOk := Agent.Send(Line, Err);
           if not TurnOk then
           begin
             NeedNewLine;
             EmitCLn(clRed, '  ' + Err);
+            { A bare 'HTTP 401 - authentication_error' is the thing this
+              feature exists to replace: it says a credential was rejected
+              without saying WHICH of six it was, where it came from, or
+              whether it has since expired.  The token itself is never in
+              this line - only the source, the file and the remedy. }
+            if (Pos('HTTP 401', Err) > 0) or
+               (Pos('authentication_error', Err) > 0) then
+              EmitCLn(clYellow, '  ' + uAuth.AuthDiagnose401(ActiveAuth));
           end;
           { The last line of the reply usually has no trailing newline and is
             still held by the renderer. }

@@ -540,9 +540,50 @@ text preserves what was missing at the time. Unchecked items remain open.
   by design and the other is program-written in both directions.*
 - [ ] **/doctor, /status, /bug** — no health check, status view, or
   feedback command.
-- [ ] **/login, /logout** — cannot authenticate on its own; it reuses the
+- [x] ~~**/login, /logout** — cannot authenticate on its own; it reuses the
   token Claude Code or Jcode wrote (read-only, never refreshed) or
-  `ANTHROPIC_API_KEY`.
+  `ANTHROPIC_API_KEY`.~~
+  *Built: pasclaude now manages credentials, and the honest qualification is
+  that it still **cannot mint one**. Anthropic documents exactly three ways
+  to authenticate — a static `sk-ant-api…` key, Workload Identity Federation
+  (an org-configured OIDC assertion, a CI mechanism rather than a human at a
+  terminal) and App Attest on Apple platforms. There is no published
+  authorization endpoint, no device-code grant, no PKCE flow and no public
+  client id a third-party program may use, so a "real" OAuth login could only
+  be built by borrowing Claude Code's client identity — claiming to be a
+  program we are not. That was refused, and it is named here so the next
+  reader does not reopen the question. A new unit `uAuth` resolves six
+  sources in one documented order: `ANTHROPIC_API_KEY`,
+  `ANTHROPIC_AUTH_TOKEN`, a stored preference if it names a live source,
+  pasclaude's own store, Claude Code, Jcode, and — new — the `ant` CLI
+  profile at `%APPDATA%\Anthropic\credentials\<profile>.json`. The two
+  environment variables always win; a preference can only **choose among**
+  sources this machine already has and can never introduce one, so a user who
+  never runs `/login` sees exactly today's behaviour. `/login` lists every
+  source with its file and a hint of the form `sk-ant-...4f2a` and never the
+  value; `/login key` reads a pasted key with **nothing echoed at all** — not
+  even asterisks, because a mask publishes the length — and stores it
+  DPAPI-protected at `%LOCALAPPDATA%\pasclaude\credential.json`. If
+  `CryptProtectData` fails nothing is written: there is no plaintext path and
+  no flag that talks one into existing, and a file that cannot be decrypted
+  is treated as absent with a note saying it was protected by a different
+  Windows account or on different hardware. `/logout` removes **only** that
+  file — Claude Code's, Jcode's and `ant`'s are read forever and written
+  never, enforced by the writers taking no path argument at all — and it says
+  which foreign file it declined to touch. A 401 mid-turn now names the
+  source, the file, whether it has since expired, and the remedy, instead of
+  printing `HTTP 401 - authentication_error`; a credential the owning program
+  refreshed on disk is picked up once per request through a nil-by-default
+  hook, and 401 is still not a retryable status. A credential expiring within
+  fifteen minutes is announced at startup.
+  **What is narrower than Claude Code's:** there is no browser sign-in, no
+  token refresh of any kind, and no account or subscription management —
+  pasclaude cannot renew what it did not issue. `/login` and `/logout` are
+  refused in `-p` and SDK runs, which have nobody to answer them, though a
+  stored credential is still used there. Only one key is stored, not a set
+  per organisation or workspace, and there is no `apiKeyHelper` hook: a
+  project-supplied command that prints a credential is exactly the shape this
+  design exists to refuse.*
 - [x] ~~**Model aliases / routing** — `/model` lists and sets models, but
   there are no aliases like `opusplan` or per-task model routing.~~
   *Built: four built-in aliases — `opus`, `sonnet`, `haiku` and the compound
