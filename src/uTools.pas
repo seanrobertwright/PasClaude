@@ -105,6 +105,25 @@ type
   end;
   TPluginInfoArray = array of TPluginInfo;
 
+  { One output style, as the listing shows it.  TSkillSource is reused rather
+    than duplicated with one extra value: a built-in has no directory and no
+    precedence, so it is a flag beside the source and not a fourth member of
+    it - an enum member meaning "not from anywhere" would have to be handled
+    at every site that maps a source to a path. }
+  TStyleInfo = record
+    Name: string;
+    Description: string;
+    Path: string;          { '' for a built-in }
+    Plugin: string;        { '' unless Source = ssPlugin }
+    { '' when the file parsed.  A style that failed is listed with its reason
+      rather than dropped, for the reason the skill catalogue gives: omitted
+      is the state in which nobody can find out why it never applied. }
+    Err: string;
+    Source: TSkillSource;
+    Builtin: Boolean;
+  end;
+  TStyleInfoArray = array of TStyleInfo;
+
 var
   { Session root; every path argument is resolved relative to it. }
   RootDir: string = '';
@@ -156,6 +175,10 @@ const
   SkillsDirName    = 'skills';
   PluginsDirName   = 'plugins';
   CommandsDirName  = 'commands';
+  { A flat <name>.md per style, like commands and agents rather than like
+    skills: a style is one document with nothing beside it, so a directory
+    per name would be an empty directory per name. }
+  StylesDirName    = 'styles';
   { Plugin enablement.  Deliberately NOT in permissions.json: that file only
     ever widens on load, which would make "/plugins disable" a lie the moment
     the session restarted.  This one is authoritative in both directions. }
@@ -176,6 +199,22 @@ const
   { Plugins are directories the user copied in on purpose; sixteen is already
     more than a project will have, and the scan runs at every launch. }
   MaxPlugins        = 16;
+
+  { An output style is a document somebody wrote by hand; 64 KB of it is
+    already more than a description of how to write prose can need, and this
+    is only how much of the file is looked at at all. }
+  MaxStyleBytes     = 64 * 1024;
+  { How much of it reaches the system prompt, and therefore what it costs
+    EVERY turn: the style rides in the uncached trailing block, so unlike the
+    skill catalogue this is a recurring charge rather than a one-off.  2 KB is
+    roughly three hundred words - ample for "how the user wants replies
+    written" - and halving it halves the standing cost.  Applied with Utf8Cut,
+    never Copy, and the command reports when it bit. }
+  MaxStyleNoteBytes = 2 * 1024;
+  { The style that emits nothing at all.  Reserved, like the other built-ins,
+    so a file can never mean something different from the name the listing
+    shows. }
+  DefaultStyleName  = 'default';
 
   { The server-side web search tool's type string.  Anthropic versions these
     by date; older models take the basic 'web_search_20250305' instead.
@@ -649,6 +688,53 @@ procedure RefreshSkills;
 procedure ClearSkills;                { test seam }
 function SkillsDirProject: string;
 function SkillsDirUser: string;
+
+{ ------------------------------------------------------------ output style -- }
+
+{ An output style is one markdown file in the SKILL.md shape, parsed by the
+  same ParseSkillFrontmatter - a second reader of the same file shape would be
+  a second set of failure modes for it.  It says how the user wants replies
+  written and nothing else: there is no frontmatter key that maps to a
+  setting, and the body is read by exactly one string concatenation, in
+  StyleNote.  That absence of a consumer is the whole of the enforcement, and
+  it is stated here because it is the only honest way to put it. }
+function StylesDirProject: string;
+function StylesDirUser: string;
+{ Project, then each enabled plugin alphabetically, then the user's own home
+  directory.  '' when no file answers to the name; a built-in name never
+  reaches here at all. }
+function ResolveStyleFile(const Name: string): string;
+{ Built-ins first, then files: project, then enabled plugins, then user, with
+  the nearer source winning and broken files listed with their reason. }
+function StyleCatalogue: TStyleInfoArray;
+procedure RefreshStyles;              { /output-style is the rescan }
+procedure ClearStyles;                { test seam, mirrors ClearSkills }
+
+function OutputStyleName: string;     { DefaultStyleName when none is set }
+function OutputStylePath: string;     { '' for a built-in }
+{ 'builtin', 'project', 'user' or 'plugin:<name>' - persisted alongside the
+  name so a project file appearing later cannot inherit the consent the user
+  gave to a user file of the same name. }
+function OutputStyleSource: string;
+{ Resolves, reads, parses and caches the body.  False with Err set leaves the
+  current style untouched, so a typo never silently clears one. }
+function SetOutputStyle(const Name: string; out Err: string): Boolean;
+{ The paragraph SessionNote prepends: '' for the default style, otherwise the
+  fence line plus the capped body.  Exposed so a test can assert the text
+  without making a request. }
+function StyleNote: string;
+{ True when the body hit MaxStyleNoteBytes.  Reported by /output-style rather
+  than silently swallowed: what the model was actually handed is the thing the
+  user needs to be able to see. }
+function StyleNoteTruncated: Boolean;
+{ What LoadPermissions had to say about the persisted style: '' when it
+  applied cleanly, otherwise a line for the host to print in yellow.  A module
+  var rather than an out parameter because uTools may not print and
+  LoadPermissions is called from three places that do not all care. }
+function StyleStartupNote: string;
+{ Cleared by a caller that has already overruled the persisted name, so the
+  user is not told about a fallback that never happened. }
+procedure ClearStyleStartupNote;
 
 function PluginsDir: string;
 function InstalledPlugins: TPluginInfoArray;
@@ -1611,10 +1697,22 @@ function SessionNote: string;
 var
   I: Integer;
 begin
-  { The plan paragraph goes first, and the additional-working-directories
-    block between it and the deny sentence.  Order is fixed so a session with
-    two of them on reads the same way every turn. }
-  Result := PermModeNote;
+  { Fixed order: the output style, then the plan paragraph, then the
+    additional-working-directories block, then the deny sentence - so a
+    session with several of them on reads the same way every turn.
+
+    The style goes FIRST because it is the only text in this block that a file
+    chose rather than pasclaude's own state, and the deny sentence stays
+    PERMANENTLY LAST because it is the one line here describing a refusal
+    nothing can override.  Anything added to this block later inserts between
+    the roots block and the deny sentence; nothing appends after it, or the
+    unbypassable rule loses the recency position to a paragraph out of a
+    repository.
+
+    The whole block is deliberately outside cache breakpoint #1, which is why
+    every one of these may flip mid-session for a few dozen tokens instead of
+    a re-read of the entire cached prefix. }
+  Result := StyleNote + PermModeNote;
   { Emitted only when there is more than one root, so an ordinary session's
     request body - and therefore its prompt cache - is byte-identical to what
     it was before this feature existed. }
@@ -4448,6 +4546,398 @@ begin
   Result := ResolveExtensionFile(AgentsDirName, Name);
 end;
 
+{ ----------------------------------------------------------- output style -- }
+
+{ Compiled in rather than shipped as files, for two reasons.  A bare checkout
+  has no .pasclaude\styles\, and a feature that demonstrates nothing until the
+  user writes a file is a mechanism rather than a feature.  And a built-in on
+  disk could be edited into something that no longer matches the name the
+  listing shows, which is the same failure the reserved-name refusal below
+  exists to prevent. }
+const
+  BuiltinStyleCount = 3;
+  BuiltinStyleNames: array[0..BuiltinStyleCount - 1] of string =
+    (DefaultStyleName, 'explanatory', 'learning');
+  BuiltinStyleDescs: array[0..BuiltinStyleCount - 1] of string = (
+    'Ordinary replies. Adds nothing to the system prompt.',
+    'Explain the code as you change it.',
+    'Leave one real step for the user to write.');
+  BuiltinStyleBodies: array[0..BuiltinStyleCount - 1] of string = (
+    '',
+    'Explain the codebase as you work. When you touch something ' +
+    'non-obvious, say in a sentence or two why it is built that way and ' +
+    'what the other way would have broken. Explain the code actually in ' +
+    'front of you, not the general topic. Keep the explanation shorter ' +
+    'than the work.',
+    'Do the work, but leave one piece of it for the user. Choose the ' +
+    'smallest step that carries the real decision, stop before it, mark it ' +
+    'TODO(you): with what it has to do and what it must not break, and hand ' +
+    'it back. Do not then write it yourself in the same reply.');
+
+var
+  { The selected style, read once at set time.  SessionNote runs on every
+    single request and must not touch the disk, so the body is cached here and
+    the corollary - editing a style file takes effect after re-running
+    /output-style - is what /help says out loud. }
+  StyleName: string = DefaultStyleName;
+  StylePath: string = '';
+  StyleSource: string = 'builtin';
+  StyleBody: string = '';
+  StyleNote_: string = '';
+  StyleNoteWasCut: Boolean = False;
+  StyleStartupNote_: string = '';
+
+  StyleCache: TStyleInfoArray;
+  StyleCacheValid: Boolean = False;
+
+function BuiltinStyleIndex(const Name: string): Integer;
+var
+  I: Integer;
+begin
+  Result := -1;
+  for I := 0 to BuiltinStyleCount - 1 do
+    if CompareText(BuiltinStyleNames[I], Trim(Name)) = 0 then Exit(I);
+end;
+
+function StylesDirProject: string;
+begin
+  Result := IncludeTrailingPathDelimiter(NormalizeRoot) + StateDirName +
+    PathDelim + StylesDirName + PathDelim;
+end;
+
+{ The user's own home directory, exactly as SkillsDirUser reads it and for a
+  stronger reason: how somebody wants their replies written is a property of
+  the person, not of the repository they happen to have open. }
+function StylesDirUser: string;
+var
+  Home: string;
+begin
+  Result := '';
+  Home := Trim(SysUtils.GetEnvironmentVariable('USERPROFILE'));
+  if Home = '' then Exit;
+  Result := IncludeTrailingPathDelimiter(Home) + StateDirName + PathDelim +
+    StylesDirName + PathDelim;
+end;
+
+function ResolveStyleFile(const Name: string): string;
+var
+  P: string;
+begin
+  { Project and the enabled plugins come free from the resolver commands and
+    agents already use; only the user-directory fallback is new here. }
+  Result := ResolveExtensionFile(StylesDirName, Name);
+  if Result <> '' then Exit;
+  if not ValidExtensionName(Trim(Name)) then Exit;
+  P := StylesDirUser;
+  if P = '' then Exit;
+  P := P + Trim(Name) + '.md';
+  if FileExists(P) then Result := P;
+end;
+
+function StyleIndex(const Arr: TStyleInfoArray; const N: string): Integer;
+var
+  I: Integer;
+begin
+  Result := -1;
+  for I := 0 to High(Arr) do
+    if CompareText(Arr[I].Name, N) = 0 then Exit(I);
+end;
+
+{ Every *.md under Dir that is not already catalogued.  Glob rather than
+  FindFirst on '*', so '.' and '..' cannot arrive as style names the way
+  ScanSkillDir has to guard against. }
+procedure ScanStyleDir(const Dir: string; Source: TSkillSource;
+  const Plugin: string; var Arr: TStyleInfoArray);
+var
+  R: TSearchRec;
+  L: TStringList;
+  I: Integer;
+  Info: TStyleInfo;
+  Base, Text, Note, StName, StDesc, StBody, StErr: string;
+begin
+  if (Dir = '') or not DirectoryExists(Dir) then Exit;
+  L := TStringList.Create;
+  try
+    if FindFirst(Dir + '*.md', faAnyFile, R) = 0 then
+    begin
+      repeat
+        if (R.Attr and faDirectory) <> 0 then Continue;
+        Base := ChangeFileExt(R.Name, '');
+        if not ValidExtensionName(Base) then Continue;
+        L.Add(Base);
+      until FindNext(R) <> 0;
+      SysUtils.FindClose(R);
+    end;
+    L.Sort;
+
+    for I := 0 to L.Count - 1 do
+    begin
+      { Nearer wins, same rule as the skill catalogue: the first source to
+        offer a name keeps it. }
+      if StyleIndex(Arr, L[I]) >= 0 then Continue;
+
+      Info.Name := L[I];
+      Info.Path := Dir + L[I] + '.md';
+      Info.Source := Source;
+      Info.Plugin := Plugin;
+      Info.Builtin := False;
+      Info.Description := '';
+      Info.Err := '';
+
+      { A file cannot take a built-in name.  Listed with the clash rather
+        than hidden, because the alternative states are both worse: hidden
+        and the user never learns why their file does nothing, or applied and
+        the listing advertises one thing while the loader uses another. }
+      if BuiltinStyleIndex(L[I]) >= 0 then
+        Info.Err := L[I] + ' is a built-in style; rename the file'
+      else if not LoadFileLimited(Info.Path, MaxStyleBytes, Text, Note) then
+        Info.Err := 'cannot read: ' + Note
+      else
+      begin
+        if not IsValidUtf8(Text) then Text := OemToUtf8(Text);
+        if not ParseSkillFrontmatter(Text, StName, StDesc, StBody, StErr) then
+          { The parser's wording is about a skill, so the listing says which
+            file it is talking about rather than leaving the user to guess. }
+          Info.Err := StErr
+        else if (Trim(StName) <> '') and
+                (CompareText(Trim(StName), Info.Name) <> 0) then
+          Info.Err := Format('name: %s does not match the file %s',
+            [Trim(StName), Info.Name + '.md'])
+        else
+          Info.Description := Utf8Cut(Trim(StDesc), MaxSkillDescBytes);
+      end;
+
+      SetLength(Arr, Length(Arr) + 1);
+      Arr[High(Arr)] := Info;
+    end;
+  finally
+    L.Free;
+  end;
+end;
+
+procedure SortStyles(var Arr: TStyleInfoArray; First: Integer);
+var
+  I, J: Integer;
+  T: TStyleInfo;
+begin
+  for I := First + 1 to High(Arr) do
+  begin
+    T := Arr[I];
+    J := I - 1;
+    while (J >= First) and (CompareText(Arr[J].Name, T.Name) > 0) do
+    begin
+      Arr[J + 1] := Arr[J];
+      Dec(J);
+    end;
+    Arr[J + 1] := T;
+  end;
+end;
+
+function StyleCatalogue: TStyleInfoArray;
+var
+  I: Integer;
+begin
+  if not StyleCacheValid then
+  begin
+    SetLength(StyleCache, BuiltinStyleCount);
+    for I := 0 to BuiltinStyleCount - 1 do
+    begin
+      StyleCache[I].Name := BuiltinStyleNames[I];
+      StyleCache[I].Description := BuiltinStyleDescs[I];
+      StyleCache[I].Path := '';
+      StyleCache[I].Plugin := '';
+      StyleCache[I].Err := '';
+      StyleCache[I].Source := ssUser;
+      StyleCache[I].Builtin := True;
+    end;
+    ScanStyleDir(StylesDirProject, ssProject, '', StyleCache);
+    for I := 0 to High(EnabledPlugins) do
+      ScanStyleDir(PluginsDir + EnabledPlugins[I] + PathDelim +
+        StylesDirName + PathDelim, ssPlugin, EnabledPlugins[I], StyleCache);
+    ScanStyleDir(StylesDirUser, ssUser, '', StyleCache);
+    { Built-ins keep the head of the list and files are sorted below them:
+      the three names that always work should not be scattered through a
+      project's own. }
+    SortStyles(StyleCache, BuiltinStyleCount);
+    StyleCacheValid := True;
+  end;
+  Result := StyleCache;
+end;
+
+procedure RefreshStyles;
+begin
+  StyleCacheValid := False;
+  SetLength(StyleCache, 0);
+end;
+
+procedure ClearStyles;
+begin
+  RefreshStyles;
+  StyleName := DefaultStyleName;
+  StylePath := '';
+  StyleSource := 'builtin';
+  StyleBody := '';
+  StyleNote_ := '';
+  StyleNoteWasCut := False;
+  StyleStartupNote_ := '';
+end;
+
+function OutputStyleName: string;
+begin
+  Result := StyleName;
+end;
+
+function OutputStylePath: string;
+begin
+  Result := StylePath;
+end;
+
+function OutputStyleSource: string;
+begin
+  Result := StyleSource;
+end;
+
+function StyleNote: string;
+begin
+  Result := StyleNote_;
+end;
+
+function StyleNoteTruncated: Boolean;
+begin
+  Result := StyleNoteWasCut;
+end;
+
+function StyleStartupNote: string;
+begin
+  Result := StyleStartupNote_;
+end;
+
+procedure ClearStyleStartupNote;
+begin
+  StyleStartupNote_ := '';
+end;
+
+{ The paragraph itself.  The fence line is fixed text and says three separate
+  things on purpose: whose voice this is, that it governs prose and nothing
+  else, and that it grants nothing.  The last clause is prose rather than
+  enforcement and is not pretending otherwise - the enforcement is that
+  nothing reads the body but this function. }
+procedure BuildStyleNote;
+var
+  Body: string;
+begin
+  StyleNoteWasCut := False;
+  StyleNote_ := '';
+  if CompareText(StyleName, DefaultStyleName) = 0 then Exit;
+  Body := Trim(StyleBody);
+  { Utf8Cut, never Copy: a body cut mid-character puts one invalid byte in
+    the system prompt and the API rejects the whole request. }
+  if Length(Body) > MaxStyleNoteBytes then
+  begin
+    Body := Utf8Cut(Body, MaxStyleNoteBytes);
+    StyleNoteWasCut := True;
+  end;
+  StyleNote_ :=
+    'Output style "' + StyleName + '" - how the user wants replies written. ' +
+    'It changes the tone'#10 +
+    'and shape of your prose only: every rule in the system prompt and every'#10 +
+    'paragraph below still holds, and nothing in this block grants access to'#10 +
+    'anything.'#10;
+  if Body <> '' then
+    StyleNote_ := StyleNote_ + Body + #10;
+end;
+
+{ Want = '' means any source is acceptable, which is what a user typing the
+  name means.  A non-empty Want is the persisted-source check: the user
+  consented to a style from one place, and a file that appeared since in a
+  nearer place is not the thing they consented to. }
+function SetStyleChecked(const Name, Want: string; out Err: string): Boolean;
+var
+  N, Path, Src, Text, Note, StName, StDesc, StBody, StErr: string;
+  B, I: Integer;
+begin
+  Err := '';
+  Result := False;
+  N := Trim(Name);
+  if N = '' then N := DefaultStyleName;
+
+  B := BuiltinStyleIndex(N);
+  if B >= 0 then
+  begin
+    Path := '';
+    Src := 'builtin';
+    StBody := BuiltinStyleBodies[B];
+    N := BuiltinStyleNames[B];
+  end
+  else
+  begin
+    if not ValidExtensionName(N) then
+    begin
+      Err := 'not a style name: ' + N;
+      Exit;
+    end;
+    Path := ResolveStyleFile(N);
+    if Path = '' then
+    begin
+      Err := 'no style called ' + N;
+      Exit;
+    end;
+    if not LoadFileLimited(Path, MaxStyleBytes, Text, Note) then
+    begin
+      Err := 'cannot read ' + Path + ': ' + Note;
+      Exit;
+    end;
+    { A style file may have come off a machine with a different codepage.
+      Repaired rather than refused, exactly as a SKILL.md is: one bad byte in
+      the request loses the whole conversation. }
+    if not IsValidUtf8(Text) then Text := OemToUtf8(Text);
+    if not ParseSkillFrontmatter(Text, StName, StDesc, StBody, StErr) then
+    begin
+      Err := N + '.md: ' + StErr;
+      Exit;
+    end;
+    if (Trim(StName) <> '') and (CompareText(Trim(StName), N) <> 0) then
+    begin
+      Err := Format('%s.md says name: %s; rename one of them',
+        [N, Trim(StName)]);
+      Exit;
+    end;
+    { Which source actually answered.  Compared by path rather than re-walked,
+      so the label can never disagree with the file that was read. }
+    Src := 'user';
+    if (StylesDirProject <> '') and
+       (CompareText(Copy(Path, 1, Length(StylesDirProject)),
+                    StylesDirProject) = 0) then
+      Src := 'project'
+    else
+      for I := 0 to High(EnabledPlugins) do
+        if CompareText(Copy(Path, 1, Length(PluginsDir + EnabledPlugins[I])),
+                       PluginsDir + EnabledPlugins[I]) = 0 then
+        begin
+          Src := 'plugin:' + EnabledPlugins[I];
+          Break;
+        end;
+  end;
+
+  if (Want <> '') and (CompareText(Want, Src) <> 0) then
+  begin
+    Err := Format('%s now resolves to %s, not %s', [N, Src, Want]);
+    Exit;
+  end;
+
+  StyleName := N;
+  StylePath := Path;
+  StyleSource := Src;
+  StyleBody := StBody;
+  BuildStyleNote;
+  Result := True;
+end;
+
+function SetOutputStyle(const Name: string; out Err: string): Boolean;
+begin
+  Result := SetStyleChecked(Name, '', Err);
+end;
+
 { -------------------------------------------------------------- subagents -- }
 
 var
@@ -4822,6 +5312,16 @@ end;
   is what makes it impossible for anything on disk to be the reason the
   sandbox is not running.
 
+  And a fourth polarity, "output_style":"explanatory" with
+  "output_style_source":"user": neither widening nor narrowing, it selects
+  prose.  It is here rather than in the project because a repository that
+  could pick its own text for the system prompt has not been asked anything -
+  the same reason the trust store is here - and it is a name rather than a
+  body because the file must stay small enough to hand-edit.  An unresolvable
+  name, or one that now resolves somewhere other than the recorded source,
+  loads as the default with a note.  Nothing in either key can grant anything:
+  see StyleNote, whose one caller is a string concatenation.
+
   Additional working directories are deliberately NOT stored here either, and
   the only-widen rule is again the reason: a persisted root would be a grant
   no later session could revoke by any means the file offers, and a clone
@@ -4875,6 +5375,27 @@ begin
     if (Root.Str('sandbox') = 'low') and
        (uSandbox.SandboxLevel < slLow) then
       uSandbox.SandboxLevel := slLow;
+    { "output_style", and it is the fourth polarity: it neither widens nor
+      narrows anything, it selects prose.  Nothing reads the body but one
+      concatenation in StyleNote and no frontmatter key maps to a setting, so
+      the failure modes worth guarding are about honesty rather than about
+      grants: a name that no longer resolves loads as the default with a note,
+      never as an error - aborting here would take the deny array and the
+      sandbox level down with it.
+
+      The source is persisted beside the name and checked, because the name
+      alone is not what the user consented to.  A user typing "explanatory"
+      when it resolved to their own home directory has not agreed to a
+      styles\explanatory.md the project created afterwards, and project wins
+      the precedence.  A mismatch falls back to the default and says so. }
+    StyleStartupNote_ := '';
+    Progs := Root.Find('output_style');
+    if (Progs <> nil) and (Trim(Progs.AsString) <> '') and
+       (CompareText(Trim(Progs.AsString), DefaultStyleName) <> 0) then
+      if not SetStyleChecked(Trim(Progs.AsString),
+           Trim(Root.Str('output_style_source')), StyleStartupNote_) then
+        StyleStartupNote_ := 'output style: ' + StyleStartupNote_ +
+          '; using ' + DefaultStyleName;
   finally
     Root.Free;
   end;
@@ -4912,6 +5433,16 @@ begin
       off, which is the one thing this key must not be able to do. }
     if uSandbox.SandboxLevel = slLow then
       Root.AddStr('sandbox', 'low');
+    { Absent for the default style, so a user who never types the command
+      keeps the file they had.  The name and not the text: the file is
+      hand-editable state and a style body pasted into it would be neither
+      readable nor answerable to the question "where did this come from",
+      which the recorded source and the startup line do answer. }
+    if CompareText(StyleName, DefaultStyleName) <> 0 then
+    begin
+      Root.AddStr('output_style', StyleName);
+      Root.AddStr('output_style_source', StyleSource);
+    end;
     Text := Root.ToJson;
   finally
     Root.Free;

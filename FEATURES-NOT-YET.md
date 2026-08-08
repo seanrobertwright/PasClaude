@@ -378,7 +378,25 @@ text preserves what was missing at the time. Unchecked items remain open.
 - [ ] **Image input** — cannot paste or attach screenshots/images.
 - [ ] **Vim mode / keybindings** — line editing is fixed (arrows, Home/End,
   Ctrl+A/E/U); no `/vim`, no configurable keybindings.
-- [ ] **Output styles** — no `/output-style`.
+- [x] ~~**Output styles** — no `/output-style`.~~
+  *Built: `/output-style` lists what is available and marks the current one,
+  `/output-style <name>` sets it, and `--output-style <name>` works under
+  `-p`, which is the only way in there. Three built-ins compiled in —
+  `default`, `explanatory`, `learning` — plus a flat `<name>.md` in
+  `.pasclaude\styles\`, an enabled plugin's `styles\`, or
+  `%USERPROFILE%\.pasclaude\styles\`, nearer winning, parsed by the same
+  frontmatter reader `SKILL.md` uses. A style ADDS a paragraph to the system
+  prompt and can never replace one: nothing reads the body but a single
+  concatenation in `SessionNote`, and no frontmatter key maps to a setting.
+  The text rides in the uncached trailing system block beside the plan-mode
+  paragraph, so switching costs a few hundred tokens rather than the whole
+  cached prefix, and it is capped at 2 KB — `/output-style` prints the byte
+  size it added. The chosen name and the source it resolved from persist
+  under `%LOCALAPPDATA%`, never in the project; a name that now resolves
+  somewhere else falls back to `default` with a yellow line. Still missing:
+  no built-in `Explanatory`/`Learning` insert markers in the reply itself,
+  no `--append-system-prompt`, and the body is read once at set time, so an
+  edited style file applies only after re-running `/output-style <name>`.*
 
 ## Integrations
 

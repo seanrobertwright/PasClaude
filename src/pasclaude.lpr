@@ -200,11 +200,12 @@ end;
 { ------------------------------------------------------------- completion -- }
 
 const
-  SlashCommands: array[0..28] of string = (
+  SlashCommands: array[0..29] of string = (
     '/help', '/clear', '/compact', '/deny', '/diff', '/hooks', '/jobs', '/mcp',
     '/memory', '/init', '/mode', '/plan', '/rewind', '/sandbox', '/sessions',
     '/skills', '/plugins', '/think', '/web', '/add-dir', '/remove-dir',
-    '/resume', '/save', '/cwd', '/model', '/yolo', '/cost', '/exit', '/quit');
+    '/resume', '/save', '/cwd', '/model', '/yolo', '/cost', '/output-style',
+    '/exit', '/quit');
 
 { Candidates for the token being completed: slash commands when the token
   opens the line with a slash, file and directory names under the session
@@ -613,15 +614,18 @@ begin
   EmitCLn(clGrey,   '  /plan          shorthand for /mode plan: read and investigate only');
   EmitCLn(clGrey,   '  /yolo          approve every tool for this session (bypass)');
   EmitCLn(clGrey,   '  /sandbox [lvl] off | limits | low: how confined child processes are');
+  EmitCLn(clGrey,   '  /output-style [name]  how replies are written; no argument lists them');
   EmitCLn(clGrey,   '  /cost          tokens used so far');
   EmitCLn(clGrey,   '  /exit          quit (Ctrl+C also works)');
   EmitLn;
   EmitCLn(clGrey,   '  Esc during a reply stops it.');
   EmitCLn(clGrey,   '  A file in .pasclaude\commands\ is a slash command; one in');
   EmitCLn(clGrey,   '  .pasclaude\agents\ is a subagent type the task tool can ask for;');
-  EmitCLn(clGrey,   '  .pasclaude\skills\<name>\SKILL.md is a skill the model can read.');
-  EmitCLn(clGrey,   '  A directory in .pasclaude\plugins\ can carry all three, once you');
-  EmitCLn(clGrey,   '  enable it by name. A skill added mid-session appears after /skills.');
+  EmitCLn(clGrey,   '  .pasclaude\skills\<name>\SKILL.md is a skill the model can read;');
+  EmitCLn(clGrey,   '  .pasclaude\styles\<name>.md is an output style.');
+  EmitCLn(clGrey,   '  A directory in .pasclaude\plugins\ can carry all four, once you');
+  EmitCLn(clGrey,   '  enable it by name. A skill added mid-session appears after /skills,');
+  EmitCLn(clGrey,   '  and an edited style applies after you re-run /output-style <name>.');
   EmitCLn(clGrey,   '  To drive pasclaude from another program: -p with');
   EmitCLn(clGrey,   '  --output-format json|stream-json (see pasclaude --help).');
 end;
@@ -1051,6 +1055,79 @@ begin
     EmitCLn(clBright, Format('  %-16s %s', [C[I].Name, Src]));
     EmitCLn(clGrey,   '    ' + C[I].Description);
   end;
+end;
+
+{ Where a style came from, in the one wording the listing and the confirmation
+  both use: two wordings for one fact is how a user ends up unable to tell
+  whether the file they are looking at is the one in force. }
+function StyleSourceLabel(const S: uTools.TStyleInfo): string;
+begin
+  if S.Builtin then Exit('built-in');
+  case S.Source of
+    uTools.ssProject: Result := 'project';
+    uTools.ssPlugin:  Result := 'plugin ' + S.Plugin;
+  else
+    Result := 'user';
+  end;
+end;
+
+{ /output-style, which like /skills doubles as the rescan.  Bare, it lists;
+  named, it sets, reports the resolved path and the note's size, and persists
+  the name.  The size is printed rather than kept quiet because the style
+  rides OUTSIDE the prompt cache: it is charged as fresh input tokens on every
+  single turn, and a number the user can see is the whole of the defence
+  against that being a surprise on the bill. }
+procedure ShowOutputStyle(const Arg: string);
+var
+  C: uTools.TStyleInfoArray;
+  I: Integer;
+  Name, Err, Mark: string;
+begin
+  Name := Trim(Arg);
+  if Name = '' then
+  begin
+    uTools.RefreshStyles;
+    C := uTools.StyleCatalogue;
+    for I := 0 to High(C) do
+    begin
+      if C[I].Err <> '' then
+      begin
+        EmitCLn(clYellow, Format('  %-14s %-12s %s',
+          [C[I].Name, StyleSourceLabel(C[I]), C[I].Err]));
+        Continue;
+      end;
+      if CompareText(C[I].Name, uTools.OutputStyleName) = 0 then
+        Mark := ' (current)'
+      else
+        Mark := '';
+      EmitCLn(clBright, Format('  %-14s %s%s',
+        [C[I].Name, StyleSourceLabel(C[I]), Mark]));
+      if C[I].Description <> '' then
+        EmitCLn(clGrey, '    ' + C[I].Description);
+    end;
+    EmitCLn(clGrey, '  a style adds to the system prompt; it never replaces it');
+    Exit;
+  end;
+
+  if not uTools.SetOutputStyle(Name, Err) then
+  begin
+    EmitCLn(clRed, '  ' + Err);
+    EmitCLn(clGrey, '  /output-style with no argument lists what is available');
+    Exit;
+  end;
+  if uTools.OutputStylePath <> '' then
+    EmitCLn(clGrey, '  ' + uTools.OutputStylePath)
+  else
+    EmitCLn(clGrey, '  built-in style ' + uTools.OutputStyleName);
+  if uTools.StyleNote = '' then
+    EmitCLn(clGrey, '  nothing is added to the system prompt')
+  else
+    EmitCLn(clGrey, Format('  %d bytes added to every request',
+      [Length(uTools.StyleNote)]));
+  if uTools.StyleNoteTruncated then
+    EmitCLn(clYellow, Format('  the body was cut to %d bytes',
+      [uTools.MaxStyleNoteBytes]));
+  SavePermissions(PermissionsPath);
 end;
 
 { /plugins, /plugins enable <name>, /plugins disable <name>.  Consent here is
@@ -1825,6 +1902,8 @@ begin
   end
   else if Cmd = '/skills' then
     ShowSkills
+  else if Cmd = '/output-style' then
+    ShowOutputStyle(Arg)
   else if Cmd = '/plugins' then
     ShowPlugins(Arg)
   else if Cmd = '/hooks' then
@@ -1981,6 +2060,12 @@ var
     optional [directory] argument has been seen. }
   AddDirs: TStringArray;
   AddArg: string = '';
+  { Held rather than applied for the reason ModeWanted is: the approvals file
+    may name a style too, and a name typed this time beats a name persisted
+    weeks ago.  Under -p it is applied on the print branch instead, which
+    never reads that file at all. }
+  StyleWanted: string = '';
+  StyleErr: string = '';
   StopActive: Boolean = False;
   Again: Boolean = False;
   TurnOk: Boolean = False;
@@ -2084,6 +2169,14 @@ begin
         PlanFlag := PlanFlag or (ModeWanted = uTools.pmodePlan);
         SkipNext := True;
       end
+      else if Arg = '--output-style' then
+      begin
+        if ArgI >= ParamCount then
+          FailStart('--output-style needs a name: default, explanatory, ' +
+            'learning or one of your own', '', 2);
+        StyleWanted := ParamStr(ArgI + 1);
+        SkipNext := True;
+      end
       else if Arg = '--sandbox' then
       begin
         if ArgI >= ParamCount then
@@ -2176,6 +2269,14 @@ begin
         EmitCLn(clGrey, '            session root. An added directory grants file access only:');
         EmitCLn(clGrey, '            its hooks, skills, commands, agents and .mcp.json are not');
         EmitCLn(clGrey, '            read. Nothing is persisted, so say it again next session.');
+        EmitCLn(clGrey, '  --output-style <name>');
+        EmitCLn(clGrey, '            how replies are written: default, explanatory, learning,');
+        EmitCLn(clGrey, '            or a .pasclaude\styles\<name>.md of your own (the user');
+        EmitCLn(clGrey, '            copy under %USERPROFILE% counts too).  A style adds a');
+        EmitCLn(clGrey, '            paragraph to the system prompt and never replaces one; it');
+        EmitCLn(clGrey, '            grants nothing and cannot change what you are asked to');
+        EmitCLn(clGrey, '            approve.  Interactively the name is remembered; under -p');
+        EmitCLn(clGrey, '            nothing is remembered and this flag is the only way in.');
         EmitCLn(clGrey, '  --output-format text|json|stream-json   (needs -p)');
         EmitCLn(clGrey, '  --input-format  text|stream-json        (needs -p and stream-json out)');
         EmitCLn(clGrey, '            json/stream-json put one JSON object per line on stdout,');
@@ -2279,6 +2380,16 @@ begin
       here either - the only thing --sandbox off restores is what shipped
       before this existed. }
     ApplySandbox;
+    { And the style, above the halt for the third time with the same argument:
+      a -p run never reads the approvals file, so this flag is the only way a
+      scripted run can have a style at all.  A name that does not resolve is a
+      startup error rather than a silent default - a script that asked for one
+      voice and got another would be discovered by reading the output. }
+    if StyleWanted <> '' then
+      if not uTools.SetOutputStyle(StyleWanted, StyleErr) then
+        FailStart('--output-style: ' + StyleErr,
+          'default, explanatory, learning, or a file in ' + SessionDir +
+          PathDelim + uTools.StylesDirName, 2);
     if PrintMode and (uTools.CurrentPermMode = uTools.pmodeBypass) then
       { On stderr, so a driver reading stdout for JSON is undisturbed and a
         log of the run still records that nothing was asked. }
@@ -2489,6 +2600,35 @@ begin
         the scratch has to be prepared before the first child, and an explicit
         --sandbox off has to survive the file. }
       ApplySandbox;
+      { And a third time for the style, same pattern: LoadPermissions may have
+        applied a name persisted weeks ago, and a name typed on this command
+        line is the user speaking about this run.  Validated above the halt
+        already, so a failure here can only mean the file moved between the
+        two calls; reported rather than fatal, because by now there is a
+        session worth keeping. }
+      if StyleWanted <> '' then
+      begin
+        if uTools.SetOutputStyle(StyleWanted, StyleErr) then
+          uTools.ClearStyleStartupNote
+        else
+          EmitCLn(clYellow, '  --output-style: ' + StyleErr);
+      end;
+      { The persisted style did not apply - it no longer resolves, or it now
+        resolves somewhere other than where the user agreed to it.  Yellow and
+        named: falling back silently would leave the user reading replies in a
+        voice they did not pick and no way to find out why. }
+      if uTools.StyleStartupNote <> '' then
+        EmitCLn(clYellow, '  ' + uTools.StyleStartupNote);
+      { And the residual risk stated out loud on every launch that hits it:
+        the project could have created this file after the name was persisted,
+        and project wins the precedence.  The source check above turns that
+        into a refusal rather than a substitution, so reaching here means the
+        user did consent to a project file - naming it is so they can see
+        which one is speaking. }
+      if (uTools.OutputStylePath <> '') and
+         (uTools.OutputStyleSource <> 'user') then
+        EmitCLn(clYellow, '  output style ' + uTools.OutputStyleName +
+          ' comes from ' + uTools.OutputStylePath);
 
       { After LoadPermissions, so an approval already given suppresses the
         prompt, and after the print-mode Halt above, which is what makes a

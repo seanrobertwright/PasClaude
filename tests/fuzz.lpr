@@ -1111,6 +1111,81 @@ begin
   SetEnvironmentVariable('USERPROFILE', PChar(Home));
 end;
 
+{ An output style is the only text in this program that a FILE puts into the
+  SYSTEM prompt, which is the most trusted position in the request.  One
+  invalid byte there does not spoil a tool result, it loses the whole
+  conversation - the API rejects the request.  So arbitrary bytes in an
+  arbitrary style file must always come out as valid UTF-8, inside the cap,
+  and must never raise. }
+procedure TestStyleFileHostile;
+var
+  Home, Dir, Body, Note: string;
+  I, N: Integer;
+  Err: string;
+
+  procedure OneCase(const Content, What: string);
+  var
+    E: string;
+  begin
+    WriteFileText(Dir + 'f.md', Content);
+    uTools.RefreshStyles;
+    uTools.ClearStyles;
+    try
+      uTools.SetOutputStyle('f', E);
+    except
+      on Ex: Exception do
+        Check(False, What + ' raised: ' + Ex.Message);
+    end;
+    Check(IsValidUtf8(uTools.StyleNote), What + ': the note is valid UTF-8');
+    Check(IsValidUtf8(uTools.SessionNote), '  and so is the whole block');
+    Check(Length(uTools.StyleNote) <= uTools.MaxStyleNoteBytes + 512,
+      Format('  and it is within the cap (%d bytes)',
+        [Length(uTools.StyleNote)]));
+  end;
+
+begin
+  Home := SysUtils.GetEnvironmentVariable('USERPROFILE');
+  SetEnvironmentVariable('USERPROFILE',
+    PChar(IncludeTrailingPathDelimiter(SessionDir) + 'nohome'));
+  uTools.RootDir := SessionDir;
+  uTools.ClearDenyRules;
+  Dir := IncludeTrailingPathDelimiter(SessionDir) + StateDirName + PathDelim +
+    uTools.StylesDirName + PathDelim;
+  ForceDirectories(Dir);
+
+  OneCase('', 'an empty file');
+  OneCase('---'#10, 'a fence with no end');
+  OneCase('---'#10'---'#10, 'a fence with no description');
+  OneCase('---'#10'description: x.'#10'---'#10, 'a zero-byte body');
+  OneCase('---'#10'description: x.'#10'---'#10 + #0#0#0#10, 'embedded NULs');
+  OneCase('---'#13'description: x.'#13'---'#13, 'lone carriage returns');
+  OneCase('---'#10'description: '#$E2'.'#10'---'#10'body', 'a truncated UTF-8 lead');
+
+  { Random bytes, deterministically seeded so a failure can be reproduced. }
+  RandSeed := 20260101;
+  for N := 1 to 40 do
+  begin
+    Body := '';
+    for I := 1 to 200 + Random(6000) do
+      Body := Body + Chr(Random(256));
+    OneCase(Body, Format('random bytes, case %d', [N]));
+  end;
+
+  { And a body whose multi-byte characters straddle the cap: cut with Copy
+    this emits half a character into the system prompt. }
+  Body := '---'#10'description: wide.'#10'---'#10;
+  for I := 1 to 4000 do Body := Body + #$E2#$82#$AC;
+  OneCase(Body, 'a body of euro signs cut at the cap');
+  Note := uTools.StyleNote;
+  Check(Length(Note) > 1000, 'which did reach the cap: ' +
+    IntToStr(Length(Note)));
+
+  uTools.SetOutputStyle(uTools.DefaultStyleName, Err);
+  uTools.ClearStyles;
+  uTools.RefreshStyles;
+  SetEnvironmentVariable('USERPROFILE', PChar(Home));
+end;
+
 { ------------------------------------------------------------------ hooks -- }
 
 procedure WriteHooks(const Body: string);
@@ -3322,6 +3397,7 @@ begin
   TestHostileSearchResult;
   TestAgentDefinitions;
   TestSkillsHostile;
+  TestStyleFileHostile;
   TestHooksHostileConfig;
   TestHooksHostileBehaviour;
   TestApprovalsOutOfTree;

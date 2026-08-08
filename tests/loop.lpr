@@ -715,6 +715,81 @@ begin
   end;
 end;
 
+{ The output style rides in the uncached trailing block, and both halves of
+  that sentence have to hold on EVERY turn.  Asserted against real request
+  bodies because both failure modes are invisible from inside uTools: a style
+  moved into the cached prefix still reads correctly here, and a style emitted
+  only on the first request still passes every SessionNote test. }
+procedure TestStyleReachesEveryTurn;
+var
+  A: TAgent;
+  Err, StyleErr: string;
+  Doc, Sys: TJson;
+  N: Integer;
+begin
+  ResetScript;
+  uTools.RootDir := SessionDir;
+  uTools.ClearDenyRules;
+  uTools.ClearWorkingDirs;
+  uTools.ClearStyles;
+  Check(uTools.SetOutputStyle('explanatory', StyleErr),
+    'a built-in style is set: ' + StyleErr);
+
+  SetLength(Replies, 2);
+  Replies[0] := TextReply('first');
+  Replies[1] := TextReply('second');
+
+  A := MakeAgent;
+  try
+    A.Send('one', Err);
+    A.Send('two', Err);
+    Check(CallCount = 2, 'two turns went out');
+    for N := 0 to 1 do
+    begin
+      Doc := JsonParse(Requests[N]);
+      try
+        Sys := Doc.Find('system');
+        Check(Sys.Count = 2,
+          Format('turn %d carries the trailing system block', [N + 1]));
+        Check(Pos('why it is built that way',
+          Sys.Item(Sys.Count - 1).Str('text')) > 0,
+          '  with the style body in it');
+        { The whole placement ruling in one line: cached, a mid-session
+          /output-style would re-charge the entire prefix. }
+        Check(Sys.Item(Sys.Count - 1).Find('cache_control') = nil,
+          '  and no cache_control on it');
+        Check(Sys.Item(0).Find('cache_control') <> nil,
+          '  while the system prompt block still carries exactly one');
+        Check(Pos('why it is built that way', Sys.Item(0).Str('text')) = 0,
+          '  and the style is not inside the cached prefix');
+      finally
+        Doc.Free;
+      end;
+    end;
+  finally
+    A.Free;
+  end;
+
+  { And back to the default, where the body is what it always was. }
+  uTools.ClearStyles;
+  ResetScript;
+  SetLength(Replies, 1);
+  Replies[0] := TextReply('hello');
+  A := MakeAgent;
+  try
+    A.Send('hi', Err);
+    Doc := JsonParse(Requests[0]);
+    try
+      Check(Doc.Find('system').Count = 1,
+        'with the default style there is no second block at all');
+    finally
+      Doc.Free;
+    end;
+  finally
+    A.Free;
+  end;
+end;
+
 { Plan mode is told to the model twice: once as a paragraph in the system
   prompt, so it does not spend a turn walking into the boundary, and once as
   the refusal when it does anyway.  Both halves are here, plus the shape of
@@ -3139,6 +3214,7 @@ begin
   TestDeniedToolContinues;
   TestDenyProducesToolResult;
   TestExtraRootsReachTheModel;
+  TestStyleReachesEveryTurn;
   TestPlanModeReachesTheModel;
   TestPrintModeInheritsNoGrants;
   TestConversationPersists;
