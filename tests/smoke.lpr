@@ -1513,7 +1513,9 @@ begin
   Check(uTools.IsPlanTool('skill'), 'and skill');
   Check(uTools.IsPlanTool('task'), 'and task');
   Check(uTools.IsPlanTool('bash_output'), 'and bash_output');
-  Check(uTools.IsPlanTool('fetch'), 'and fetch');
+  { The one tool on the boundary: every other plan tool reads this machine,
+    and fetch is the only way for what they read to leave it. }
+  Check(not uTools.IsPlanTool('fetch'), 'and refuses fetch, which reaches out');
   Check(not uTools.IsPlanTool('write_file'), 'and refuses write_file');
   Check(not uTools.IsPlanTool('edit_file'), 'and edit_file');
   Check(not uTools.IsPlanTool('notebook_edit'), 'and notebook_edit');

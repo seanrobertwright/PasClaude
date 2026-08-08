@@ -256,8 +256,10 @@ text preserves what was missing at the time. Unchecked items remain open.
   so bypass, a class allow-all, a stored bash prefix, a hook's `allow` and a
   nil `Ask` are all structurally unable to lift it; what it permits is an
   allowlist (`read_file`, `list_dir`, `search`, `todo_write`, `skill`, `task`,
-  `bash_output`, `fetch`), so a third-party MCP verb or a tool added next year
-  is refused without anyone deciding to refuse it. The model learns the mode
+  `bash_output`), so a third-party MCP verb or a tool added next year is
+  refused without anyone deciding to refuse it. `fetch` is deliberately not on
+  it: every other name reads this machine, and `fetch` is the one way what
+  they read could leave it. The model learns the mode
   both ways: a paragraph in an uncached trailing system block, and a refusal
   naming the mode. Accept-edits IS the existing `AllowAllEdits` flag given a
   name, an indicator and — for the first time — an off switch, `/mode ask`,

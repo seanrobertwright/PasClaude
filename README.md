@@ -740,13 +740,19 @@ and every call that would change anything is refused before the permission
 gate is consulted at all.
 
 That last clause is the design, and its mechanics are in the predicate section
-above. What plan mode allows is an allowlist of eight tool names in one line -
+above. What plan mode allows is an allowlist of seven tool names in one line -
 `read_file`, `list_dir`, `search`, `todo_write`, `skill`, `task`,
-`bash_output`, `fetch` - which is how a tool somebody's MCP server contributes
-next year is refused without anybody deciding to refuse it. `fetch` is on that
-list because investigation is the point of the mode; it is also the one
-observable external effect plan mode permits, and anyone who wants it airtight
-adds `tool:fetch` to a deny rule, which plan mode cannot lift either.
+`bash_output` - which is how a tool somebody's MCP server contributes next
+year is refused without anybody deciding to refuse it.
+
+`fetch` was on that list once, on the argument that investigation is the point
+of the mode. It came off. Every other name there reads something already on
+this machine, which is what makes plan mode safe to enter without being asked
+anything; `fetch` is the one channel by which what those tools read can leave.
+A mode whose promise is "look, do not touch" cannot also POST the tree to a
+URL, and a promise with one exception is not a promise anybody can rely on.
+Investigation that genuinely needs the network is what leaving plan mode is
+for.
 
 The model is told the mode twice: once as a paragraph in the system prompt, so
 it does not spend a turn finding out, and once in the refusal, because prompt

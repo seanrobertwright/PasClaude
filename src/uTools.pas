@@ -4507,9 +4507,15 @@ end;
   intersection: a subagent in plan mode has exactly the subagent's three. }
 function IsPlanTool(const Name: string): Boolean;
 begin
+  { fetch is deliberately absent.  Everything else here reads what is already
+    on this machine, which is what makes plan mode safe to enter without being
+    asked anything; an outbound HTTPS request is a side effect the user cannot
+    see and the one channel by which everything the model just read can leave.
+    A mode whose promise is "look, do not touch" cannot hold that promise and
+    also POST the tree to a URL.  Investigation that genuinely needs the
+    network is what leaving plan mode is for. }
   Result := IsSubagentTool(Name) or (Name = 'todo_write') or
-    (Name = 'skill') or (Name = 'task') or (Name = 'bash_output') or
-    (Name = 'fetch');
+    (Name = 'skill') or (Name = 'task') or (Name = 'bash_output');
 end;
 
 { NormalizeRoot, deliberately: an added working directory contributes no
@@ -5537,10 +5543,11 @@ begin
   if not PlanMode then Exit;
   Result :=
     'This session is in plan mode. Investigate as much as you like: '#10 +
-    'read_file, list_dir, search, fetch, task and bash_output all work, '#10 +
+    'read_file, list_dir, search, task and bash_output all work, '#10 +
     'and todo_write is there for your own notes. Every call that would '#10 +
-    'change anything is refused while plan mode is on - write_file, '#10 +
-    'edit_file, notebook_edit, bash, kill_bash, and every tool an MCP '#10 +
+    'change anything, or reach off this machine, is refused while plan '#10 +
+    'mode is on - write_file, edit_file, notebook_edit, bash, kill_bash, '#10 +
+    'fetch, and every tool an MCP '#10 +
     'server contributed. Do not retry a refused call and do not ask to be '#10 +
     'let out mid-turn: only the user can leave plan mode. End your turn by '#10 +
     'saying what you would do and why, and stop there.'#10;
