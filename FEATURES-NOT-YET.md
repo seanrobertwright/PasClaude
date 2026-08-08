@@ -289,7 +289,12 @@ text preserves what was missing at the time. Unchecked items remain open.
   0xC0000142 without window-station ACL plumbing, and AppContainer needs a
   persistent profile identity for confinement we would still have to
   hand-build. Under `low`, `npx`-based MCP servers and hooks that write
-  `%APPDATA%` will fail; `/sandbox off` restores the old behaviour.*
+  `%APPDATA%` will fail; `/sandbox off` restores the old behaviour — with one
+  thing it deliberately does not switch off, because it was never a
+  restriction: at every level, `off` included, a child still gets a job object
+  carrying `KILL_ON_JOB_CLOSE`, so `kill_bash`, a hook's timeout and process
+  exit reap the whole tree instead of terminating `cmd.exe` and orphaning what
+  it started.*
 - [x] ~~**Additional working directories** — one session root, fixed at
   startup; no `--add-dir`.~~
   *Built: `--add-dir <dir>` (repeatable, also `--add-dir=<dir>`) and `/add-dir`
@@ -302,7 +307,11 @@ text preserves what was missing at the time. Unchecked items remain open.
   it, and the model is told so by a system-prompt block emitted only when
   there is more than one root. Each root gets its own `.gitignore`; the state
   directory is refused at the top of every root; deny rules still apply
-  everywhere. An added root grants file access and nothing else: its
+  everywhere, and an anchored one (`path:secrets/**`) is measured against
+  whichever root contains the file, so it means the same thing in an added
+  directory as it does in the session root — the path guard and the `list_dir`
+  and `search` walkers agree, rather than the walkers hiding a file the guard
+  would still hand over by its absolute name. An added root grants file access and nothing else: its
   `.pasclaude\hooks.json`, skills, commands and agents, its `.mcp.json` and
   its `CLAUDE.md` are all deliberately unread, and the session, history,
   approvals, snapshots and bash's working directory stay bound to the session

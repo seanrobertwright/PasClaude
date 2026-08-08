@@ -1315,19 +1315,37 @@ begin
 end;
 
 { Both spellings of one absolute path, lowercased with / separators: the
-  whole thing, and the part under the session root when it is under it.  A
+  whole thing, and the part under the root that contains it when one does.  A
   rule written the way a user thinks about their project - path:src/**.pas -
-  has to match the same file a rule written absolutely does. }
+  has to match the same file a rule written absolutely does.
+
+  The relative form is measured against the WINNING root, not the primary one.
+  The list_dir and search walkers hand DenyWalkReason a name relative to the
+  tree they are walking, so an anchored rule already hides matching files in an
+  added working directory; measuring here against the primary only would leave
+  RelForm empty for those files and let an absolute read_file or write_file
+  through - a file invisible to the model and fully readable by name, which is
+  the "looks enforced and is not" failure the walker half exists to prevent. }
 procedure PathForms(const Full: string; out Slashed, RelForm, Base: string);
 var
+  I: Integer;
   Root: string;
 begin
   Slashed := LowerCase(StringReplace(Full, '\', '/', [rfReplaceAll]));
   Base := LowerCase(ExtractFileName(ExcludeTrailingPathDelimiter(Full)));
   RelForm := '';
-  Root := LowerCase(StringReplace(NormalizeRoot, '\', '/', [rfReplaceAll]));
-  if Copy(Slashed, 1, Length(Root) + 1) = Root + '/' then
-    RelForm := Copy(Slashed, Length(Root) + 2, MaxInt);
+  { Primary first, the same order RootIndexOf and SafePath use, so a nested
+    added root cannot change what a path is relative to. }
+  for I := 0 to RootCount - 1 do
+  begin
+    Root := LowerCase(StringReplace(
+      ExcludeTrailingPathDelimiter(RootAt(I)), '\', '/', [rfReplaceAll]));
+    if (Root <> '') and (Copy(Slashed, 1, Length(Root) + 1) = Root + '/') then
+    begin
+      RelForm := Copy(Slashed, Length(Root) + 2, MaxInt);
+      Exit;
+    end;
+  end;
 end;
 
 function DenyPathReason(const Full: string): string;

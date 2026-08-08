@@ -107,7 +107,11 @@ function SandboxLowReady: Boolean;
 { Creates and configures a job for the current level.  0 on failure, which
   every caller treats as 'spawn anyway, unconfined' - degrading is the rule
   the background-job table already used, and refusing to run a command
-  because a job object could not be made would be a worse trade. }
+  because a job object could not be made would be a worse trade.
+
+  A job is made at every level, slOff included; slOff simply gets nothing but
+  KILL_ON_JOB_CLOSE.  Reaping a child's tree is what the callers had before the
+  sandbox existed and is not one of the restrictions 'off' switches off. }
 function SandboxNewJob: THandle;
 
 { The primary token for the current level, or 0 meaning 'use the parent's'.
@@ -538,10 +542,29 @@ var
   Info: TJobExtendedLimits;
   UI: TJobUIRestrictions;
 begin
-  Result := 0;
-  if SandboxLevel = slOff then Exit;
   Result := CreateJobObjectA(nil, nil);
   if Result = 0 then Exit;
+
+  { KILL_ON_JOB_CLOSE alone at slOff, and never nothing.  Every one of these
+    call sites created a job unconditionally before the sandbox existed, purely
+    so that closing the handle reaps the grandchildren: without it kill_bash
+    terminates cmd.exe and leaves whatever it started holding the spool file
+    open, a timed-out hook leaks its tree, and process exit reaps nothing.
+    That is process lifetime, not confinement, so turning the sandbox off must
+    not turn it off - "off" means no limits on what a child may do, not that a
+    child outlives the tool call that made it. }
+  if SandboxLevel = slOff then
+  begin
+    FillChar(Info, SizeOf(Info), 0);
+    Info.BasicLimitInformation.LimitFlags := JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if not SetInformationJobObject(Result, JobObjectExtendedLimitInformation,
+             @Info, SizeOf(Info)) then
+    begin
+      CloseHandle(Result);
+      Result := 0;
+    end;
+    Exit;
+  end;
 
   FillChar(Info, SizeOf(Info), 0);
   { KILL_ON_JOB_CLOSE is what makes closing the handle reap the whole tree.

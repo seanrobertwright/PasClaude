@@ -2750,6 +2750,55 @@ begin
   end;
 end;
 
+{ The half of that gate that an added root nearly opened.  A rule with a
+  separator in it is anchored to the root it is measured against, and the
+  list_dir and search walkers measure against the tree they are walking - so
+  the file is hidden from the model in an added root either way.  If SafePath
+  measured against the primary root only, the relative spelling would be empty
+  there and the anchored pattern would match nothing, leaving a file the model
+  cannot see and can still read and overwrite by its absolute name.  Both
+  halves are asserted together because agreeing is the property. }
+procedure TestDenyAnchoredInAddedRoot;
+var
+  Extra, Norm, Err, Full, Rel: string;
+  Ok: Boolean;
+begin
+  uTools.RootDir := SessionDir;
+  uTools.ClearWorkingDirs;
+  uTools.ClearDenyRules;
+  Extra := ExtraDir;
+  ForceDirectories(IncludeTrailingPathDelimiter(Extra) + 'secrets');
+  Full := IncludeTrailingPathDelimiter(Extra) + 'secrets' + PathDelim + 'k.txt';
+  WriteFileText(Full, 'LIBSECRET');
+  WriteFileText(IncludeTrailingPathDelimiter(Extra) + 'open.txt', 'fine');
+  try
+    uTools.AddDenyRule('path:secrets/**', 'test');
+    Ok := uTools.AddWorkingDir(Extra, Norm, Err);
+    Check(Ok, 'the extra root is added: ' + Err);
+
+    Rel := 'secrets' + PathDelim + 'k.txt';
+    Check(uTools.DenyWalkReason(Rel, 'k.txt') <> '',
+      'the walkers hide it, so search and list_dir never name it');
+    Check(uTools.DenyPathReason(Full) <> '',
+      'and the path guard refuses the same file by its absolute name');
+    Check(not ReadsOk(Full), 'so read_file cannot fetch what search cannot see');
+    Check(ReadsOk(IncludeTrailingPathDelimiter(Extra) + 'open.txt'),
+      'while an unmatched file in the added root still reads');
+
+    { The primary root has not changed meaning: the same anchored rule still
+      applies there, measured against the primary. }
+    ForceDirectories(IncludeTrailingPathDelimiter(SessionDir) + 'secrets');
+    WriteFileText(IncludeTrailingPathDelimiter(SessionDir) + 'secrets' +
+      PathDelim + 'k.txt', 'PRIMARY');
+    Check(uTools.DenyPathReason(IncludeTrailingPathDelimiter(SessionDir) +
+      'secrets' + PathDelim + 'k.txt') <> '',
+      'and the primary root is still covered by the same rule');
+  finally
+    uTools.ClearDenyRules;
+    uTools.ClearWorkingDirs;
+  end;
+end;
+
 { One session in a process cannot inherit another's working directories: they
   are a grant made to a session, not a property of the machine. }
 procedure TestSdkSessionDoesNotInheritRoots;
@@ -3298,6 +3347,7 @@ begin
   TestAddWorkingDirRejects;
   TestNoRootFromProject;
   TestDenyBeatsAddedRoot;
+  TestDenyAnchoredInAddedRoot;
   TestSdkSessionDoesNotInheritRoots;
   TestSandboxDoesNotTouchTheGate;
   TestSandboxNoBreakaway;

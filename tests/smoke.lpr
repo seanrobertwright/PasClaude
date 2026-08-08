@@ -2261,6 +2261,7 @@ var
   SI: STARTUPINFOA;
   PI: PROCESS_INFORMATION;
   InJob, Started: Boolean;
+  Saved: TSandboxLevel;
 begin
   Out_ := RunShell('exit 3', GetTempDir, False, Code);
   Check(Code = 3, 'the exit code comes back');
@@ -2319,6 +2320,21 @@ begin
       CloseHandle(PI.hProcess);
     end;
     CloseHandle(Job);
+  end;
+
+  { And the same job at slOff.  Every one of the four spawn sites made a
+    KILL_ON_JOB_CLOSE job unconditionally before the sandbox existed; if
+    turning the sandbox off returned 0 here, "/sandbox off" would quietly also
+    turn off tree-kill, and kill_bash would start orphaning grandchildren
+    holding the spool file open. }
+  Saved := uSandbox.SandboxLevel;
+  try
+    uSandbox.SandboxLevel := slOff;
+    Job := SandboxNewJob;
+    Check(Job <> 0, 'SandboxNewJob still returns a job with the sandbox off');
+    if Job <> 0 then CloseHandle(Job);
+  finally
+    uSandbox.SandboxLevel := Saved;
   end;
 end;
 
