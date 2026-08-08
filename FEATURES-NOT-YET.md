@@ -425,8 +425,10 @@ text preserves what was missing at the time. Unchecked items remain open.
   from `read_file` (it keeps its hex dump — a tool result has no human in the
   loop, and `uNotebook` and `uMcp` already refuse to sail base64 into context
   unexamined), no images in tool results at all, no URL or Files API sources,
-  8 per message, and `-p` never expands `@mentions` so an image cannot be
-  attached in print mode. **An image can carry text instructing the model that
+  8 per message, and plain `-p` never expands `@mentions` — though a
+  `--input-format stream-json` driver can send image blocks in its own
+  user message, so print mode is not closed to images, only the `@`
+  shorthand is. **An image can carry text instructing the model that
   a person reading the transcript cannot see — the transcript shows only
   `[image 1920x1080 image/png]`. Nothing here detects that and nothing can.
   What bounds it: an image enters only by your own `@mention` or `/paste`, both
