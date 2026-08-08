@@ -56,6 +56,32 @@ var
   { The same seam for GET, used by the fetch tool's tests. }
   HttpGetTransport: TGetProc = nil;
 
+  { Resolve/connect/send/receive timeouts, in milliseconds, for the duration
+    of one call.  0 means the behaviour this unit has always had: WinHTTP's
+    own defaults with the receive timeout widened to 300s, because a streamed
+    answer idles between tokens and 30s truncates long replies.
+
+    Only the telemetry flush sets this, and it restores it in a finally.  A
+    collector must never be able to delay a turn, and equally must never be
+    able to leave a two-second receive timeout behind on the model's own
+    stream - which would surface as a truncated answer and look like a model
+    fault rather than a telemetry one. }
+  HttpTimeoutMs: Integer = 0;
+
+{ Splits a URL into its parts and says whether the transport must be secure.
+  https:// anywhere; http:// ONLY when the host is exactly '127.0.0.1' or
+  'localhost'.  That exception exists for one caller - metrics to a collector
+  on the same machine, where there is no network to be in the clear on - and
+  it is an exact host test rather than a prefix one, because
+  '127.0.0.1.evil.com' reading as loopback is the whole difference between a
+  narrow exception and a hole.  A bracketed IPv6 literal is refused: the colon
+  scan below cannot parse one and guessing would be worse.
+
+  Exposed so it can be tested directly.  SplitUrl below is the unchanged
+  https-only contract every other caller in this program still uses. }
+function SplitUrlEx(const Url: string; out Host, Path: string;
+  out Port: Word; out Secure: Boolean): Boolean;
+
 implementation
 
 uses SysUtils;
@@ -67,6 +93,7 @@ const
   WINHTTP_QUERY_RETRY_AFTER           = 35;
   WINHTTP_QUERY_FLAG_NUMBER           = $20000000;
   INTERNET_DEFAULT_HTTPS_PORT         = 443;
+  INTERNET_DEFAULT_HTTP_PORT          = 80;
   WINHTTP_OPTION_RECEIVE_TIMEOUT      = 6;
 
 type
@@ -91,6 +118,9 @@ type
     lpBuffer: Pointer; dwBufferLength: DWORD): BOOL; stdcall;
   TWinHttpCrackUrl = function(pwszUrl: PWideChar; dwUrlLength, dwFlags: DWORD;
     lpUrlComponents: Pointer): BOOL; stdcall;
+  TWinHttpSetTimeouts = function(hInternet: Pointer;
+    nResolveTimeout, nConnectTimeout, nSendTimeout,
+    nReceiveTimeout: Integer): BOOL; stdcall;
 
 var
   Lib: HMODULE = 0;
@@ -103,6 +133,9 @@ var
   wReadData: TWinHttpReadData;
   wCloseHandle: TWinHttpCloseHandle;
   wSetOption: TWinHttpSetOption;
+  { Resolved optionally, exactly as wSetOption is: its absence must never be
+    what makes LoadWinHttp fail, because the program works without it. }
+  wSetTimeouts: TWinHttpSetTimeouts;
 
 function LoadWinHttp: Boolean;
 begin
@@ -118,6 +151,7 @@ begin
   Pointer(wReadData) := GetProcAddress(Lib, 'WinHttpReadData');
   Pointer(wCloseHandle) := GetProcAddress(Lib, 'WinHttpCloseHandle');
   Pointer(wSetOption) := GetProcAddress(Lib, 'WinHttpSetOption');
+  Pointer(wSetTimeouts) := GetProcAddress(Lib, 'WinHttpSetTimeouts');
   Result := Assigned(wOpen) and Assigned(wConnect) and Assigned(wOpenRequest) and
             Assigned(wSendRequest) and Assigned(wReceiveResponse) and
             Assigned(wQueryHeaders) and Assigned(wReadData) and
@@ -129,17 +163,23 @@ begin
   Result := LoadWinHttp;
 end;
 
-{ Splits https://host/path into its parts.  Only https is supported, which is
-  all this program talks. }
-function SplitUrl(const Url: string; out Host, Path: string;
-  out Port: Word): Boolean;
+function SplitUrlEx(const Url: string; out Host, Path: string;
+  out Port: Word; out Secure: Boolean): Boolean;
 var
   Rest: string;
   Slash, Colon: Integer;
 begin
   Result := False;
-  if Copy(Url, 1, 8) <> 'https://' then Exit;
-  Rest := Copy(Url, 9, MaxInt);
+  Secure := False;
+  if Copy(Url, 1, 8) = 'https://' then
+  begin
+    Secure := True;
+    Rest := Copy(Url, 9, MaxInt);
+  end
+  else if Copy(Url, 1, 7) = 'http://' then
+    Rest := Copy(Url, 8, MaxInt)
+  else
+    Exit;
   Slash := Pos('/', Rest);
   if Slash = 0 then
   begin
@@ -151,14 +191,34 @@ begin
     Host := Copy(Rest, 1, Slash - 1);
     Path := Copy(Rest, Slash, MaxInt);
   end;
-  Port := INTERNET_DEFAULT_HTTPS_PORT;
+  { A bracketed IPv6 host would be shredded by the colon scan below. }
+  if (Host <> '') and (Host[1] = '[') then Exit;
+  if Secure then
+    Port := INTERNET_DEFAULT_HTTPS_PORT
+  else
+    Port := INTERNET_DEFAULT_HTTP_PORT;
   Colon := Pos(':', Host);
   if Colon > 0 then
   begin
-    Port := Word(StrToIntDef(Copy(Host, Colon + 1, MaxInt), 443));
+    Port := Word(StrToIntDef(Copy(Host, Colon + 1, MaxInt), Port));
     Host := Copy(Host, 1, Colon - 1);
   end;
-  Result := Host <> '';
+  if Host = '' then Exit;
+  { Plaintext leaves this function only for a loopback literal. }
+  if (not Secure) and (Host <> '127.0.0.1') and
+     (LowerCase(Host) <> 'localhost') then Exit;
+  Result := True;
+end;
+
+{ The unchanged contract: https only, Result False for anything else.  Every
+  caller but the telemetry flush comes through here, so the loopback exception
+  above cannot reach the Anthropic request path even by accident. }
+function SplitUrl(const Url: string; out Host, Path: string;
+  out Port: Word): Boolean;
+var
+  Secure: Boolean;
+begin
+  Result := SplitUrlEx(Url, Host, Path, Port, Secure) and Secure;
 end;
 
 function LastErrText: string;
@@ -179,8 +239,9 @@ var
   Buf: array[0..8191] of Byte;
   Got: DWORD;
   Chunk: string;
-  Aborted, IsError: Boolean;
+  Aborted, IsError, Secure: Boolean;
   Timeout: DWORD;
+  ReqFlags: DWORD;
   RetrySecs: Integer;
 begin
   Result.Ok := False;
@@ -194,9 +255,11 @@ begin
     Result.Error := 'winhttp.dll is not available';
     Exit;
   end;
-  if not SplitUrl(Url, Host, Path, Port) then
+  if not SplitUrlEx(Url, Host, Path, Port, Secure) then
   begin
-    Result.Error := 'only https:// URLs are supported: ' + Url;
+    Result.Error := 'only https:// URLs are supported (http:// is accepted ' +
+      'for a collector on 127.0.0.1 or localhost, where there is no network ' +
+      'to be in the clear on): ' + Url;
     Exit;
   end;
 
@@ -207,8 +270,13 @@ begin
     Exit;
   end;
   try
-    { Streamed answers can idle between tokens; the 30s default is too tight. }
-    if Assigned(wSetOption) then
+    { Streamed answers can idle between tokens; the 30s default is too tight.
+      A caller that set HttpTimeoutMs is saying the opposite - it would rather
+      give up than wait - and gets all four timeouts at that value instead. }
+    if (HttpTimeoutMs > 0) and Assigned(wSetTimeouts) then
+      wSetTimeouts(Sess, HttpTimeoutMs, HttpTimeoutMs, HttpTimeoutMs,
+        HttpTimeoutMs)
+    else if Assigned(wSetOption) then
     begin
       Timeout := 300000;
       wSetOption(Sess, WINHTTP_OPTION_RECEIVE_TIMEOUT, @Timeout, SizeOf(Timeout));
@@ -224,8 +292,12 @@ begin
     try
       PathW := UTF8Decode(Path);
       VerbW := UTF8Decode(Verb);
+      { The flag comes from the parsed scheme and from nothing else: https://
+        is the only scheme SplitUrlEx marks secure, so an Anthropic request
+        cannot lose TLS through this branch. }
+      if Secure then ReqFlags := WINHTTP_FLAG_SECURE else ReqFlags := 0;
       Req := wOpenRequest(Conn, PWideChar(VerbW), PWideChar(PathW), nil, nil, nil,
-        WINHTTP_FLAG_SECURE);
+        ReqFlags);
       if Req = nil then
       begin
         Result.Error := LastErrText;

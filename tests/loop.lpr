@@ -12,7 +12,7 @@ program loop;
 
 {$mode objfpc}{$H+}
 
-uses SysUtils, Classes, uJson, uHttp, uHooks, uTools, uAgent, uSdk;
+uses SysUtils, Classes, uJson, uHttp, uTelem, uHooks, uTools, uAgent, uSdk;
 
 var
   Fails: Integer = 0;
@@ -3858,6 +3858,129 @@ begin
   end;
 end;
 
+{ ------------------------------------------------------------- telemetry -- }
+
+var
+  SawStatus: Integer = -1;
+  SawElapsed: Integer = -1;
+  SawModel: string = '';
+  SawCalls: Integer = 0;
+
+procedure CapRequestDone(StatusCode, ElapsedMs: Integer; const Model: string);
+begin
+  Inc(SawCalls);
+  SawStatus := StatusCode;
+  SawElapsed := ElapsedMs;
+  SawModel := Model;
+end;
+
+procedure BoomRequestDone(StatusCode, ElapsedMs: Integer; const Model: string);
+begin
+  Inc(SawCalls);
+  { A telemetry fault must not be able to fail a turn: the give-up rule is
+    worthless if the recording path itself can raise. }
+  raise Exception.Create('telemetry exploded');
+end;
+
+{ OnRequestDone fires once per request, carrying a status and a non-negative
+  duration and NOTHING that could hold prompt or reply text.  And a recorder
+  that throws is still not allowed to cost the answer. }
+procedure TestRequestDoneSeam;
+var
+  A: TAgent;
+  Err: string;
+begin
+  ResetScript;
+  uTools.RootDir := SessionDir;
+  SetLength(Replies, 1);
+  Replies[0] := TextReply('an answer');
+  SawCalls := 0;
+  SawStatus := -1;
+  SawElapsed := -1;
+  A := MakeAgent;
+  try
+    A.OnRequestDone := @CapRequestDone;
+    Check(A.Send('ask', Err), 'the turn succeeds with a request recorder wired');
+    Check(SawCalls = 1, 'and the recorder fired exactly once');
+    Check(SawStatus = 200, 'with the HTTP status');
+    Check(SawElapsed >= 0, 'and a non-negative duration');
+    Check(SawModel <> '', 'and the model the request actually carried');
+    { The only three things it is given.  A body or an error string here would
+      be the first place completion text could reach a metrics exporter. }
+    Check(Pos('an answer', SawModel) = 0, 'and never the reply text');
+  finally
+    A.Free;
+  end;
+
+  ResetScript;
+  SetLength(Replies, 1);
+  Replies[0] := TextReply('still fine');
+  SawCalls := 0;
+  A := MakeAgent;
+  try
+    A.OnRequestDone := @BoomRequestDone;
+    Check(A.Send('ask', Err), 'a recorder that raises does not fail the turn');
+    Check(SawCalls = 1, 'though it was called');
+  finally
+    A.Free;
+  end;
+end;
+
+{ The central promise, asserted against the transport: a turn with telemetry
+  OFF makes exactly one request - the model call - and a turn with telemetry
+  ON but the collector answering nonsense still completes. }
+procedure TestTelemetryNeverCostsATurn;
+var
+  A: TAgent;
+  Err, FErr: string;
+  C: TTelemConfig;
+  Status: Integer;
+begin
+  ResetScript;
+  uTools.RootDir := SessionDir;
+  SetLength(Replies, 1);
+  Replies[0] := TextReply('off');
+  TelemInit(TelemDefaultConfig);
+  A := MakeAgent;
+  try
+    A.OnRequestDone := @CapRequestDone;
+    Check(A.Send('ask', Err), 'a turn completes with telemetry off');
+    { FakePost is installed for this whole process, so a flush that went out
+      would show up here as a second recorded request. }
+    Check(CallCount = 1, 'and exactly one request was made - the model call');
+    TelemRecordTurn(A.TokensIn, A.TokensOut, A.CacheReadTokens,
+      A.CacheWriteTokens, A.LastRequestModel);
+    Check(not TelemDueForFlush, 'and nothing is ever due while it is off');
+  finally
+    A.Free;
+  end;
+
+  ResetScript;
+  SetLength(Replies, 1);
+  Replies[0] := TextReply('on');
+  C := TelemDefaultConfig;
+  C.Enabled := True;
+  C.Endpoint := 'http://127.0.0.1:4318/v1/metrics';
+  C.IntervalTurns := 1;
+  TelemInit(C);
+  A := MakeAgent;
+  try
+    Check(A.Send('ask', Err), 'a turn completes with telemetry on');
+    TelemRecordTurn(A.TokensIn, A.TokensOut, A.CacheReadTokens,
+      A.CacheWriteTokens, A.LastRequestModel);
+    TelemRecordTurn(A.TokensIn * 2, A.TokensOut * 2, 0, 0, A.LastRequestModel);
+    Check(TelemDueForFlush, 'and the flush comes due');
+    TelemFlush(Status, FErr);
+    ResetScript;
+    SetLength(Replies, 1);
+    Replies[0] := TextReply('and again');
+    Check(A.Send('again', Err), 'the next turn works whatever the flush did');
+  finally
+    A.Free;
+    TelemInit(TelemDefaultConfig);
+  end;
+end;
+
 begin
   { Every request in this suite goes to the stand-in rather than the network. }
   SetEnvironmentVariable('USERPROFILE',
@@ -3922,6 +4045,8 @@ begin
   TestSdkResumeRoundTrip;
   TestSdkResumeRefusesCorrupt;
   TestSdkSaveFailureReported;
+  TestRequestDoneSeam;
+  TestTelemetryNeverCostsATurn;
 
   WriteLn;
   if Fails = 0 then

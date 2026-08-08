@@ -8,7 +8,7 @@ program fuzz;
 
 {$mode objfpc}{$H+}
 
-uses SysUtils, Classes, Windows, uJson, uSettings, uAuth, uMcp, uHooks,
+uses SysUtils, Classes, Windows, uJson, uSettings, uAuth, uTelem, uMcp, uHooks,
   uSandbox, uTools, uImage, uAgent, uHttp, uSdk;
 
 var
@@ -3910,6 +3910,121 @@ begin
   P := nil;
 end;
 
+{ Hostile telemetry configuration.  The failure that matters is not a crash -
+  it is a malformed file that comes back ENABLED, because then the program
+  starts sending from a document the user did not successfully write. }
+procedure TestTelemetryHostileConfig;
+var
+  C: TTelemConfig;
+  I: Integer;
+  Bad: array[0..10] of string = (
+    '',
+    'not json at all',
+    '[1,2,3]',
+    '{"telemetry.enabled":true}',
+    '{"telemetry.enabled":true,"telemetry.endpoint":"file:///E:/x"}',
+    '{"telemetry.enabled":true,"telemetry.endpoint":"http://evil.example.com/"}',
+    '{"telemetry.enabled":"yes","telemetry.endpoint":"http://localhost:4318"}',
+    '{"telemetry.enabled":true,"telemetry.headers":["a","b"],' +
+      '"telemetry.endpoint":"http://localhost:4318"}',
+    '{"telemetry.interval_turns":"ten"}',
+    '{"telemetry.timeout_ms":1e308}',
+    '{"telemetry.enabled":true,"telemetry.endpoint":' +
+      '"http://localhost:4318"'#0'}');
+begin
+  for I := 0 to High(Bad) do
+  begin
+    C := TelemParse(Bad[I]);
+    TelemInit(C);
+    Check(not TelemEnabled,
+      Format('hostile telemetry config %d does not enable anything', [I]));
+    { Nothing may fail silently: a user who wrote a file and got no reaction
+      would believe it took. }
+    if Bad[I] <> '' then
+      Check(Length(TelemNotes) > 0, Format('and config %d says why', [I]));
+  end;
+
+  { Deep nesting and a large document, neither of which may throw. }
+  C := TelemParse(StringOfChar('[', 400) + StringOfChar(']', 400));
+  TelemInit(C);
+  Check(not TelemEnabled, 'deeply nested JSON is refused, not obeyed');
+  C := TelemParse('{"telemetry.endpoint":"' + StringOfChar('a', 5 * 1024 * 1024)
+    + '"}');
+  TelemInit(C);
+  Check(not TelemEnabled, 'a 5MB document is refused whole');
+  Check(Length(TelemNotes) > 0, 'and says so');
+
+  { Invalid UTF-8 must never survive into a payload. }
+  C := TelemParse('{"telemetry.service_name":"' + #$FF#$FE + '"}');
+  TelemInit(C);
+  Check(not TelemEnabled, 'and invalid UTF-8 gets nowhere');
+
+  TelemInit(TelemDefaultConfig);
+  uSettings.SettingsClear;
+end;
+
+{ A hostile project can name 5000 tools and 5000 models.  It must not be able
+  to grow the payload one row per name: unbounded attribute cardinality is how
+  a flush becomes slow and a collector starts rejecting batches. }
+procedure TestTelemetryCardinality;
+var
+  C: TTelemConfig;
+  Doc, M, P, A: TJson;
+  I, J, K: Integer;
+  Payload, V: string;
+  Ok: Boolean;
+begin
+  C := TelemDefaultConfig;
+  C.Enabled := True;
+  C.Endpoint := 'http://127.0.0.1:4318';
+  TelemInit(C);
+  for I := 1 to 5000 do
+  begin
+    case I mod 4 of
+      0: TelemRecordTool('mcp__srv' + IntToStr(I) + '__tool', False);
+      1: TelemRecordTool('tool-' + StringOfChar('x', I mod 300), True);
+      2: TelemRecordTool('E:\Projects\secret\' + IntToStr(I), False);
+    else TelemRecordTool('read_file', False);
+    end;
+    TelemRecordTurn(I, I, 0, 0, 'claude-' + IntToStr(I) + '-model');
+    TelemRecordRequest(200 + (I mod 300), 1);
+  end;
+
+  Payload := TelemBuildPayload(False);
+  Check(IsValidUtf8(Payload), 'the payload is valid UTF-8 after 5000 hostile names');
+  Check(Length(Payload) < 128 * 1024,
+    Format('and stays bounded (%d bytes)', [Length(Payload)]));
+
+  Doc := JsonParse(Payload);
+  Check(Doc <> nil, 'and still parses');
+  if Doc = nil then Exit;
+  try
+    Ok := True;
+    M := Doc.Find('resourceMetrics').Item(0).Find('scopeMetrics').Item(0).
+      Find('metrics');
+    for I := 0 to M.Count - 1 do
+    begin
+      if M.Item(I).Str('name') <> 'pasclaude.tool.calls' then Continue;
+      P := M.Item(I).Find('sum').Find('dataPoints');
+      for J := 0 to P.Count - 1 do
+      begin
+        A := P.Item(J).Find('attributes');
+        for K := 0 to A.Count - 1 do
+          if A.Item(K).Str('key') = 'tool' then
+          begin
+            V := A.Item(K).Find('value').Str('stringValue');
+            if (V <> 'mcp') and (V <> 'other') and
+               (TelemBucketTool(V) <> V) then Ok := False;
+          end;
+      end;
+    end;
+    Check(Ok, 'every tool attribute is a built-in name, mcp, or other');
+  finally
+    Doc.Free;
+  end;
+  TelemInit(TelemDefaultConfig);
+end;
+
 begin
   TestImageDecodersHostile;
   TestBinaryFileDoesNotCorruptBody;
@@ -3963,6 +4078,8 @@ begin
   TestModelSettingsHostile;
   TestHostileCredentialFile;
   TestHostileForeignCredentials;
+  TestTelemetryHostileConfig;
+  TestTelemetryCardinality;
   uTools.ClearWorkingDirs;
   uSandbox.SandboxShutdown;
 

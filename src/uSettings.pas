@@ -592,6 +592,15 @@ begin
           begin
             if V.Kind <> jkNum then
               Bad('"' + Name + '" must be a number')
+            { Round() on a double outside Int64 raises, and an exception here
+              would escape a loader whose whole contract is that a hostile
+              project file can never stop the program - 1e308 in a cloned
+              settings.json would have been startup denial of service.  The
+              range test has to happen in floating point, before the
+              conversion. }
+            else if (V.AsNumber < -9.2e18) or (V.AsNumber > 9.2e18) then
+              Bad(Format('"%s" must be between %d and %d',
+                [Name, D.Lo, D.Hi]))
             else
             begin
               N := Round(V.AsNumber);

@@ -624,7 +624,41 @@ text preserves what was missing at the time. Unchecked items remain open.
   or to route by prompt length. The alias table remains a table of strings
   about a namespace this program does not own; a retired target is answered
   by overriding it in `settings.json` rather than by anything automatic.*
-- [ ] **Telemetry** — no OpenTelemetry/usage metrics export.
+- [x] **Telemetry** — ~~no OpenTelemetry/usage metrics export.~~
+  *Built: opt-in OTLP/HTTP metrics with the JSON encoding, off by default and
+  turned on only by `telemetry.enabled` plus `telemetry.endpoint` in
+  `%USERPROFILE%\.pasclaude\settings.json` — both keys are user scope in the
+  settings table, so a cloned repository cannot enable telemetry, name an
+  endpoint, add a header or change the interval, and `OTEL_EXPORTER_OTLP_*`
+  is deliberately not honoured because environment is inherited from whatever
+  launched us. JSON rather than protobuf because hand-writing a protobuf
+  encoder is the dependency this program keeps refusing; the spec's rules are
+  obeyed literally — `/v1/metrics`, `Content-Type: application/json`,
+  lowerCamelCase keys, enums as integers, int64 as decimal strings, DELTA
+  temporality so a process that dies owes nothing. Five counters go out and
+  nothing else: turns, tokens by kind and model, tool calls by name and
+  ok/error, API requests by HTTP status, and total request milliseconds. The
+  two strings that could carry text are filtered rather than trusted — a tool
+  name must be in a compile-time list of built-ins or it becomes `mcp` or
+  `other`, and a model name must match `claude-[a-z0-9._-]*` or it becomes
+  `other` — because both reach here from files that arrive with a clone.
+  `/telemetry preview` prints the exact payload from the same builder the
+  sender uses, with any collector token redacted to a length. The flush is
+  synchronous at the end of a turn, at most once every `interval_turns`, and
+  three consecutive failures stop it for the session with one yellow note.
+  `http://` is accepted for `127.0.0.1` and `localhost` only, on an exact
+  host test, and `SplitUrl` itself is unchanged so the API path cannot lose
+  TLS.
+  **What is narrower than Claude Code's:** metrics only — no traces, no
+  spans, no logs and no events, so there is nothing to correlate a slow turn
+  against. No protobuf, so a vendor endpoint that speaks only protobuf cannot
+  be used at all. No histograms: latency is a request count and a millisecond
+  sum, which gives a mean and never a p95. No `session.id` and no host,
+  user or account attribute, so a collector cannot tell two sessions apart —
+  deliberate, but it does mean per-session dashboards are impossible. No
+  queue and no spool: a failed batch is discarded rather than retried, so an
+  offline period is simply missing. Nothing is sent from a `-p` run that
+  never reached a turn, and startup refusals send nothing at all.*
 
 ## Completed since this list was compiled
 

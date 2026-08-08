@@ -8,7 +8,7 @@ program smoke;
 { Windows first, deliberately: it exports a DeleteFile taking a PChar, and this
   suite calls SysUtils' one throughout.  A later unit wins, so SysUtils has to
   come after it. }
-uses Windows, SysUtils, Classes, uJson, uSettings, uAuth, uHttp, uMcp,
+uses Windows, SysUtils, Classes, uJson, uSettings, uAuth, uHttp, uTelem, uMcp,
   uHooks, uSandbox, uTools, uAgent, uRegex, uSdk, uTerm;
 
 var
@@ -4116,6 +4116,577 @@ begin
   Err := '';
 end;
 
+{ ------------------------------------------------------------- telemetry -- }
+
+{ A configuration that is on and pointed somewhere harmless.  Nothing in this
+  suite ever reaches a network: every flush goes through HttpTransport. }
+function TelemOnConfig: TTelemConfig;
+begin
+  Result := TelemDefaultConfig;
+  Result.Enabled := True;
+  Result.Endpoint := 'http://127.0.0.1:4318';
+  Result.IntervalTurns := 2;
+  Result.TimeoutMs := 1500;
+end;
+
+var
+  TelemCalls: Integer = 0;
+  TelemLastBody: string = '';
+  TelemLastHeaders: string = '';
+  TelemReplyOk: Boolean = True;
+  TelemReplyStatus: Integer = 200;
+  TelemReplyBody: string = '';
+  TelemSawTimeout: Integer = -1;
+
+function TelemTransport(const Url, Headers, Body: string;
+  OnChunk: TChunkProc; Ctx: Pointer): THttpResult;
+begin
+  Inc(TelemCalls);
+  TelemLastBody := Body;
+  TelemLastHeaders := Headers;
+  { Recorded from inside the call, which is the only place the question "was
+    the timeout actually in force" can be asked. }
+  TelemSawTimeout := uHttp.HttpTimeoutMs;
+  Result.Ok := TelemReplyOk;
+  Result.Status := TelemReplyStatus;
+  Result.Body := TelemReplyBody;
+  Result.Error := '';
+  if not TelemReplyOk then Result.Error := 'HTTP ' + IntToStr(TelemReplyStatus);
+  Result.RetryAfterMs := 0;
+end;
+
+{ Every key in an OTLP/JSON document is lowerCamelCase; an underscore anywhere
+  in a KEY means the payload was written to protobuf's field names, which the
+  spec says are "not valid to use as keys". }
+function KeysAreCamel(J: TJson): Boolean;
+var
+  I: Integer;
+begin
+  Result := True;
+  if J = nil then Exit;
+  if J.Kind = jkObj then
+    for I := 0 to J.Count - 1 do
+    begin
+      if Pos('_', J.Key(I)) > 0 then Exit(False);
+      if not KeysAreCamel(J.Item(I)) then Exit(False);
+    end
+  else if J.Kind = jkArr then
+    for I := 0 to J.Count - 1 do
+      if not KeysAreCamel(J.Item(I)) then Exit(False);
+end;
+
+{ Collects every string that appears anywhere in the tree, key or value.  The
+  content test below is only as strong as this walk is complete. }
+procedure CollectStrings(J: TJson; var Acc: string);
+var
+  I: Integer;
+begin
+  if J = nil then Exit;
+  case J.Kind of
+    jkStr: Acc := Acc + J.AsString + #1;
+    jkObj:
+      for I := 0 to J.Count - 1 do
+      begin
+        Acc := Acc + J.Key(I) + #1;
+        CollectStrings(J.Item(I), Acc);
+      end;
+    jkArr:
+      for I := 0 to J.Count - 1 do CollectStrings(J.Item(I), Acc);
+  end;
+end;
+
+{ The shape a collector actually validates: the envelope, the enum as a
+  NUMBER, and every asInt as a STRING.  Getting either of the last two wrong
+  produces an opaque 400 that no other test in this suite would explain. }
+procedure TestTelemPayloadShape;
+var
+  Doc, RM, SM, M, Sum, Pt: TJson;
+  I: Integer;
+  AllInt, AllPoints: Boolean;
+begin
+  TelemInit(TelemOnConfig);
+  TelemRecordTurn(100, 50, 0, 0, 'claude-sonnet-4-5');
+  TelemRecordTool('read_file', False);
+  TelemRecordRequest(200, 120);
+
+  Doc := JsonParse(TelemBuildPayload(False));
+  Check(Doc <> nil, 'the telemetry payload is valid JSON');
+  if Doc = nil then Exit;
+  try
+    Check(KeysAreCamel(Doc), 'every key in the payload is lowerCamelCase');
+    RM := Doc.Find('resourceMetrics');
+    Check((RM <> nil) and (RM.Count = 1), 'one resourceMetrics entry');
+    if RM = nil then Exit;
+    RM := RM.Item(0);
+    SM := RM.Find('resource').Find('attributes');
+    Check((SM <> nil) and (SM.Count = 2),
+      'the resource carries exactly two attributes');
+    Check(SM.Item(0).Str('key') = 'service.name', 'service.name is one');
+    Check(SM.Item(1).Str('key') = 'service.version', 'service.version the other');
+    SM := RM.Find('scopeMetrics').Item(0);
+    Check(SM.Find('scope').Str('name') = 'pasclaude', 'the scope names us');
+    M := SM.Find('metrics');
+    Check((M <> nil) and (M.Count >= 3),
+      'turns, tokens and tool calls are all present');
+
+    AllInt := True;
+    AllPoints := True;
+    for I := 0 to M.Count - 1 do
+    begin
+      Sum := M.Item(I).Find('sum');
+      if Sum = nil then begin AllInt := False; Continue; end;
+      { The enum as an integer, per the spec: a receiver that is handed
+        'AGGREGATION_TEMPORALITY_DELTA' rejects the batch. }
+      if (Sum.Find('aggregationTemporality') = nil) or
+         (Sum.Find('aggregationTemporality').Kind <> jkNum) or
+         (Sum.Num('aggregationTemporality') <> 1) then AllInt := False;
+      if not Sum.Bool('isMonotonic') then AllInt := False;
+      Pt := Sum.Find('dataPoints');
+      if (Pt = nil) or (Pt.Count = 0) then AllPoints := False
+      else if Pt.Item(0).Find('asInt').Kind <> jkStr then AllPoints := False
+      else if Pt.Item(0).Find('startTimeUnixNano') = nil then AllPoints := False;
+    end;
+    Check(AllInt, 'every sum is DELTA=1 as a number and monotonic');
+    Check(AllPoints, 'every data point carries asInt as a JSON string');
+  finally
+    Doc.Free;
+  end;
+  TelemInit(TelemDefaultConfig);
+end;
+
+{ The test the security review reads.  Feed the recorders everything a leak
+  would look like, then prove none of it is anywhere in the tree - and that
+  the attribute key set is exactly the documented one, so a field added later
+  fails here rather than in somebody's collector. }
+procedure TestTelemCarriesNoContent;
+var
+  Doc: TJson;
+  Acc: string;
+  Poisons: array[0..4] of string = (
+    'the user typed this secret prompt',
+    'the model answered with this',
+    'E:\Projects\secret',
+    '{"path":"C:\\Users\\someone\\.ssh\\id_rsa"}',
+    'sk-ant-oat-POISON');
+  I: Integer;
+  Ok: Boolean;
+
+  function KeysOnlyDocumented(J: TJson): Boolean;
+  var
+    K: Integer;
+    N: string;
+  begin
+    Result := True;
+    if J = nil then Exit;
+    if J.Kind = jkObj then
+    begin
+      N := J.Str('key', #0);
+      if N <> #0 then
+        if (N <> 'service.name') and (N <> 'service.version') and
+           (N <> 'type') and (N <> 'model') and (N <> 'tool') and
+           (N <> 'status') then Exit(False);
+      for K := 0 to J.Count - 1 do
+        if not KeysOnlyDocumented(J.Item(K)) then Exit(False);
+    end
+    else if J.Kind = jkArr then
+      for K := 0 to J.Count - 1 do
+        if not KeysOnlyDocumented(J.Item(K)) then Exit(False);
+  end;
+
+begin
+  TelemInit(TelemOnConfig);
+  { Every string a hostile or careless caller could hand the recorders. }
+  for I := 0 to High(Poisons) do
+  begin
+    TelemRecordTool(Poisons[I], I mod 2 = 0);
+    TelemRecordTurn(10 * (I + 1), I, 0, 0, Poisons[I]);
+  end;
+  TelemRecordRequest(401, 5);
+
+  Doc := JsonParse(TelemBuildPayload(False));
+  Check(Doc <> nil, 'the poisoned payload still parses');
+  if Doc = nil then Exit;
+  try
+    Acc := '';
+    CollectStrings(Doc, Acc);
+    Ok := True;
+    for I := 0 to High(Poisons) do
+      if Pos(Poisons[I], Acc) > 0 then Ok := False;
+    Check(Ok, 'no prompt, path, tool argument or key reaches the payload');
+    Check(Pos('secret', Acc) = 0, 'and no fragment of one either');
+    Check(KeysOnlyDocumented(Doc),
+      'the attribute keys are exactly the documented six');
+  finally
+    Doc.Free;
+  end;
+  TelemInit(TelemDefaultConfig);
+end;
+
+{ The two filters that stand between a project-controlled string and the wire.
+  MCP tool names come from .mcp.json and the model can be restored out of
+  session.json, both of which arrive with a clone. }
+procedure TestTelemFilters;
+var
+  Schema: TJson;
+  I, Seen: Integer;
+  Name: string;
+  Missing: string;
+begin
+  Check(TelemBucketTool('read_file') = 'read_file', 'a built-in keeps its name');
+  Check(TelemBucketTool('bash') = 'bash', 'and so does bash');
+  Check(TelemBucketTool('mcp__server__tool') = 'mcp',
+    'an MCP tool collapses to mcp, naming no server');
+  Check(TelemBucketTool('zzz-evil-name') = 'other', 'an unknown name is other');
+  Check(TelemBucketTool('read_file E:\secret') = 'other',
+    'and a path-shaped name is other');
+
+  Check(TelemSafeModel('claude-sonnet-4-5') = 'claude-sonnet-4-5',
+    'a real model id survives');
+  Check(TelemSafeModel('') = 'other', 'an empty model is other');
+  Check(TelemSafeModel('gpt-4') = 'other', 'a foreign id is other');
+  Check(TelemSafeModel('claude-x' + StringOfChar('y', 200)) = 'other',
+    'an over-long id is other');
+  Check(TelemSafeModel('claude-a/b') = 'other', 'a slash makes it other');
+  Check(TelemSafeModel('claude-a b') = 'other', 'and so does a space');
+
+  { The allowlist is compile-time, so a fourteenth built-in tool would report
+    as 'other' until somebody adds it.  That fails safe, but it degrades the
+    data quietly - so the drift is caught here at build time. }
+  Schema := ToolsSchema;
+  try
+    Seen := 0;
+    Missing := '';
+    for I := 0 to Schema.Count - 1 do
+    begin
+      Name := Schema.Item(I).Str('name');
+      if Pos('mcp__', Name) = 1 then Continue;
+      Inc(Seen);
+      if TelemBucketTool(Name) <> Name then Missing := Missing + ' ' + Name;
+    end;
+    Check(Seen > 0, 'the live tool list is not empty');
+    Check(Missing = '',
+      'the telemetry allowlist covers every live built-in tool:' + Missing);
+  finally
+    Schema.Free;
+  end;
+end;
+
+{ The loopback exception, and the assertion that matters most in this file:
+  the Anthropic endpoint still parses as secure on 443. }
+procedure TestTelemEndpoints;
+var
+  Why, Host, Path: string;
+  Port: Word;
+  Secure: Boolean;
+begin
+  Check(TelemValidEndpoint('https://collector.example.com:4318/v1/metrics', Why),
+    'an https collector is accepted');
+  Check(TelemValidEndpoint('http://127.0.0.1:4318/v1/metrics', Why),
+    'and a loopback literal');
+  Check(TelemValidEndpoint('http://localhost:4318/v1/metrics', Why),
+    'and localhost');
+  Check(not TelemValidEndpoint('http://evil.example.com/v1/metrics', Why),
+    'plaintext to a real host is refused');
+  Check(not TelemValidEndpoint('http://127.0.0.1.evil.com/', Why),
+    'and a host that merely BEGINS 127.0.0.1 is not loopback');
+  Check(not TelemValidEndpoint('ftp://x/', Why), 'and a foreign scheme');
+  Check(not TelemValidEndpoint('https://x/'#13#10'Injected: 1', Why),
+    'and a URL carrying CRLF');
+  Check(not TelemValidEndpoint('https://' + StringOfChar('a', 4096), Why),
+    'and a 4KB URL');
+  Check(not TelemValidEndpoint('http://[::1]:4318/', Why),
+    'and a bracketed IPv6 literal');
+
+  { The single most dangerous edit in this feature, asserted directly. }
+  Check(uHttp.SplitUrlEx(uAgent.ApiUrl, Host, Path, Port, Secure),
+    'the API URL still parses');
+  Check(Secure and (Port = 443) and (Host = 'api.anthropic.com'),
+    'and is still secure on 443 at api.anthropic.com');
+  Check(uHttp.SplitUrlEx('http://127.0.0.1:4318/v1/metrics',
+    Host, Path, Port, Secure) and (not Secure) and (Port = 4318),
+    'loopback plaintext parses with Secure false');
+  Check(not uHttp.SplitUrlEx('http://api.anthropic.com/v1/messages',
+    Host, Path, Port, Secure),
+    'plaintext to a real host does not parse at all');
+  { SplitUrl itself stays private to uHttp and unchanged; what is asserted
+    here is the property that makes it safe - Secure is True for https and
+    for nothing else, and every non-telemetry caller goes through the wrapper
+    that demands it. }
+  Check(uHttp.SplitUrlEx('https://localhost:4318/x', Host, Path, Port, Secure)
+    and Secure, 'https to localhost is still secure, not downgraded');
+end;
+
+{ Cumulative in, deltas out - and a DECREASE, which session.json can cause,
+  must clamp to zero and re-baseline rather than emit a negative counter. }
+procedure TestTelemDeltas;
+var
+  Doc, Pts: TJson;
+
+  function SumOfKind(const Kind: string): Int64;
+  var
+    Doc2, M, Sum, P, A: TJson;
+    I, J, K: Integer;
+  begin
+    Result := 0;
+    Doc2 := JsonParse(TelemBuildPayload(False));
+    if Doc2 = nil then Exit;
+    try
+      M := Doc2.Find('resourceMetrics').Item(0).Find('scopeMetrics').Item(0).
+        Find('metrics');
+      for I := 0 to M.Count - 1 do
+      begin
+        if M.Item(I).Str('name') <> 'pasclaude.tokens' then Continue;
+        Sum := M.Item(I).Find('sum');
+        P := Sum.Find('dataPoints');
+        for J := 0 to P.Count - 1 do
+        begin
+          A := P.Item(J).Find('attributes');
+          for K := 0 to A.Count - 1 do
+            if (A.Item(K).Str('key') = 'type') and
+               (A.Item(K).Find('value').Str('stringValue') = Kind) then
+              Result := Result + StrToInt64Def(P.Item(J).Str('asInt'), 0);
+        end;
+      end;
+    finally
+      Doc2.Free;
+    end;
+  end;
+
+begin
+  TelemInit(TelemOnConfig);
+  TelemRecordTurn(100, 50, 0, 0, 'claude-sonnet-4-5');
+  Check(SumOfKind('input') = 0,
+    'the first turn baselines rather than reporting a resumed total');
+  TelemRecordTurn(250, 90, 10, 5, 'claude-sonnet-4-5');
+  Check(SumOfKind('input') = 150, 'the second turn reports the delta, not 250');
+  Check(SumOfKind('output') = 40, 'and 40 output, not 90');
+  Check(SumOfKind('cache_read') = 10, 'and the cache read delta');
+  Check(SumOfKind('cache_write') = 5, 'and the cache write delta');
+
+  { A saved session restoring the counters downward. }
+  TelemRecordTurn(10, 5, 0, 0, 'claude-sonnet-4-5');
+  Check(SumOfKind('input') = 150, 'a decrease adds nothing rather than a negative');
+  Doc := JsonParse(TelemBuildPayload(False));
+  try
+    { Not a substring test on the whole document - a model id is full of
+      dashes.  Only the counters themselves. }
+    Pts := Doc.Find('resourceMetrics').Item(0).Find('scopeMetrics').Item(0).
+      Find('metrics');
+    Check(Pos('"asInt":"-', Pts.ToJson) = 0,
+      'and no negative asInt appears anywhere');
+  finally
+    Doc.Free;
+  end;
+  TelemRecordTurn(60, 25, 0, 0, 'claude-sonnet-4-5');
+  Check(SumOfKind('input') = 200, 'and the next turn measures from the new base');
+  TelemInit(TelemDefaultConfig);
+end;
+
+{ A collector that is down must cost a bounded number of timeouts and then go
+  quiet, must never grow a queue, and must never be retried inside a flush. }
+procedure TestTelemFailureGivesUp;
+var
+  Saved: TPostProc;
+  Status, Before: Integer;
+  Err: string;
+  C: TTelemConfig;
+begin
+  Saved := uHttp.HttpTransport;
+  uHttp.HttpTransport := @TelemTransport;
+  try
+    TelemCalls := 0;
+    TelemReplyOk := False;
+    TelemReplyStatus := 503;
+    TelemReplyBody := '';
+    TelemInit(TelemOnConfig);
+
+    TelemRecordTurn(1, 1, 0, 0, 'claude-sonnet-4-5');
+    Check(not TelemFlush(Status, Err), 'a refused flush fails');
+    Check(TelemCalls = 1, 'and makes exactly one request - no retry inside it');
+    TelemRecordTurn(2, 2, 0, 0, 'claude-sonnet-4-5');
+    Check(not TelemFlush(Status, Err), 'the second fails too');
+    Check(not TelemState.SelfDisabled, 'two failures are not yet enough');
+    TelemRecordTurn(3, 3, 0, 0, 'claude-sonnet-4-5');
+    Check(not TelemFlush(Status, Err), 'and the third');
+    Check(TelemState.SelfDisabled, 'the third failure disables telemetry');
+    Check(not TelemEnabled, 'and TelemEnabled goes false');
+
+    Before := TelemCalls;
+    TelemRecordTurn(4, 4, 0, 0, 'claude-sonnet-4-5');
+    TelemFlush(Status, Err);
+    Check(TelemCalls = Before,
+      'a fourth flush makes no request at all once disabled');
+
+    { A 200 whose partialSuccess names rejected points is a failure the spec
+      forbids retrying, and the batch goes in the bin either way. }
+    TelemCalls := 0;
+    TelemReplyOk := True;
+    TelemReplyStatus := 200;
+    TelemReplyBody := '{"partialSuccess":{"rejectedDataPoints":"3",' +
+      '"errorMessage":"nope"}}';
+    C := TelemOnConfig;
+    TelemInit(C);
+    TelemRecordTurn(1, 1, 0, 0, 'claude-sonnet-4-5');
+    TelemRecordTool('bash', False);
+    Check(not TelemFlush(Status, Err), 'a populated partialSuccess is a failure');
+    Check(TelemCalls = 1, 'and is not retried');
+    TelemCalls := 0;
+    TelemReplyBody := '';
+    TelemFlush(Status, Err);
+    Check(TelemCalls = 0,
+      'the discarded batch is not re-sent on the next flush');
+  finally
+    uHttp.HttpTransport := Saved;
+    TelemInit(TelemDefaultConfig);
+  end;
+end;
+
+{ Leaving HttpTimeoutMs set would put a two-second receive timeout on the next
+  streamed model turn, which would look like a truncated answer rather than
+  like a telemetry bug. }
+procedure TestTelemTimeoutIsRestored;
+var
+  Saved: TPostProc;
+  Status: Integer;
+  Err: string;
+  C: TTelemConfig;
+begin
+  Saved := uHttp.HttpTransport;
+  uHttp.HttpTransport := @TelemTransport;
+  try
+    TelemReplyOk := False;
+    TelemReplyStatus := 500;
+    TelemReplyBody := '';
+    TelemSawTimeout := -1;
+    uHttp.HttpTimeoutMs := 0;
+    TelemInit(TelemOnConfig);
+    TelemRecordTurn(1, 1, 0, 0, 'claude-sonnet-4-5');
+    TelemFlush(Status, Err);
+    Check(TelemSawTimeout = 1500, 'the flush runs with the configured timeout');
+    Check(uHttp.HttpTimeoutMs = 0,
+      'and restores it even when the transport failed');
+  finally
+    uHttp.HttpTransport := Saved;
+    uHttp.HttpTimeoutMs := 0;
+  end;
+
+  { The clamps, which are what stop a settings file asking for a 10-minute
+    stall or a 50ms one that can never succeed. }
+  C := TelemOnConfig;
+  C.TimeoutMs := 50;
+  C.IntervalTurns := 0;
+  TelemInit(C);
+  Check(TelemState.TimeoutMs = 250, 'a 50ms timeout clamps up to 250');
+  Check(TelemState.IntervalTurns = 1, 'and a zero interval to 1');
+  C.TimeoutMs := 600000;
+  C.IntervalTurns := 5000;
+  TelemInit(C);
+  Check(TelemState.TimeoutMs = 5000, 'a ten-minute timeout clamps to 5000');
+  Check(TelemState.IntervalTurns = 100, 'and the interval to 100');
+  TelemInit(TelemDefaultConfig);
+end;
+
+{ A collector token is a secret the user wrote down; preview is exactly the
+  output that ends up in a screenshot. }
+procedure TestTelemHeaders;
+var
+  C: TTelemConfig;
+  B: string;
+begin
+  C := TelemOnConfig;
+  SetLength(C.HeaderNames, 3);
+  SetLength(C.HeaderValues, 3);
+  C.HeaderNames[0] := 'x-collector-key'; C.HeaderValues[0] := 'SECRET123';
+  { Two headers that must be dropped: one would change the encoding out from
+    under the builder, the other is request splitting through a file the user
+    edits by hand. }
+  C.HeaderNames[1] := 'Content-Type';    C.HeaderValues[1] := 'text/plain';
+  C.HeaderNames[2] := 'x-bad';           C.HeaderValues[2] := 'a'#13#10'b: c';
+  TelemInit(C);
+
+  B := TelemHeaderBlock;
+  Check(Pos('content-type: application/json', B) = 1,
+    'the spec-required content type leads the block');
+  Check(Pos('x-collector-key: SECRET123', B) > 0, 'the user header is sent');
+  Check(Pos('text/plain', B) = 0, 'a configured Content-Type is dropped');
+  Check(Pos(#13#10'b: c', B) = 0, 'and a CRLF value cannot split the request');
+  Check(Pos(#13#10'x-collector-key', B) > 0, 'headers are CRLF separated');
+  Check(Copy(B, Length(B) - 1, 2) <> #13#10, 'and the block does not end in one');
+
+  B := TelemHeaderBlockRedacted;
+  Check(Pos('x-collector-key', B) > 0, 'the redacted block names the header');
+  Check(Pos('9 bytes', B) > 0, 'and gives its length');
+  Check(Pos('SECRET123', B) = 0, 'but never its value');
+  Check(Length(TelemState.Endpoint) > 0, 'and the state names the target URL');
+  Check(Pos('/v1/metrics', TelemState.Endpoint) > 0,
+    'a bare base URL gains OTLP''s documented metrics path');
+  TelemInit(TelemDefaultConfig);
+end;
+
+{ The authority boundary, end to end through the real loader: a project file
+  cannot turn telemetry on and cannot name an endpoint. }
+procedure TestTelemetryIsUserScopeOnly;
+var
+  Problems: TStringArray;
+  C: TTelemConfig;
+begin
+  uSettings.SettingsClear;
+  uSettings.SettingsParseTier(stProject, '{"telemetry.enabled":true,' +
+    '"telemetry.endpoint":"https://evil.example.com/v1/metrics"}',
+    'project', Problems);
+  C := TelemConfigFromSettings('0.1');
+  TelemInit(C);
+  Check(not C.Enabled, 'a project file cannot enable telemetry');
+  Check(C.Endpoint = '', 'and cannot name an endpoint');
+  Check(not TelemEnabled, 'so nothing is enabled');
+  Check(Length(Problems) >= 2, 'and both keys are refused by name');
+
+  { The same document at the user tier does take effect, which is what makes
+    the assertion above about SCOPE rather than about a broken parser. }
+  C := TelemParse('{"telemetry.enabled":true,' +
+    '"telemetry.endpoint":"http://localhost:4318"}');
+  TelemInit(C);
+  Check(C.Enabled and (C.Endpoint <> ''), 'the user file may set both');
+  Check(TelemEnabled, 'and telemetry comes on');
+
+  { Half a configuration sends nothing: enabling without an endpoint is a
+    user who meant to and did not finish. }
+  C := TelemParse('{"telemetry.enabled":true}');
+  TelemInit(C);
+  Check(not TelemEnabled, 'enabled with no endpoint stays off');
+  C := TelemParse('{"telemetry.endpoint":"http://localhost:4318"}');
+  TelemInit(C);
+  Check(not TelemEnabled, 'and an endpoint with no enabled stays off');
+
+  TelemInit(TelemDefaultConfig);
+  uSettings.SettingsClear;
+end;
+
+{ Nothing is sent when telemetry is off - the promise the whole feature rests
+  on, asserted against the transport rather than against a flag. }
+procedure TestTelemetryOffSendsNothing;
+var
+  Saved: TPostProc;
+  Status: Integer;
+  Err: string;
+begin
+  Saved := uHttp.HttpTransport;
+  uHttp.HttpTransport := @TelemTransport;
+  try
+    TelemInit(TelemDefaultConfig);
+    TelemCalls := 0;
+    TelemRecordTurn(1000, 1000, 1000, 1000, 'claude-sonnet-4-5');
+    TelemRecordTool('bash', False);
+    TelemRecordRequest(200, 10);
+    Check(not TelemDueForFlush, 'a disabled telemetry is never due');
+    Check(not TelemFlush(Status, Err), 'and a forced flush refuses');
+    Check(TelemCalls = 0, 'no request is made when telemetry is off');
+    Check(not TelemState.HasData, 'and nothing was even recorded');
+  finally
+    uHttp.HttpTransport := Saved;
+  end;
+end;
+
 var
   Schema: TJson;
 begin
@@ -4172,6 +4743,16 @@ begin
   TestAuthResolutionOrder;
   TestAuthStoreRoundTrip;
   TestAuthAntProfile;
+  TestTelemPayloadShape;
+  TestTelemCarriesNoContent;
+  TestTelemFilters;
+  TestTelemEndpoints;
+  TestTelemDeltas;
+  TestTelemFailureGivesUp;
+  TestTelemTimeoutIsRestored;
+  TestTelemHeaders;
+  TestTelemetryIsUserScopeOnly;
+  TestTelemetryOffSendsNothing;
   Schema := ToolsSchema;
   try
     Check(Pos('"input_schema"', Schema.ToJson) > 0, 'the schema serialises');

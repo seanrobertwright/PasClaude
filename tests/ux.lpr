@@ -15,7 +15,8 @@ program ux;
 { Windows first, so SysUtils' DeleteFile and GetEnvironmentVariable win over
   the raw API of the same names. }
 uses Windows, SysUtils, Classes, DateUtils, uJson, uSettings, uAuth, uDiff,
-  uHooks, uSandbox, uTools, uImage, uAgent, uTerm, uNotebook, uSdk;
+  uHttp, uTelem, uHooks, uSandbox, uTools, uImage, uAgent, uTerm, uNotebook,
+  uSdk;
 
 var
   Fails: Integer = 0;
@@ -4844,6 +4845,149 @@ begin
   SettingsClear;
 end;
 
+{ ------------------------------------------------------------- telemetry -- }
+
+var
+  UxTelemCalls: Integer = 0;
+  UxTelemOk: Boolean = False;
+
+function UxTelemTransport(const Url, Headers, Body: string;
+  OnChunk: TChunkProc; Ctx: Pointer): THttpResult;
+begin
+  Inc(UxTelemCalls);
+  Result.Ok := UxTelemOk;
+  Result.Body := '';
+  Result.RetryAfterMs := 0;
+  if UxTelemOk then
+  begin
+    Result.Status := 200;
+    Result.Error := '';
+  end
+  else
+  begin
+    Result.Status := 503;
+    Result.Error := 'HTTP 503';
+  end;
+end;
+
+{ What /telemetry has to be able to say.  With nothing configured it must say
+  off and must NOT invent an endpoint; configured, it must report the URL,
+  the interval and the timeout it will actually use. }
+procedure TestTelemetryPanel;
+var
+  C: TTelemConfig;
+  S: TTelemState;
+begin
+  TelemInit(TelemDefaultConfig);
+  S := TelemState;
+  Check(not S.Enabled, 'with nothing configured telemetry reports off');
+  Check(S.Endpoint = '', 'and names no endpoint at all');
+  Check(not S.SelfDisabled, 'and has not disabled itself');
+
+  C := TelemDefaultConfig;
+  C.Enabled := True;
+  C.Endpoint := 'http://localhost:4318';
+  C.IntervalTurns := 7;
+  C.TimeoutMs := 1200;
+  TelemInit(C);
+  S := TelemState;
+  Check(S.Enabled, 'a configured telemetry reports on');
+  Check(S.Endpoint = 'http://localhost:4318/v1/metrics',
+    'and shows the URL it would really POST to, path included');
+  Check((S.IntervalTurns = 7) and (S.TimeoutMs = 1200),
+    'and the interval and timeout in force');
+  TelemInit(TelemDefaultConfig);
+end;
+
+{ /telemetry preview must be the SAME builder the sender uses, or "read the
+  payload before you trust it" is a lie about the code. }
+procedure TestTelemetryPreviewIsWhatShips;
+var
+  C: TTelemConfig;
+  Saved: TPostProc;
+  Preview: string;
+  Doc: TJson;
+  Status: Integer;
+  Err: string;
+begin
+  C := TelemDefaultConfig;
+  C.Enabled := True;
+  C.Endpoint := 'http://127.0.0.1:4318/v1/metrics';
+  SetLength(C.HeaderNames, 1);
+  SetLength(C.HeaderValues, 1);
+  C.HeaderNames[0] := 'x-collector-key';
+  C.HeaderValues[0] := 'SUPERSECRET';
+  TelemInit(C);
+  TelemRecordTurn(10, 5, 0, 0, 'claude-sonnet-4-5');
+  TelemRecordTurn(30, 15, 0, 0, 'claude-sonnet-4-5');
+  TelemRecordTool('search', False);
+
+  Preview := TelemBuildPayload(True);
+  Doc := JsonParse(Preview);
+  Check(Doc <> nil, 'the preview is JSON a parser accepts');
+  if Doc <> nil then Doc.Free;
+  Check(Pos('SUPERSECRET', Preview) = 0, 'and carries no collector token');
+  Check(Pos('SUPERSECRET', TelemHeaderBlockRedacted) = 0,
+    'and neither does the header block the user is shown');
+  Check(Pos('x-collector-key', TelemHeaderBlockRedacted) > 0,
+    'though it does name the header');
+
+  Saved := uHttp.HttpTransport;
+  uHttp.HttpTransport := @UxTelemTransport;
+  try
+    UxTelemCalls := 0;
+    UxTelemOk := True;
+    Check(TelemFlush(Status, Err), 'the flush succeeds');
+    Check(UxTelemCalls = 1, 'having made one request');
+    Check(not TelemState.HasData, 'and the batch is gone afterwards');
+  finally
+    uHttp.HttpTransport := Saved;
+    TelemInit(TelemDefaultConfig);
+  end;
+end;
+
+{ A dead collector must say so ONCE.  A note on every turn is noise; no note
+  at all leaves the user believing data is flowing when it stopped. }
+procedure TestTelemetrySelfDisableIsSaidOnce;
+var
+  C: TTelemConfig;
+  Saved: TPostProc;
+  Status, Notes, I: Integer;
+  Err: string;
+  WasDisabled: Boolean;
+begin
+  C := TelemDefaultConfig;
+  C.Enabled := True;
+  C.Endpoint := 'http://127.0.0.1:4318/v1/metrics';
+  C.IntervalTurns := 1;
+  TelemInit(C);
+  Saved := uHttp.HttpTransport;
+  uHttp.HttpTransport := @UxTelemTransport;
+  try
+    UxTelemOk := False;
+    UxTelemCalls := 0;
+    Notes := 0;
+    { The host prints its one note on the transition, which is what this
+      counts: the flush that first sets SelfDisabled. }
+    for I := 1 to 6 do
+    begin
+      TelemRecordTurn(I * 10, I, 0, 0, 'claude-sonnet-4-5');
+      if not TelemDueForFlush then Continue;
+      WasDisabled := TelemState.SelfDisabled;
+      TelemFlush(Status, Err);
+      if (not WasDisabled) and TelemState.SelfDisabled then Inc(Notes);
+    end;
+    Check(Notes = 1, 'exactly one self-disabled note is produced, not three');
+    Check(UxTelemCalls = 3,
+      'and the dead collector was contacted three times, then never again');
+    Check(not TelemEnabled, 'telemetry is off for the rest of the session');
+    Check(Err <> '', 'and the note has a reason to carry');
+  finally
+    uHttp.HttpTransport := Saved;
+    TelemInit(TelemDefaultConfig);
+  end;
+end;
+
 begin
   TmpRoot := IncludeTrailingPathDelimiter(GetTempDir) + 'pasclaude-ux';
   Cleanup(TmpRoot);
@@ -4910,6 +5054,9 @@ begin
     TestConfigShowsProvenance;
     TestConfigSetPreservesUnknownKeys;
     TestConfigSetWritesUserTier;
+    TestTelemetryPanel;
+    TestTelemetryPreviewIsWhatShips;
+    TestTelemetrySelfDisableIsSaidOnce;
   finally
     { Before the cleanup, not after: a live child holding a spool handle under
       TmpRoot would make the recursive delete fail. }

@@ -11,7 +11,7 @@ program pasclaude;
 
 uses
   Windows, SysUtils, Classes, DateUtils, uTerm, uJson, uSettings, uAuth,
-  uHttp, uMcp, uHooks, uSandbox, uTools, uImage, uAgent, uSdk;
+  uHttp, uTelem, uMcp, uHooks, uSandbox, uTools, uImage, uAgent, uSdk;
 
 const
   Version = '0.1';
@@ -227,13 +227,13 @@ end;
 { ------------------------------------------------------------- completion -- }
 
 const
-  SlashCommands: array[0..35] of string = (
+  SlashCommands: array[0..36] of string = (
     '/help', '/clear', '/compact', '/config', '/deny', '/diff', '/hooks',
     '/jobs', '/mcp', '/memory', '/init', '/mode', '/plan', '/rewind',
     '/sandbox', '/sessions', '/skills', '/plugins', '/think', '/web',
     '/add-dir', '/remove-dir', '/resume', '/save', '/cwd', '/model', '/yolo',
-    '/cost', '/output-style', '/paste', '/vim', '/keys', '/login', '/logout',
-    '/exit', '/quit');
+    '/cost', '/telemetry', '/output-style', '/paste', '/vim', '/keys',
+    '/login', '/logout', '/exit', '/quit');
 
 { Candidates for the token being completed: slash commands when the token
   opens the line with a slash, file and directory names under the session
@@ -649,6 +649,9 @@ begin
   EmitCLn(clGrey,   '  /config        settings and where each value came from;');
   EmitCLn(clGrey,   '                 get <k>, set [--local] <k> <v>, unset, reload');
   EmitCLn(clGrey,   '  /cost          tokens used so far');
+  EmitCLn(clGrey,   '  /telemetry     usage metrics: off unless YOUR settings');
+  EmitCLn(clGrey,   '                 file turns them on; preview shows the');
+  EmitCLn(clGrey,   '                 exact JSON, send flushes now');
   EmitCLn(clGrey,   '  /login [key]   which credential answers; key stores one of');
   EmitCLn(clGrey,   '                 pasclaude''s own, encrypted, out of the project');
   EmitCLn(clGrey,   '  /logout        remove that stored credential (only that one:');
@@ -1007,6 +1010,65 @@ begin
     HookNotice('keys.json: ' + Notes[I]);
   SetLength(Notes, 0);
   SetPromptProfile(P);
+end;
+
+{ Telemetry, from the six user-scope keys of the settings files and from
+  nowhere else.  No argv flag sets an endpoint and OTEL_EXPORTER_OTLP_ENDPOINT
+  is deliberately NOT honoured: environment is inherited from whatever
+  launched us, so a wrapper script in a repository would otherwise hand a
+  project the endpoint by the back door - and a project-settable telemetry URL
+  is an exfiltration channel wearing a respectable name.
+
+  TierAllowed in uSettings is the enforcement: telemetry.enabled,
+  .endpoint, .headers, .interval_turns, .timeout_ms and .service_name are all
+  scUserOnly, so a project or local file naming one is refused by name and the
+  value is never stored where this could read it. }
+procedure LoadTelemetry;
+var
+  C: TTelemConfig;
+  Notes: TStringArray;
+  I: Integer;
+begin
+  C := uTelem.TelemConfigFromSettings(Version);
+  uTelem.TelemInit(C);
+  { Read back out of the unit, not off the record handed in: TelemInit copies,
+    and the refusals that matter most - a bad endpoint, an unsendable header -
+    are the ones it adds itself. }
+  Notes := uTelem.TelemNotes;
+  for I := 0 to High(Notes) do
+    HookNotice('telemetry: ' + Notes[I]);
+end;
+
+{ The two recording callbacks, wired to the agent after it is built.  Both are
+  deliberately narrow.  TelemToolDone uses ONLY Name and IsErr and never
+  touches Output, which is tool RESULT TEXT - the single largest thing in this
+  program that must not leave the machine. }
+procedure TelemToolDone(const Id, Name, Output: string; IsError: Boolean);
+begin
+  uTelem.TelemRecordTool(Name, IsError);
+end;
+
+procedure TelemRequestDone(StatusCode, ElapsedMs: Integer; const Model: string);
+begin
+  uTelem.TelemRecordRequest(StatusCode, ElapsedMs);
+end;
+
+{ One flush.  Synchronous, because this program has no threads: the honest
+  price is at worst telemetry.timeout_ms of dead air before the next prompt,
+  at most once every telemetry.interval_turns turns.  The third consecutive
+  failure says so once and goes quiet for the rest of the process. }
+procedure FlushTelemetry;
+var
+  Status: Integer;
+  Err: string;
+  WasDisabled: Boolean;
+begin
+  if not uTelem.TelemEnabled then Exit;
+  WasDisabled := uTelem.TelemState.SelfDisabled;
+  if uTelem.TelemFlush(Status, Err) then Exit;
+  if (not WasDisabled) and uTelem.TelemState.SelfDisabled then
+    HookNotice('telemetry stopped after ' + IntToStr(uTelem.TelemMaxFailures) +
+      ' failures (' + Err + '); nothing more will be sent this session');
 end;
 
 { /vim save.  Read-modify-write so a hand-written bindings block survives;
@@ -2366,6 +2428,105 @@ begin
   EmitCLn(clGrey, '  {"vim":true,"bindings":{"ctrl+w":"delete-word-left"}}');
 end;
 
+{ /telemetry.  Three things: the state, the payload, and a forced send.
+
+  preview exists because "off by default" is only half the promise; the other
+  half is that a user can READ what would leave the machine before trusting
+  it.  It prints uTelem.TelemBuildPayload, which is the same function the
+  sender calls - not a description of it - so the two cannot drift apart. }
+procedure ShowTelemetry(const Arg: string);
+var
+  S: TTelemState;
+  A, Status: string;
+  Code: Integer;
+  L: TStringList;
+  I: Integer;
+begin
+  S := uTelem.TelemState;
+  A := LowerCase(Trim(Arg));
+  if (A <> '') and (A <> 'preview') and (A <> 'send') then
+  begin
+    EmitCLn(clGrey, '  /telemetry [preview|send]');
+    Exit;
+  end;
+
+  if A = '' then
+  begin
+    EmitCLn(clBright, 'Telemetry');
+    if S.Enabled then
+    begin
+      EmitCLn(clGrey, '  on, OTLP/HTTP with JSON encoding');
+      EmitCLn(clGrey, '  ' + S.Endpoint);
+      EmitCLn(clGrey, Format('  every %d turns, %d ms timeout (%d buffered)',
+        [S.IntervalTurns, S.TimeoutMs, S.TurnsBuffered]));
+      if S.LastStatus <> 0 then
+        EmitCLn(clGrey, '  last send: HTTP ' + IntToStr(S.LastStatus));
+      if S.LastError <> '' then
+        EmitCLn(clYellow, '  last error: ' + S.LastError);
+      if S.ConsecFailures > 0 then
+        EmitCLn(clYellow, Format('  %d consecutive failures', [S.ConsecFailures]));
+    end
+    else if S.SelfDisabled then
+      EmitCLn(clYellow, '  stopped for this session after repeated failures')
+    else
+      EmitCLn(clGrey, '  off');
+    EmitLn;
+    EmitCLn(clGrey, '  counters only: turns, tokens by kind and model, tool');
+    EmitCLn(clGrey, '  calls by built-in name and ok/error, API requests by');
+    EmitCLn(clGrey, '  HTTP status, and total request milliseconds.  No prompt');
+    EmitCLn(clGrey, '  or reply text, no tool arguments or output, no paths,');
+    EmitCLn(clGrey, '  no project or host name, no credential of any kind.');
+    EmitCLn(clGrey, '  /telemetry preview shows the exact JSON.');
+    EmitLn;
+    EmitCLn(clGrey, '  Turned on only by telemetry.enabled and');
+    EmitCLn(clGrey, '  telemetry.endpoint in %USERPROFILE%\.pasclaude\' +
+      uSettings.SettingsFileName + ';');
+    EmitCLn(clGrey, '  a project file may not set either (/config), and no');
+    EmitCLn(clGrey, '  environment variable is consulted.');
+    if S.Enabled then
+    begin
+      EmitLn;
+      EmitCLn(clGrey, Format('  A flush is synchronous: at worst %d ms of ' +
+        'quiet before', [S.TimeoutMs]));
+      EmitCLn(clGrey, Format('  the next prompt, at most once every %d turns.',
+        [S.IntervalTurns]));
+    end;
+    Exit;
+  end;
+
+  if A = 'preview' then
+  begin
+    EmitCLn(clBright, 'Would send to ' +
+      Choice(S.Endpoint <> '', S.Endpoint, '(no endpoint)'));
+    L := TStringList.Create;
+    try
+      L.Text := uTelem.TelemHeaderBlockRedacted;
+      for I := 0 to L.Count - 1 do EmitCLn(clGrey, '  ' + L[I]);
+      EmitLn;
+      { Values are redacted to a length above: a collector token is a secret
+        the user wrote down, and this is exactly the output that ends up in a
+        screenshot. }
+      L.Text := uTelem.TelemBuildPayload(True);
+      for I := 0 to L.Count - 1 do EmitCLn(clGrey, L[I]);
+    finally
+      L.Free;
+    end;
+    if not S.HasData then
+      EmitCLn(clGrey, '  (nothing recorded yet this interval)');
+    Exit;
+  end;
+
+  if not uTelem.TelemEnabled then
+  begin
+    EmitCLn(clGrey, '  telemetry is off; nothing was sent');
+    Exit;
+  end;
+  if uTelem.TelemFlush(Code, Status) then
+    EmitCLn(clGrey, '  sent; HTTP ' + IntToStr(Code))
+  else
+    EmitCLn(clYellow, '  not sent: ' + Status);
+end;
+
 { ------------------------------------------------------------ credential -- }
 
 { Re-resolves and installs whatever uAuth now says should answer.  Called
@@ -2946,6 +3107,8 @@ begin
            Rows[ArgI].CacheRead, Rows[ArgI].CacheWrite]));
     end;
   end
+  else if Cmd = '/telemetry' then
+    ShowTelemetry(Arg)
   else
     { Not one of ours.  Left unhandled so the caller can try the custom
       commands in .pasclaude\commands before declaring it unknown. }
@@ -3532,6 +3695,14 @@ begin
       repository that could pick the model would be spending the user's money
       on its own say-so, and could pick a weaker one to review its own code. }
     if Trim(ModelName) = '' then ModelName := uSettings.SettingStr('model');
+    { Telemetry initialises here: it needs nothing from the credential and
+      must never read one, but it has to exist before the first turn can
+      happen in either mode.  ABOVE the print-mode halt, so a -p run's turns
+      are counted - and that is legal for exactly one reason, which is that
+      all six telemetry keys are scUserOnly.  If anyone ever gives telemetry a
+      project tier, this call must move below the halt or a -p run gains an
+      outbound channel from a repository. }
+    LoadTelemetry;
     { The banner names the source when it is anything other than a plain
       exported API key.  'subscription' is preserved for the two OAuth
       sources because that is what the word means to the user and what the
@@ -3607,6 +3778,12 @@ begin
       Agent.OnToolUseBegin := @OnToolUseBegin;
       Agent.OnToolArg := @OnToolArg;
       Agent.OnToolResult := @OnToolResult;
+      { The two telemetry seams.  OnRequestDone carries a status, a duration
+        and the model and nothing else; OnToolDone hands over a name and an
+        error flag, and TelemToolDone ignores the Output parameter entirely -
+        that is tool result text. }
+      Agent.OnRequestDone := @TelemRequestDone;
+      Agent.OnToolDone := @TelemToolDone;
       Agent.OnNotice := @OnNotice;
       Agent.Ask := @AskPermission;
       Agent.ShouldCancel := @UserWantsStop;
@@ -3653,6 +3830,9 @@ begin
           SdkOpts.AskViaDriver :=
             uTools.CurrentPermMode in [uTools.pmodeAsk, uTools.pmodeAcceptEdits];
           SdkCode := uSdk.SdkRun(Agent, SdkOpts, PrintPrompt, Err);
+          { Halt skips finally, so the one flush a scripted run gets has to be
+            spelled out at every exit rather than left to the block below. }
+          uTelem.TelemShutdown;
           TermDone;
           Halt(SdkCode);
         end;
@@ -3699,6 +3879,9 @@ begin
             SdkOpts.PermissionMode :=
               uTools.PermModeName(uTools.CurrentPermMode);
           SdkCode := uSdk.SdkRun(Agent, SdkOpts, PrintPrompt, Err);
+          { Halt skips finally, so the one flush a scripted run gets has to be
+            spelled out at every exit rather than left to the block below. }
+          uTelem.TelemShutdown;
           TermDone;
           Halt(SdkCode);
         end;
@@ -3712,6 +3895,7 @@ begin
           begin
             NeedNewLine;
             EmitCLn(clRed, 'cannot resume ' + SessionFileFull + ': ' + ResumeErr);
+            uTelem.TelemShutdown;
             TermDone;
             Halt(2);
           end;
@@ -3720,14 +3904,19 @@ begin
         if Agent.Send(PrintPrompt, Err) then
         begin
           MdFinish;
+          uTelem.TelemRecordTurn(Agent.TokensIn, Agent.TokensOut,
+            Agent.CacheReadTokens, Agent.CacheWriteTokens,
+            Agent.LastRequestModel);
           if SessionFileFull <> '' then
             if not Agent.SaveSession(SessionFileFull, SaveErr) then
             begin
               NeedNewLine;
               EmitCLn(clYellow, '  (session not saved: ' + SaveErr + ')');
+              uTelem.TelemShutdown;
               TermDone;
               Halt(1);
             end;
+          uTelem.TelemShutdown;
           TermDone;
           Halt(0);
         end
@@ -3736,6 +3925,7 @@ begin
           MdFinish;
           NeedNewLine;
           EmitCLn(clRed, Err);
+          uTelem.TelemShutdown;
           TermDone;
           Halt(1);
         end;
@@ -4124,6 +4314,15 @@ begin
           flags it sets are indistinguishable from real per-answer grants. }
         if not YoloSession then
           SavePermissions(PermissionsPath);
+        { The flush point.  Here and nowhere else: the answer is already on
+          screen and the next prompt has not been drawn, so the only thing a
+          slow collector can delay is the user's next keystroke - and only
+          once every telemetry.interval_turns turns.  Cumulative totals in,
+          deltas kept inside uTelem. }
+        uTelem.TelemRecordTurn(Agent.TokensIn, Agent.TokensOut,
+          Agent.CacheReadTokens, Agent.CacheWriteTokens,
+          Agent.LastRequestModel);
+        if uTelem.TelemDueForFlush then FlushTelemetry;
         NeedNewLine;
         EmitLn;
       until False;
@@ -4131,6 +4330,12 @@ begin
       Agent.Free;
     end;
   finally
+    { The last flush, before the console is torn down so a note about a
+      failure still has somewhere to go.  A startup refusal deliberately does
+      NOT come through here: FailStart sends nothing, because a run that never
+      reached a turn has nothing worth reporting and a collector should not
+      learn that the program was started at all. }
+    uTelem.TelemShutdown;
     { Before TermDone, so anything a dying child prints on its way out lands
       while the console is still in a sane state.  uTools' finalization
       repeats this as the backstop for the paths that skip a finally. }

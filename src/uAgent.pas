@@ -53,6 +53,15 @@ type
     consumer could not tell a refusal from an answer. }
   TToolDoneProc = procedure(const Id, Name, Output: string; IsError: Boolean);
 
+  { Fires once at the end of every API request, on the success path and on
+    both failure paths.  StatusCode is 0 when the transport never produced
+    one.  It carries NO body, NO error text and NO headers - deliberately, so
+    that nothing which could contain prompt or completion content is reachable
+    from it.  The host wires telemetry to this; nothing in uAgent depends on
+    it being assigned. }
+  TRequestDoneProc = procedure(StatusCode, ElapsedMs: Integer;
+    const Model: string);
+
   TModelInfo = record
     Id: string;           { what the API wants in "model" }
     DisplayName: string;  { what a human calls it }
@@ -230,6 +239,11 @@ type
       it did. }
     OnToolInput: TToolInputProc;
     OnToolDone: TToolDoneProc;
+    { Nil by default and never assigned by this unit, the HttpTransport
+      pattern again.  Fired inside a try/except so a telemetry fault cannot
+      fail a turn: a give-up rule is worthless if the recording path can
+      raise. }
+    OnRequestDone: TRequestDoneProc;
     Ask: TAskProc;
     { Polled between chunks so the user can abandon a long reply. }
     ShouldCancel: TCancelProc;
@@ -1804,6 +1818,22 @@ var
   Headers, Body: string;
   Res: THttpResult;
   ErrJson, ErrObj: TJson;
+  StartedMs: QWord;
+
+  { Every exit from this function below the POST goes through here.  Wrapped,
+    because a fault in a metrics callback must not become a failed turn. }
+  procedure FireDone(Status: Integer);
+  begin
+    if not Assigned(OnRequestDone) then Exit;
+    try
+      OnRequestDone(Status, Integer(GetTickCount64 - StartedMs),
+        FLastRequestModel);
+    except
+      { Swallowed on purpose and reported nowhere: uAgent has no console, and
+        the alternative is losing the user's answer to a counter. }
+    end;
+  end;
+
 begin
   Blocks := nil;
   StopReason := '';
@@ -1838,6 +1868,7 @@ begin
       'accept: text/event-stream';
 
   Body := BuildBody;
+  StartedMs := GetTickCount64;
   Res := HttpPost(ApiUrl, Headers, Body, @StreamChunk, @St);
   { Clamped on this side too: a substituted transport may leave the field
     uninitialized, and a nonsense wait must not become a nonsense sleep. }
@@ -1859,6 +1890,7 @@ begin
     FLastPromptTokens := St.InTok + St.CacheWrite + St.CacheRead;
     Blocks := St.Blocks;
     StopReason := 'cancelled';
+    FireDone(Res.Status);
     Exit(True);
   end;
 
@@ -1890,12 +1922,14 @@ begin
       printed here - uAgent has no console - the text is returned. }
     if (Res.Status = 404) or (Copy(Err, 1, 8) = 'HTTP 404') then
       Err := Err + ModelSourceNote(FLastRequestSource);
+    FireDone(Res.Status);
     Exit(False);
   end;
 
   if St.ErrText <> '' then
   begin
     Err := St.ErrText;
+    FireDone(Res.Status);
     Exit(False);
   end;
 
@@ -1908,6 +1942,7 @@ begin
   FLastPromptTokens := St.InTok + St.CacheWrite + St.CacheRead;
   Blocks := St.Blocks;
   StopReason := St.StopReason;
+  FireDone(Res.Status);
   Result := True;
 end;
 
