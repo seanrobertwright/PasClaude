@@ -4,7 +4,7 @@ pasclaude already covers a lot of the core experience: streaming chat with
 markdown rendering, thirteen tools (read_file, write_file, edit_file,
 notebook_edit, list_dir, search, bash, bash_output, kill_bash, fetch,
 todo_write, skill, task) behind a diff-previewing permission gate,
-per-program bash approval, an opt-in server-side web_search, regex search
+an opt-in server-side web_search, regex search
 and notebook-aware read/edit, background shell jobs, read-only subagents,
 CLAUDE.md / AGENTS.md / .pasclaude.md project instructions, `@path` file
 mentions, tab completion, persistent history, session save/resume with
@@ -21,6 +21,20 @@ registry any future source can plug into, and an SDK — `-p` with
 console-free embedding facade in `src/uSdk.pas`. Standing approvals moved out
 of the project to `%LOCALAPPDATA%\pasclaude\approvals\`, so a repository can no
 longer ship the file that answers its own permission questions.
+
+The permission system is now most of one too. Deny rules — `tool:`, `bash:`
+and `path:` globs, out of tree only — are checked above every allow-all, the
+bash prefix table, the nil-`Ask` check and a `PreToolUse` hook's allow, so
+nothing overrides one. Four modes named on the prompt (`ask`, `plan`,
+`accept-edits`, `bypass`), reachable from `--permission-mode`,
+`--dangerously-skip-permissions`, `/mode`, `/plan` and `/yolo`, with plan
+enforced as a boundary in `RunTool` rather than as a gate setting.
+`--add-dir` and `/add-dir` widen which directories the file tools may reach
+without widening what is asked. And every child process — bash, background
+jobs, hooks, MCP servers — is spawned into a job object by `src/uSandbox.pas`,
+optionally at low integrity. Approvals remain per-program for bash and
+per-server for MCP; nothing in a project directory can set a mode, add a
+directory, remove a deny rule or lower the sandbox.
 
 Checked items have been built since this list was compiled; the strikethrough
 text preserves what was missing at the time. Unchecked items remain open.
@@ -231,9 +245,8 @@ text preserves what was missing at the time. Unchecked items remain open.
   considered and refused, because WinHTTP follows redirects and a host rule
   would match the URL typed rather than the host that answered. No deny rule
   is ever read from the project tree. And the move is silent — a session that
-  had accumulated
-  approvals in an in-repo `.pasclaude\permissions.json` is simply re-asked,
-  with no notice explaining why.*
+  had accumulated approvals in an in-repo `.pasclaude\permissions.json` is
+  simply re-asked, with no notice explaining why.*
 - [x] ~~**Permission modes** — no plan mode, no accept-edits mode, no
   `--dangerously-skip-permissions` flag (`/yolo` is per-session only).~~
   *Built: four modes, shown as one word — `ask`, `plan`, `accept-edits`,
@@ -311,7 +324,8 @@ text preserves what was missing at the time. Unchecked items remain open.
   whichever root contains the file, so it means the same thing in an added
   directory as it does in the session root — the path guard and the `list_dir`
   and `search` walkers agree, rather than the walkers hiding a file the guard
-  would still hand over by its absolute name. An added root grants file access and nothing else: its
+  would still hand over by its absolute name. An added root grants file access
+  and nothing else: its
   `.pasclaude\hooks.json`, skills, commands and agents, its `.mcp.json` and
   its `CLAUDE.md` are all deliberately unread, and the session, history,
   approvals, snapshots and bash's working directory stay bound to the session
@@ -396,7 +410,7 @@ text preserves what was missing at the time. Unchecked items remain open.
 - **Persistent permission rules** — "always" approvals (tool classes and
   bash programs) survive restarts in `.pasclaude\permissions.json`;
   widen-only, hand-editable, skipped by `/yolo` sessions and print mode.
-  (Deny rules remain missing.)
+  (Later moved out of the repository; see below.)
 - **Memory** — `# note` appends to the project memory file under a Notes
   heading; `/memory` shows it. (User-level `~/.claude/CLAUDE.md` and
   `@import` remain missing.)
@@ -485,6 +499,44 @@ text preserves what was missing at the time. Unchecked items remain open.
   `%LOCALAPPDATA%\pasclaude\approvals\<project>-<hash>.json`, so a cloned
   repository cannot ship the file that answers its own permission questions.
   Existing in-repo files are not migrated and are no longer read.
+- **Deny rules** — one string per rule, `tool:<glob>`, `bash:<program-glob>`
+  or `path:<glob>`, in `%LOCALAPPDATA%\pasclaude\deny.json` (global,
+  `/deny add|remove`) or in a hand-edited `"deny"` array in the per-root
+  approvals file, round-tripped verbatim. Checked at the top of `RunTool` and
+  inside `SafePath`, above every allow-all, the bash prefix table, the
+  nil-`Ask` check and a `PreToolUse` hook's allow, so `/yolo`, an "always" and
+  a hook are all unable to override one; a refusal names the rule and its
+  file. Path rules canonicalise and also hide the file from `list_dir` and
+  `search`. `-p` inherits the rules and still inherits no approvals. Nothing
+  in the project tree is ever read for one. (`bash:` filters a program name
+  and is evadable — `tool:bash` is the airtight form; `path:` does not cover
+  the shell; `fetch:<host>` is deliberately not offered.)
+- **Permission modes** — `ask`, `plan`, `accept-edits` and `bypass`, shown as
+  one word on the prompt and set only by `--permission-mode`,
+  `--dangerously-skip-permissions`, `/mode`, `/plan` or `/yolo`. Plan mode is
+  a boundary in `RunTool` beside the subagent read-only list, above the
+  `PreToolUse` fire and far above the gate, permitting an eight-name
+  allowlist; accept-edits is the existing `AllowAllEdits` flag given a name,
+  an indicator and an off switch. (No `exit_plan_mode` tool, deliberately;
+  no mode is persisted or resumed; plan mode stops the model, not the user's
+  own hooks.)
+- **Additional working directories** — `--add-dir <dir>` and `/add-dir` add
+  directories the file tools may work in; `/cwd` lists them and
+  `/remove-dir` takes one away. One resolution base, so a relative path
+  always means the session root and an added directory can only make a
+  refused absolute path succeed. An added root grants file access and nothing
+  else — its hooks, skills, commands, agents, `.mcp.json` and `CLAUDE.md` are
+  unread — and roots come only from argv or a typed command, never from a
+  file, and are never persisted.
+- **Sandboxed child processes** — every child pasclaude starts is created by
+  `src/uSandbox.pas` inside a job object: 64 processes, no breakaway, no
+  clipboard or desktop access, killed with the session. `--sandbox low` and
+  `/sandbox low` add a low-integrity token and a scratch `%TEMP%` out of
+  tree. This also gave the foreground shell a job object it never had and
+  closed the grandchild-escape race at all three spawn sites. (Low integrity
+  stops writes and registry persistence and nothing else — not reads, not the
+  network — which is why it changes nothing about what you are asked to
+  approve. `/sandbox off` keeps kill-on-close.)
 
 *Compiled from `README.md` and the `src/` units at
 `E:\Projects\pascal\pasclaude`, compared against the public Claude Code

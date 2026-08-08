@@ -39,7 +39,10 @@ Requires Free Pascal 3.2.x for `x86_64-win64`. The script finds `fpc.exe` on
 ```
 set ANTHROPIC_API_KEY=sk-ant-...
 set ANTHROPIC_MODEL=claude-sonnet-4-5          :: optional
-bin\pasclaude.exe [directory] [--resume] [--web] [-p "prompt"]
+bin\pasclaude.exe [directory] [--resume] [--web] [--add-dir <dir>]
+                  [--permission-mode ask|plan|accept-edits]
+                  [--dangerously-skip-permissions] [--sandbox off|limits|low]
+                  [-p "prompt"]
                   [--output-format text|json|stream-json] [--input-format text|stream-json]
 ```
 
@@ -55,9 +58,41 @@ the system prompt opens with Claude Code's identity line, which the API
 requires verbatim; ours follows unchanged, cache breakpoint included.
 
 The directory argument (default: the current one) becomes the *session root*.
-Every path the model asks for is resolved against it and refused if it would
-escape, so the agent cannot wander into `C:\Windows` because it misread a
-relative path.
+It cannot wander into `C:\Windows` because it misread a relative path: every
+path a tool is handed is resolved against the session root and refused unless
+the result lands inside it, or inside a directory you named yourself.
+
+`--add-dir <dir>` adds a directory the file tools may also work in, repeatable
+and also spelled `--add-dir=<dir>`; `/add-dir` does the same mid-session,
+`/cwd` lists the set numbered and `/remove-dir <n|path>` takes one away. The
+guard keeps one resolution base: a bare relative path always means the session
+root, so adding a directory can only make an absolute path that used to be
+refused succeed - it can never quietly re-point `src\main.pas` at another
+tree. A file in an added directory is named by its full absolute path, which
+is exactly how `list_dir` and `search` print it back, and the model is told so
+by a system-prompt block emitted only when there is more than one root.
+
+What an added directory does *not* get is the interesting half. It grants file
+access and nothing else: its `.pasclaude\hooks.json` does not run, its skills,
+commands and agents are not offered, its `.mcp.json` spawns nothing and its
+`CLAUDE.md` is not read. Otherwise `--add-dir` would be a way to make any
+directory execute what it ships, which is a much larger grant than the words
+suggest. The session, the history, the approvals file, the rewind snapshots
+and bash's working directory all stay bound to the session root; `.pasclaude`
+is refused at the top of every root, added ones included, because a walker and
+a guard that disagreed about that name would be the inconsistency.
+
+Directories come from the command line or from a typed `/add-dir`, and from
+nowhere else - no file names one, and nothing is persisted, so each session
+starts at one root and you say it again. A write into an added directory still
+raises the same approval prompt with the same rendered diff, and a deny rule
+still refuses inside it. `--add-dir` widens reach, not permission. At most
+eight extras: the root list is scanned by the hottest guard in the program.
+
+It is honest about its one soft edge: `--add-dir C:\Users` is accepted and
+grants a great deal. Only a bare drive letter or share root is refused, and
+that is a typo guard rather than a boundary. The boundary is that only you can
+type it, and that it lasts exactly one session.
 
 If the project contains `AGENTS.md`, `CLAUDE.md` or `.pasclaude.md`, the
 contents are appended to the system prompt as binding instructions.
@@ -84,9 +119,15 @@ contents are appended to the system prompt as binding instructions.
 | `/web [on\|off]` | let the model search the web (off by default) |
 | `/resume` | reload the saved conversation |
 | `/save [name]` | write the conversation now; a name makes a keepable copy |
-| `/cwd` | show the session root |
+| `/cwd` | the session root and any added directories, numbered |
+| `/add-dir <dir>` | also work in that directory (file access only) |
+| `/remove-dir <n>` | stop working in it; the session root cannot go |
 | `/model [name]` | pick a model from a live list, or set one by name |
-| `/yolo` | approve every tool for the rest of the session |
+| `/deny` | the rules nothing overrides; `/deny add <rule>`, `/deny remove <n>` |
+| `/mode [name]` | `ask`, `plan` or `accept-edits`; bare, it shows the whole state |
+| `/plan` | shorthand for `/mode plan` |
+| `/yolo` | approve every tool for the rest of the session (bypass mode) |
+| `/sandbox [level]` | `off`, `limits` or `low`: how confined child processes are |
 | `/cost` | turns and tokens used |
 | `/exit` | quit (Ctrl+C also works) |
 
@@ -134,7 +175,12 @@ itself when `-p` has no argument. No banner, no session save - a script's
 throwaway question should not disturb the directory's saved conversation -
 and no permission prompts: stdin may be a pipe, so asking would hang.
 Read-only tools work; a run that needed an edit approved says so in its
-output instead of stalling. It also loads no hooks and spawns no MCP server,
+output instead of stalling. Deny rules do load, before the halt that stops
+the approvals file being read, so a scripted run inherits every refusal and
+no grant - strictly stricter than the interactive session that started with
+the same flags, which is the rule. `--dangerously-skip-permissions` is the
+one way past that, and it prints a warning to stderr when it is used.
+It also loads no hooks and spawns no MCP server,
 not by a new rule but by where it halts: a scripted run cannot be the thing
 that first executes a project's code.
 
@@ -291,11 +337,11 @@ the first's conversation on its very first save.
 | --- | --- | --- |
 | `read_file` | no | line-numbered, capped at 400 KB, hex dump if not text; a `.ipynb` comes back as numbered notebook cells instead |
 | `list_dir` | no | skips `.git`, `node_modules`, `.pasclaude` and `.gitignore`d entries; depth 4 when recursive, or a `depth` argument up to 12 |
-| `search` | no | case-insensitive substring or, with `regex`, a bounded regular expression; `*` globs, `case_sensitive` and `depth` arguments, respects `.gitignore`, capped at 200 hits |
+| `search` | no | case-insensitive substring or, with `regex`, a bounded regular expression; `*` globs, `case_sensitive` and `depth` arguments, an optional `path` narrowing it to one tree, respects each root's `.gitignore`, capped at 200 hits |
 | `write_file` | yes | creates intermediate directories |
 | `edit_file` | yes | one hunk or several at once; all must match or none apply |
 | `notebook_edit` | yes | replace, insert or delete one cell of a Jupyter notebook; same diff preview and approval as `edit_file` |
-| `bash` | yes | `cmd.exe /C`, output merged, 120 s timeout; `run_in_background` returns a job id instead of waiting |
+| `bash` | yes | `cmd.exe /C` inside a job object, output merged, 120 s timeout; `run_in_background` returns a job id instead of waiting |
 | `bash_output` | no | what a background job has printed since the last read, or the list of jobs |
 | `kill_bash` | no | stops a background job and the whole process tree under it |
 | `fetch` | yes | HTTPS GET, capped at 200 KB, own "always" class |
@@ -335,6 +381,18 @@ deleting a line must do the predictable thing. `/yolo` is the exception:
 its blanket flags are "I trust this session", not "and every future one",
 so a yolo session never writes the file. Print mode neither reads nor
 writes it - a scripted run must not inherit interactive grants.
+
+That file now carries three keys with three different polarities, which is
+worth knowing before editing one. The grants (`allow_edits`, `allow_bash`,
+`allow_fetch`, `bash_programs`, `trusted`) only widen: a true key can turn a
+flag on and an absent one can never turn it off, which is what makes
+`allow_edits: false` - written by `/mode ask` - a durable off switch rather
+than a silence. `deny` only narrows, is read by a different function that runs
+much earlier, and is written back verbatim, unparseable lines included,
+because a hand-edited rule silently erased at exit is worse than one that
+never worked. `sandbox` only raises: `"low"` loads, `"off"` is neither written
+nor read, so nothing on disk can be the reason the sandbox is not running.
+Working directories and the permission mode are stored nowhere at all.
 
 The model also has a `todo_write` tool for multi-step work: it maintains a
 task list that renders in the terminal as it changes - `[x]` done (green),
@@ -453,7 +511,8 @@ is the only mechanism on Windows that answers "must not be orphaned"
 honestly - `TerminateProcess` on `cmd.exe` leaves the grandchildren, which
 is precisely the shape of `npm run dev`, and `taskkill /T` does nothing at
 all if pasclaude itself is killed. FPC 3.2.2 does not declare the job API,
-so four `kernel32` prototypes are declared in `uTools`.
+so the prototypes are declared once, in `uSandbox`, which is also where the
+job is created and the child assigned to it before it is allowed to run.
 
 Polling reads the spool from a per-job byte offset that advances by exactly
 what was returned: no byte twice, no byte skipped. While the job is running
@@ -480,12 +539,10 @@ cancellation: Esc cancels the model's reply, not the user's build. At most
 eight run at once, and a job that writes more than 16 MB is stopped and says
 so.
 
-Three limits are worth stating rather than hiding. A grandchild spawned in
-the microseconds between `CreateProcess` and the job assignment escapes the
-job and would survive `kill_bash`. The 16 MB cap is only enforced when
-something sweeps the table - a launch, a poll, a list - so an unpolled job
-can overrun it until the next tool call, the same shape of limitation the
-foreground 120-second deadline already has. And a job still running at exit
+Two limits are worth stating rather than hiding. The 16 MB cap is only
+enforced when something sweeps the table - a launch, a poll, a list - so an
+unpolled job can overrun it until the next tool call, the same shape of
+limitation the foreground 120-second deadline already has. And a job still running at exit
 is stopped by design, so a user who wanted a truly detached server will find
 it gone; that is the deliberate trade against orphaning, which the launch
 message and `/jobs` make visible.
@@ -522,6 +579,285 @@ believed was there, and it is only computed when someone is actually going to
 be asked - under `/yolo` the work is skipped entirely. A binary file is
 summarised instead of dumped, and an edit whose snippet is missing or
 ambiguous is refused before any prompt appears.
+
+## The permission predicate
+
+"May this run?" is answered in four functions, and the order they run in is
+the whole of the argument. It is written down here because a line inserted in
+the wrong place still compiles, still passes most of the suite, and quietly
+turns a boundary into a suggestion.
+
+`RunTool` is the boundary layer. It runs before any gate is consulted:
+
+```
+R0   IsError := False
+R1   clear the pending hook allow    (a hook's yes never crosses calls)
+R2   refuse a nil input              (a rule cannot be matched against nothing)
+R3   [DENY] a tool rule matching the name
+R3b  [DENY] a bash rule matching any cmd.exe segment's program name
+R4   plan mode: refuse anything not on the plan allowlist
+R5   the subagent read-only list
+R6   fire PreToolUse hooks; a block refuses here
+R7   the per-tool arm: validate, resolve paths through SafePath, build the
+     preview, call the gate
+R8   fire PostToolUse hooks
+```
+
+Below that sit the three gates, and each opens with the same lines. `Permit`
+(edits, fetch, MCP tools) is `[DENY]`, then `BypassMode`, then the class
+allow-alls, then the edits catch-all, then a per-server standing yes, then the
+nil-`Ask` refusal, then a hook's allow, then the question itself. `PermitBash`
+is `[DENY]` twice - the tool name and the program name - then bypass, the bash
+blanket, the stored prefix, nil `Ask`, a hook's allow, the question.
+`SafePath` resolves the path, refuses anything outside every root, refuses the
+state directory, and only then applies the path rules.
+
+Five orderings carry the safety, and none of them is stylistic.
+
+**Deny is first everywhere.** Above the class allow-alls, above the bash
+prefix table, above the nil-`Ask` check, above a `PreToolUse` hook's `allow`,
+and above `BypassMode` - so nothing overrides a rule: not `/yolo`, not an
+"always" answered weeks ago, not a hook that answers allow. It is also above
+the hook *fire*, because a hook is a program a repository ships and handing it
+the arguments of a call the user forbade is a leak even when the hook cannot
+allow it. The copies in `Permit` and `PermitBash` are belt and braces: a
+reader sees deny-first without trusting the caller, and a fifth gate added
+later cannot be talked into a yes. Any fifth gate opens with the same lines -
+that is a copy-paste rule on purpose, not a memory test.
+
+**Plan mode is a boundary, not a gate setting.** It lives in `RunTool`, in a
+different function from `Permit`, beside the subagent read-only list. A check
+inside the gate would have sat below the very short-circuits it needed to
+beat; here, bypass, a class allow-all, a stored bash prefix, a hook's allow
+and a nil `Ask` are all structurally unable to lift it, and none of them had
+to be taught that plan mode exists.
+
+**`TakeHookAllow` stays below the nil-`Ask` check.** Three properties fall out
+of that position with no separate guard: print mode cannot be widened by a
+hook, a subagent cannot, and the flag is reachable only where a human was
+about to be asked anyway. The position is frozen; a feature that moves it is
+a defect.
+
+**`SafePath` is the only place a path argument becomes an absolute path.**
+Every path-taking tool, the change preview, `@`-mentions and `@import` funnel
+through it, so `..\` tricks, 8.3 names and junctions are unwound exactly once
+and a tool added later cannot forget the rule. Deny is applied once, outside
+the root loop, on the winning candidate: inside the loop it would be
+order-dependent, and a rule whose effect depends on which directory was named
+first is exactly the silently-failing rule deny exists to eliminate. The
+escape comparison exists in one function, `WithinRoot`, and compares against
+`Root + PathDelim` - which is what refuses `C:\proj-sibling\leak.txt` against
+`C:\proj`. Nobody else writes a prefix compare.
+
+**The sandbox is not an input to any of this.** No branch of any gate reads
+`uSandbox.SandboxLevel`, and the level does not appear in an approval prompt's
+detail line either. A confined command still reads every file you can read and
+still reaches the network, so "it's sandboxed" buys no approval discount, and
+a level shown at approval time would only invite "so yes".
+
+What can move any of it is a short list, and the project directory is not on
+it. No mode, working directory, deny rule or sandbox level is ever read from a
+file inside a root, from a hook's output, from an MCP server, a skill, a
+custom command, a plugin manifest or anything the model can emit. A mode comes
+from a keystroke, from this process's command line, or from the `allow_edits`
+key the user's own "always" wrote in `%LOCALAPPDATA%`. A working directory
+comes from argv or a typed command. A deny rule comes from
+`%LOCALAPPDATA%\pasclaude\deny.json` or from a hand-edited `"deny"` array in
+the per-root approvals file. The sandbox level rises from argv, `/sandbox`, or
+a key a previous session wrote, and falls only from argv or `/sandbox`. The
+built-in slash dispatch runs above custom-command expansion, whose result is
+prompt text and is never re-dispatched; that ordering is load-bearing.
+
+Under `-p` every one of these is either identical or strictly stricter. Deny
+rules load *before* the print-mode halt and standing approvals load after it,
+so a scripted run inherits every refusal and no grant, and can neither add nor
+remove a rule. `LoadDenyRules` reads only the `deny` array of each file, and
+that is the whole reason: it is the one reader of the approvals file that runs
+early, and if it ever grew to read a grant key, `-p` would start inheriting
+approvals.
+
+## Deny rules
+
+One string per rule, `kind:pattern`, in a JSON array:
+
+```
+tool:bash        tool:fetch      tool:mcp__github__*
+bash:rm          bash:del
+path:.env        path:**/*.pem   path:/secrets/**
+```
+
+`tool:` and `bash:` are read at the top of `RunTool`, above the `PreToolUse`
+hook fire; `path:` is read inside `SafePath`, where every path-taking tool,
+`@`-mention and `@import` already funnels. A refusal names the rule and the
+file it came from, so a rule is never mistaken for a bug. A pattern with no
+separator in it is a name rule and matches the base name at any depth, so
+`path:.env` catches `src\.env` without anybody thinking about where they are;
+a pattern with one is anchored, and measured against whichever root contains
+the file, so `path:secrets/**` means the same thing in an added working
+directory as it does in the session root. Path rules also hide the file from
+`list_dir` and `search` - the guard and the walkers agree, rather than the
+walkers hiding something the guard would still hand over by absolute name.
+An unparseable rule is kept with its reason, reported at startup and listed as
+NOT IN FORCE, because a user who wrote `read:.env` believing it protected
+something has to be told it does not.
+
+Rules live in `%LOCALAPPDATA%\pasclaude\deny.json` (global, every project) and
+in a `"deny"` array in the per-root approvals file (per project, hand-edited,
+written back verbatim). Nothing in a repository is ever read for one - a deny
+rule can only narrow, but strictness in one place buys looseness in another:
+denying `search` pushes the model onto `bash`, where an "always" the user gave
+weeks ago is waiting. `/deny` lists rules with their source file; `/deny add
+<rule>` and `/deny remove <n>` write the global file. `remove` is the only
+widening operation in the feature and exists only at the console - unreachable
+from `-p`, from the SDK protocol, from a hook, from a server, from the model.
+
+Three honest limits, printed by `/deny` as well as documented. `bash:` reads
+the first token of each `cmd.exe` segment - it catches `git status && rm -rf
+x`, where the approval prefix table gives up, but it cannot follow `%VAR%`
+expansion, a `for` loop, a renamed copy, a `.cmd` wrapper or a caret inside
+the name (`r^m`); `tool:bash` is the airtight form. `path:` covers pasclaude's
+file tools and not the shell: `type .env` run through bash never touches
+`SafePath`. Hardlinks evade `path:` - canonicalisation follows junctions, 8.3
+names and case, but a second name for the same bytes is a different path to
+every API Windows offers.
+
+`fetch:<host>` is deliberately not offered. WinHTTP follows redirects and
+`uHttp` sets no redirect policy, so a host rule would match the URL the model
+typed and not the host that answered; `tool:fetch` is the honest version.
+Blocking an MCP server's *spawn* is likewise not a deny rule: the spawn
+decision happens before any tool name exists, so a rule can only block calls
+(`tool:mcp__srv__*`) and stopping the program means editing `.mcp.json`.
+
+## Permission modes
+
+The gate now has a word for what it is doing, and the word is on the prompt.
+`ask` is the default and means what it says. `accept-edits` stops the prompts
+for file writes and nothing else - it is the flag a previous "always" answer
+already set, finally visible and finally revocable. `bypass` approves
+everything for this session and persists nothing. `plan` is the odd one out
+and the most useful: the model may read, search, fetch and keep a todo list,
+and every call that would change anything is refused before the permission
+gate is consulted at all.
+
+That last clause is the design, and its mechanics are in the predicate section
+above. What plan mode allows is an allowlist of eight tool names in one line -
+`read_file`, `list_dir`, `search`, `todo_write`, `skill`, `task`,
+`bash_output`, `fetch` - which is how a tool somebody's MCP server contributes
+next year is refused without anybody deciding to refuse it. `fetch` is on that
+list because investigation is the point of the mode; it is also the one
+observable external effect plan mode permits, and anyone who wants it airtight
+adds `tool:fetch` to a deny rule, which plan mode cannot lift either.
+
+The model is told the mode twice: once as a paragraph in the system prompt, so
+it does not spend a turn finding out, and once in the refusal, because prompt
+text is advice it can ignore mid-turn. The paragraph rides in a trailing
+system block with no cache marker, so turning plan mode on costs a few dozen
+tokens instead of re-reading the whole cached prefix - and with everything at
+its default the request body is byte-identical to what it was before this
+feature existed.
+
+There is no tool the model can call to leave plan mode. A tool that lets the
+model leave plan mode is a tool that lets the model grant itself write access.
+Leaving is a keystroke - `/mode ask` or `/mode accept-edits` - and it approves
+nothing retroactively: a plan is prose, and an approval that claims to cover
+"the plan" while actually covering everything is a lie with a friendly label.
+What real approval looks like is the diff `ChangePreview` already renders, one
+edit at a time. `/mode ask` also revokes the bash, fetch and MCP class
+blankets, which is broader than the name suggests and is printed; the named
+per-program and per-server grants are left alone, because each of those named
+the thing it covered.
+
+`--dangerously-skip-permissions` is `/yolo` before the first prompt, including
+under `-p`, and it is the largest single weakening in the program: a prompt
+injection in a repository file reaches a fully unattended agent. It keeps its
+long spelling on purpose - `--permission-mode bypass` is rejected by the
+parser with a message naming the real flag, and `/mode bypass` says the same.
+What still stands in its way: the session root, the deny rules, the subagent
+read-only list, and the fact that `-p` halts before it can load a hook or
+spawn an MCP server. Two combinations are startup errors rather than silent
+precedence: `--permission-mode accept-edits` under `-p` with no stream-json
+driver ("stop asking me" presupposes a me), and `--permission-mode plan`
+together with `--dangerously-skip-permissions`, where either guess about which
+the user meant is dangerous.
+
+No mode is persisted or resumed - a session restarted with `--resume` comes
+back in `ask` - and plan mode stops the model, not the machine: a
+`SessionStart` or `UserPromptSubmit` hook is a command the user configured
+themselves, and it still runs. `/mode` says so, and prints the four class
+flags, the counts of the narrow grants a mode word does not cover, and whether
+this session will persist anything at all. The prompt string carries the mode
+on every keystroke (`plan> `, `accept-edits> `) with a `+` when a class grant
+or a stored bash prefix makes the bare word an understatement; the `+` is a
+pointer to `/mode`, not information, because no suffix can render every
+combination and one that tried would be read as complete.
+
+## Sandboxing
+
+This is defence in depth and not an approval mechanism, and the two must not
+be described in the same breath as if they were points on one scale. A mode
+decides what you are asked; the sandbox decides what a child process can do
+once you have said yes.
+
+Every command pasclaude runs - the bash tool, a background job, a hook, an MCP
+server - starts inside a job object. The tree is capped at 64 processes,
+cannot break out of the job, cannot read the clipboard or change your desktop,
+and dies when the session does. That is the default, it costs nothing, and a
+command that behaves will never notice it. `/sandbox off` removes the limits
+but not the job itself: kill-on-close is what makes `kill_bash`, a hook's
+timeout and process exit reap a whole tree rather than terminating `cmd.exe`
+and orphaning what it started, and that was never one of the restrictions
+"off" was meant to switch off.
+
+`--sandbox low` goes further and runs children at low integrity. They then
+cannot write your user profile, the registry under HKCU, or any directory
+nobody has labelled for them - which includes the project you are working in.
+They get a scratch `%TEMP%` of their own instead, under `%LOCALAPPDATA%` and
+keyed like the approvals file, out of the tree. That is a real cost, which is
+why it is opt-in: a build that writes into its own tree will fail, `npx`-based
+MCP servers and hooks that write `%APPDATA%` will fail, and the failure says
+so on the same line as the exit code rather than leaving you to guess. When
+there is no home directory to put the scratch in, `low` falls back to `limits`
+and says so - never to `off`, because failing to find somewhere for a temp
+directory is not a reason to stop confining children.
+
+What low integrity does not do is worth saying plainly, because it is the part
+people assume. It does not stop a command reading anything you can read, and
+it does not stop it using the network - a probe on the machine this was
+developed on ran `dir %USERPROFILE%`, read `.gitconfig` and completed an HTTPS
+request under low integrity, all exiting 0. Scoping a process to a directory
+needs a filesystem filter driver; denying it the network needs a firewall
+rule. Neither is something an ordinary program can do to itself, so neither is
+offered.
+
+That measurement is why the sandbox changes nothing about what you are asked
+to approve. A confined command can still read every credential on the machine
+and send it anywhere, so "it's sandboxed" is not a reason to say yes to
+something you would otherwise refuse. The level is shown in `/sandbox`, in the
+banner when it is not the default, and on a failed command's exit line -
+`[exit code 1; sandbox: low]`, tagged on the exit code rather than on any
+message marker, because the markers that would let us guess more precisely are
+English. A hint naming `icacls` and `/sandbox off` is added on top when the
+failure looks sandbox-shaped. It is deliberately not in the approval prompt,
+and deliberately not in the system prompt either: a model told it is sandboxed
+routes around the sandbox.
+
+Two designs were probed and rejected. Restricted tokens produce a child that
+dies at 0xC0000142 without window-station ACL plumbing, and dropping
+privileges alone buys nothing on an ordinary user token. AppContainer needs a
+persistent per-profile identity and hand-written ACL grants for confinement
+that is still mostly filesystem scoping we would have to build anyway. And one
+asymmetry is documented rather than smoothed over: under `low`, an added
+working directory is writable by `write_file` and not by sandboxed bash.
+pasclaude never changes an ACL or an integrity label on anything outside its
+own scratch; the failure message tells you the exact `icacls` command so you
+can do it to your own tree deliberately.
+
+Building this closed two older defects. The foreground shell had no job object
+at all, so a timed-out command killed `cmd.exe` and orphaned its children; and
+all three raw spawn sites assigned to the job *after* the spawn, leaving the
+grandchild-escape race this README used to list as an accepted limit.
+`SandboxSpawn` creates suspended, assigns, and only then resumes - a child
+that has not run yet cannot have started anything outside the job.
 
 ## Web search
 
@@ -717,11 +1053,14 @@ its own hooks and its own servers before a prompt appeared. When neither
 approve-nothing and persist-nothing rather than a fall back into the project,
 which would restore the hole.
 
-Three things deliberately do *not* answer these questions. `/yolo` grants the
-per-call classes and not the right to spawn: yolo has always meant "stop
-asking me about these tools", it is answered before the repository's config is
-known to exist, and extending it to launching third-party binaries a cloned
-repository chose is a different sentence. Print mode is structurally unable to
+Three things deliberately do *not* answer these questions. `/yolo` answers the
+per-call gate and not the right to spawn: yolo has always meant "stop asking
+me about these tools", it is answered before the repository's config is known
+to exist, and extending it to launching third-party binaries a cloned
+repository chose is a different sentence. That survived the move to bypass
+mode for free - bypass is one line inside `Permit`, and neither the server
+spawn prompt nor the hooks fingerprint prompt goes through `Permit`. Print
+mode is structurally unable to
 reach either prompt - it halts before the config is read, and would arrive
 with a nil `Ask` and deny everything if it did - so a scripted run can never
 be the thing that first executes a project's code. And enabling a plugin
@@ -1009,8 +1348,9 @@ to listen. `-p` takes the next argument as its prompt only when that argument
 does not begin with `-`, so the flags may go on either side of it.
 
 The message types: `system` (subtype `init`, emitted once, carrying the session
-id, cwd, model, permission mode and the full inventory of tools, agents,
-commands, MCP servers and skills), `user` (the prompt echoed back),
+id, cwd, any additional working directories, model, permission mode and the
+full inventory of tools, agents, commands, MCP servers and skills), `user`
+(the prompt echoed back),
 `assistant_delta` (`delta.type` is `text` or `thinking`), `tool_use` (id, name,
 and the input as a parsed object), `tool_result` (tool_use_id, name, content,
 is_error), `notice`, `hook`, `permission_request`, `error`, and `result`.
@@ -1036,6 +1376,17 @@ unknown verb, a mismatched id, a line that is not JSON, a message that is not a
 `permission_response`, and end of stream. That is the same rule the console
 prompt follows when its own read fails, and there is no default-allow branch
 anywhere in the parser.
+
+A driver is a permission answerer and nothing more. The protocol has no
+message that sets a mode, adds a working directory, edits a deny rule or
+changes the sandbox level; the working directories and the mode name appear in
+the `init` event because a driver that cannot see them cannot explain a
+refusal to whoever reads its log. Whether the channel is armed at all is a
+separate decision from what is reported - `AskViaDriver`, set only in the two
+modes where a question can arise, since plan refuses before the gate and
+bypass answers itself. That used to be one string compared against `'ask'`,
+which was a behaviour switch keyed on a display name and became a latent bug
+the moment the vocabulary grew past two words.
 
 A run *without* `--input-format stream-json` can read files, list directories
 and search, and nothing else. Every write, edit and shell command is refused in
@@ -1071,6 +1422,12 @@ the root, construct, ask, free - and `build.cmd` builds it, so it cannot rot
 into needing `uTerm`. One session per process, because `RootDir`, the AllowAll
 flags, the job table, the bash prefixes, the snapshots and the ignore rules are
 all module-global in `uTools`; a subprocess is the isolation boundary.
+Constructing a session clears the working-directory set before setting the
+root - they are a grant made to a session, not a property of the machine - and
+loads the user's deny rules and nothing else out of the approvals store. That
+is the one class of rule it is safe to hand an embedder unasked, because it is
+the one class that cannot grant anything: `Ask` stays nil, so the session
+inherits the user's refusals and none of their approvals.
 
 That unit is also where the system prompt now lives. It was lifted out of
 `pasclaude.lpr` verbatim, which is what makes it testable for the first time -
@@ -1439,6 +1796,102 @@ wrong reason: it used `not McpAlive(C)`, which answers from the recorded state
 and survived the mutant, and now asserts `McpConnectionCount = 0`, which only
 falls when the connection was actually torn down.
 
+The permissions round is tested the same way, and its tests are shaped by one
+question: did the gate get *weaker*? Forty-five new procedures across `smoke`,
+`fuzz`, `loop` and `ux`, plus `tests\sbxmock.lpr`, a fixture that reports from
+*inside* a job object what only a child can observe - breakaway is refused with
+ERROR_ACCESS_DENIED, and the process cap bites at 63 made plus
+ERROR_NOT_ENOUGH_QUOTA, 63 because the fixture itself is the 64th. Like
+`srvmock` it is built without `-gh`.
+
+Four tests carry most of the weight, one per feature, and each of them stacks
+every weakening the program offers and asserts the boundary still holds.
+`TestDenyBeatsEverything` sets all four class blankets, a stored bash prefix
+and an `Ask` that answers "always", and asserts `write_file`, `bash rm -rf x`
+and `fetch` all refuse through `RunTool`, that `Permit` and `PermitBash` each
+refuse directly, and that the `Ask` counter is still zero.
+`TestPlanModeBeatsEverything` does the same with plan mode on top of bypass.
+`TestDenyBeatsAddedRoot` adds the directory holding a `.pem`, turns on bypass
+and `AllowAllEdits`, and asserts the rule still refuses. And
+`TestSandboxDoesNotTouchTheGate` proves a counting `Ask` reaches the identical
+decision the identical number of times at every sandbox level - the "sandboxed
+commands need less approval" weakening this round must not make.
+`TestDenyBeatsHookAllow` and `TestPlanModeBeatsHookAllow` run a real
+`PreToolUse` hook that writes a marker file and echoes `{"decision":"allow"}`:
+a positive control proves it fires for an ordinary call, then the boundary
+refuses *and the marker is absent*, i.e. the forbidden call's arguments never
+reached the repository's program.
+
+The other half asks where a loosening could come *from*.
+`TestDenyRulesNotFromProject`, `TestNoModeFromProject`, `TestNoRootFromProject`
+and `TestSandboxLevelNotFromProject` each plant the relevant key in
+`.pasclaude\permissions.json`, in a config file at the root, in `CLAUDE.md` and
+in an environment variable, with `%LOCALAPPDATA%` pointed at a *sibling* of the
+session root so a fixture that wrote inside the tree would test nothing - then
+assert nothing changed, and that the real out-of-tree file does work, so the
+loader is proven capable of the thing it is refusing.
+`TestPrintModeInheritsNoGrants` pins the startup ordering: `LoadDenyRules`
+alone brings the rules and not `AllowAllBash`, not the prefix table, not the
+hooks fingerprint. `TestDenyRoundTrip` pins the hand-edited `"deny"` array
+surviving a load and a save, unparseable line included.
+`TestSdkSessionDoesNotInheritRoots` pins the embedder.
+
+`ux` covers what a person meets - the mode indicator in all four modes and its
+`+` suffix, the banner announcing a grant loaded from disk, `/add-dir`'s echo
+of the resolved absolute path, `list_dir` on `.` byte-identical before and
+after an add, a denied file invisible to `list_dir` *and* `search` *and*
+`read_file`, the sandbox failure annotation, and a foreground timeout that
+kills the grandchild rather than orphaning it. `loop` covers the wire: the
+system array has two blocks with plan mode or a deny rule or an extra root in
+play, the second carrying no `cache_control`, and exactly one block with
+everything at its default.
+
+Mutation-checked in the usual form. Dropping the `+ PathDelim` from
+`WithinRoot` - the classic sibling-prefix bug - fails 42 assertions across
+three suites, including the original path-guard assertion written years
+earlier. Moving the plan check out of `RunTool` and into `Permit` fails 11, and
+`bash` actually executes under the mutant because `PermitBash` is a different
+function, which is the clearest available demonstration of why the check
+belongs above the gate rather than inside one arm of it. Moving
+`if BypassMode then Exit(True)` above the deny line in `Permit` fails 1 - only
+one, because `RunTool` still catches the tool call, which is exactly why the
+belt-and-braces assertion on `Permit` directly exists. Deleting the `[DENY]`
+lines from `Permit` and `PermitBash` only fails exactly 2, and every `RunTool`
+assertion still passes. Replacing `CanonicalPath` with `ExpandFileName` fails
+2, and the junction assertions still pass - a junction leaves the base name
+intact, so the 8.3 pair is what distinguishes "canonicalises" from "expands".
+Deleting the deny `Continue` from the `search` walker alone fails 1 assertion
+while `read_file` still refuses and `list_dir` still hides the file: the single
+most damaging silent hole, and one test catches it. Deleting the deny
+write-back from `SavePermissions` fails 2. Making `LoadPermissions` honour any
+sandbox level from the file fails 3. Applying the state-directory check only to
+root 0 fails 4, all in the two tests written for it and nothing else.
+Inverting `SafePath`'s deny-as-fallthrough fails 11, four of them pre-existing
+assertions with nothing to do with this round. Adding
+`JOB_OBJECT_LIMIT_BREAKAWAY_OK` fails 2, and adding
+`if SandboxLevel = slLow then Exit(True)` to `PermitBash` fails 3. Dropping the
+`+` from the mode indicator fails 1, which is the exact failure this feature
+exists to prevent.
+
+A fifth sandbox mutation found a real bug rather than confirming a test.
+Deleting the post-exit drain from `RunShell` failed nothing - which exposed
+that the loop drained *before* testing for exit, so the trailing drain was
+papering over a genuine race: bytes written between the drain and the exit test
+were lost. The loop is now test-then-drain, correct by construction, and the
+residual trailing drain serves only the kill path.
+
+Review after the round found two more, both real. `PathForms` measured a
+path's relative spelling against the primary root only, so an anchored rule
+like `path:secrets/**` hid a file from `list_dir` and `search` in an added
+working directory while `read_file` handed it over by absolute name - invisible
+and fully readable, the worst possible pairing. It now measures against the
+root that contains the file, primary first. And routing the three raw spawn
+sites through `SandboxNewJob` had made the job object conditional on the
+sandbox being on, so `/sandbox off` silently disabled tree-kill as well;
+`SandboxNewJob` now always creates the job and configures nothing but
+kill-on-close at `slOff`. Both are regression-tested, and the first was
+verified to fail on the old code with the walker assertion still passing.
+
 The one place with no regression test says so. The argument loop that parses
 `-p` and the format flags is inline in `pasclaude.lpr`'s main block,
 interleaved with `FailStart`, `Halt` and `SetCurrentDir`, and no suite spawns
@@ -1480,17 +1933,24 @@ transcript's *shape*; that is why the structural rules are enforced in
 | `uNotebook` | `.ipynb` cell view, cell edits, nbformat's exact layout |
 | `uMcp` | MCP stdio client: two pipes, JSON-RPC, a deadline on every wait |
 | `uHooks` | a child process with a deadline, the hook table, hook dispatch |
+| `uSandbox` | the one spawn: job object, integrity level, scratch `%TEMP%` |
 | `uTools` | the tool implementations, path guard, permission gate |
 | `uAgent` | request building, SSE decoding, the tool loop |
 | `uSdk` | system prompt assembly, the NDJSON line protocol, the facade |
 | `pasclaude.lpr` | REPL, slash commands, rendering |
 
-The ladder is strict: `uJson` -> `uHttp`/`uDiff`/`uRegex`/`uNotebook`/`uMcp`/
-`uHooks` -> `uTools` -> `uAgent` -> `uSdk` -> `pasclaude.lpr`. Nothing at or
-below `uAgent` knows the console exists. `uHooks` sits below `uTools` and so
-cannot call it, which is why the UTF-8 family - `IsValidUtf8` and `OemToUtf8`
-- moved down into `uJson` beside `Utf8Cut`, with one-line forwards left in
-`uTools` so every existing reference still compiles.
+The ladder is strict: `uSandbox` -> `uJson` -> `uHttp`/`uDiff`/`uRegex`/
+`uNotebook`/`uMcp`/`uHooks` -> `uTools` -> `uAgent` -> `uSdk` ->
+`pasclaude.lpr`. Nothing at or below `uAgent` knows the console exists.
+`uHooks` sits below `uTools` and so cannot call it, which is why the UTF-8
+family - `IsValidUtf8` and `OemToUtf8` - moved down into `uJson` beside
+`Utf8Cut`, with one-line forwards left in `uTools` so every existing reference
+still compiles. `uSandbox` is at the bottom for the same class of reason: it
+imports `Windows` and `SysUtils` and nothing else, because a spawn shared by
+`uHooks`, `uMcp` and `uTools` is only expressible below all three - which is
+exactly why the job-object declarations used to be copied verbatim into each
+of them. Adding `uses uJson` there creates the cycle the ladder exists to
+prevent.
 
 Details worth knowing if you touch this code:
 
@@ -1636,11 +2096,58 @@ Details worth knowing if you touch this code:
 * **The approvals file lives outside the project.** It records what the user
   let *this project* do, so a project that could ship its own copy would be
   answering its own question. When no home directory is set there is no store,
-  which means approve-nothing - never a fall back into the project.
+  which means approve-nothing - never a fall back into the project. It now
+  holds three polarities: the grants widen only, `deny` narrows only, and
+  `sandbox` raises only. Each direction is the safe one for a stale file, and
+  they must not be collapsed into one rule.
 * **`.pasclaude\plugins.json` is authoritative in both directions**, unlike
   the approvals file, which only ever widens. A disable that did not survive a
   restart would be a consent bug nobody could diagnose. Both files carry a
   comment saying they have opposite semantics and why.
+* **Deny is the first line of every gate, and `BypassMode` is the second.**
+  `RunTool` refuses a denied call before the hook fire; `Permit` and
+  `PermitBash` each repeat the check at the top, so a fifth gate added later
+  cannot be talked into a yes and a reader sees deny-first without trusting
+  the caller. `BypassMode` sits below those lines and in a different function
+  from the `RunTool` checks, which is the cheapest available proof that no
+  mode reaches around a rule. Anyone adding a gate copies both lines - that is
+  a copy-paste rule on purpose, not a memory test.
+* **Plan mode is a boundary, not a gate setting.** It is enforced in
+  `RunTool`, beside the subagent read-only list and above the `PreToolUse`
+  fire, so bypass, a class allow-all, a stored bash prefix, a hook's allow and
+  a nil `Ask` are all structurally unable to lift it. Inside `Permit` it would
+  have sat below the short-circuits it needed to beat. There is deliberately
+  no `exit_plan_mode` tool: a tool that lets the model leave plan mode is a
+  tool that lets the model grant itself write access.
+* **There is exactly one path resolution base, however many roots there are.**
+  A relative or rooted path always means the primary root, so `--add-dir` can
+  only make a previously-refused absolute path succeed and can never re-point
+  `src\main.pas` at another tree. The escape comparison lives only in
+  `WithinRoot` and compares against `Root + PathDelim`; anyone who needs "is
+  this inside that" calls it rather than writing a prefix compare. The deny
+  check runs once, outside the root loop, on the winning candidate - inside it
+  the answer would depend on which root was named first.
+* **An added working directory contributes no code and no configuration.**
+  `SkillsDirProject`, `HookRoot`, `AgentsDir`, `McpConfigPath`,
+  `ResolveExtensionFile` and `SdkProjectContext` all read `NormalizeRoot` and
+  each carries a comment saying why. Generalising any of them to scan every
+  root turns `--add-dir` into a way to make an arbitrary directory execute
+  what it ships, which is a far larger grant than the flag's words.
+* **The sandbox is never consulted by a permission decision.** No gate reads
+  `uSandbox.SandboxLevel`, and the level does not decorate an approval
+  prompt's detail either. The reason is a measurement rather than a principle:
+  a Low-integrity child still reads the whole user profile and still reaches
+  the network, so a boundary that stops writes and stops nothing else cannot
+  buy an approval discount.
+* **`SessionNote` is one function, one trailing block, and empty by default.**
+  Plan mode, the extra roots and the deny sentence are appended in that fixed
+  order as a second `system` content block carrying no `cache_control` marker
+  of its own, after the marked one - so turning any of them on costs a few
+  dozen tokens rather than the whole cached prefix. With one root, `ask` mode
+  and no rules it returns `''`, no second block is emitted, and the request
+  body is byte-identical to what it was before this round. The deny *patterns*
+  and the sandbox level are deliberately absent: naming `.env` advertises a
+  target, and a model told it is sandboxed routes around the sandbox.
 * **Every new path under `.pasclaude` bypasses `SafePath` and must say so.**
   `SafePath` refuses that directory by design, so the substitute guard is the
   established one and no feature may invent a second: filter the bare name for
