@@ -8,8 +8,8 @@ program fuzz;
 
 {$mode objfpc}{$H+}
 
-uses SysUtils, Classes, Windows, uJson, uMcp, uHooks, uTools, uAgent, uHttp,
-  uSdk;
+uses SysUtils, Classes, Windows, uJson, uMcp, uHooks, uSandbox, uTools, uAgent,
+  uHttp, uSdk;
 
 var
   Fails: Integer = 0;
@@ -2857,6 +2857,408 @@ begin
   Doc.Free;
 end;
 
+{ ---------------------------------------------------------------- sandbox -- }
+
+var
+  SandboxAsks: Integer = 0;
+
+{ Counted as well as answered, so "the same decision" below can mean the same
+  number of questions and not merely the same verdict.  A sandbox that skipped
+  the prompt and allowed anyway would return True either way. }
+function CountingDeny(const Title, Detail: string): TPermission;
+begin
+  Inc(SandboxAsks);
+  Result := pmDeny;
+end;
+
+{ THE test for this feature.  Everything else it does is subtraction; this is
+  the assertion that it subtracts from the CHILD and never from the gate.
+  Low integrity was measured to permit reading the whole user profile and
+  unrestricted network use, so a sandboxed command has bought no safety a
+  permission prompt cares about, and any code that let the level shorten the
+  decision would be trading a real approval for an imaginary guarantee. }
+procedure TestSandboxDoesNotTouchTheGate;
+var
+  Saved: uSandbox.TSandboxLevel;
+  R1, R2, R3: Boolean;
+  A1, A2, A3: Integer;
+begin
+  Saved := uSandbox.SandboxLevel;
+  uTools.ClearDenyRules;
+  uTools.ClearBashPrefixes;
+  uTools.AllowAllEdits := False;
+  uTools.AllowAllBash := False;
+  uTools.AllowAllFetch := False;
+  uTools.AllowAllMcp := False;
+  uTools.BypassMode := False;
+  uTools.PlanMode := False;
+  try
+    SandboxAsks := 0;
+    uSandbox.SandboxLevel := slOff;
+    R1 := uTools.PermitBash('git status', 'd', @CountingDeny);
+    A1 := SandboxAsks;
+
+    SandboxAsks := 0;
+    uSandbox.SandboxLevel := slLimits;
+    R2 := uTools.PermitBash('git status', 'd', @CountingDeny);
+    A2 := SandboxAsks;
+
+    SandboxAsks := 0;
+    uSandbox.SandboxLevel := slLow;
+    R3 := uTools.PermitBash('git status', 'd', @CountingDeny);
+    A3 := SandboxAsks;
+
+    Check((R1 = R2) and (R2 = R3) and not R3,
+      'the sandbox level does not change what PermitBash decides');
+    Check((A1 = 1) and (A2 = 1) and (A3 = 1),
+      'nor how many times the user is asked');
+
+    { The nil-Ask backstop is the deny-by-default rule itself.  A sandbox that
+      short-circuited it would make "print mode denies everything" false. }
+    uSandbox.SandboxLevel := slLow;
+    Check(not uTools.PermitBash('git status', 'd', nil),
+      'a sandboxed command with nobody to ask is still denied');
+    Check(not uTools.Permit('bash', 'd', nil),
+      'and so is bash through Permit');
+    Check(not uTools.Permit('fetch', 'd', nil),
+      'and fetch, which the sandbox does not touch at all');
+    Check(not uTools.Permit('mcp__x__y', 'd', nil),
+      'and an MCP tool call');
+    Check(not uTools.Permit('write_file', 'd', nil),
+      'and a file write');
+
+    { And a deny rule still beats it, which is the property this whole round
+      exists to keep: the sandbox is not a way to be talked into a yes. }
+    uTools.AddDenyRule('bash:git', 'test');
+    Check(not uTools.PermitBash('git status', 'd', @SayAlways),
+      'a deny rule beats an "always" answer at every sandbox level');
+    uTools.ClearDenyRules;
+  finally
+    uSandbox.SandboxLevel := Saved;
+    uTools.ClearBashPrefixes;
+  end;
+end;
+
+{ Reads the fixture's one-line report.  '' when it never wrote one, which
+  reads as a failure at every call site rather than as a silent pass. }
+function ReadLine1(const Path: string): string;
+var
+  F: TFileStream;
+begin
+  Result := '';
+  if not FileExists(Path) then Exit;
+  try
+    F := TFileStream.Create(Path, fmOpenRead or fmShareDenyNone);
+    try
+      SetLength(Result, F.Size);
+      if F.Size > 0 then F.ReadBuffer(Result[1], F.Size);
+    finally
+      F.Free;
+    end;
+  except
+    Result := '';
+  end;
+end;
+
+{ Runs sbxmock inside Job and waits.  Bounded, like every other child in these
+  suites: a hang here would be indistinguishable from a slow machine. }
+function RunMock(const Args: string; Job: THandle): Boolean;
+var
+  SI: STARTUPINFOA;
+  PI: PROCESS_INFORMATION;
+  InJob: Boolean;
+  Exe: string;
+begin
+  Exe := ExtractFilePath(ParamStr(0)) + 'sbxmock.exe';
+  FillChar(SI, SizeOf(SI), 0);
+  SI.cb := SizeOf(SI);
+  Result := uSandbox.SandboxSpawn('"' + Exe + '" ' + Args, '', '', 0,
+    SI, PI, Job, InJob);
+  if not Result then Exit;
+  Result := InJob;
+  WaitForSingleObject(PI.hProcess, 20000);
+  CloseHandle(PI.hThread);
+  CloseHandle(PI.hProcess);
+end;
+
+{ Both halves are observed from inside the job, because that is the only place
+  the answer exists.  Checking the flag word instead would assert that we typed
+  the constant we meant to, which passes just as well when it does nothing. }
+procedure TestSandboxNoBreakaway;
+var
+  Saved: uSandbox.TSandboxLevel;
+  Job: THandle;
+  Rep, OutPath: string;
+begin
+  Saved := uSandbox.SandboxLevel;
+  OutPath := IncludeTrailingPathDelimiter(SessionDir) + 'sbx.txt';
+  try
+    uSandbox.SandboxLevel := slLimits;
+    Job := uSandbox.SandboxNewJob;
+    Check(Job <> 0, 'a job object is created at the default level');
+    if Job = 0 then Exit;
+    try
+      SysUtils.DeleteFile(OutPath);
+      Check(RunMock('breakaway "' + OutPath + '"', Job),
+        'the fixture ran and was assigned to the job before it resumed');
+      Rep := ReadLine1(OutPath);
+      { 5 is ERROR_ACCESS_DENIED.  BREAKAWAY_OK is absent from the flag word,
+        so a child asking to leave the job is refused outright - which is what
+        makes "everything this session started dies with it" true. }
+      Check(Pos('ok=0', Rep) > 0,
+        'a child inside the job cannot break out of it: ' + Rep);
+      Check(Pos('err=5', Rep) > 0, 'and is refused with ACCESS_DENIED');
+    finally
+      CloseHandle(Job);
+    end;
+
+    { The cap.  Sixty-four is too many to reach in a test, so the fixture is
+      pointed at a job configured the same way and asked for more than it can
+      have; what matters is that the flag word enforces the field at all. }
+    Job := uSandbox.SandboxNewJob;
+    if Job <> 0 then
+    try
+      SysUtils.DeleteFile(OutPath);
+      RunMock('fanout 100 "' + OutPath + '"', Job);
+      Rep := ReadLine1(OutPath);
+      Check(Rep <> '', 'the fanout fixture reported: ' + Rep);
+      { A hundred simultaneous children is past the 64 the job allows, so some
+        spawn must have been refused - and with 1816, ERROR_NOT_ENOUGH_QUOTA,
+        which is the job speaking rather than the machine running out of
+        anything.  ACTIVE_PROCESS missing from the flag word while the field
+        stays populated would show up here as made=100. }
+      Check((Pos('err=1816', Rep) > 0) and (Pos('made=100', Rep) = 0),
+        'and the process cap is enforced, not merely populated: ' + Rep);
+    finally
+      CloseHandle(Job);
+    end;
+  finally
+    uSandbox.SandboxLevel := Saved;
+    SysUtils.DeleteFile(OutPath);
+  end;
+end;
+
+{ The level is a decision about this machine and this run.  A repository that
+  could set it could switch off the confinement applied to the commands that
+  repository's own build ships - which is the same hole that moved approvals
+  out of the tree in the first place. }
+procedure TestSandboxLevelNotFromProject;
+var
+  Saved: uSandbox.TSandboxLevel;
+  Local, Base, Approvals: string;
+begin
+  Saved := uSandbox.SandboxLevel;
+  Local := SysUtils.GetEnvironmentVariable('LOCALAPPDATA');
+  Base := ExcludeTrailingPathDelimiter(SessionDir) + '-appdata';
+  ForceDirectories(Base);
+  try
+    uTools.RootDir := SessionDir;
+    uSandbox.SandboxLevel := slLimits;
+
+    { Every file a project could plausibly use to say something. }
+    WriteFileText(IncludeTrailingPathDelimiter(SessionDir) + StateDirName +
+      PathDelim + 'sandbox.json', '{"level":"off"}');
+    WriteFileText(IncludeTrailingPathDelimiter(SessionDir) + StateDirName +
+      PathDelim + 'settings.json', '{"sandbox":"off"}');
+    WriteFileText(IncludeTrailingPathDelimiter(SessionDir) + StateDirName +
+      PathDelim + 'permissions.json', '{"sandbox":"off"}');
+    WriteFileText(IncludeTrailingPathDelimiter(SessionDir) + '.pasclaude.md',
+      'sandbox: off');
+    WriteFileText(IncludeTrailingPathDelimiter(SessionDir) + 'CLAUDE.md',
+      'sandbox: off');
+    SetEnvironmentVariable('PASCLAUDE_SANDBOX', 'off');
+
+    { The in-tree file, read the way a mistaken implementation would read it. }
+    LoadPermissions(IncludeTrailingPathDelimiter(SessionDir) + StateDirName +
+      PathDelim + 'permissions.json');
+    Check(uSandbox.SandboxLevel = slLimits,
+      'nothing in the project directory can lower the sandbox level');
+
+    SetEnvironmentVariable('LOCALAPPDATA', PChar(Base));
+    Approvals := ApprovalsPath;
+
+    { Even the real, out-of-tree store may not lower it.  This key has the
+      opposite polarity to every other key in that file, and for a reason: a
+      stale or hostile line must never be why the sandbox is not running. }
+    WriteFileText(Approvals, '{"sandbox":"off"}');
+    uSandbox.SandboxLevel := slLimits;
+    LoadPermissions(Approvals);
+    Check(uSandbox.SandboxLevel = slLimits,
+      '"off" in the approvals file is not read at all');
+
+    WriteFileText(Approvals, '{"sandbox":"low"}');
+    LoadPermissions(Approvals);
+    Check(uSandbox.SandboxLevel = slLow,
+      'but "low" raises it, which is the one direction that is safe');
+
+    { A raise cannot become a lowering by arriving twice. }
+    WriteFileText(Approvals, '{"sandbox":"off"}');
+    LoadPermissions(Approvals);
+    Check(uSandbox.SandboxLevel = slLow, 'and nothing on disk takes it back');
+
+    { Junk in the key changes nothing in either direction. }
+    uSandbox.SandboxLevel := slLimits;
+    WriteFileText(Approvals, '{"sandbox":123}');
+    LoadPermissions(Approvals);
+    WriteFileText(Approvals, '{"sandbox":null}');
+    LoadPermissions(Approvals);
+    WriteFileText(Approvals, '{"sandbox":["low"]}');
+    LoadPermissions(Approvals);
+    Check(uSandbox.SandboxLevel = slLimits,
+      'a non-string sandbox key changes nothing');
+  finally
+    SetEnvironmentVariable('PASCLAUDE_SANDBOX', nil);
+    if Local <> '' then SetEnvironmentVariable('LOCALAPPDATA', PChar(Local))
+    else SetEnvironmentVariable('LOCALAPPDATA', nil);
+    uSandbox.SandboxLevel := Saved;
+    uTools.RootDir := SessionDir;
+  end;
+end;
+
+{ The scratch is out of the tree for two reasons, and the second is specific
+  to this feature: a Low-labelled directory is writable by every other
+  low-integrity process on the machine, which is not a thing to create inside
+  somebody's source.  And the model must not be able to read it. }
+procedure TestSandboxScratchOutOfTree;
+var
+  Saved: uSandbox.TSandboxLevel;
+  Local, Profile, Base, P1, P2, Full, Err: string;
+begin
+  Saved := uSandbox.SandboxLevel;
+  Local := SysUtils.GetEnvironmentVariable('LOCALAPPDATA');
+  Profile := SysUtils.GetEnvironmentVariable('USERPROFILE');
+  { A sibling, not a subdirectory, exactly as TestApprovalsOutOfTree does it:
+    a fixture that put the scratch inside the root would test nothing. }
+  Base := ExcludeTrailingPathDelimiter(SessionDir) + '-sbxappdata';
+  ForceDirectories(Base);
+  try
+    SetEnvironmentVariable('LOCALAPPDATA', PChar(Base));
+    uTools.RootDir := SessionDir;
+    P1 := uSandbox.SandboxScratchPath(uTools.SessionKey);
+    Check(Pos(UpperCase(Base), UpperCase(P1)) = 1,
+      'the sandbox scratch sits under LOCALAPPDATA: ' + P1);
+    Check(Pos(UpperCase(IncludeTrailingPathDelimiter(
+      ExpandFileName(SessionDir))), UpperCase(P1)) = 0,
+      'and nowhere inside the project');
+    Check(uSandbox.SandboxScratchPath(uTools.SessionKey) = P1,
+      'the same root always names the same scratch');
+
+    uTools.RootDir := IncludeTrailingPathDelimiter(SessionDir) + 'sbxother';
+    ForceDirectories(uTools.RootDir);
+    P2 := uSandbox.SandboxScratchPath(uTools.SessionKey);
+    Check(P1 <> P2, 'and two roots never share one');
+    uTools.RootDir := SessionDir;
+
+    Check(uSandbox.SandboxSetScratchRoot(P1),
+      'the scratch is created and labelled low');
+    Check(uSandbox.SandboxTempDir <> '', 'and is then reportable');
+
+    { The model must never be able to name what a sandboxed command wrote to
+      its %TEMP%.  SafePath gets no clause for the scratch, so it is refused
+      by the ordinary escape rule and stays refused. }
+    Check(not uTools.ResolveInRoot(uSandbox.SandboxTempDir, Full, Err),
+      'the model cannot resolve the scratch directory');
+    Check(not uTools.ResolveInRoot(IncludeTrailingPathDelimiter(
+      uSandbox.SandboxTempDir) + 'leaked.txt', Full, Err),
+      'nor anything a sandboxed command left in it');
+
+    { No home is "there is nowhere out of tree", and the answer is to refuse
+      low - never to invent a location inside the project. }
+    SetEnvironmentVariable('LOCALAPPDATA', nil);
+    SetEnvironmentVariable('USERPROFILE', nil);
+    Check(uSandbox.SandboxScratchPath(uTools.SessionKey) = '',
+      'with no home directory there is no scratch');
+    Check(not uSandbox.SandboxSetScratchRoot(''),
+      'and low is refused rather than falling back into the tree');
+  finally
+    if Local <> '' then SetEnvironmentVariable('LOCALAPPDATA', PChar(Local))
+    else SetEnvironmentVariable('LOCALAPPDATA', nil);
+    if Profile <> '' then SetEnvironmentVariable('USERPROFILE', PChar(Profile))
+    else SetEnvironmentVariable('USERPROFILE', nil);
+    uSandbox.SandboxLevel := Saved;
+    uTools.RootDir := SessionDir;
+  end;
+end;
+
+{ The environment block is the one piece of this feature that is parsed rather
+  than merely set, so it is the one that can be quietly wrong.  Every check
+  here is a way a plausible implementation truncates or drops something. }
+procedure TestSandboxEnvBlock;
+var
+  Saved: uSandbox.TSandboxLevel;
+  Local, Base, Blk, Scratch: string;
+  Odd: string;
+
+  function Has(const Entry: string): Boolean;
+  begin
+    Result := Pos(Entry + #0, Blk) > 0;
+  end;
+
+  function CountOf(const Entry: string): Integer;
+  var
+    I: Integer;
+  begin
+    Result := 0;
+    for I := 1 to Length(Blk) - Length(Entry) + 1 do
+      if Copy(Blk, I, Length(Entry)) = Entry then Inc(Result);
+  end;
+
+begin
+  Saved := uSandbox.SandboxLevel;
+  Local := SysUtils.GetEnvironmentVariable('LOCALAPPDATA');
+  Base := ExcludeTrailingPathDelimiter(SessionDir) + '-sbxappdata';
+  ForceDirectories(Base);
+  try
+    uSandbox.SandboxLevel := slOff;
+    Check(uSandbox.SandboxApplyEnv('') = '',
+      'at "off" the child inherits our environment unchanged');
+    uSandbox.SandboxLevel := slLimits;
+    Check(uSandbox.SandboxApplyEnv('') = '',
+      'and at "limits" too - nothing is redirected below low');
+
+    SetEnvironmentVariable('LOCALAPPDATA', PChar(Base));
+    uTools.RootDir := SessionDir;
+    uSandbox.SandboxSetScratchRoot(
+      uSandbox.SandboxScratchPath(uTools.SessionKey));
+    Scratch := uSandbox.SandboxTempDir;
+    uSandbox.SandboxLevel := slLow;
+
+    Blk := uSandbox.SandboxApplyEnv('');
+    Check(Has('TEMP=' + Scratch), 'at "low" TEMP points at the scratch');
+    Check(Has('TMP=' + Scratch), 'and TMP');
+    Check(Has('TMPDIR=' + Scratch), 'and TMPDIR');
+    { Exactly once each: an implementation that appended without removing the
+      inherited one would leave two, and which one cmd.exe believes is not
+      something worth finding out the hard way. }
+    Check(CountOf('TEMP=' + Scratch + #0) = 1, 'TEMP appears exactly once');
+    Check(Copy(Blk, Length(Blk) - 1, 2) = #0#0,
+      'the block ends in two NULs, so CreateProcess knows where it stops');
+    Check(Pos(#0'='#0, Blk) = 0, 'and holds no empty NAME= pair');
+
+    { A value containing '=' must survive: splitting on the LAST '=' is the
+      classic way to truncate a PATH-like or base64 value. }
+    Odd := 'PASCLAUDE_ODD=a=b=c';
+    Blk := uSandbox.SandboxApplyEnv(Odd + #0 + 'TEMP=C:\old'#0#0);
+    Check(Has(Odd), 'a value containing = survives intact');
+    Check(not Has('TEMP=C:\old'), 'and the old TEMP is replaced, not kept');
+    Check(Has('TEMP=' + Scratch), 'by the scratch');
+
+    { cmd.exe keeps its per-drive working directories in names that BEGIN with
+      '=', so a split on the first '=' anywhere drops them and a shell forgets
+      where it was on every drive but the current one. }
+    Blk := uSandbox.SandboxApplyEnv('=D:=D:\work'#0'PATH=x'#0#0);
+    Check(Has('=D:=D:\work'),
+      'a name beginning with = is kept, not read as an empty name');
+    Check(Has('PATH=x'), 'and an ordinary entry beside it');
+  finally
+    if Local <> '' then SetEnvironmentVariable('LOCALAPPDATA', PChar(Local))
+    else SetEnvironmentVariable('LOCALAPPDATA', nil);
+    uSandbox.SandboxLevel := Saved;
+    uSandbox.SandboxShutdown;
+    uTools.RootDir := SessionDir;
+  end;
+end;
+
 begin
   TestBinaryFileDoesNotCorruptBody;
   TestNulByteIsEscaped;
@@ -2897,7 +3299,13 @@ begin
   TestNoRootFromProject;
   TestDenyBeatsAddedRoot;
   TestSdkSessionDoesNotInheritRoots;
+  TestSandboxDoesNotTouchTheGate;
+  TestSandboxNoBreakaway;
+  TestSandboxLevelNotFromProject;
+  TestSandboxScratchOutOfTree;
+  TestSandboxEnvBlock;
   uTools.ClearWorkingDirs;
+  uSandbox.SandboxShutdown;
 
   WriteLn;
   if Fails = 0 then

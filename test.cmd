@@ -43,6 +43,18 @@ if errorlevel 1 (
   exit /b 1
 )
 
+rem The sandbox tests need something that runs INSIDE the job object: whether
+rem breakaway is refused and whether the process cap bites are both things
+rem only a child can report.  A fixture like srvmock, and built without -gh
+rem for the same reason - it writes a small file the suite then parses, and a
+rem heaptrc report is not something that parser expects.
+"%FPC%" %FLAGS% -o"%OUT%\sbxmock.exe" "%ROOT%tests\sbxmock.lpr" >nul
+if errorlevel 1 (
+  echo BUILD FAILED: sbxmock
+  "%FPC%" %FLAGS% -o"%OUT%\sbxmock.exe" "%ROOT%tests\sbxmock.lpr"
+  exit /b 1
+)
+
 rem -gh makes the RTL report anything the suite allocated and did not free.
 rem JSON ownership here is manual, so a leak is a real defect, not noise.
 for %%T in (%SUITES%) do (

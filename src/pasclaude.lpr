@@ -10,8 +10,8 @@ program pasclaude;
 {$mode objfpc}{$H+}
 
 uses
-  SysUtils, Classes, DateUtils, uTerm, uJson, uHttp, uMcp, uHooks, uTools,
-  uAgent, uSdk;
+  SysUtils, Classes, DateUtils, uTerm, uJson, uHttp, uMcp, uHooks, uSandbox,
+  uTools, uAgent, uSdk;
 
 const
   Version = '0.1';
@@ -200,10 +200,10 @@ end;
 { ------------------------------------------------------------- completion -- }
 
 const
-  SlashCommands: array[0..27] of string = (
+  SlashCommands: array[0..28] of string = (
     '/help', '/clear', '/compact', '/deny', '/diff', '/hooks', '/jobs', '/mcp',
-    '/memory', '/init', '/mode', '/plan', '/rewind', '/sessions', '/skills',
-    '/plugins', '/think', '/web', '/add-dir', '/remove-dir',
+    '/memory', '/init', '/mode', '/plan', '/rewind', '/sandbox', '/sessions',
+    '/skills', '/plugins', '/think', '/web', '/add-dir', '/remove-dir',
     '/resume', '/save', '/cwd', '/model', '/yolo', '/cost', '/exit', '/quit');
 
 { Candidates for the token being completed: slash commands when the token
@@ -432,6 +432,94 @@ begin
   EmitCLn(clGrey, '  Plan mode stops the model, not the machine: your own');
   EmitCLn(clGrey, '  hooks still run.  Deny rules beat every mode, always.');
   EmitCLn(clGrey, '  /mode ask | plan | accept-edits   (/yolo for bypass)');
+  { Named here because a mode and a sandbox level are the two things most
+    easily confused for each other, and they are on different axes: a mode
+    decides what you are ASKED, the sandbox decides what a child process CAN
+    DO once you have said yes. }
+  EmitCLn(clGrey, '  sandbox:      ' +
+    uSandbox.SandboxLevelName(uSandbox.SandboxLevel) +
+    ' (/sandbox) - what a child process may do, not what you are asked');
+end;
+
+{ --------------------------------------------------------- the sandbox -- }
+
+{ The scratch directory a low-integrity child is given as its TEMP, keyed the
+  way ApprovalsPath is keyed and put in the same place, out of the tree.  Two
+  reasons, one of them specific to this feature: a clone must not be able to
+  ship it, and a directory labelled low integrity is writable by every other
+  low-integrity process on the machine - browser renderers included - which is
+  a thing to keep under %LOCALAPPDATA% rather than inside somebody's source. }
+function SandboxScratchDir: string;
+begin
+  Result := uSandbox.SandboxScratchPath(uTools.SessionKey);
+end;
+
+{ True when low is usable.  Called before the level is accepted from anywhere,
+  so 'low' is never a word printed over a sandbox that is not running. }
+function PrepareSandbox: Boolean;
+begin
+  Result := uSandbox.SandboxSetScratchRoot(SandboxScratchDir) and
+    uSandbox.SandboxLowReady;
+end;
+
+procedure ShowSandbox(const Arg: string);
+var
+  L: uSandbox.TSandboxLevel;
+begin
+  if Trim(Arg) = '' then
+  begin
+    EmitCLn(clBright, '  sandbox: ' +
+      uSandbox.SandboxLevelName(uSandbox.SandboxLevel));
+    EmitCLn(clGrey, '  ' + uSandbox.SandboxDescribe(uSandbox.SandboxLevel));
+    EmitLn;
+    { Said every time, because the honest limit is the part a user would
+      otherwise assume away.  A confined command can still read every file
+      the user can read and still reach the network: scoping a child to a
+      directory needs a filesystem filter driver and blocking its network
+      needs a firewall rule, and neither is something an ordinary process
+      can do to itself. }
+    EmitCLn(clGrey, '  No level stops a command READING your files, and no ' +
+      'level stops it using');
+    EmitCLn(clGrey, '  the network.  The sandbox is defence in depth; it is ' +
+      'not a reason to');
+    EmitCLn(clGrey, '  approve a command you would otherwise refuse, and it ' +
+      'changes nothing');
+    EmitCLn(clGrey, '  about what you are asked.');
+    if uSandbox.SandboxLevel = uSandbox.slLow then
+    begin
+      EmitLn;
+      EmitCLn(clGrey, '  scratch: ' + uSandbox.SandboxTempDir);
+      EmitCLn(clGrey, '  That directory is writable by any other ' +
+        'low-integrity program on this');
+      EmitCLn(clGrey, '  machine, so a command that writes a secret to ' +
+        '%TEMP% puts it somewhere');
+      EmitCLn(clGrey, '  more exposed than %TEMP% was.');
+    end;
+    EmitLn;
+    EmitCLn(clGrey, '  /sandbox off | limits | low');
+    Exit;
+  end;
+  if not uSandbox.SandboxParseLevel(Trim(Arg), L) then
+  begin
+    EmitCLn(clYellow, '  not a sandbox level: ' + Arg +
+      '  (off, limits or low)');
+    Exit;
+  end;
+  if (L = uSandbox.slLow) and not PrepareSandbox then
+  begin
+    EmitCLn(clYellow, '  low is unavailable: there is no writable scratch ' +
+      'directory outside');
+    EmitCLn(clYellow, '  the project to give children as %TEMP%.  Staying at ' +
+      uSandbox.SandboxLevelName(uSandbox.SandboxLevel) + '.');
+    Exit;
+  end;
+  uSandbox.SandboxLevel := L;
+  EmitCLn(clGrey, '  sandbox: ' + uSandbox.SandboxLevelName(L));
+  EmitCLn(clGrey, '  ' + uSandbox.SandboxDescribe(L));
+  { The two axes are separate and saying so here is cheaper than a bug
+    report: the sandbox takes capability away from a child process and has
+    no opinion at all about what you will be asked to approve. }
+  EmitCLn(clGrey, '  You will be asked about commands exactly as before.');
 end;
 
 { Split from ShowMode only so /plan can reach the same code with no argument
@@ -524,6 +612,7 @@ begin
   EmitCLn(clGrey,   '  /mode [name]   ask | plan | accept-edits; no argument shows the state');
   EmitCLn(clGrey,   '  /plan          shorthand for /mode plan: read and investigate only');
   EmitCLn(clGrey,   '  /yolo          approve every tool for this session (bypass)');
+  EmitCLn(clGrey,   '  /sandbox [lvl] off | limits | low: how confined child processes are');
   EmitCLn(clGrey,   '  /cost          tokens used so far');
   EmitCLn(clGrey,   '  /exit          quit (Ctrl+C also works)');
   EmitLn;
@@ -1488,6 +1577,11 @@ begin
   if uTools.DenyRulesInForce then
     EmitCLn(clGrey, Format('  %d deny rules in force (/deny)',
       [uTools.DenyRuleCount]));
+  { Only when it is not the default, and in both directions: "off" is as much
+    a thing a user should not be surprised by as "low" is. }
+  if uSandbox.SandboxLevel <> uSandbox.slLimits then
+    EmitCLn(clGrey, '  sandbox: ' +
+      uSandbox.SandboxLevelName(uSandbox.SandboxLevel) + ' (/sandbox)');
   EmitCLn(clGrey, '  /help for commands, /exit to quit, Esc stops a reply');
   EmitLn;
 end;
@@ -1739,6 +1833,8 @@ begin
     ShowMcp(Arg)
   else if Cmd = '/deny' then
     ShowDeny(Arg)
+  else if Cmd = '/sandbox' then
+    ShowSandbox(Arg)
   else if (Cmd = '/mode') or (Cmd = '/plan') then
     SetMode(Cmd, Arg)
   else if Cmd = '/yolo' then
@@ -1768,6 +1864,14 @@ begin
       prompt they replace. }
     if uTools.DenyRulesInForce then
       EmitCLn(clYellow, '  deny rules still apply');
+    { And so does the sandbox, deliberately untouched here.  /yolo is a
+      statement about what the user will be ASKED; the sandbox is about what a
+      child process CAN DO.  Turning one off because the other went off would
+      be treating them as the same axis, which is the confusion this whole
+      feature is careful not to make. }
+    if uSandbox.SandboxLevel <> uSandbox.slOff then
+      EmitCLn(clYellow, '  the sandbox still applies (' +
+        uSandbox.SandboxLevelName(uSandbox.SandboxLevel) + '; /sandbox)');
   end
   else if Cmd = '/cost' then
   begin
@@ -1822,8 +1926,10 @@ begin
   end
   else
     uSdk.SdkEmit(uSdk.SdkErrorLine(Msg));
-  { Halt skips the finally block, so the console has to be put back here or
-    the caller's codepage stays switched to UTF-8. }
+  { Halt skips the finally block, so the console has to be put back here - and
+    the sandbox's cached token closed here - or the caller's codepage stays
+    switched to UTF-8 and a handle outlives the process that opened it. }
+  uSandbox.SandboxShutdown;
   TermDone;
   Halt(Code);
 end;
@@ -1864,6 +1970,12 @@ var
     in. }
   PlanFlag: Boolean = False;
   BypassFlag: Boolean = False;
+  { Held the same way and for a mirror-image reason: the approvals file may
+    RAISE the sandbox level, so a --sandbox given on argv has to be applied
+    both before that file is read (a -p run never gets past the halt) and
+    again after it, or "--sandbox off" would be undone by a stale key. }
+  SandboxWanted: uSandbox.TSandboxLevel = uSandbox.slLimits;
+  SandboxGiven: Boolean = False;
   { Collected rather than applied as they are parsed: AddWorkingDir resolves
     relative to the session root, and the root is not set until after the
     optional [directory] argument has been seen. }
@@ -1890,6 +2002,23 @@ begin
       now sets no persisted flag, so this is the second line of defence
       rather than the only one. }
     YoloSession := True;
+end;
+
+{ Settles the sandbox level, and is called in the same two places and for the
+  same reason as ApplyStartupMode.  A level of low that cannot actually be
+  applied - no home directory to put the scratch in - falls back to limits and
+  says so.  Never to off: the failure to find somewhere to put a temp
+  directory is not a reason to stop confining children altogether. }
+procedure ApplySandbox;
+begin
+  if SandboxGiven then uSandbox.SandboxLevel := SandboxWanted;
+  if uSandbox.SandboxLevel <> uSandbox.slLow then Exit;
+  if PrepareSandbox then Exit;
+  uSandbox.SandboxLevel := uSandbox.slLimits;
+  if not PrintMode then
+    EmitCLn(clYellow, '  sandbox low is unavailable: no writable scratch ' +
+      'directory outside the project to give children as %TEMP%. Using ' +
+      'limits.');
 end;
 
 begin
@@ -1955,6 +2084,16 @@ begin
         PlanFlag := PlanFlag or (ModeWanted = uTools.pmodePlan);
         SkipNext := True;
       end
+      else if Arg = '--sandbox' then
+      begin
+        if ArgI >= ParamCount then
+          FailStart('--sandbox needs a value: off, limits or low', '', 2);
+        if not uSandbox.SandboxParseLevel(ParamStr(ArgI + 1), SandboxWanted) then
+          FailStart('unknown sandbox level: ' + ParamStr(ArgI + 1),
+            'off, limits or low', 2);
+        SandboxGiven := True;
+        SkipNext := True;
+      end
       else if (Arg = '--add-dir') or (Copy(Arg, 1, 10) = '--add-dir=') then
       begin
         if Copy(Arg, 1, 10) = '--add-dir=' then
@@ -2014,6 +2153,19 @@ begin
         EmitCLn(clGrey, '            so under -p it needs --input-format stream-json.');
         EmitCLn(clGrey, '            Plan mode stops the MODEL, not the machine: your own');
         EmitCLn(clGrey, '            hooks still run.');
+        EmitCLn(clGrey, '  --sandbox off|limits|low');
+        EmitCLn(clGrey, '            how confined the child processes are - shell commands,');
+        EmitCLn(clGrey, '            background jobs, hooks and MCP servers.  limits (the');
+        EmitCLn(clGrey, '            default) puts each in a job object: at most 64 processes,');
+        EmitCLn(clGrey, '            no breakaway, killed with the session.  low additionally');
+        EmitCLn(clGrey, '            runs them at low integrity, which stops them writing your');
+        EmitCLn(clGrey, '            profile, HKCU and this project, and gives them a scratch');
+        EmitCLn(clGrey, '            %TEMP% of their own.  Neither level stops a command');
+        EmitCLn(clGrey, '            READING your files and neither stops it using the network:');
+        EmitCLn(clGrey, '            scoping a process to a directory needs a filesystem filter');
+        EmitCLn(clGrey, '            driver and blocking its network needs a firewall rule.');
+        EmitCLn(clGrey, '            The sandbox is defence in depth and does NOT change what');
+        EmitCLn(clGrey, '            you are asked to approve.');
         EmitCLn(clGrey, '  --dangerously-skip-permissions');
         EmitCLn(clGrey, '            approve everything, asking nothing, for this run only.');
         EmitCLn(clGrey, '            Nothing is persisted.  Deny rules, the session root and');
@@ -2122,6 +2274,11 @@ begin
       reaching the second application.  It is applied again after
       LoadPermissions so a loaded grant cannot undo it. }
     ApplyStartupMode;
+    { Beside it, and above the print-mode halt for the same reason: a -p run
+      is confined exactly as an interactive one is.  It cannot be made looser
+      here either - the only thing --sandbox off restores is what shipped
+      before this existed. }
+    ApplySandbox;
     if PrintMode and (uTools.CurrentPermMode = uTools.pmodeBypass) then
       { On stderr, so a driver reading stdout for JSON is undisturbed and a
         log of the run still records that nothing was asked. }
@@ -2327,6 +2484,11 @@ begin
         saying "ask me" would be quietly overruled by a grant the user made
         weeks ago and has since forgotten. }
       ApplyStartupMode;
+      { And again for the sandbox, because LoadPermissions may have RAISED the
+        level to low from a key a previous session's /sandbox low wrote - so
+        the scratch has to be prepared before the first child, and an explicit
+        --sandbox off has to survive the file. }
+      ApplySandbox;
 
       { After LoadPermissions, so an approval already given suppresses the
         prompt, and after the print-mode Halt above, which is what makes a
@@ -2608,6 +2770,11 @@ begin
       launched it is a process the user did not start by hand and cannot name.
       uMcp's finalization repeats this for the paths that skip a finally. }
     uMcp.McpShutdownAll;
+    { The cached low-integrity token is a process handle like any other, and
+      the cached environment block is a string; neither should outlive the
+      program.  After the two kills above, because a job object closing is
+      what reaps the children and this does not. }
+    uSandbox.SandboxShutdown;
     TermDone;
   end;
 end.

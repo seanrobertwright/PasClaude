@@ -263,8 +263,33 @@ text preserves what was missing at the time. Unchecked items remain open.
   the bash, fetch and MCP class blankets as well as edits, which is broader
   than the name suggests and is printed, but leaves the named per-program and
   per-server grants alone.*
-- [ ] **Sandboxed bash** — commands run directly through `cmd.exe /C`,
-  unsandboxed (compound commands are re-prompted, but not isolated).
+- [x] ~~**Sandboxed bash** — commands run directly through `cmd.exe /C`,
+  unsandboxed (compound commands are re-prompted, but not isolated).~~
+  *Built: every child this program starts — foreground bash, background bash,
+  hook commands and MCP servers — is now created by one function in the new
+  `uSandbox` unit, at one of two levels. `limits` is the default and costs
+  nothing: a job object capping the tree at 64 processes, killing it when the
+  session ends, refusing breakaway, and blocking clipboard reads and desktop
+  changes. `low` is opt-in via `--sandbox low` or `/sandbox low` and adds a
+  low-integrity token, so a command cannot write your profile, HKCU, or any
+  directory not labelled for it — including the project — and gets a scratch
+  `%TEMP%` of its own under `%LOCALAPPDATA%`. This also fixed two older gaps:
+  the foreground shell had no job object at all (a timed-out command killed
+  `cmd.exe` and orphaned its children), and all three raw spawn sites assigned
+  to the job after the spawn, leaving a documented race that suspend-then-
+  resume now closes. Still missing, and these are limits of Win32 rather than
+  of the implementation: bash cannot be scoped to the session root, which
+  needs a filesystem filter driver, and cannot be denied the network, which
+  needs WFP or a firewall rule — so low integrity stops writes and registry
+  persistence and stops nothing else. It does not stop a command reading every
+  file you can read, and it does not stop it exfiltrating what it read, which
+  is exactly why the sandbox changes nothing about what you are asked to
+  approve. Restricted tokens and AppContainer were both probed and rejected:
+  `CreateRestrictedToken(WRITE_RESTRICTED)` produces a child that dies at
+  0xC0000142 without window-station ACL plumbing, and AppContainer needs a
+  persistent profile identity for confinement we would still have to
+  hand-build. Under `low`, `npx`-based MCP servers and hooks that write
+  `%APPDATA%` will fail; `/sandbox off` restores the old behaviour.*
 - [x] ~~**Additional working directories** — one session root, fixed at
   startup; no `--add-dir`.~~
   *Built: `--add-dir <dir>` (repeatable, also `--add-dir=<dir>`) and `/add-dir`

@@ -150,52 +150,17 @@ function HookEventFromName(const S: string): THookEvent;
 
 implementation
 
-{ FPC 3.2.2 does not declare the job-object API, so it is declared here - a
-  deliberate second copy of uTools', not a shared one.  uTools' copies belong
-  to the background-job table's polled, reaped lifecycle; these belong to a
-  one-shot child with a deadline.  The two features have no other contact, and
-  coupling them for the sake of one Win32 struct fixed by the OS is the worse
-  trade: the reconciler made the same call for uMcp. }
+uses uSandbox;
+
+{ The job-object record and its four kernel32 imports used to be declared here
+  verbatim, a deliberate second copy of uTools' because the ladder forbids
+  this unit from importing uTools.  uSandbox is a leaf below all three, so the
+  copy is now one shared declaration - which is what the ladder wanted all
+  along, and the only direction the duplication could ever have been resolved
+  in.  A hook is still a one-shot child with a deadline and still owns its own
+  lifecycle; only the process creation is shared. }
 const
-  JobObjectExtendedLimitInformation = 9;
-  JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = $2000;
   HookKillWaitMs = 2000;
-
-type
-  TJobBasicLimits = record
-    PerProcessUserTimeLimit: Int64;
-    PerJobUserTimeLimit: Int64;
-    LimitFlags: DWORD;
-    MinimumWorkingSetSize: SIZE_T;
-    MaximumWorkingSetSize: SIZE_T;
-    ActiveProcessLimit: DWORD;
-    Affinity: ULONG_PTR;
-    PriorityClass: DWORD;
-    SchedulingClass: DWORD;
-  end;
-
-  TJobIoCounters = record
-    ReadOperationCount, WriteOperationCount, OtherOperationCount: QWord;
-    ReadTransferCount, WriteTransferCount, OtherTransferCount: QWord;
-  end;
-
-  TJobExtendedLimits = record
-    BasicLimitInformation: TJobBasicLimits;
-    IoInfo: TJobIoCounters;
-    ProcessMemoryLimit: SIZE_T;
-    JobMemoryLimit: SIZE_T;
-    PeakProcessMemoryUsed: SIZE_T;
-    PeakJobMemoryUsed: SIZE_T;
-  end;
-
-function CreateJobObjectA(Attr: Pointer; Name: PAnsiChar): THandle; stdcall;
-  external 'kernel32' name 'CreateJobObjectA';
-function SetInformationJobObject(J: THandle; Cls: Integer; Info: Pointer;
-  Len: DWORD): BOOL; stdcall; external 'kernel32' name 'SetInformationJobObject';
-function AssignProcessToJobObject(J, P: THandle): BOOL; stdcall;
-  external 'kernel32' name 'AssignProcessToJobObject';
-function TerminateJobObject(J: THandle; Code: UINT): BOOL; stdcall;
-  external 'kernel32' name 'TerminateJobObject';
 
 type
   THookEntry = record
@@ -272,7 +237,6 @@ function RunChild(const Cmd, StdinText, WorkDir: string;
   TimeoutMs, MaxOut: Integer; out Output: string;
   out TimedOut: Boolean): Integer;
 var
-  Info: TJobExtendedLimits;
   SA: SECURITY_ATTRIBUTES;
   SI: STARTUPINFOA;
   PI: PROCESS_INFORMATION;
@@ -282,6 +246,7 @@ var
   Code: DWORD;
   F: TFileStream;
   N: Int64;
+  InJob: Boolean;
 begin
   Result := -1;
   Output := '';
@@ -301,18 +266,7 @@ begin
   if Dir = '' then Dir := RootPath;
 
   try
-    hJob := CreateJobObjectA(nil, nil);
-    if hJob <> 0 then
-    begin
-      FillChar(Info, SizeOf(Info), 0);
-      Info.BasicLimitInformation.LimitFlags := JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-      if not SetInformationJobObject(hJob, JobObjectExtendedLimitInformation,
-               @Info, SizeOf(Info)) then
-      begin
-        CloseHandle(hJob);
-        hJob := 0;
-      end;
-    end;
+    hJob := SandboxNewJob;
 
     FillChar(SA, SizeOf(SA), 0);
     SA.nLength := SizeOf(SA);
@@ -353,10 +307,10 @@ begin
 
     ComSpec := SysUtils.GetEnvironmentVariable('ComSpec');
     if ComSpec = '' then ComSpec := 'cmd.exe';
+    { Wrapped in cmd.exe, unlike an MCP server: a hook is a shell line out of
+      a config file.  SandboxSpawn takes the finished line and never composes
+      one, which is what lets both callers share it. }
     CmdLine := '"' + ComSpec + '" /C ' + Cmd;
-    { CreateProcessA may write into lpCommandLine, so it must not be sharing
-      a string with anybody. }
-    UniqueString(CmdLine);
 
     FillChar(SI, SizeOf(SI), 0);
     SI.cb := SizeOf(SI);
@@ -369,10 +323,12 @@ begin
     SI.hStdError := hOut;
     FillChar(PI, SizeOf(PI), 0);
 
-    if not CreateProcess(nil, PChar(CmdLine), nil, nil, True, CREATE_NO_WINDOW,
-             nil, PChar(Dir), SI, PI) then
+    if not SandboxSpawn(CmdLine, Dir, SandboxEnvBlock, 0, SI, PI, hJob,
+             InJob) then
     begin
       Output := 'could not start the hook: ' + SysErrorMessage(GetLastError);
+      if uSandbox.SandboxLevel = slLow then
+        Output := Output + ' [sandbox: low]';
       CloseHandle(hIn);
       CloseHandle(hOut);
       if hJob <> 0 then CloseHandle(hJob);
@@ -386,18 +342,16 @@ begin
     CloseHandle(hOut);
     CloseHandle(PI.hThread);
 
-    { Assignment is after the spawn, exactly as in uTools' background jobs and
-      with the same documented race: cmd.exe has to parse its command line
-      first, so the window is tiny, but a grandchild started inside it escapes
-      the job and survives the kill below. }
-    if hJob <> 0 then AssignProcessToJobObject(hJob, PI.hProcess);
+    { The child was created suspended, assigned, and only then resumed, so the
+      grandchild race this used to document is closed: nothing it starts can
+      have started before it was in the job. }
 
     if WaitForSingleObject(PI.hProcess, TimeoutMs) = WAIT_TIMEOUT then
     begin
       TimedOut := True;
       { The job, not the process: a hook that started a build has children,
         and killing only cmd.exe would leave them holding the spool. }
-      if hJob <> 0 then TerminateJobObject(hJob, 1)
+      if hJob <> 0 then SandboxTerminateJob(hJob, 1)
       else TerminateProcess(PI.hProcess, 1);
       WaitForSingleObject(PI.hProcess, HookKillWaitMs);
     end;

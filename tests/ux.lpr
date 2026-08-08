@@ -12,8 +12,10 @@ program ux;
 
 {$mode objfpc}{$H+}
 
-uses SysUtils, Classes, uJson, uDiff, uHooks, uTools, uAgent, uTerm, uNotebook,
-  uSdk;
+{ Windows first, so SysUtils' DeleteFile and GetEnvironmentVariable win over
+  the raw API of the same names. }
+uses Windows, SysUtils, Classes, uJson, uDiff, uHooks, uSandbox, uTools, uAgent,
+  uTerm, uNotebook, uSdk;
 
 var
   Fails: Integer = 0;
@@ -2161,6 +2163,183 @@ end;
 { What /jobs shows.  A process started on the user's behalf by a model has to
   be legible to the user without asking the model about it: which job, whether
   it is alive, and what it is actually running. }
+{ Puts the scratch somewhere this suite owns and turns low on, or reports why
+  it could not.  False means every low assertion below is skipped rather than
+  failed: a machine with no LOCALAPPDATA is a machine where low is correctly
+  unavailable, not a machine where this feature is broken. }
+function EnableLow: Boolean;
+begin
+  Result := uSandbox.SandboxSetScratchRoot(
+    uSandbox.SandboxScratchPath(uTools.SessionKey)) and uSandbox.SandboxLowReady;
+  if Result then uSandbox.SandboxLevel := slLow;
+end;
+
+{ The measurement the whole design rests on, pinned as a test rather than left
+  in a comment.  Low integrity stops writes outside the scratch - and stops
+  NOTHING ELSE, which is asserted here explicitly, because that half is what
+  makes "the sandbox is not an approval substitute" true. }
+procedure TestSandboxLowBlocksProfileWrite;
+var
+  Saved: uSandbox.TSandboxLevel;
+  Code: Integer;
+  Profile, Mark, Out_: string;
+begin
+  Saved := uSandbox.SandboxLevel;
+  Profile := SysUtils.GetEnvironmentVariable('USERPROFILE');
+  if Profile = '' then
+  begin
+    Check(True, 'no USERPROFILE on this machine; low-integrity test skipped');
+    Exit;
+  end;
+  Mark := IncludeTrailingPathDelimiter(Profile) + 'pasclaude-ux-sandbox.txt';
+  try
+    { At off it must succeed, or the test proves nothing about low: a write
+      that fails for an ordinary reason would look exactly like confinement. }
+    uSandbox.SandboxLevel := slOff;
+    SysUtils.DeleteFile(Mark);
+    RunShell('echo x > "' + Mark + '"', TmpRoot, True, Code);
+    Check(FileExists(Mark),
+      'unsandboxed, a command can write the user profile');
+    SysUtils.DeleteFile(Mark);
+
+    if not EnableLow then
+    begin
+      Check(True, 'low integrity unavailable here; the rest is skipped');
+      Exit;
+    end;
+
+    RunShell('echo x > "' + Mark + '"', TmpRoot, True, Code);
+    Check(Code <> 0, 'at low, the identical write fails');
+    Check(not FileExists(Mark), 'and really leaves no file');
+
+    { And the honest other half.  A model asked to exfiltrate can still read
+      everything the user can read, which is why no approval may be skipped
+      on the strength of the level. }
+    RunShell('dir "' + Profile + '" >nul', TmpRoot, True, Code);
+    Check(Code = 0,
+      'but a low-integrity command can still READ the user profile');
+
+    { The scratch is what keeps ordinary tools working: almost everything
+      that breaks at low breaks first on a temporary file. }
+    RunShell('echo y > "%TEMP%\pasclaude-ux-scratch.txt"', TmpRoot, True, Code);
+    Check(Code = 0, 'and can write the %TEMP% it was given');
+    Check(FileExists(IncludeTrailingPathDelimiter(uSandbox.SandboxTempDir) +
+      'pasclaude-ux-scratch.txt'),
+      'which really is the sandbox scratch, not the real %TEMP%');
+
+    { RunShellQuiet is this program's own introspection and is exempt.  If it
+      were confined too, pasclaude would appear to forget how to read its own
+      repository the moment somebody typed /sandbox low. }
+    Out_ := uTools.RunShellQuiet('echo introspection', Code);
+    Check((Code = 0) and (Pos('introspection', Out_) > 0),
+      'and the program''s own git introspection is not confined');
+  finally
+    SysUtils.DeleteFile(Mark);
+    uSandbox.SandboxLevel := Saved;
+  end;
+end;
+
+{ A command that fails only because it was confined must say so on the line
+  the user reads, or the sandbox is indistinguishable from a broken tool. }
+procedure TestSandboxAnnotatesFailure;
+var
+  Saved: uSandbox.TSandboxLevel;
+begin
+  Saved := uSandbox.SandboxLevel;
+  try
+    { The tag is keyed on the exit code, never on a message marker.  A marker
+      is English and a localised Windows would carry no sandbox context at
+      all - which is the misdiagnosis this exists to prevent. }
+    uSandbox.SandboxLevel := slLow;
+    Check(uSandbox.SandboxTag(1) = '; sandbox: low',
+      'a failed command carries the level');
+    Check(uSandbox.SandboxTag(0) = '',
+      'a command that succeeded carries nothing');
+    uSandbox.SandboxLevel := slLimits;
+    Check(uSandbox.SandboxTag(1) = '; sandbox: limits',
+      'and the default level says so too, rather than staying quiet');
+    uSandbox.SandboxLevel := slOff;
+    Check(uSandbox.SandboxTag(1) = '',
+      'with the sandbox off there is nothing to blame it for');
+
+    { The hint is the opposite: it fires only when something suggests the
+      sandbox, because a remedy printed under every ordinary build failure
+      would train the user to ignore it. }
+    uSandbox.SandboxLevel := slLow;
+    Check(Pos('icacls', uSandbox.SandboxExplain(1, 'Access is denied.')) > 0,
+      'a denied write is explained, with the icacls the user may run');
+    Check(Pos('/sandbox off', uSandbox.SandboxExplain(1, 'Access is denied.')) > 0,
+      'and the way out is named');
+    Check(uSandbox.SandboxExplain(4, 'ordinary compile error') = '',
+      'an ordinary failure gets no sandbox hint');
+    Check(uSandbox.SandboxExplain(0, 'Access is denied.') = '',
+      'and a command that succeeded is never explained');
+    Check(Pos('quota', LowerCase(uSandbox.SandboxExplain(1816, ''))) >= 0,
+      'the process cap is recognised by its exit code, not its wording');
+    uSandbox.SandboxLevel := slOff;
+    Check(uSandbox.SandboxExplain(1, 'Access is denied.') = '',
+      'with the sandbox off nothing is explained either');
+  finally
+    uSandbox.SandboxLevel := Saved;
+  end;
+end;
+
+{ The foreground shell had no job object at all, so a timeout terminated
+  cmd.exe and left whatever it had started running.  Under this suite that
+  surfaces as the recursive Cleanup failing on the next run, which reads as an
+  unrelated flake. }
+procedure TestForegroundTimeoutKillsTree;
+var
+  SavedMs: Integer;
+  Code: Integer;
+  Started, Elapsed, Deadline: QWord;
+  LockPath, Cmd, Text: string;
+  Freed: Boolean;
+begin
+  SavedMs := uTools.ShellTimeoutMs;
+  LockPath := IncludeTrailingPathDelimiter(TmpRoot) + 'held.txt';
+  SysUtils.DeleteFile(LockPath);
+  try
+    { The grandchild holds the file open for far longer than the deadline, so
+      "the file can be deleted afterwards" is a real observation about the
+      grandchild being gone rather than about it having finished. }
+    uTools.ShellTimeoutMs := 2000;
+    Cmd := 'start /b cmd /c "ping -n 60 127.0.0.1 > ""' + LockPath +
+      '""" & ping -n 60 127.0.0.1 >nul';
+    Started := GetTickCount64;
+    Text := RunShell(Cmd, TmpRoot, True, Code);
+    Elapsed := GetTickCount64 - Started;
+
+    Check(Elapsed < 30000,
+      'a hung foreground command returns on its deadline: ' +
+      IntToStr(Elapsed) + 'ms');
+    Check(Pos('[timed out after', Text) > 0, 'and says it timed out');
+
+    { The whole point.  A surviving grandchild keeps a write handle on the
+      file, and Windows refuses the delete while it does.
+
+      Bounded rather than immediate, and for a reason worth stating: the kill
+      reaches the whole job, but only the top process is waited for, so the
+      grandchild can still be releasing its handle when this line runs.  Five
+      seconds separates "being reaped" from "still running", because the
+      grandchild was told to hold the file for sixty - a retry loop cannot
+      turn a survivor into a pass, it can only stop a busy machine turning a
+      correct kill into a phantom failure. }
+    Deadline := GetTickCount64 + 5000;
+    repeat
+      Freed := SysUtils.DeleteFile(LockPath) or not FileExists(LockPath);
+      if Freed then Break;
+      Sleep(50);
+    until GetTickCount64 > Deadline;
+    Check(Freed,
+      'and the grandchild it started is gone, so its file can be deleted');
+    Check(not FileExists(LockPath), 'leaving nothing locked under TmpRoot');
+  finally
+    uTools.ShellTimeoutMs := SavedMs;
+    SysUtils.DeleteFile(LockPath);
+  end;
+end;
+
 procedure TestJobList;
 var
   Id, Err, L: string;
@@ -2806,6 +2985,9 @@ begin
     TestLoadedGrantIsAnnounced;
     TestExtraRootDisplay;
     TestAddDirCommands;
+    TestSandboxLowBlocksProfileWrite;
+    TestSandboxAnnotatesFailure;
+    TestForegroundTimeoutKillsTree;
   finally
     { Before the cleanup, not after: a live child holding a spool handle under
       TmpRoot would make the recursive delete fail. }
@@ -2819,6 +3001,12 @@ begin
     uTools.ClearPluginState;
     uTools.ClearDenyRules;
     uTools.ClearWorkingDirs;
+    { Beside the two above and for a related reason: the cached low-integrity
+      token is a handle, and a suite that left one open would report it.  The
+      level goes back to the default so nothing after this point is confined
+      by a decision this suite made. }
+    uSandbox.SandboxLevel := slLimits;
+    uSandbox.SandboxShutdown;
     uTools.RootDir := '';
     Cleanup(TmpRoot);
   end;

@@ -523,8 +523,25 @@ function IsIgnored(const RelPath: string; IsDir: Boolean): Boolean;
 
 { Runs a command in the session root and returns its combined output, for the
   host's own use (git context at startup).  Same machinery as the bash tool,
-  without the permission gate - the host is not the model. }
+  without the permission gate - the host is not the model.  Sandboxed=False,
+  for the reason written above the implementation. }
 function RunShellQuiet(const Cmd: string; out ExitCode: Integer): string;
+
+{ The foreground shell itself.  Public because the output contract - exit
+  code, interleaved stderr, nothing truncated, the tail after exit - is the
+  thing most easily broken by a change to the drain loop, and a test that had
+  to go through the tool arm and the permission gate to reach it could not say
+  which part was wrong.  Output is returned raw; the caller repairs the OEM
+  codepage. }
+function RunShell(const Cmd, WorkDir: string; Sandboxed: Boolean;
+  out ExitCode: Integer): string;
+
+{ The foreground deadline, in milliseconds.  A variable rather than a constant
+  only so a test can wind it down: the path it guards needs a command that
+  genuinely never finishes, and the alternative to a seam is two minutes of
+  wall clock in a suite.  Nothing in the shipped program assigns it. }
+var
+  ShellTimeoutMs: Integer = 120000;
 
 { The leading program name of a shell command - the part an "always" answer
   reasonably covers.  Exposed for the tests. }
@@ -735,6 +752,12 @@ function SnapshotCount: Integer;
   be importing exactly the bytes this function exists to distrust. }
 function ApprovalsPath: string;
 
+{ The filename-safe name this session's out-of-tree state is filed under, from
+  the PRIMARY root only.  ApprovalsPath is built from it, and so is the host's
+  sandbox scratch, so the two cannot drift into disagreeing about which
+  session they belong to. }
+function SessionKey: string;
+
 { Loads standing approvals from Path: the tool-class "always" answers and
   the approved bash programs, so an "a" gives once survives restarts.  A
   missing or unreadable file simply approves nothing. }
@@ -868,7 +891,7 @@ procedure AllowMcpServer(const ToolName: string);
 
 implementation
 
-uses Classes, Process, Windows, uHttp, uRegex, uNotebook, uMcp, uHooks;
+uses Classes, Windows, uHttp, uRegex, uNotebook, uMcp, uHooks, uSandbox;
 
 const
   MaxReadBytes = 400 * 1024;   { keeps a stray huge file out of the context }
@@ -2462,69 +2485,170 @@ end;
 { -------------------------------------------------------------------- bash -- }
 
 { Runs Cmd through cmd.exe and returns its combined output.  A hard timeout
-  keeps a hung command from freezing the session. }
-function RunShell(const Cmd, WorkDir: string; out ExitCode: Integer): string;
+  keeps a hung command from freezing the session.
+
+  Raw CreateProcess through uSandbox rather than TProcess, which cannot be
+  given a job object - and a foreground command was the one child of this
+  program that had none, so a timed-out command's kill reached cmd.exe and
+  orphaned everything cmd.exe had started.  The byte contract is unchanged:
+  stderr is merged into stdout in arrival order, output is returned raw for
+  the caller to repair out of the OEM codepage, and the pipe is drained again
+  after the process exits so the tail is never lost.
+
+  Sandboxed is a parameter rather than a read of the level inside, because the
+  sandbox is a property of WHO asked for the command.  This program's own
+  introspection is not the model's command and must not be confined; see
+  RunShellQuiet. }
+function RunShell(const Cmd, WorkDir: string; Sandboxed: Boolean;
+  out ExitCode: Integer): string;
 var
-  P: TProcess;
+  SA: SECURITY_ATTRIBUTES;
+  SI: STARTUPINFOA;
+  PI: PROCESS_INFORMATION;
+  hRead, hWrite, hNul, hJob: THandle;
   Buf: array[0..4095] of Byte;
-  N: LongInt;
+  N, Avail: DWORD;
   Deadline: QWord;
-  S: string;
+  S, CmdLine, ComSpec, Env: string;
+  Code: DWORD;
+  Saved: TSandboxLevel;
+  InJob, Alive: Boolean;
+
+  { Everything the pipe has right now, and nothing more.  PeekNamedPipe first
+    is mandatory: ReadFile on an empty pipe whose write end is still open
+    blocks forever, which on this thread means the session stops. }
+  procedure Drain;
+  begin
+    repeat
+      Avail := 0;
+      if not PeekNamedPipe(hRead, nil, 0, nil, @Avail, nil) then Exit;
+      if Avail = 0 then Exit;
+      N := 0;
+      if not ReadFile(hRead, Buf[0], SizeOf(Buf), N, nil) then Exit;
+      if N = 0 then Exit;
+      SetString(S, PAnsiChar(@Buf[0]), N);
+      Result := Result + S;
+    until False;
+  end;
+
 begin
   Result := '';
   ExitCode := -1;
-  P := TProcess.Create(nil);
+
+  FillChar(SA, SizeOf(SA), 0);
+  SA.nLength := SizeOf(SA);
+  SA.bInheritHandle := True;
+  hRead := 0;
+  hWrite := 0;
+  if not CreatePipe(hRead, hWrite, @SA, 0) then
+  begin
+    Result := 'failed to start: ' + SysErrorMessage(GetLastError);
+    Exit;
+  end;
+  { Mandatory, not hygiene, and the same rule uMcp documents: without it the
+    child inherits a duplicate of our read end, so the pipe never reports EOF
+    and the drain loop below can never tell empty from finished. }
+  SetHandleInformation(hRead, HANDLE_FLAG_INHERIT, 0);
+  { NUL for stdin, matching background bash: a command that reads stdin gets
+    an instant EOF instead of waiting forever for a keyboard nobody is at. }
+  hNul := CreateFile('NUL', GENERIC_READ, FILE_SHARE_READ or FILE_SHARE_WRITE,
+    @SA, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
+
+  ComSpec := SysUtils.GetEnvironmentVariable('ComSpec');
+  if ComSpec = '' then ComSpec := 'cmd.exe';
+  CmdLine := '"' + ComSpec + '" /C ' + Cmd;
+
+  FillChar(SI, SizeOf(SI), 0);
+  SI.cb := SizeOf(SI);
+  SI.dwFlags := STARTF_USESTDHANDLES;
+  SI.hStdInput := hNul;
+  SI.hStdOutput := hWrite;
+  { Both ends of the child's output on one handle, which is what makes the two
+    streams interleave in the order they were written rather than arriving as
+    two blocks - the same thing poStderrToOutPut bought. }
+  SI.hStdError := hWrite;
+
+  { An unsandboxed caller is served by forcing the level off for the duration,
+    so there is exactly one spawn and one place that decides what a child
+    gets.  Saving and restoring rather than branching keeps the job object,
+    the env block and the token consistent with each other. }
+  Saved := uSandbox.SandboxLevel;
+  if not Sandboxed then uSandbox.SandboxLevel := slOff;
   try
-    P.Executable := SysUtils.GetEnvironmentVariable('ComSpec');
-    if P.Executable = '' then P.Executable := 'cmd.exe';
-    P.Parameters.Add('/C');
-    P.Parameters.Add(Cmd);
-    P.CurrentDirectory := WorkDir;
-    P.Options := [poUsePipes, poStderrToOutPut, poNoConsole];
-    try
-      P.Execute;
-    except
-      on E: Exception do
-      begin
-        Result := 'failed to start: ' + E.Message;
-        Exit;
-      end;
+    hJob := SandboxNewJob;
+    Env := SandboxEnvBlock;
+    if not SandboxSpawn(CmdLine, WorkDir, Env, 0, SI, PI, hJob, InJob) then
+    begin
+      Result := 'failed to start: ' + SysErrorMessage(GetLastError);
+      CloseHandle(hRead);
+      CloseHandle(hWrite);
+      if hNul <> INVALID_HANDLE_VALUE then CloseHandle(hNul);
+      if hJob <> 0 then CloseHandle(hJob);
+      Exit;
     end;
-    Deadline := GetTickCount64 + 120000;
+
+    { After the spawn, never before: closing the write end first would leave
+      the child writing into a pipe with no reader.  Ours must go, though, or
+      the read end never sees EOF. }
+    CloseHandle(hWrite);
+    if hNul <> INVALID_HANDLE_VALUE then CloseHandle(hNul);
+    CloseHandle(PI.hThread);
+
+    Deadline := GetTickCount64 + QWord(ShellTimeoutMs);
     repeat
-      while P.Output.NumBytesAvailable > 0 do
-      begin
-        N := P.Output.Read(Buf[0], SizeOf(Buf));
-        if N <= 0 then Break;
-        SetString(S, PAnsiChar(@Buf[0]), N);
-        Result := Result + S;
-      end;
-      if not P.Running then Break;
+      { The order is load-bearing and is the whole of the no-lost-bytes
+        argument.  Asking whether it has exited BEFORE draining means the
+        drain that follows an observed exit cannot miss anything, since a
+        process that has already gone writes nothing more.  Drained first and
+        asked afterwards, the bytes written between the two would be lost -
+        which is a race, so it would show up as a tail that goes missing on a
+        busy machine perhaps one run in a hundred, and never in a test. }
+      Alive := WaitForSingleObject(PI.hProcess, 0) <> WAIT_OBJECT_0;
+      Drain;
+      if not Alive then Break;
       if GetTickCount64 > Deadline then
       begin
-        P.Terminate(1);
-        Result := Result + #10'[timed out after 120s]';
+        { The job, not the process.  TProcess could only ever terminate
+          cmd.exe, which left the build it had started running and holding
+          this pipe; killing the job takes the tree. }
+        if hJob <> 0 then
+          SandboxTerminateJob(hJob, 1)
+        else
+          TerminateProcess(PI.hProcess, 1);
+        WaitForSingleObject(PI.hProcess, 2000);
+        Result := Result + #10 +
+          Format('[timed out after %ds]', [ShellTimeoutMs div 1000]);
         Break;
       end;
       Sleep(20);
     until False;
-    { Drain whatever landed in the pipe after the process exited. }
-    while P.Output.NumBytesAvailable > 0 do
-    begin
-      N := P.Output.Read(Buf[0], SizeOf(Buf));
-      if N <= 0 then Break;
-      SetString(S, PAnsiChar(@Buf[0]), N);
-      Result := Result + S;
-    end;
-    ExitCode := P.ExitStatus;
+
+    { And once more after the kill path, which breaks out without having
+      drained since the exit was observed.  On the ordinary path the loop has
+      already read everything and this finds an empty pipe. }
+    Drain;
+
+    Code := 0;
+    if GetExitCodeProcess(PI.hProcess, Code) then ExitCode := Integer(Code);
+    CloseHandle(PI.hProcess);
+    CloseHandle(hRead);
+    { Closed last: KILL_ON_JOB_CLOSE reaps anything the command left behind.
+      That is a real behaviour change - a foreground "start /b server.exe"
+      used to outlive the tool call and now does not - and it is the right
+      one, because run_in_background is what outliving a call is for. }
+    if hJob <> 0 then CloseHandle(hJob);
   finally
-    P.Free;
+    uSandbox.SandboxLevel := Saved;
   end;
 end;
 
+{ pasclaude's own "git status" and "git rev-parse", never the model's command,
+  so Sandboxed is False: at low integrity git would fail writing its index
+  lock in a tree nobody has labelled, and the program would appear to have
+  forgotten how to read its own repository. }
 function RunShellQuiet(const Cmd: string; out ExitCode: Integer): string;
 begin
-  Result := RunShell(Cmd, NormalizeRoot, ExitCode);
+  Result := RunShell(Cmd, NormalizeRoot, False, ExitCode);
   if not IsValidUtf8(Result) then
     Result := OemToUtf8(Result);
 end;
@@ -2555,50 +2679,11 @@ const
   JobKillWaitMs = 2000;
   JobsDirName = 'jobs';
 
-{ FPC 3.2.2's Windows unit does not declare the job-object API at all, so the
-  four entry points and the two records it needs are declared here.  These are
-  the documented kernel32 exports, nothing exotic; TJobExtendedLimits is 144
-  bytes on x64, which SetInformationJobObject validates on every call and a
-  probe confirmed before this was written. }
-const
-  JobObjectExtendedLimitInformation = 9;
-  JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = $2000;
-
-type
-  TJobBasicLimits = record
-    PerProcessUserTimeLimit: Int64;
-    PerJobUserTimeLimit: Int64;
-    LimitFlags: DWORD;
-    MinimumWorkingSetSize: SIZE_T;
-    MaximumWorkingSetSize: SIZE_T;
-    ActiveProcessLimit: DWORD;
-    Affinity: ULONG_PTR;
-    PriorityClass: DWORD;
-    SchedulingClass: DWORD;
-  end;
-
-  TJobIoCounters = record
-    ReadOperationCount, WriteOperationCount, OtherOperationCount: QWord;
-    ReadTransferCount, WriteTransferCount, OtherTransferCount: QWord;
-  end;
-
-  TJobExtendedLimits = record
-    BasicLimitInformation: TJobBasicLimits;
-    IoInfo: TJobIoCounters;
-    ProcessMemoryLimit: SIZE_T;
-    JobMemoryLimit: SIZE_T;
-    PeakProcessMemoryUsed: SIZE_T;
-    PeakJobMemoryUsed: SIZE_T;
-  end;
-
-function CreateJobObjectA(Attr: Pointer; Name: PAnsiChar): THandle; stdcall;
-  external 'kernel32' name 'CreateJobObjectA';
-function SetInformationJobObject(J: THandle; Cls: Integer; Info: Pointer;
-  Len: DWORD): BOOL; stdcall; external 'kernel32' name 'SetInformationJobObject';
-function AssignProcessToJobObject(J, P: THandle): BOOL; stdcall;
-  external 'kernel32' name 'AssignProcessToJobObject';
-function TerminateJobObject(J: THandle; Code: UINT): BOOL; stdcall;
-  external 'kernel32' name 'TerminateJobObject';
+{ The job-object record and its four kernel32 imports used to be declared here
+  and, verbatim, in uHooks and uMcp - three copies, because the ladder forbids
+  the other two from importing this unit.  They now live in uSandbox, which is
+  a leaf below all three and is therefore the only place they could ever have
+  been shared. }
 
 type
   TBackgroundJob = record
@@ -2683,7 +2768,7 @@ begin
     if WaitForSingleObject(J.Proc, 0) <> WAIT_OBJECT_0 then
     begin
       if J.Job <> 0 then
-        TerminateJobObject(J.Job, 1)
+        SandboxTerminateJob(J.Job, 1)
       else
         TerminateProcess(J.Proc, 1);
       WaitForSingleObject(J.Proc, JobKillWaitMs);
@@ -2718,7 +2803,7 @@ begin
     if JobAlive(Jobs[I]) and (SpoolSize(Jobs[I].Spool) > MaxSpoolBytes) then
     begin
       if Jobs[I].Job <> 0 then
-        TerminateJobObject(Jobs[I].Job, 1)
+        SandboxTerminateJob(Jobs[I].Job, 1)
       else
         TerminateProcess(Jobs[I].Proc, 1);
       WaitForSingleObject(Jobs[I].Proc, JobKillWaitMs);
@@ -2743,13 +2828,13 @@ end;
 
 function StartBackgroundJob(const Cmd: string; out Id: string; out Err: string): Boolean;
 var
-  Info: TJobExtendedLimits;
   SA: SECURITY_ATTRIBUTES;
   SI: STARTUPINFOA;
   PI: PROCESS_INFORMATION;
   hJob, hSpool, hNul: THandle;
   CmdLine, Spool, ComSpec: string;
   J: TBackgroundJob;
+  InJob: Boolean;
 begin
   Result := False;
   Id := '';
@@ -2770,22 +2855,18 @@ begin
   Inc(JobSeq);
   Spool := JobsDir + 'bg' + IntToStr(JobSeq) + '.out';
 
-  hJob := CreateJobObjectA(nil, nil);
-  if hJob <> 0 then
-  begin
-    FillChar(Info, SizeOf(Info), 0);
-    Info.BasicLimitInformation.LimitFlags := JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-    if not SetInformationJobObject(hJob, JobObjectExtendedLimitInformation,
-             @Info, SizeOf(Info)) then
-    begin
-      CloseHandle(hJob);
-      hJob := 0;
-    end;
-  end;
+  hJob := SandboxNewJob;
 
   { The child inherits a handle onto the spool and onto NUL.  NUL for stdin
     matters as much as the spool does: a command that reads stdin gets an
-    instant EOF instead of waiting forever for a keyboard nobody is at. }
+    instant EOF instead of waiting forever for a keyboard nobody is at.
+
+    Both handles survive the integrity drop: a probe confirmed that a handle
+    this medium-integrity process opened is still writable by a low-integrity
+    child that inherited it.  The asymmetry is a bonus rather than a cost -
+    the low child can write its own spool through the handle it was given and
+    cannot re-open that path by name, so it cannot go back and rewrite what it
+    already said. }
   FillChar(SA, SizeOf(SA), 0);
   SA.nLength := SizeOf(SA);
   SA.bInheritHandle := True;
@@ -2811,9 +2892,6 @@ begin
     foreground is a trap nobody could explain afterwards.  The line reaching
     cmd.exe here is character-identical to RunShell's. }
   CmdLine := '"' + ComSpec + '" /C ' + Cmd;
-  { CreateProcessA may write into lpCommandLine, so it must not be sharing a
-    string with anybody. }
-  UniqueString(CmdLine);
   FillChar(SI, SizeOf(SI), 0);
   SI.cb := SizeOf(SI);
   SI.dwFlags := STARTF_USESTDHANDLES;
@@ -2822,8 +2900,8 @@ begin
   SI.hStdError := hSpool;
   FillChar(PI, SizeOf(PI), 0);
 
-  if not CreateProcess(nil, PChar(CmdLine), nil, nil, True, CREATE_NO_WINDOW,
-           nil, PChar(NormalizeRoot), SI, PI) then
+  if not SandboxSpawn(CmdLine, NormalizeRoot, SandboxEnvBlock, 0, SI, PI,
+           hJob, InJob) then
   begin
     Err := 'could not start: ' + SysErrorMessage(GetLastError);
     CloseHandle(hSpool);
@@ -2846,12 +2924,12 @@ begin
   J.Job := hJob;
   J.Started := GetTickCount64;
   J.ExitCode := -1;
-  { Assignment is after the spawn, so a grandchild started in the microseconds
-    before it escapes the job.  cmd.exe has to parse its command line first,
-    so the window is tiny - but it is real, and a stray that escapes survives
-    kill_bash.  When assignment fails outright the kill reaches cmd.exe only,
-    which the status line says out loud rather than pretending otherwise. }
-  J.Tree := (hJob <> 0) and AssignProcessToJobObject(hJob, PI.hProcess);
+  { The child is created suspended, assigned, and only then resumed, so the
+    race this used to document - a grandchild started while cmd.exe parsed its
+    command line, escaping the job and surviving kill_bash - is closed.  When
+    assignment fails outright the kill still reaches cmd.exe only, which the
+    status line says out loud rather than pretending otherwise. }
+  J.Tree := InJob;
   if (hJob <> 0) and not J.Tree then
     J.Note := Format('[%s could not be put in a job object; stopping it may ' +
       'leave programs it started running]', [J.Id]);
@@ -2975,7 +3053,7 @@ begin
   if WaitForSingleObject(Jobs[I].Proc, 0) <> WAIT_OBJECT_0 then
   begin
     if Jobs[I].Job <> 0 then
-      TerminateJobObject(Jobs[I].Job, 1)
+      SandboxTerminateJob(Jobs[I].Job, 1)
     else
       TerminateProcess(Jobs[I].Proc, 1);
     WaitForSingleObject(Jobs[I].Proc, JobKillWaitMs);
@@ -3276,23 +3354,24 @@ begin
   end;
 end;
 
-function ApprovalsPath: string;
+{ The name this session's out-of-tree state is filed under.  The leaf is
+  decoration - it is what makes the directory readable by a human deleting an
+  entry - so anything that is not plainly a filename character is dropped
+  rather than escaped.  The hash of the whole path, case-folded because
+  Windows paths are, is what actually distinguishes two roots.
+
+  Factored out of ApprovalsPath because the sandbox scratch needs the same
+  key.  Sharing the function rather than the convention is what stops the two
+  stores drifting into disagreeing about which session they belong to - and it
+  binds both to the PRIMARY root, which is deliberate: an added working
+  directory contributes no key, or adding a directory would become a way to
+  import another session's approvals. }
+function SessionKey: string;
 var
-  Home, Root, Leaf: string;
+  Root, Leaf: string;
   I: Integer;
 begin
-  Result := '';
-  { SysUtils. qualified deliberately: the Windows unit's raw API of the same
-    name is in scope here and shadows it. }
-  Home := Trim(SysUtils.GetEnvironmentVariable('LOCALAPPDATA'));
-  if Home = '' then
-    Home := Trim(SysUtils.GetEnvironmentVariable('USERPROFILE'));
-  if Home = '' then Exit;
   Root := NormalizeRoot;
-  { The leaf is decoration - it is what makes the directory readable by a human
-    deleting an entry - so anything that is not plainly a filename character is
-    dropped rather than escaped.  The hash of the whole path, case-folded
-    because Windows paths are, is what actually distinguishes two roots. }
   Leaf := '';
   for I := 1 to Length(ExtractFileName(Root)) do
     if ExtractFileName(Root)[I] in ['a'..'z', 'A'..'Z', '0'..'9', '-', '_'] then
@@ -3301,10 +3380,23 @@ begin
       if Length(Leaf) >= 32 then Break;
     end;
   if Leaf = '' then Leaf := 'root';
+  Result := Leaf + '-' +
+    LowerCase(IntToHex(Fnv1a(UpperCase(Root), QWord($CBF29CE484222325)), 16));
+end;
+
+function ApprovalsPath: string;
+var
+  Home: string;
+begin
+  Result := '';
+  { SysUtils. qualified deliberately: the Windows unit's raw API of the same
+    name is in scope here and shadows it. }
+  Home := Trim(SysUtils.GetEnvironmentVariable('LOCALAPPDATA'));
+  if Home = '' then
+    Home := Trim(SysUtils.GetEnvironmentVariable('USERPROFILE'));
+  if Home = '' then Exit;
   Result := IncludeTrailingPathDelimiter(Home) + 'pasclaude' + PathDelim +
-    'approvals' + PathDelim + Leaf + '-' +
-    LowerCase(IntToHex(Fnv1a(UpperCase(Root), QWord($CBF29CE484222325)), 16)) +
-    '.json';
+    'approvals' + PathDelim + SessionKey + '.json';
 end;
 
 type
@@ -4666,7 +4758,8 @@ end;
 { ------------------------------------------------- permission persistence -- }
 
 { The file is JSON: {"allow_edits":bool,"allow_bash":bool,"allow_fetch":bool,
-  "bash_programs":["git","build",...],"trusted":{"mcp:github":"3f9a1c04..."}}.
+  "bash_programs":["git","build",...],"trusted":{"mcp:github":"3f9a1c04..."},
+  "deny":["bash:rm"],"sandbox":"low"}.
   Path is ApprovalsPath, which is outside the project: every key here answers
   "what may this project do", so a copy the project itself supplies would be
   the project answering for the user.  Deliberately not the transcript format
@@ -4696,6 +4789,14 @@ end;
   array back verbatim, including a line it could not parse, because the file
   is hand-edited and a rule silently erased on exit is worse than one that
   never worked.
+
+  And one more, "sandbox":"low", which is the third polarity: it can only
+  raise.  Every other key in this file is about what may be ALLOWED, so the
+  safe direction for a stale file is to grant less; the sandbox is about what
+  is FORBIDDEN, so the safe direction there is to forbid more.  Hence 'low'
+  loads and 'off' does not exist - it is never written and never read, which
+  is what makes it impossible for anything on disk to be the reason the
+  sandbox is not running.
 
   Additional working directories are deliberately NOT stored here either, and
   the only-widen rule is again the reason: a persisted root would be a grant
@@ -4740,6 +4841,16 @@ begin
     if (Progs <> nil) and (Progs.Kind = jkObj) then
       for I := 0 to Progs.Count - 1 do
         RecordTrust(Progs.Key(I), Progs.Item(I).AsString);
+    { "sandbox", and it raises only.  The mirror image of the only-widen rule
+      above, pointing the other way because the sandbox is a restriction
+      rather than a grant: 'low' can turn confinement on, and no value here
+      can ever turn it off - 'off' is never written and, as the comparison
+      shows, never read.  So a stale file, a corrupt one or a hostile one can
+      never be the reason the sandbox is not running.  A non-string, a null or
+      an array all read as '' and change nothing. }
+    if (Root.Str('sandbox') = 'low') and
+       (uSandbox.SandboxLevel < slLow) then
+      uSandbox.SandboxLevel := slLow;
   finally
     Root.Free;
   end;
@@ -4772,6 +4883,11 @@ begin
     for I := 0 to High(RootDenyRaw) do
       Progs.Push(TJson.NewStr(RootDenyRaw[I]));
     Root.Add('deny', Progs);
+    { Written only for 'low', never for 'off' and never for the default.  A
+      file that could say off would be a file that could switch the sandbox
+      off, which is the one thing this key must not be able to do. }
+    if uSandbox.SandboxLevel = slLow then
+      Root.AddStr('sandbox', 'low');
     Text := Root.ToJson;
   finally
     Root.Free;
@@ -5557,7 +5673,17 @@ end;
 { The bash gate.  "Always" for a shell command approves its program, not
   every future command: the user who said always to "git status" meant git,
   and quietly extending that to "del /s" is how trust gets spent.  /yolo
-  still approves everything through AllowAllBash. }
+  still approves everything through AllowAllBash.
+
+  uSandbox.SandboxLevel is NOT read here, and must never be - not to reach a
+  decision, and not even to decorate Detail.  A sandboxed command faces this
+  function in the identical order with the identical question.  The reason is
+  a measurement rather than a principle: a probe ran "dir %USERPROFILE%",
+  "type .gitconfig" and an HTTPS request under low integrity and all three
+  exited 0, so a confined command can still read every credential on the
+  machine and send it anywhere.  A boundary that stops writes and stops
+  nothing else cannot buy an approval discount, and a level shown at approval
+  time would only invite "it's sandboxed, so yes". }
 function PermitBash(const Cmd, Detail: string; Ask: TAskProc): Boolean;
 var
   A: TPermission;
@@ -6935,14 +7061,22 @@ begin
         'read its output with bash_output(job_id="%s"), stop it with kill_bash.',
         [Note, Cmd, Note]));
     end;
-    Text := RunShell(Cmd, NormalizeRoot, Code);
+    Text := RunShell(Cmd, NormalizeRoot, True, Code);
     { Console programs emit OEM-codepage bytes, not UTF-8, so anything
       non-ASCII has to be converted or the request body becomes invalid. }
     if not IsValidUtf8(Text) then
       Text := OemToUtf8(Text);
     Result := Clip(Text);
     if Result = '' then Result := '(no output)';
-    Result := Result + Format(#10'[exit code %d]', [Code]);
+    { The level goes on the same line as the exit code, and it goes there
+      whenever a sandboxed command failed rather than only when something in
+      the output looked like the sandbox's doing.  A command that fails only
+      because it was confined must say so, or every user diagnoses a broken
+      tool instead; and the markers that would let us guess more precisely are
+      English, so the tag is what has to carry it. }
+    Result := Result + Format(#10'[exit code %d%s]', [Code, SandboxTag(Code)]);
+    Note := SandboxExplain(Code, Result);
+    if Note <> '' then Result := Result + #10 + Note;
     IsError := Code <> 0;
   end
 

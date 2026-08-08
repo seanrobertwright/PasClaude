@@ -198,54 +198,15 @@ function McpConnectionCount: Integer;
 
 implementation
 
-uses SysUtils;
+uses SysUtils, uSandbox;
 
-{ FPC 3.2.2's Windows unit declares CreatePipe, PeekNamedPipe and
-  SetHandleInformation but not the job-object API.  uTools declares its own
-  copy for background bash; this is a second one on purpose.  Sharing them
-  would mean editing a currently-green path for another feature's
-  convenience, and thirty lines of header fixed by the operating system are
-  not the kind of duplication that drifts. }
+{ The job-object record and its four kernel32 imports used to be declared here
+  verbatim, a third copy of the same thirty lines, because the ladder forbids
+  this unit from importing uTools.  uSandbox is a leaf below all three, so
+  there is now one declaration - the only direction that duplication could
+  ever have been collapsed in. }
 const
-  JobObjectExtendedLimitInformation = 9;
-  JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = $2000;
   McpKillWaitMs = 2000;
-
-type
-  TJobBasicLimits = record
-    PerProcessUserTimeLimit: Int64;
-    PerJobUserTimeLimit: Int64;
-    LimitFlags: DWORD;
-    MinimumWorkingSetSize: SIZE_T;
-    MaximumWorkingSetSize: SIZE_T;
-    ActiveProcessLimit: DWORD;
-    Affinity: ULONG_PTR;
-    PriorityClass: DWORD;
-    SchedulingClass: DWORD;
-  end;
-
-  TJobIoCounters = record
-    ReadOperationCount, WriteOperationCount, OtherOperationCount: QWord;
-    ReadTransferCount, WriteTransferCount, OtherTransferCount: QWord;
-  end;
-
-  TJobExtendedLimits = record
-    BasicLimitInformation: TJobBasicLimits;
-    IoInfo: TJobIoCounters;
-    ProcessMemoryLimit: SIZE_T;
-    JobMemoryLimit: SIZE_T;
-    PeakProcessMemoryUsed: SIZE_T;
-    PeakJobMemoryUsed: SIZE_T;
-  end;
-
-function CreateJobObjectA(Attr: Pointer; Name: PAnsiChar): THandle; stdcall;
-  external 'kernel32' name 'CreateJobObjectA';
-function SetInformationJobObject(J: THandle; Cls: Integer; Info: Pointer;
-  Len: DWORD): BOOL; stdcall; external 'kernel32' name 'SetInformationJobObject';
-function AssignProcessToJobObject(J, P: THandle): BOOL; stdcall;
-  external 'kernel32' name 'AssignProcessToJobObject';
-function TerminateJobObject(J: THandle; Code: UINT): BOOL; stdcall;
-  external 'kernel32' name 'TerminateJobObject';
 
 type
   TMcpConn = record
@@ -462,11 +423,10 @@ var
   SA: SECURITY_ATTRIBUTES;
   SI: STARTUPINFOA;
   PI: PROCESS_INFORMATION;
-  Info: TJobExtendedLimits;
   hInR, hInW, hOutR, hOutW, hErr, hJob: THandle;
   Mode: DWORD;
   CmdLine, EnvBlock, Dir: string;
-  EnvPtr, DirPtr: PChar;
+  InJob: Boolean;
 begin
   Err := '';
   Result := -1;
@@ -535,27 +495,18 @@ begin
       FILE_SHARE_READ or FILE_SHARE_WRITE, @SA, OPEN_EXISTING,
       FILE_ATTRIBUTE_NORMAL, 0);
 
-  hJob := CreateJobObjectA(nil, nil);
-  if hJob <> 0 then
-  begin
-    FillChar(Info, SizeOf(Info), 0);
-    Info.BasicLimitInformation.LimitFlags := JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-    if not SetInformationJobObject(hJob, JobObjectExtendedLimitInformation,
-             @Info, SizeOf(Info)) then
-    begin
-      CloseHandle(hJob);
-      hJob := 0;
-    end;
-  end;
+  hJob := SandboxNewJob;
 
+  { Unmodified, with no cmd.exe wrapper, unlike bash and hooks: what .mcp.json
+    holds is a complete command line passed to CreateProcess as written.
+    SandboxSpawn takes a finished line and never composes one, which is the
+    property that lets this and the wrapped callers share it. }
   CmdLine := Cmd;
-  { CreateProcessA may write into lpCommandLine, so it must not be sharing a
-    string with anybody. }
-  UniqueString(CmdLine);
-  EnvBlock := BuildEnvBlock(EnvPairs);
-  if EnvBlock = '' then EnvPtr := nil else EnvPtr := PChar(EnvBlock);
+  { The server's own env pairs first, then the sandbox's temp redirection over
+    the top - the scratch is the only directory a low child can write, so it
+    has to win over anything the config set. }
+  EnvBlock := SandboxApplyEnv(BuildEnvBlock(EnvPairs));
   Dir := WorkDir;
-  if Dir = '' then DirPtr := nil else DirPtr := PChar(Dir);
 
   FillChar(SI, SizeOf(SI), 0);
   SI.cb := SizeOf(SI);
@@ -565,10 +516,14 @@ begin
   SI.hStdError := hErr;
   FillChar(PI, SizeOf(PI), 0);
 
-  if not CreateProcess(nil, PChar(CmdLine), nil, nil, True, CREATE_NO_WINDOW,
-           EnvPtr, DirPtr, SI, PI) then
+  if not SandboxSpawn(CmdLine, Dir, EnvBlock, 0, SI, PI, hJob, InJob) then
   begin
     Err := 'could not start: ' + SysErrorMessage(GetLastError);
+    { Said here rather than left to the caller: at low integrity a server that
+      wants to unpack itself into %APPDATA% fails before it has spoken a word
+      of protocol, and without this the level looks like a broken config. }
+    if uSandbox.SandboxLevel = slLow then
+      Err := Err + ' [sandbox: low]';
     CloseHandle(hInR); CloseHandle(hInW);
     CloseHandle(hOutR); CloseHandle(hOutW);
     if hErr <> INVALID_HANDLE_VALUE then CloseHandle(hErr);
@@ -588,11 +543,9 @@ begin
   Cn.hOut := hOutR;
   Cn.Proc := PI.hProcess;
   Cn.Job := hJob;
-  { After the spawn, so a grandchild started in the microseconds before it
-    escapes the job.  The same documented race the background-bash path has,
-    and for the same reason: there is no way to create a process already in a
-    job without also inheriting it into every child of this one. }
-  Cn.Tree := (hJob <> 0) and AssignProcessToJobObject(hJob, PI.hProcess);
+  { Created suspended, assigned, then resumed, so the grandchild race this
+    used to document is closed. }
+  Cn.Tree := InJob;
 
   SetLength(Conns, Length(Conns) + 1);
   Conns[High(Conns)] := Cn;
@@ -629,7 +582,7 @@ begin
   if Conns[C].Proc <> 0 then
   begin
     if WaitForSingleObject(Conns[C].Proc, McpKillWaitMs) <> WAIT_OBJECT_0 then
-      if Conns[C].Job <> 0 then TerminateJobObject(Conns[C].Job, 1)
+      if Conns[C].Job <> 0 then SandboxTerminateJob(Conns[C].Job, 1)
       else TerminateProcess(Conns[C].Proc, 1);
     Code := DWORD(-1);
     if GetExitCodeProcess(Conns[C].Proc, Code) and (Code <> STILL_ACTIVE) then

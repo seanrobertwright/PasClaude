@@ -5,8 +5,11 @@ program smoke;
 
 {$mode objfpc}{$H+}
 
-uses SysUtils, Classes, uJson, uHttp, uMcp, uHooks, uTools, uAgent, uRegex,
-  uSdk;
+{ Windows first, deliberately: it exports a DeleteFile taking a PChar, and this
+  suite calls SysUtils' one throughout.  A later unit wins, so SysUtils has to
+  come after it. }
+uses Windows, SysUtils, Classes, uJson, uHttp, uMcp, uHooks, uSandbox, uTools,
+  uAgent, uRegex, uSdk;
 
 var
   Fails: Integer = 0;
@@ -2244,6 +2247,173 @@ begin
         (Length(uTools.DenyRules) = 0), 'and clearing empties all of it');
 end;
 
+{ RunShell was rewritten off TProcess onto raw CreateProcess and a
+  PeekNamedPipe drain loop, on the tool the model calls most.  Every assertion
+  here is a way that loop can be subtly wrong while still looking like it
+  works: a lost stderr, a truncated tail, a deadlock on a silent child.
+  Sandboxed=False throughout - this is about the byte contract, which the
+  level must not change. }
+procedure TestRunShellContract;
+var
+  Code: Integer;
+  Out_, Big: string;
+  Job: THandle;
+  SI: STARTUPINFOA;
+  PI: PROCESS_INFORMATION;
+  InJob, Started: Boolean;
+begin
+  Out_ := RunShell('exit 3', GetTempDir, False, Code);
+  Check(Code = 3, 'the exit code comes back');
+
+  { One handle for both streams, so they interleave the way they were
+    written.  Pointing stderr anywhere else loses the second line entirely. }
+  Out_ := RunShell('echo out & echo err 1>&2', GetTempDir, False, Code);
+  Check(Pos('out', Out_) > 0, 'stdout is captured');
+  Check(Pos('err', Out_) > 0, 'and stderr is merged into the same result');
+  Check(Code = 0, 'and the command succeeded');
+
+  { Well past a pipe buffer, so the drain loop has to run many times and the
+    post-exit drain has to pick up the tail.  A missing final drain truncates
+    this and nothing else in the suite would notice. }
+  Out_ := RunShell('for /L %i in (1,1,2000) do @echo ' +
+    '0123456789012345678901234567890123456789', GetTempDir, False, Code);
+  Check(Length(Out_) > 64 * 1024,
+    'a producer of more than 64 KB comes back whole: ' + IntToStr(Length(Out_)));
+  Check(Code = 0, 'and still reports its exit code');
+
+  { A command that says nothing at all.  ReadFile without a preceding
+    PeekNamedPipe blocks here forever, which shows up as the suite hanging
+    rather than as a failed assertion - so this line is the canary. }
+  Out_ := RunShell('exit 0', GetTempDir, False, Code);
+  Check(Code = 0, 'a command that produces no output returns rather than hangs');
+
+  { Quoting and the metacharacters that make BashPrefix refuse to remember a
+    command.  The line reaching cmd.exe must be the line that was typed. }
+  Out_ := RunShell('echo "a & b" & echo 100%%', GetTempDir, False, Code);
+  Check(Pos('a & b', Out_) > 0, 'a quoted ampersand survives to cmd.exe');
+  Out_ := RunShell('echo hello^world', GetTempDir, False, Code);
+  Check(Pos('helloworld', Out_) > 0, 'and a caret escape means what it means');
+
+  { Console programs emit OEM bytes; the caller repairs them.  What RunShell
+    must do is hand back the bytes unaltered, so the repair still works. }
+  Big := RunShell('echo abc', GetTempDir, False, Code);
+  Check(IsValidUtf8(Big) or IsValidUtf8(OemToUtf8(Big)),
+    'output is returned raw, so the caller can still repair the codepage');
+
+  { The job the foreground shell never used to have. }
+  Job := SandboxNewJob;
+  Check(Job <> 0, 'SandboxNewJob returns a job at the default level');
+  if Job <> 0 then
+  begin
+    FillChar(SI, SizeOf(SI), 0);
+    SI.cb := SizeOf(SI);
+    Started := SandboxSpawn('"' +
+      SysUtils.GetEnvironmentVariable('ComSpec') + '" /C exit 0',
+      GetTempDir, '', 0, SI, PI, Job, InJob);
+    Check(Started, 'and a child spawns into it');
+    Check(InJob, 'and reports that it was assigned before it resumed');
+    if Started then
+    begin
+      WaitForSingleObject(PI.hProcess, 10000);
+      CloseHandle(PI.hThread);
+      CloseHandle(PI.hProcess);
+    end;
+    CloseHandle(Job);
+  end;
+end;
+
+{ The level is a word from a flag or a command, and one string key on disk
+  that may only ever raise.  Both halves are here because a parser that
+  accepts anything and a writer that persists "off" fail the same way: the
+  sandbox silently stops running. }
+procedure TestSandboxLevelParsingAndPersistence;
+var
+  L: TSandboxLevel;
+  Saved: TSandboxLevel;
+  P, Text: string;
+  S: TStringList;
+begin
+  Saved := uSandbox.SandboxLevel;
+  P := IncludeTrailingPathDelimiter(GetTempDir) + 'pasclaude-sbx.json';
+  try
+    Check(SandboxParseLevel('off', L) and (L = slOff), 'off parses');
+    Check(SandboxParseLevel('limits', L) and (L = slLimits), 'limits parses');
+    Check(SandboxParseLevel('low', L) and (L = slLow), 'low parses');
+    { Exact, deliberately.  A parser that shrugged at near-misses would let a
+      typo or a corrupt byte choose the least confined thing that nearly
+      matched, which is the wrong direction to guess in. }
+    Check(not SandboxParseLevel('', L), 'an empty level is not a level');
+    Check(not SandboxParseLevel('Low ', L), 'nor one with trailing space');
+    Check(not SandboxParseLevel('LIMITS'#10, L), 'nor a shouted one');
+    Check(not SandboxParseLevel('none', L), 'nor a plausible-sounding word');
+    Check(not SandboxParseLevel('lo', L), 'nor a prefix of a real one');
+    Check(not SandboxParseLevel(#0#1#2, L), 'nor arbitrary bytes');
+    Check(SandboxLevelName(slOff) + SandboxLevelName(slLimits) +
+      SandboxLevelName(slLow) = 'offlimitslow', 'and the names round-trip');
+
+    { The key is written only for low.  Writing it for off would hand a file
+      the power to switch the sandbox off, which is the one thing it may not
+      have. }
+    DeleteFile(P);
+    uSandbox.SandboxLevel := slLimits;
+    SavePermissions(P);
+    S := TStringList.Create;
+    try
+      S.LoadFromFile(P);
+      Text := S.Text;
+    finally
+      S.Free;
+    end;
+    Check(Pos('sandbox', Text) = 0, 'the default level writes no sandbox key');
+
+    uSandbox.SandboxLevel := slOff;
+    SavePermissions(P);
+    S := TStringList.Create;
+    try
+      S.LoadFromFile(P);
+      Text := S.Text;
+    finally
+      S.Free;
+    end;
+    Check(Pos('sandbox', Text) = 0, 'and neither does off - ever');
+
+    uSandbox.SandboxLevel := slLow;
+    SavePermissions(P);
+    S := TStringList.Create;
+    try
+      S.LoadFromFile(P);
+      Text := S.Text;
+    finally
+      S.Free;
+    end;
+    Check(Pos('"sandbox":"low"', Text) > 0, 'low writes the key');
+
+    { Raise-only, in both directions and twice over. }
+    uSandbox.SandboxLevel := slLimits;
+    LoadPermissions(P);
+    Check(uSandbox.SandboxLevel = slLow, 'and loading it raises the level');
+    LoadPermissions(P);
+    Check(uSandbox.SandboxLevel = slLow, 'a second round trip is idempotent');
+    SavePermissions(P);
+    LoadPermissions(P);
+    Check(uSandbox.SandboxLevel = slLow, 'and so is a second save and load');
+
+    uSandbox.SandboxLevel := slOff;
+    LoadPermissions(P);
+    Check(uSandbox.SandboxLevel = slLow,
+      'a file may raise a level the user turned off this session');
+
+    { Idempotent teardown, and no block left over: -gh turns a leaked cache
+      into a suite failure, which is what makes this worth asserting. }
+    SandboxShutdown;
+    SandboxShutdown;
+    Check(SandboxTempDir = '', 'shutdown forgets the scratch and repeats safely');
+  finally
+    DeleteFile(P);
+    uSandbox.SandboxLevel := Saved;
+  end;
+end;
+
 procedure TestPermissionPersistence;
 var
   P: string;
@@ -2898,6 +3068,8 @@ begin
   TestSkillTool;
   TestPluginPrecedence;
   TestDenyRuleParsing;
+  TestRunShellContract;
+  TestSandboxLevelParsingAndPersistence;
   TestPermissionPersistence;
   TestPermModes;
   TestBypassGate;
