@@ -3973,6 +3973,7 @@ procedure TestSystemPromptLift;
 var
   Root, Home, Full, SavedHome: string;
   UserAt, ProjectAt, GuideAt, ExtraAt, BindingAt: Integer;
+  SavedAllowed: Boolean;
 begin
   Root := IncludeTrailingPathDelimiter(TmpRoot) + 'prompt';
   Home := IncludeTrailingPathDelimiter(Root) + 'home';
@@ -3980,6 +3981,13 @@ begin
   SavedHome := SysUtils.GetEnvironmentVariable('USERPROFILE');
   SetEnvironmentVariable('USERPROFILE', PChar(Home));
   uTools.RootDir := Root;
+  SavedAllowed := uSdk.SdkProjectContextAllowed;
+  { Set here rather than inherited.  Every assertion below about a project's
+    CLAUDE.md, its @import and the "treat them as binding" line is an assertion
+    about the REPL, and the REPL is the caller that turns this on - so this
+    test stands in for that caller itself instead of resting on the cleanup of
+    whichever test happened to run before it. }
+  uSdk.SdkProjectContextAllowed := True;
   try
     WriteFileText(Home + PathDelim + '.pasclaude' + PathDelim + 'CLAUDE.md',
       'always speak plainly'#10);
@@ -4024,6 +4032,114 @@ begin
   finally
     SetEnvironmentVariable('USERPROFILE', PChar(SavedHome));
     uTools.RootDir := TmpRoot;
+    uSdk.SdkProjectContextAllowed := SavedAllowed;
+  end;
+end;
+
+{ The CI gate on the project's own instruction files, put in both directions
+  because both are requirements and only one of them is the new behaviour.
+
+  Under --ci report the working directory is a checkout of the pull request
+  head, so AGENTS.md, CLAUDE.md and .pasclaude.md are files whoever opened the
+  pull request wrote, and until this flag they went straight into the system
+  prompt - the most trusted position in the request - carrying whatever they
+  @imported with them.  The CI deny floor could never have caught it: uTools'
+  path: rules are matched against the model's TOOL CALLS and this loader is
+  not one.  The other direction is the requirement that is easier to break by
+  accident: the REPL and every ordinary -p run must still bind a project's
+  CLAUDE.md, imports and all, because that is a promise README makes to every
+  scripted user.  Widening or narrowing this gate means deleting an assertion
+  here first. }
+procedure TestProjectContextIsNotForCi;
+var
+  Root, Home, SavedHome, Full, SkillDir: string;
+  SavedAllowed: Boolean;
+begin
+  SavedAllowed := uSdk.SdkProjectContextAllowed;
+  Root := IncludeTrailingPathDelimiter(TmpRoot) + 'ctxgate';
+  Home := IncludeTrailingPathDelimiter(Root) + 'home';
+  ForceDirectories(Home + PathDelim + '.pasclaude');
+  SavedHome := SysUtils.GetEnvironmentVariable('USERPROFILE');
+  SetEnvironmentVariable('USERPROFILE', PChar(Home));
+  uTools.RootDir := Root;
+  try
+    { Before a single instruction file exists, because an empty tree is the
+      case the notice has to stay quiet about - otherwise every CI run in a
+      repository that ships none prints a line about nothing. }
+    Check(uSdk.SdkProjectContextFiles = '',
+      'a tree with no instruction files gives the log nothing to say');
+
+    WriteFileText(Home + PathDelim + '.pasclaude' + PathDelim + 'CLAUDE.md',
+      'always speak plainly'#10);
+    WriteFileText(IncludeTrailingPathDelimiter(Root) + 'secret.md',
+      'the imported branch text'#10);
+    WriteFileText(IncludeTrailingPathDelimiter(Root) + 'CLAUDE.md',
+      'branch rules'#10'@import secret.md'#10);
+    WriteFileText(IncludeTrailingPathDelimiter(Root) + 'AGENTS.md',
+      'branch agent rules'#10);
+    Check(uSdk.SdkProjectContextFiles = 'AGENTS.md, CLAUDE.md',
+      'the notice names the instruction files in load order');
+
+    { The shipped default, and this is the only place in the suite it is
+      observable: nothing has set the flag yet, and false is exactly what the
+      two --ci verbs leave it at. }
+    Check(not uSdk.SdkProjectContextAllowed,
+      'SdkProjectContextAllowed ships false, so a host that never sets it ' +
+      'loads no project instructions');
+    Full := uSdk.SdkFullSystem;
+    Check(Pos('branch rules', Full) = 0,
+      'a ci run gets no claude.md out of the checked-out tree');
+    Check(Pos('branch agent rules', Full) = 0, 'nor agents.md');
+    Check(Pos('the imported branch text', Full) = 0,
+      'and an @import inside one is never followed either');
+    Check(Pos('always speak plainly', Full) > 0,
+      'while the user memory survives: a pull request cannot write %userprofile%');
+    Check(Pos('Session root: ' + Root, Full) > 0,
+      'and the guidelines the program wrote are untouched');
+
+    { Skills are NOT gated by this flag, and the reason is that they never
+      reach the prompt to begin with: the catalogue rides in the skill tool's
+      own description, rebuilt with the schema on every request.  That fact
+      has just become load-bearing for a security argument, so it is pinned
+      here - anyone who later moves the catalogue into the system prompt has
+      to come and read why they may not. }
+    SkillDir := IncludeTrailingPathDelimiter(Root) + uTools.StateDirName +
+      PathDelim + uTools.SkillsDirName + PathDelim + 'branchskill';
+    ForceDirectories(SkillDir);
+    WriteFileText(IncludeTrailingPathDelimiter(SkillDir) + 'SKILL.md',
+      '---'#10'description: SKILLDESC-FROM-BRANCH.'#10'---'#10'the body'#10);
+    uTools.RefreshSkills;
+    Check(Pos('SKILLDESC-FROM-BRANCH', uTools.SkillListDescription) > 0,
+      'a skill description reaches the skill tool''s own description');
+    Check(Pos('SKILLDESC-FROM-BRANCH', uSdk.SdkFullSystem) = 0,
+      'skill descriptions are not in the system prompt at all');
+
+    { And the other direction: with the flag on - the REPL, and every -p run
+      that is not a --ci verb - the same files out of the same tree bind. }
+    uSdk.SdkProjectContextAllowed := True;
+    Full := uSdk.SdkFullSystem;
+    Check(Pos('branch rules', Full) > 0,
+      'and the repl loads the same file from the same tree');
+    Check(Pos('the imported branch text', Full) > 0, 'imports and all');
+    { The skill pin again, and THIS is the run that matters: the check above
+      it passed in a configuration where SdkProjectContext contributes nothing
+      at all, so on its own it proves only that skills are absent from a prompt
+      the project loader never touched.  README calls this pin load-bearing for
+      the argument that the flag does not have to gate skills, and the shipped
+      REPL and -p configuration is the one that argument is about. }
+    Check(Pos('SKILLDESC-FROM-BRANCH', Full) = 0,
+      'and with the project loader on - the shipped repl and -p ' +
+      'configuration - it is still nowhere in the system prompt');
+  finally
+    SetEnvironmentVariable('USERPROFILE', PChar(SavedHome));
+    uTools.RootDir := TmpRoot;
+    uTools.ClearSkills;
+    { Restored to what it was found at, like any other module state this
+      suite touches.  It used to be left ON for TestSystemPromptLift, which
+      made the order of the two load-bearing and the failure of the second one
+      unreadable if either ever moved; that test now sets the flag it needs
+      itself. }
+    uSdk.SdkProjectContextAllowed := SavedAllowed;
   end;
 end;
 
@@ -5577,6 +5693,106 @@ begin
   uTools.AllowAllEdits := False;
 end;
 
+{ The "before" side of a diff is project text living outside the project, so
+  its lifetime is the feature.  uIde owns exactly one at a time: holding a new
+  one deletes the last, and dropping deletes what is held.  Asserted against
+  real files rather than a mocked filesystem, because the whole claim is
+  about a file existing or not existing on disk. }
+procedure TestIdeScratchLifetime;
+var
+  A, B: string;
+begin
+  A := IncludeTrailingPathDelimiter(TmpRoot) + 'base-one.txt';
+  B := IncludeTrailingPathDelimiter(TmpRoot) + 'base-two.txt';
+  try
+    WriteFileText(A, 'before one');
+    uIde.IdeHoldScratch(A);
+    Check(FileExists(A), 'a held baseline is left alone while it is the live one');
+    Check(uIde.IdeHeldScratch = A, 'and it is the one being held');
+
+    { Re-holding the same path must not delete it: the caller has just
+      rewritten those bytes, and /ide diff twice on one file composes the
+      same base-<name> both times. }
+    WriteFileText(A, 'before one again');
+    uIde.IdeHoldScratch(A);
+    Check(FileExists(A),
+      're-holding the same path leaves the bytes just written in place');
+
+    WriteFileText(B, 'before two');
+    uIde.IdeHoldScratch(B);
+    Check(not FileExists(A),
+      'holding a second baseline deletes the first, so at most one is ever live');
+    Check(FileExists(B), 'and the second one is there for the editor to read');
+
+    uIde.IdeDropScratch;
+    Check(not FileExists(B), 'dropping deletes the held baseline');
+    Check(uIde.IdeHeldScratch = '', 'and nothing is held after a drop');
+    uIde.IdeDropScratch;
+    Check(uIde.IdeHeldScratch = '', 'a drop with nothing held is quiet');
+  finally
+    uIde.IdeDropScratch;
+    SysUtils.DeleteFile(A);
+    SysUtils.DeleteFile(B);
+  end;
+end;
+
+{ A file over the snapshot cap gets no baseline, and until now that was
+  indistinguishable from a file this session never wrote - so /ide diff said
+  "one of these two things" and named neither.  The skip is recorded where it
+  happens, so the message can say which. }
+procedure TestSnapshotOversizeIsNamed;
+var
+  J: TJson;
+  Out_, Text, Big, Small: string;
+  IsErr, Existed: Boolean;
+begin
+  Big := IncludeTrailingPathDelimiter(TmpRoot) + 'huge.log';
+  Small := IncludeTrailingPathDelimiter(TmpRoot) + 'tiny.log';
+  uTools.AllowAllEdits := True;
+  uTools.ClearSnapshots;
+  uTools.ClearChangedFiles;
+  try
+    WriteFileText(Big, StringOfChar('x', uTools.SnapshotLimitBytes + 1));
+    WriteFileText(Small, 'small enough');
+
+    uTools.BeginTurn(1);
+    J := TJson.NewObj;
+    J.AddStr('path', 'huge.log');
+    J.AddStr('content', 'overwritten');
+    Out_ := uTools.RunTool('write_file', J, nil, IsErr);
+    J.Free;
+    Check(not IsErr, 'the write over an oversized file still applies: ' + Out_);
+
+    J := TJson.NewObj;
+    J.AddStr('path', 'tiny.log');
+    J.AddStr('content', 'overwritten too');
+    uTools.RunTool('write_file', J, nil, IsErr);
+    J.Free;
+
+    Check(not uTools.SessionBaseline(Big, Text, Existed),
+      'a file over the snapshot limit gets no baseline');
+    Check(uTools.SnapshotSkippedOversize(Big),
+      'and the skip is recorded, so /ide diff can name the reason instead of guessing');
+    Check(Length(uTools.ChangedFiles) > 0,
+      'and it is still listed as changed this session, which is why the silence read as a bug');
+    Check(uTools.SessionBaseline(Small, Text, Existed) and
+      not uTools.SnapshotSkippedOversize(Small),
+      'an ordinary snapshotted file is not reported as oversized');
+    Check(uTools.SnapshotLimitBytes div 1024 = 400,
+      'the reported limit is the 400 KB /rewind prints');
+
+    uTools.ClearSnapshots;
+    Check(not uTools.SnapshotSkippedOversize(Big),
+      'and the oversize record dies with the snapshots');
+  finally
+    uTools.ClearSnapshots;
+    uTools.ClearChangedFiles;
+    SysUtils.DeleteFile(Big);
+    SysUtils.DeleteFile(Small);
+    uTools.AllowAllEdits := False;
+  end;
+end;
+
 procedure TestDoctorLevelsAndCosts;
 var
   R: TDiagReport;
@@ -6246,6 +6462,13 @@ begin
   uTools.RootDir := TmpRoot;
 
   try
+    { First, because it is the only test that can see
+      SdkProjectContextAllowed's shipped default: nothing above this line sets
+      it, and one assertion in there is about exactly that byte.  It no longer
+      leaves the flag on for anybody - TestSystemPromptLift sets what it needs
+      itself - so this is an ordering the suite reads better in, not one it
+      depends on. }
+    TestProjectContextIsNotForCi;
     TestDiff;
     TestPreview;
     TestCompact;
@@ -6317,6 +6540,8 @@ begin
     TestGithubDiagRows;
     TestStatusReportsIde;
     TestIdeBaseline;
+    TestIdeScratchLifetime;
+    TestSnapshotOversizeIsNamed;
     TestDoctorLevelsAndCosts;
     TestDoctorReplaysTheLedger;
     TestProbeWritableLeavesNothing;

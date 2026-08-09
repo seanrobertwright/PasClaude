@@ -859,11 +859,33 @@ function SnapshotCount: Integer;
 
   False means no snapshot exists - the file was never written this session,
   or it was larger than MaxReadBytes when SnapshotFile looked at it and was
-  skipped, the same limit /rewind already documents.  Existed=False with a
-  True result is the distinct third answer: this session CREATED the file,
-  so its baseline is genuinely empty. }
+  skipped, the same limit /rewind already documents.  SnapshotSkippedOversize
+  below is how a caller tells those two apart instead of guessing between
+  them out loud.  Existed=False with a True result is the distinct third
+  answer: this session CREATED the file, so its baseline is genuinely
+  empty. }
 function SessionBaseline(const Full: string;
   out Text: string; out Existed: Boolean): Boolean;
+
+{ The snapshot cap, in bytes, so a caller that has to EXPLAIN a missing
+  baseline can name the real number instead of re-typing "400 KB" into
+  prose and drifting when the constant moves.  It exists for that one
+  reason: nothing outside this unit gets to change what is snapshotted. }
+function SnapshotLimitBytes: Integer;
+
+{ True when SnapshotFile looked at Full this session and put it down again
+  because it was over SnapshotLimitBytes.  This is the third answer
+  SessionBaseline structurally cannot give: False from that function means
+  "never written" and "written, but too big to hold" at the same time, and
+  those two want different sentences - one says the session has not touched
+  the file, the other says the file is too large and names the limit.
+
+  Recorded where the skip HAPPENS rather than deduced afterwards from the
+  file's size right now, which was the shorter version and is wrong in a way
+  that reads as confident: a file that was 500 KB when this session first
+  touched it and is 3 KB now would be told, flatly, that it was never
+  written. }
+function SnapshotSkippedOversize(const Full: string): Boolean;
 
 { Where the standing approvals for the current RootDir live, and deliberately
   NOT inside it.  The file answers "may this project's code run", so a copy of
@@ -5280,6 +5302,13 @@ type
 
 var
   Snapshots: array of TSnapshot;
+  { The paths SnapshotFile declined for size, and nothing else about them.
+    Deliberately NOT a member of TSnapshot with an empty Text: a record in
+    the Snapshots array claiming Existed with no bytes is exactly what
+    RestoreFilesSince would write back, so /rewind would truncate a 400 KB
+    file to nothing.  A separate append-only list cannot do that, because
+    nothing reads it but the sentence that explains a missing baseline. }
+  Oversize: array of string;
   CurrentTurn: Integer = 0;
 
 procedure BeginTurn(TurnNo: Integer);
@@ -5290,6 +5319,11 @@ end;
 procedure ClearSnapshots;
 begin
   SetLength(Snapshots, 0);
+  { The record of what was skipped dies with the records of what was kept.
+    It only ever existed to explain the absence of a snapshot, so once the
+    snapshots are gone it explains nothing, and /clear and the suites need
+    nothing new to reset it. }
+  SetLength(Oversize, 0);
 end;
 
 function SnapshotCount: Integer;
@@ -5297,11 +5331,40 @@ begin
   Result := Length(Snapshots);
 end;
 
+function SnapshotLimitBytes: Integer;
+begin
+  Result := MaxReadBytes;
+end;
+
+{ CompareText, not a byte comparison, and for the same reason SessionBaseline
+  gives above: the three places that decide whether two paths are "the same
+  file" must agree, or a file would be skipped under one spelling and looked
+  up under another. }
+procedure NoteOversize(const Full: string);
+var
+  I: Integer;
+begin
+  for I := 0 to High(Oversize) do
+    if CompareText(Oversize[I], Full) = 0 then Exit;
+  SetLength(Oversize, Length(Oversize) + 1);
+  Oversize[High(Oversize)] := Full;
+end;
+
+function SnapshotSkippedOversize(const Full: string): Boolean;
+var
+  I: Integer;
+begin
+  Result := False;
+  for I := 0 to High(Oversize) do
+    if CompareText(Oversize[I], Full) = 0 then Exit(True);
+end;
+
 { Captures Full's state before its first change this turn.  Later changes in
   the same turn keep the first snapshot: rewinding lands at the turn start,
   not midway through it.  Snapshot bytes live in memory; a 400 KB cap keeps
   a huge generated file from bloating the process, at the cost of that file
-  not being rewindable - noted at restore time. }
+  not being rewindable - noted at restore time, and recorded in Oversize so
+  the caller explaining a missing baseline can name the reason. }
 procedure SnapshotFile(const Full: string);
 var
   I: Integer;
@@ -5323,7 +5386,16 @@ begin
     try
       F := TFileStream.Create(Full, fmOpenRead or fmShareDenyNone);
       try
-        if F.Size > MaxReadBytes then Exit;   { too big to hold; not rewindable }
+        if F.Size > MaxReadBytes then
+        begin
+          { Too big to hold; not rewindable - and now said so out loud.  The
+            note goes HERE and at no other Exit in this procedure: the
+            except path below is a file that could not be read at all, which
+            is a different fact, and reporting it as oversized would tell a
+            user a locked 2 KB file was over the cap. }
+          NoteOversize(Full);
+          Exit;
+        end;
         SetLength(S.Text, F.Size);
         if F.Size > 0 then F.ReadBuffer(S.Text[1], F.Size);
       finally

@@ -5307,10 +5307,16 @@ function SetEnvVar(Name, Value: PChar): LongBool; stdcall;
 
 var
   GhCalls: Integer = 0;
-  GhUrls: array[0..7] of string;
-  GhHdrs: array[0..7] of string;
-  GhBodies: array[0..7] of string;
-  GhStatus: array[0..7] of Integer;
+  { Sixteen rather than eight: the page-cap test spends one request on the
+    pull request itself and three on each of the three lists, which is ten,
+    and a fixture array that silently stops recording is a test that passes
+    for the wrong reason. }
+  GhUrls: array[0..15] of string;
+  GhHdrs: array[0..15] of string;
+  GhBodies: array[0..15] of string;
+  GhStatus: array[0..15] of Integer;
+  { The Link response header the fake returns for each call, '' for none. }
+  GhLinks: array[0..15] of string;
   GhMaxSeen: Integer = 0;
   GhRetryMs: Integer = 0;
   GhTimeoutSeen: Integer = -1;
@@ -5342,6 +5348,8 @@ begin
   Result.Error := '';
   if not Result.Ok then Result.Error := Format('HTTP %d', [Result.Status]);
   Result.RetryAfterMs := GhRetryMs;
+  Result.Link := '';
+  if GhCalls <= High(GhLinks) then Result.Link := GhLinks[GhCalls];
   Inc(GhCalls);
 end;
 
@@ -5366,6 +5374,10 @@ begin
     GhHdrs[I] := '';
     GhBodies[I] := '[]';
     GhStatus[I] := 0;
+    { Module state this suite touches, cleared here: a Link left over from a
+      pagination test would make the next suite follow a page it never asked
+      for. }
+    GhLinks[I] := '';
   end;
   GhBodies[0] := '{"title":"t","state":"open","user":{"login":"o"},' +
     '"head":{"ref":"b"}}';
@@ -5763,7 +5775,14 @@ begin
     Check(Items[0].Truncated, 'the oversized body is marked truncated');
     Check(IsValidUtf8(Items[1].Body),
       'and a cut inside a multi-byte character still leaves valid UTF-8');
-    Check(Info.Notice <> '', 'a full page is reported as possibly incomplete');
+    { An OVER-full page - 300 items where per_page=100 was asked for - which
+      is what this fixture sends and what the flat "not all were read" sentence
+      is for.  A merely full page is the ambiguous case and gets the weaker
+      sentence; TestGhLinkPagination covers that one, and the two must not be
+      described in each other's words. }
+    Check(Pos('were read:', Info.Notice) > 0,
+      'a page bigger than the per-page cap is reported as cut, not as ' +
+      'possibly cut: ' + Info.Notice);
     Check(Pos('100', Info.Notice) > 0, 'naming the number: ' + Info.Notice);
 
     Prompt := GhCommentsPrompt(R, Info, Items);
@@ -5804,6 +5823,268 @@ begin
         Check(Pos(Lines[I], Prompt) > 0,
           'every printed line is in the payload');
   finally
+    uHttp.HttpGetTransport := nil;
+    GitHubAllowed := False;
+  end;
+end;
+
+{ Link-header pagination: the pure parser, the pure validator, and five paths
+  through the transport seam.  The validator is the load-bearing half - a next
+  URL is a URL a server chose, and the compiled-in host is only an invariant
+  while nothing on the wire can move it. }
+procedure TestGhLinkPagination;
+const
+  P1 = 'https://api.github.com/repos/o/r/pulls/1/comments?per_page=100';
+  P2 = 'https://api.github.com/repos/o/r/pulls/1/comments?per_page=100&page=2';
+  P3 = 'https://api.github.com/repos/o/r/pulls/1/comments?per_page=100&page=3';
+  P4 = 'https://api.github.com/repos/o/r/pulls/1/comments?per_page=100&page=4';
+var
+  R: TGhRepo;
+  A: TGhAuth;
+  Info: TGhPrInfo;
+  Items: TGhCommentArray;
+  E: TGhError;
+  Big, Page: string;
+  I: Integer;
+
+  function Rel(const Url: string): string;
+  begin
+    Result := '<' + Url + '>; rel="next"';
+  end;
+
+  { A list body of N items whose bodies are n1..nN, so order across pages is
+    observable rather than merely counted. }
+  function Items100(First, Count: Integer): string;
+  var
+    K: Integer;
+  begin
+    Result := '[';
+    for K := First to First + Count - 1 do
+    begin
+      if K > First then Result := Result + ',';
+      Result := Result + '{"user":{"login":"a"},"body":"n' + IntToStr(K) + '"}';
+    end;
+    Result := Result + ']';
+  end;
+
+begin
+  { ---- the pure parser ---- }
+  Check(GhLinkNext(Rel(P2)) = P2, 'rel="next" is read out of a Link header');
+  Check(GhLinkNext('<' + P1 + '>; rel="prev", ' + Rel(P2)) = P2,
+    'and found when it is not the first entry');
+  Check(GhLinkNext('<' + P2 + '>; REL="NEXT"') = P2,
+    'rel is matched however it is cased');
+  Check(GhLinkNext('<' + P2 + '>; rel=next') = P2, 'and unquoted');
+  Check(GhLinkNext('<' + P1 + '>; rel="last"') = '',
+    'a Link with no next yields nothing');
+  Check(GhLinkNext('') = '', 'and an empty header');
+  Check(GhLinkNext('<' + P2 + '>; rel="nextpage"') = '',
+    'and rel="nextpage" is not rel="next"');
+  { A comma is legal inside a query, so splitting the header on commas first
+    would cut this entry into two halves neither of which is the URL. }
+  Check(GhLinkNext('<https://api.github.com/x?a=1,2&page=2>; rel="next"') =
+    'https://api.github.com/x?a=1,2&page=2',
+    'a comma inside the angle brackets does not split the entry');
+  Big := '<https://api.github.com/x?q=' + StringOfChar('z', 5000) +
+    '>; rel="next"';
+  Check(GhLinkNext(Big) = '',
+    'a Link header past the transport cap is refused whole, not cut');
+  Check(GhLinkNext(Rel('https://api.github.com/x?q=' +
+    StringOfChar('z', 600))) = '',
+    'and a next URL past 512 bytes is refused');
+
+  { ---- the pure validator ---- }
+  Check(GhNextUrlOk(P1, P2), 'the same path with a different query is followable');
+  Check(not GhNextUrlOk(P1,
+    'https://evil.com/repos/o/r/pulls/1/comments?page=2'),
+    'a Link to another host is refused');
+  Check(not GhNextUrlOk(P1,
+    'https://api.github.com.evil.net/repos/o/r/pulls/1/comments?page=2'),
+    'and a suffixed lookalike host');
+  Check(not GhNextUrlOk(P1,
+    'http://api.github.com/repos/o/r/pulls/1/comments?page=2'),
+    'and a downgrade to http');
+  Check(not GhNextUrlOk(P1,
+    'https://u:p@api.github.com/repos/o/r/pulls/1/comments?page=2'),
+    'and a credential in the URL');
+  { The one test that kills both: SplitUrlEx would read this as a port and
+    hand back api.github.com, which is why this unit splits its own. }
+  Check(not GhNextUrlOk(P1,
+    'https://api.github.com@evil.com/repos/o/r/pulls/1/comments?page=2'),
+    'and a userinfo hiding the real host');
+  Check(not GhNextUrlOk(P1,
+    'https://api.github.com:443/repos/o/r/pulls/1/comments?page=2'),
+    'and a port on the compiled-in host');
+  Check(not GhNextUrlOk(P1, 'https://api.github.com/user/emails?page=2'),
+    'and a next link that changes the endpoint');
+  Check(not GhNextUrlOk(P1,
+    'https://api.github.com/repos/o/r/pulls/1/comments/../../../../user/emails'),
+    'and one walking out of the path with ..');
+  Check(not GhNextUrlOk(P1, P2 + #13#10 + 'x-evil: 1'),
+    'and one carrying CRLF');
+  Check(not GhNextUrlOk(P1, ''), 'and an empty next URL');
+
+  { ---- through the seam ---- }
+  GhReset;
+  uHttp.HttpGetTransport := @GhFakeGet;
+  GitHubAllowed := True;
+  SetEnvVar('GH_TOKEN', 'ghp_thetokenvalue');
+  try
+    GhParseRemote('https://github.com/o/r', R);
+    GhResolveToken(A);
+
+    { One followed link: five GETs, not four, and the second page comes from
+      the URL the Link named rather than one this program guessed. }
+    GhBodies[1] := '[{"user":{"login":"a"},"body":"p1"}]';
+    GhLinks[1] := Rel(P2);
+    GhBodies[2] := '[{"user":{"login":"a"},"body":"p2"}]';
+    Check(GhFetchPrComments(R, 1, A, Info, Items, E),
+      'a rel="next" is followed, making five GETs and not four');
+    Check(GhCalls = 5, 'five requests: ' + IntToStr(GhCalls));
+    Check(GhUrls[2] = P2,
+      'and the second page is fetched from the URL the Link named: ' +
+      GhUrls[2]);
+    Check((Length(Items) = 2) and (Items[0].Body = 'p1') and
+      (Items[1].Body = 'p2'), 'items from both pages are kept in order');
+    Check(Info.Notice = '',
+      'and a list that ended is not reported as truncated: ' + Info.Notice);
+
+    { A Link naming another host.  This is the attack the compiled-in constant
+      cannot stop by itself, because nothing in a settings file was involved. }
+    GhReset;
+    GhBodies[1] := '[{"user":{"login":"a"},"body":"p1"}]';
+    GhLinks[1] := Rel('https://evil.com/repos/o/r/pulls/1/comments?page=2');
+    Check(GhFetchPrComments(R, 1, A, Info, Items, E),
+      'a cross-host Link is not followed');
+    Check(GhCalls = 4, 'so there are still four requests: ' + IntToStr(GhCalls));
+    for I := 0 to 3 do
+      Check(Copy(GhUrls[I], 1, 23) = 'https://api.github.com/',
+        'every request stayed on the compiled-in host: ' + GhUrls[I]);
+    for I := 0 to 3 do
+      Check(Pos('evil.com', GhUrls[I]) = 0,
+        'the token never goes to the host a Link named');
+    Check(Pos('A page link was refused', Info.Notice) > 0,
+      'and the refusal is named in the notice: ' + Info.Notice);
+    Check(Pos(GhApiBase, Info.Notice) > 0,
+      'which quotes the rule and names the only host a link may point at');
+
+    { The same sentence for a refusal that is not a cross-host one, and that
+      sameness is the point.  Eight different things make GhNextUrlOk say no
+      and only one of them is another host; a link to a different endpoint on
+      api.github.com itself is refused for the path rule.  Telling that user a
+      server had tried to redirect them off the host would be a lie on the one
+      line whose whole job is to report that something attacked them. }
+    GhReset;
+    GhBodies[1] := '[{"user":{"login":"a"},"body":"p1"}]';
+    GhLinks[1] := Rel('https://api.github.com/user/emails?per_page=100');
+    Check(GhFetchPrComments(R, 1, A, Info, Items, E),
+      'a same-host link to another endpoint is refused as well');
+    Check(GhCalls = 4, 'costing no extra request: ' + IntToStr(GhCalls));
+    Check(Pos('A page link was refused', Info.Notice) > 0,
+      'and gets the same sentence, which claims no attack it cannot see: ' +
+      Info.Notice);
+
+    { The page cap.  Every page offers another, for all three lists: one GET
+      for the pull request and three for each list is ten. }
+    GhReset;
+    for I := 1 to 9 do
+      GhBodies[I] := '[{"user":{"login":"a"},"body":"x"}]';
+    GhLinks[1] := Rel(P2);
+    GhLinks[2] := Rel(P3);
+    GhLinks[3] := Rel(P4);
+    GhLinks[4] := Rel('https://api.github.com/repos/o/r/pulls/1/reviews' +
+      '?per_page=100&page=2');
+    GhLinks[5] := Rel('https://api.github.com/repos/o/r/pulls/1/reviews' +
+      '?per_page=100&page=3');
+    GhLinks[6] := Rel('https://api.github.com/repos/o/r/pulls/1/reviews' +
+      '?per_page=100&page=4');
+    GhLinks[7] := Rel('https://api.github.com/repos/o/r/issues/1/comments' +
+      '?per_page=100&page=2');
+    GhLinks[8] := Rel('https://api.github.com/repos/o/r/issues/1/comments' +
+      '?per_page=100&page=3');
+    GhLinks[9] := Rel('https://api.github.com/repos/o/r/issues/1/comments' +
+      '?per_page=100&page=4');
+    Check(GhFetchPrComments(R, 1, A, Info, Items, E),
+      'the page cap stops each list at three pages');
+    Check(GhCalls = 1 + 3 * GhMaxPages,
+      'ten requests and no more: ' + IntToStr(GhCalls));
+    Check(Pos('pages of 100', Info.Notice) > 0,
+      'and the notice says which lists pasclaude''s own cap truncated: ' +
+      Info.Notice);
+    Check((Pos('inline review comments', Info.Notice) > 0) and
+      (Pos('reviews', Info.Notice) > 0) and
+      (Pos('conversation comments', Info.Notice) > 0),
+      'naming all three');
+
+    { The total item cap.  With GhMaxPages * GhMaxItems equal to it exactly,
+      the arithmetic is what holds the bound rather than a branch - which is
+      the property worth asserting: three full pages is 300 and not 301. }
+    GhReset;
+    Page := Items100(1, 100);
+    GhBodies[1] := Page;
+    GhBodies[2] := Items100(101, 100);
+    GhBodies[3] := Items100(201, 100);
+    GhLinks[1] := Rel(P2);
+    GhLinks[2] := Rel(P3);
+    GhLinks[3] := Rel(P4);
+    Check(GhFetchPrComments(R, 1, A, Info, Items, E),
+      'the total item cap holds across pages');
+    Check(Length(Items) = GhMaxTotalItems,
+      'exactly 300 items: ' + IntToStr(Length(Items)));
+    { Every page here offers a fourth, so the count of REQUESTS is what shows
+      the caps stopped the following rather than the fixture running out:
+      one for the pull request, GhMaxPages for the comments, and one each for
+      the two empty lists.  Asserting Length(Items) <= 300 on the line after
+      asserting it = 300 tested nothing at all. }
+    Check(GhCalls = 1 + GhMaxPages + 2,
+      'and the fourth page each of them offered was never asked for: ' +
+      IntToStr(GhCalls));
+    Check((Items[0].Body = 'n1') and (Items[299].Body = 'n300'),
+      'in page order across all three');
+
+    { A link back at the page it came from.  The page cap would absorb it, but
+      it is named so the notice can be honest about a list that was cut by a
+      cycle rather than by length. }
+    GhReset;
+    GhBodies[1] := '[{"user":{"login":"a"},"body":"p1"}]';
+    GhLinks[1] := Rel(P1);
+    Check(GhFetchPrComments(R, 1, A, Info, Items, E),
+      'a Link pointing back at the page it came from is not followed');
+    Check(GhCalls = 4, 'and costs no extra request: ' + IntToStr(GhCalls));
+    Check(Length(Items) = 1, 'and the page is not read twice');
+    Check(Info.Notice <> '', 'and the list is reported as cut');
+
+    { The case the old count-based guess used to catch, and the reason it is
+      not simply gone: a FULL page with no Link at all.  GitHub sends no Link
+      when a list fits on one page - so this may be a complete hundred - and a
+      Link that was dropped, over uHttp's cap or through a query that failed,
+      looks identical from here.  Reporting nothing would hand a user 100 of
+      250 comments with no sign anything was missing, which is exactly what
+      the notice existed to prevent before pagination was written. }
+    GhReset;
+    GhBodies[1] := Items100(1, GhMaxItems);
+    Check(GhFetchPrComments(R, 1, A, Info, Items, E),
+      'a full page with no rel="next" is read');
+    Check(GhCalls = 4, 'and no next page is guessed at: ' + IntToStr(GhCalls));
+    Check(Length(Items) = GhMaxItems,
+      'the whole page is kept: ' + IntToStr(Length(Items)));
+    Check(Pos('may not be all of them', Info.Notice) > 0,
+      'and the list is reported as possibly incomplete rather than silently ' +
+      'truncated: ' + Info.Notice);
+    Check(Pos('were read:', Info.Notice) = 0,
+      'in the weaker sentence, since no cap of ours actually fired');
+
+    { And the short page beside it, so the weaker sentence is not simply
+      always on: one item short of the page size, with no Link, is a list that
+      ended and the notice stays silent about it. }
+    GhReset;
+    GhBodies[1] := Items100(1, GhMaxItems - 1);
+    Check(GhFetchPrComments(R, 1, A, Info, Items, E),
+      'a last page one item short of the page size is read');
+    Check(Info.Notice = '',
+      'and a list that could not have had more says nothing: ' + Info.Notice);
+  finally
+    SetEnvVar('GH_TOKEN', nil);
     uHttp.HttpGetTransport := nil;
     GitHubAllowed := False;
   end;
@@ -6291,6 +6572,7 @@ begin
   TestGhDisabledAndBadToken;
   TestGhErrorClassification;
   TestGhCapsAndEnvelope;
+  TestGhLinkPagination;
   TestCiEventParse;
   TestCiAuthorize;
   TestCiForkRefused;

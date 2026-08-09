@@ -1228,10 +1228,44 @@ begin
     'ide' + PathDelim;
 end;
 
-{ Files older than a day, on the way in.  Sweeping at exit was the other
-  option and it is worse: several exit paths go through Halt, which skips
+const
+  IdeScratchMaxAgeDays = 1.0;
+
+{ Files older than IdeScratchMaxAgeDays, on the way in - and that is now ALL
+  this sweep does.  The ordinary lifetime of a "before" side belongs to
+  uIde.IdeHoldScratch and uIde.IdeDropScratch: the next /ide diff deletes the
+  last one, a refused or failed launch deletes it at once, and the session's
+  end deletes it through uIde's finalization.  So the only file this ever
+  meets is one orphaned by a stop that ran no finalization at all -
+  Ctrl+Break, a console window closed with its X, Task Manager.
+
+  BE PRECISE ABOUT WHAT THAT BUYS, because the obvious sentence is wrong.
+  This has exactly one call site, a few lines below, inside the /ide diff
+  path.  It is not a startup sweep and it must not be read as one: a user
+  whose session was killed with a diff tab open, and who never types /ide
+  diff again, is never swept at all and that file stays until something else
+  deletes it.  Making it a startup sweep was considered and refused - the
+  startup path is deliberately free of mutations under --status, --doctor and
+  the two --ci verbs, and a command whose name promises diagnosis must not
+  delete files merely by being run, which is the same rule BackupSession is
+  already skipped for.  So the bound this sweep offers is "the next time you
+  ask for a diff", and the day-old test is what keeps that from deleting
+  something live.
+
+  Sweeping at exit was the option that was rejected here, and the reasoning
+  stands where it was aimed: several exit paths go through Halt, which skips
   finally, and one of them is the Ctrl+C path where the user is already
-  waiting. }
+  waiting.  Halt does run unit finalization, which is why the lifetime moved
+  there rather than into a finally - see the comment at the foot of uIde.
+
+  A day, still, and NOT the hour that looks tighter now that this is only a
+  backstop.  The sweep cannot tell one session's leftovers from another's:
+  a second pasclaude in another terminal keeps its live baseline in this same
+  directory, and an hour is well inside the time a diff tab stays open, so a
+  short bound would start deleting a file another session's editor is still
+  reading.  Nothing is gained by shortening it either - the file this sweep
+  finds is one no exit path got to, and there is no bound at which that stops
+  being true. }
 procedure IdeSweepScratch(const Dir: string);
 var
   R: TSearchRec;
@@ -1240,7 +1274,7 @@ begin
   try
     repeat
       if (R.Attr and faDirectory) <> 0 then Continue;
-      if FileDateToDateTime(R.Time) < Now - 1.0 then
+      if FileDateToDateTime(R.Time) < Now - IdeScratchMaxAgeDays then
         SysUtils.DeleteFile(Dir + R.Name);
     until FindNext(R) <> 0;
   finally
@@ -1264,6 +1298,23 @@ begin
       Result := Result + '_';
   if Result = '' then Result := 'baseline';
   Result := 'base-' + Copy(Result, 1, 64);
+end;
+
+{ The scratch file this call just wrote, when this call is not going to launch
+  anything after all.  It is a plain delete and NOT uIde.IdeDropScratch, which
+  is the whole reason it exists: IdeDropScratch deletes whatever is HELD, and
+  what is held at this point is the previous /ide diff's baseline, whose tab
+  may still be open on screen.  A user who answers "n" is refusing this diff,
+  not asking for the last one to be taken away.
+
+  The one path that must not delete: Tmp IS the held file, because the same
+  file was diffed twice.  The bytes were just rewritten identical, the earlier
+  tab is reading that path, and there is nothing to clean up - the hold
+  already covers it. }
+procedure IdeDiscardScratch(const Tmp: string);
+begin
+  if CompareText(Tmp, uIde.IdeHeldScratch) = 0 then Exit;
+  SysUtils.DeleteFile(Tmp);
 end;
 
 { The whole gate for this feature, and it is here rather than in uTools
@@ -1434,10 +1485,23 @@ begin
   end;
   if not uTools.SessionBaseline(Full, Text, Existed) then
   begin
-    EmitCLn(clGrey, '  no baseline for ' + Rest + ': this session has not ' +
-      'written it,');
-    EmitCLn(clGrey, '    or it was too large to hold when it was first ' +
-      'touched - the same limit /rewind reports');
+    { Two different facts, and they used to be printed as one sentence with
+      an "or" in the middle, which is the shape of a message that does not
+      know.  uTools records the oversize skip where it happens, so the case
+      that used to be a silent shrug now names itself and names the number -
+      and the number comes from the constant /rewind quotes rather than from
+      a second copy of "400 KB" typed into prose here. }
+    if uTools.SnapshotSkippedOversize(Full) then
+    begin
+      EmitCLn(clYellow, '  no baseline for ' + Rest + ': it was over ' +
+        IntToStr(uTools.SnapshotLimitBytes div 1024) +
+        ' KB when this session first touched it,');
+      EmitCLn(clYellow, '    so nothing was held to diff against - the same ' +
+        'limit, and the same reason, that stops /rewind restoring it');
+    end
+    else
+      EmitCLn(clGrey, '  no baseline for ' + Rest +
+        ': this session has not written it');
     Exit;
   end;
   if not FileExists(Full) then
@@ -1476,6 +1540,22 @@ begin
   except
     on E: Exception do
     begin
+      { fmCreate truncated the file before WriteBuffer failed, so there is
+        something on disk here even though nothing succeeded - and on this
+        path nothing else in the program knows about it.  The hold below is
+        never reached, and both the shutdown finally and uIde's finalization
+        only ever delete what was HELD, so a partial copy of project text
+        would sit in %LOCALAPPDATA% as exactly the orphan this lifetime was
+        rewritten to stop existing.  It is deleted here, at the only point
+        that still has the path.
+
+        Through uIde when it happens to BE the held file - the same file
+        diffed twice - because those bytes are gone whatever happens next and
+        a held path pointing at a ruined file is worse than none. }
+      if CompareText(Tmp, uIde.IdeHeldScratch) = 0 then
+        uIde.IdeDropScratch
+      else
+        SysUtils.DeleteFile(Tmp);
       EmitCLn(clYellow, '  could not write the "before" side: ' + E.Message);
       Exit;
     end;
@@ -1483,18 +1563,46 @@ begin
 
   if not uIde.IdeDiffLine(Host, Cli, Tmp, Full, Line, Err) then
   begin
+    IdeDiscardScratch(Tmp);
     EmitCLn(clYellow, '  ' + Err);
     Exit;
   end;
   if IdeConfirmAndLaunch(Line) then
   begin
+    { Handed over only once something has been launched, and the ordering is
+      the correction: holding it before the prompt meant that answering "n"
+      deleted the PREVIOUS baseline - IdeHoldScratch drops what it was
+      holding - and killed the left-hand pane of a diff tab still open on
+      screen, on the strength of a command the user had just refused.  The
+      hold is here instead, so the file that dies is only ever replaced by
+      one an editor has actually been pointed at.
+
+      LATE ENOUGH: nothing deletes this one until either the NEXT launched
+      /ide diff or the end of the session, and both of those are on the far
+      side of the user typing something.  The editor reads the left-hand pane
+      while IdeLaunch is still inside its wait - up to IdeLaunchWaitMs on the
+      shim - and then has however long the human takes to read a diff and type
+      again.  The one real race is a user who runs /ide diff and types /exit
+      inside the same second, before the editor has opened the file; the shim
+      returns when the running instance has been SIGNALLED, not when it has
+      read anything, so that window is small but not zero, and the failure is
+      a diff tab whose left pane says the file is gone.  That is a smaller
+      harm, knowingly taken, than project text sitting in %LOCALAPPDATA%
+      until tomorrow.
+
+      EARLY ENOUGH: the file no longer outlives the session at all, and a long
+      session accumulates nothing, because holding this one deletes the one
+      before it. }
+    uIde.IdeHoldScratch(Tmp);
     if Existed then
       EmitCLn(clGrey, '  ' + Rest +
         ': before this session on the left, now on the right')
     else
       EmitCLn(clGrey, '  ' + Rest +
         ': created this session, so the left pane is empty');
-  end;
+  end
+  else
+    IdeDiscardScratch(Tmp);
 end;
 
 { Background commands were started on the user's behalf, by a model, without
@@ -2409,7 +2517,13 @@ begin
       [rfReplaceAll]) + #10);
   EmitCLn(clGrey, Format('  rewound: %d messages in the transcript, %d files restored',
     [Agent.MessageCount, Restored]));
-  EmitCLn(clYellow, '  shell commands are not undone, and files over 400 KB were not snapshotted');
+  { The number comes from the constant, not from a typed '400 KB'.  /ide diff
+    quotes the same cap when it explains a missing baseline, and two copies of
+    a number in prose is exactly the pair that drifts apart the day the
+    constant moves. }
+  EmitCLn(clYellow, '  shell commands are not undone, and files over ' +
+    IntToStr(uTools.SnapshotLimitBytes div 1024) +
+    ' KB were not snapshotted');
 
   { The checkpoints past the target are gone with the turns they marked. }
   SetLength(CheckTurns, Pick - 1);
@@ -5228,6 +5342,56 @@ begin
     HookSystemExtra := '';
     uSdk.SdkSystemExtra := @SdkExtra;
     uHooks.HooksAllowed := (not PrintMode) and (DiagMode = dmNone);
+    { The same shape as the line above it and a DIFFERENT condition, and the
+      difference is the feature rather than an oversight.  Hooks lose every
+      unattended mode because a hook executes a command with nobody to answer
+      for it.  The project's instruction files lose only the two --ci verbs,
+      because binding a project's CLAUDE.md under -p and in the REPL is a
+      promise README makes to every scripted user, and prose that still has to
+      talk a gated tool past its own prompt is not a command.
+
+      --ci report is the verb that reaches a checkout: it runs after
+      actions/checkout, with the current directory set to the pull request
+      head, so AGENTS.md, CLAUDE.md and .pasclaude.md - and everything they
+      @import - would be read out of the branch under review and assembled
+      into this process's system prompt.  No deny rule could have caught it:
+      uTools' path: rules are consulted for the model's tool calls and this
+      loader is not one.  --ci prepare is gated for symmetry; it runs BEFORE
+      the checkout in an empty workspace, so in the template it has no files
+      to skip and the notice below never fires for it.
+
+      WHAT THIS DOES NOT DO, said here rather than left to be discovered.
+      Neither --ci verb sends anything to a model: RunCi ends in Halt on every
+      path, and the prompt built a few lines below is thrown away under both.
+      So this gate stops a branch's instructions being READ and assembled - it
+      is not what kept them out of the answer, because the answer was not
+      produced here.  In the mention template it comes from the step before,
+      an ordinary -p in the same checked-out head, where the gate is
+      deliberately open: a project's CLAUDE.md binding under -p is a promise
+      README makes to every scripted user.  That residual is real, it is
+      recorded in FEATURES-NOT-YET.md, and the notice below is worded so that
+      nobody reading a build log can mistake this line for a statement about
+      the answer above it.
+
+      The notice is unconditional rather than suppressed for machine output
+      because --ci refuses --output-format at the argument parser, so this
+      stdout is a build log by construction and cannot land in front of a
+      driver's parser.
+
+      MemoryFileCount is deliberately left alone: it feeds the REPL status
+      line and --doctor, and neither is reachable under these two verbs -
+      RunCi halts before FillDiagFacts - so what it counts is still what that
+      caller wants to know. }
+    uSdk.SdkProjectContextAllowed :=
+      not (DiagMode in [dmCiPrepare, dmCiReport]);
+    if (not uSdk.SdkProjectContextAllowed) and
+       (uSdk.SdkProjectContextFiles <> '') then
+    begin
+      EmitCLn(clGrey, '  ci: ' + uSdk.SdkProjectContextFiles +
+        ' in this directory were not read by this --ci step');
+      EmitCLn(clGrey, '    it asks no model anything; a -p step in the same ' +
+        'checkout loads them as usual');
+    end;
     if uHooks.HooksAllowed then
     begin
       uHooks.OnHookNotice := @HookNotice;
@@ -5971,6 +6135,12 @@ begin
       launched it is a process the user did not start by hand and cannot name.
       uMcp's finalization repeats this for the paths that skip a finally. }
     uMcp.McpShutdownAll;
+    { And the same shape for the one file this program leaves outside the
+      project: the "before" side of the last /ide diff holds project text, so
+      it goes with the session that asked for it rather than waiting a day
+      for a sweep.  uIde's finalization repeats this for the paths that skip
+      a finally, which is most of the ones that matter here. }
+    uIde.IdeDropScratch;
     { The cached low-integrity token is a process handle like any other, and
       the cached environment block is a string; neither should outlive the
       program.  After the two kills above, because a job object closing is

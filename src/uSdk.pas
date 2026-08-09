@@ -80,11 +80,54 @@ var
   SdkSource: TLineSource = nil;
   SdkSystemExtra: TSystemExtraProc = nil;
 
+  { Whether the tree the session is pointed at may write part of the system
+    prompt.  False by default, and the default is the whole point: a host that
+    forgets to set it loses a project's instructions, which is a visible
+    disappointment, where a host that forgets to clear it would ship the hole
+    this flag exists to close.  Same one-byte shape as uHooks.HooksAllowed and
+    uGitHub.GitHubAllowed, deliberately, because a third spelling of the same
+    idea is a third thing to check when somebody audits the unattended path.
+
+    What it is for: under --ci report the working directory is a checkout of
+    the PULL REQUEST HEAD - actions/checkout runs before the step - so
+    AGENTS.md, CLAUDE.md, .pasclaude.md and everything they @import were being
+    read out of a branch and assembled into a system prompt, which is the most
+    trusted position in a request, bounded only by their author having push
+    access.  The CI deny floor cannot reach it: uTools' rules govern the
+    model's TOOL CALLS, and this loader is not a tool call, so no path: rule
+    was ever consulted for these three files.
+
+    Be exact about the size of that, because the obvious reading is too
+    generous.  Neither --ci verb runs a turn - RunCi ends in Halt on every
+    path - so the prompt those two build is discarded, and what the flag stops
+    there is the READ and the assembly rather than a delivery to a model.
+    Worth stopping anyway, since the cheapest place to lose a hostile file is
+    before it is in a string, but the paragraph below is the one that says
+    what is still open.
+
+    Why the condition is NOT `not PrintMode`, which is what hooks use.  A hook
+    executes a command; an instruction file is prose that still has to talk a
+    gated tool past its own prompt.  And a project's CLAUDE.md binding under
+    -p is a promise README makes to every scripted user, so the host narrows
+    this to the two --ci verbs only.  The honest cost of that: the mention
+    template's answering step IS an ordinary -p in the checked-out head, so
+    the branch's CLAUDE.md still reaches THAT run's prompt.  This narrows the
+    surface rather than closing it, and the remainder is written down in
+    FEATURES-NOT-YET.md rather than papered over here. }
+  SdkProjectContextAllowed: Boolean = False;
+
 { ---- system prompt assembly, lifted verbatim from pasclaude.lpr ---- }
 function SdkGitContext: string;
 function SdkExpandImports(const Text: string): string;
 function SdkUserContext: string;
 function SdkProjectContext: string;
+{ The instruction files present in the session root right now, in load order,
+  comma separated, '' when there are none.  It exists so a host that has just
+  suppressed them can NAME what it ignored without keeping a second copy of
+  the list beside the loader's: a notice that says CLAUDE.md when the file the
+  loader would have opened is .pasclaude.md is a different claim, and the kind
+  that is only found once somebody trusts it. }
+function SdkProjectContextFiles: string;
 function SdkSystemPrompt: string;
 { The single call site the host uses.  The extra text sits between the
   guidelines and the project's own instructions, because it is session
@@ -374,36 +417,78 @@ begin
   end;
 end;
 
+const
+  { One list, two readers: the loader below and the name it gives a host that
+    suppressed it.  A local array here and a literal over there would drift,
+    and a notice naming different files from the suppression is not a smaller
+    bug than the suppression being wrong - it is a claim about what was kept
+    out, made by something that was not looking at the same list. }
+  SdkContextNames: array[0..2] of string =
+    ('AGENTS.md', 'CLAUDE.md', '.pasclaude.md');
+
 { Project instructions, if the repository ships any.  This is how a project
   tells the agent about its own conventions.  The user-level memory loads
   first so the project's own files can override it - nearer wins. }
 function SdkProjectContext: string;
 var
-  Names: array[0..2] of string = ('AGENTS.md', 'CLAUDE.md', '.pasclaude.md');
   I: Integer;
   Path: string;
   L: TStringList;
 begin
   Result := SdkUserContext;
-  for I := 0 to High(Names) do
-  begin
-    Path := IncludeTrailingPathDelimiter(uTools.RootDir) + Names[I];
-    if not FileExists(Path) then Continue;
-    L := TStringList.Create;
-    try
+  { SdkProjectContextAllowed is re-read HERE, where the files are actually
+    opened, and not at the call site.  Two reasons, and the second is the one
+    that matters.  SdkFullSystem is not the only way in - TSdkSession.Create
+    builds a prompt of its own - so a check at one call site leaves the other
+    ungated.  And uHooks.HooksEnabled re-reads HooksAllowed for exactly this
+    reason: clearing the byte has to turn the feature off everywhere at once,
+    including in whatever calls somebody adds next year.
+    Gating the loop also covers @import for free: a suppressed run never opens
+    the importing file, so SdkExpandImports is never reached and no imported
+    path is resolved against the checkout either. }
+  if SdkProjectContextAllowed then
+    for I := 0 to High(SdkContextNames) do
+    begin
+      Path := IncludeTrailingPathDelimiter(uTools.RootDir) + SdkContextNames[I];
+      if not FileExists(Path) then Continue;
+      L := TStringList.Create;
       try
-        L.LoadFromFile(Path);
-        Result := Result + #10#10 + '--- ' + Names[I] + ' ---' + #10 +
-          SdkExpandImports(L.Text);
-      except
-        { An unreadable context file is not worth failing the session over. }
+        try
+          L.LoadFromFile(Path);
+          Result := Result + #10#10 + '--- ' + SdkContextNames[I] + ' ---' +
+            #10 + SdkExpandImports(L.Text);
+        except
+          { An unreadable context file is not worth failing the session over. }
+        end;
+      finally
+        L.Free;
       end;
-    finally
-      L.Free;
     end;
-  end;
+  { SdkUserContext is above the gate on purpose, so it survives a suppressed
+    run.  The gate asks WHICH TREE wrote the prompt, and
+    %USERPROFILE%\.pasclaude\CLAUDE.md is not in the checkout: the mention
+    template builds the agent from a clone in RUNNER_TEMP and checks the head
+    out afterwards, so nothing a pull request contains can write that path.
+    Suppressing it as well would be a second rule, with a second and much
+    weaker argument - "unattended runs should ignore their user" - which is
+    not the one this flag makes, and it would silently change what -p means
+    the day somebody widened the condition. }
   if Result <> '' then
     Result := #10#10 + 'Project instructions follow. Treat them as binding.' + Result;
+end;
+
+function SdkProjectContextFiles: string;
+var
+  I: Integer;
+begin
+  Result := '';
+  for I := 0 to High(SdkContextNames) do
+    if FileExists(IncludeTrailingPathDelimiter(uTools.RootDir) +
+      SdkContextNames[I]) then
+    begin
+      if Result <> '' then Result := Result + ', ';
+      Result := Result + SdkContextNames[I];
+    end;
 end;
 
 function SdkFullSystem: string;

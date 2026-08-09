@@ -131,6 +131,27 @@ function IdeOpenLine(const Host: TIdeHost; const Cli, Path: string;
   captures output. }
 function IdeLaunch(const CmdLine: string; out Err: string): Boolean;
 
+{ ---- the lifetime of the "before" side of a diff ----
+  The caller writes that file, out of the project, and then hands the path
+  here.  This unit owns it from that moment: holding a new one DELETES the
+  one held before it, so at most one baseline is ever live in a session, and
+  the session's end deletes the last.  The path is only ever a string to
+  this unit - it is composed, screened and written above, exactly as a
+  command line is. }
+
+{ Drops whatever is held and records Path.  Re-holding the same path is a
+  no-op rather than a delete-then-record, because the caller has just
+  written those bytes and deleting them would leave an editor pointed at
+  nothing. }
+procedure IdeHoldScratch(const Path: string);
+
+{ Deletes the held file, if any, and forgets it either way - see the
+  implementation for why a failed delete is not retried. }
+procedure IdeDropScratch;
+
+{ Test seam: the path currently held, '' when none is. }
+function IdeHeldScratch: string;
+
 implementation
 
 { --------------------------------------------------------- sanitisation -- }
@@ -551,5 +572,73 @@ begin
     uSandbox.SandboxLevel := Saved;
   end;
 end;
+
+{ --------------------------------------------- the scratch file's lifetime -- }
+
+var
+  { One path, not a list.  A list would only be needed if more than one
+    baseline could be live at once, and IdeHoldScratch is written precisely
+    so that it cannot be. }
+  ScratchLive: string = '';
+
+procedure IdeDropScratch;
+begin
+  if ScratchLive = '' then Exit;
+  { SysUtils. qualified for the same reason FindClose is above: the Windows
+    unit is in scope and exports a DeleteFile(LPCSTR) that shadows the RTL's
+    DeleteFile(const string).  It compiles either way here and only one of
+    them takes the string this unit is holding.
+
+    The result is not checked and the variable is cleared regardless.  A
+    delete can fail because an editor still has the file open with a
+    deny-delete share, and the two alternatives are both worse: keeping the
+    path and retrying puts a loop in front of a user who just typed /exit,
+    and keeping it without retrying means the NEXT hold deletes nothing and
+    the file is orphaned silently.  Letting it go leaves it to the day-old
+    sweep on the way into the next /ide diff, which is the case that sweep
+    now exists for - and, being a sweep that only runs there, is also why it
+    is described as a collector rather than a bound. }
+  SysUtils.DeleteFile(ScratchLive);
+  ScratchLive := '';
+end;
+
+procedure IdeHoldScratch(const Path: string);
+begin
+  { CompareText, matching the comparison the rest of this program uses for
+    two paths.  Running /ide diff twice on the same file recomputes the same
+    base-<name>, and the caller has already written the new bytes into it by
+    the time it gets here, so dropping first would delete the file the
+    editor is about to be pointed at. }
+  if CompareText(Path, ScratchLive) = 0 then Exit;
+  IdeDropScratch;
+  ScratchLive := Path;
+end;
+
+function IdeHeldScratch: string;
+begin
+  Result := ScratchLive;
+end;
+
+finalization
+  { THE POINT THE OLD OBJECTION DOES NOT REACH.  Sweeping the scratch
+    directory at exit was rejected in the host, and that reasoning is still
+    exactly right: several exit paths go through Halt, which skips finally,
+    and one of them is the Ctrl+C path where the user is already waiting.
+    Halt does NOT skip unit finalization - it runs it - which is the same
+    distinction uTools.ClearJobs and uMcp.McpShutdownAll are already built
+    on, and it is why the ordinary lifetime of the "before" side lives here
+    rather than in the host's shutdown finally.  The host calls IdeDropScratch
+    there too; this is the backstop for the paths that skip it.
+
+    What still escapes even this: Ctrl+Break, which uTerm deliberately leaves
+    at its default meaning rather than trapping, a console window closed with
+    its X, and a kill from Task Manager.  Those leave one file behind, and the
+    day-old sweep in the host is the collector for them - but only on the
+    terms that sweep actually has, which are narrower than "eventually".  It
+    runs on the way into /ide diff and nowhere else, so the file a hard stop
+    left behind waits for the next time somebody asks for a diff, not for a
+    day to pass.  A user who never runs the command again never runs the
+    sweep, and that residual is written down rather than described away. }
+  IdeDropScratch;
 
 end.

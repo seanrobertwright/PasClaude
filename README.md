@@ -102,7 +102,10 @@ that is a typo guard rather than a boundary. The boundary is that only you can
 type it, and that it lasts exactly one session.
 
 If the project contains `AGENTS.md`, `CLAUDE.md` or `.pasclaude.md`, the
-contents are appended to the system prompt as binding instructions.
+contents are appended to the system prompt as binding instructions. Not under
+`--ci prepare` or `--ci report`, where the working directory is a checkout of
+the pull request under review: those two runs load none of them and name the
+files they skipped - see **Running unattended**.
 
 ## Commands
 
@@ -280,6 +283,19 @@ no cursor, and nothing an editor prints is captured. There is no extension,
 there is no selection support, and there is no plan for either - a VS Code
 integrated terminal exports nothing naming a file, a line, a column or a
 selection, so there is no channel to read one over and none was invented.
+
+The left-hand pane is a copy of your file, written under
+`%LOCALAPPDATA%\pasclaude\ide` and never beside the file it came from, so
+nothing appears inside the project you are working in. It does not linger: the
+next launched `/ide diff` deletes the last one, so only ever one exists, a diff
+you decline or that fails to start deletes the file it just wrote, and the end
+of the session deletes whatever is still held. What survives all of that is a
+session killed outright - `Ctrl+Break`, the window's X, Task Manager - which
+runs no shutdown of any kind; that file is collected by a day-old sweep the
+*next* time you run `/ide diff`, and by nothing else, so a session you never
+run the command in again never runs the sweep. A file that was too large to
+snapshot has no "before" side at all, and `/ide diff` says so and names the
+400 KB limit rather than opening nothing.
 
 The approval prompt was left alone on purpose. Opening the proposed change in
 the editor sounds better than a diff in the terminal and is worse in practice:
@@ -1379,7 +1395,10 @@ system prompt. The system prompt is fixed when the agent is constructed and has
 no setter, so a catalogue there could never change during a session; the tool
 schema is rebuilt fresh on every request, and both sit inside the same single
 `cache_control` breakpoint, so the token cost is byte-identical and a skill
-dropped in after `/skills` is live on the next turn. `/skills` prints the
+dropped in after `/skills` is live on the next turn. That placement is now
+load-bearing for a security argument as well as a caching one - it is why the
+`--ci` gate on the instruction files does not have to cover skills, and a ux
+check pins it. `/skills` prints the
 catalogue and doubles as the rescan, because re-reading up to thirty-two files
 per request would cost more than a stale list does.
 
@@ -1970,7 +1989,12 @@ inherits the user's refusals and none of their approvals.
 That unit is also where the system prompt now lives. It was lifted out of
 `pasclaude.lpr` verbatim, which is what makes it testable for the first time -
 specifically that user memory loads *before* the project's own instruction
-files, so nearer still wins.
+files, so nearer still wins. The facade ships with
+`SdkProjectContextAllowed` false, and `examples\embed.lpr` sets it: letting
+the tree you point a session at write part of the system prompt is a
+deliberate act, like assigning `Ask`, and an embedder that clones a
+stranger's repository into the working directory leaves the line out and gets
+the guidelines only.
 
 ## Pull requests: /review and /pr-comments
 
@@ -2000,7 +2024,8 @@ own test, and it is one requirement with the resolver below rather than two
 ideas: both, or neither ships.
 
 `/pr-comments` fetches the inline review comments, the review bodies and the
-conversation thread of one pull request in four GETs, renders them to the
+conversation thread of one pull request in four GETs, or more when a list runs
+to more than one page, renders them to the
 console, and sends the model exactly the lines it printed. With no number it
 infers the pull request from the current branch and asks for one when that is
 not exactly one match. `--show` prints and sends nothing. Consent is per
@@ -2014,10 +2039,40 @@ produced by any amount of injected text, in any mode, by any answer to any
 prompt. A read-only client cannot be talked into an action, which is a
 stronger statement than any amount of prompt hygiene and is why the hygiene is
 the second line rather than the first. The consequences are stated rather than
-worked around: no replying, no resolving, no approving, and one page of 100
-per list, because `uHttp` exposes no response headers and therefore no `Link`
-header - a full page is reported as possibly incomplete rather than silently
-truncated.
+worked around: no replying, no resolving, no approving.
+
+Pagination exists now. `uHttp` returns the `Link` response header - one header
+by name, verbatim and unparsed, dropped whole rather than cut if it is over
+4 KB, because a truncated URL is a URL that is nearly right and nearly right
+is the worst thing an untrusted URL can be - and pasclaude follows
+`rel="next"`. But a next URL is a URL a *server* chose, so it is followed only
+when it is one pasclaude would have composed itself: `https`, the host exactly
+`api.github.com` with no port and no credential in it, and the same path as
+the page just read with only the query allowed to change. A `Link` that fails
+any of that is refused, the list stops there, and the notice says so by
+quoting the rule rather than guessing which half of it fired - eight different
+things make that check say no and only one of them is another host, so a
+notice that named the host every time would be wrong on the one line whose job
+is to tell you something tried to move you. That check is not decoration:
+a configurable API host is the one knob a credential must not have, and
+without the check a `Link` header *is* that knob, operated from the wire with
+no settings file involved and nothing for the scope table to refuse.
+
+At most three pages of 100 and 300 items a list - the page cap bounds requests
+carrying the token, the item cap bounds memory, and the two multiply to each
+other on purpose so neither is a number that could never bite. A list stopped
+by either cap is still reported rather than silently truncated, and the notice
+now names *our* cap, which is a different sentence from the one it used to
+have to write. The old sentence is still there for the one case that needs it:
+a list whose last page came back exactly full with no `rel="next"` in it is
+reported as *possibly* incomplete, because a `Link` that was dropped - over
+the 4 KB cap, or through a header query that failed - looks from here exactly
+like a list that ended, and handing you 100 of 250 comments with no sign
+anything was missing is the failure this notice has always existed to prevent.
+A short last page cannot be that case and says nothing at all. The honest
+cost: a busy pull request spends up to ten GETs
+where it spent four, and unauthenticated requests get sixty an hour, so six
+runs can exhaust a limit fifteen used to.
 
 Every program pasclaude runs by name - `git`, `gh` - is resolved on `PATH`
 first. `cmd.exe` searches the current directory before `PATH`, so a repository
@@ -2146,6 +2201,32 @@ runs after the rules load and exits 2 naming every missing one. The one thing
 that floor cannot cover is a hook, because `uHooks` sits below `uTools` and no
 hook command is ever matched against a rule; hooks are therefore switched off
 structurally instead, as **Hooks** above describes.
+
+**The project's own instruction files are switched off the same way, and for
+a reason the deny floor also cannot reach.** `uSdk.SdkProjectContextAllowed`
+ships false; the host sets it true unless the mode is one of the two `--ci`
+verbs, and `SdkProjectContext` re-reads it where the files are opened rather
+than at the call site, so clearing that byte stops every caller at once -
+including `TSdkSession`, which builds a prompt of its own. It matters for the
+same reason hooks did: `--ci report` runs after `actions/checkout`, so
+`AGENTS.md`, `CLAUDE.md`, `.pasclaude.md` and everything they `@import` came
+from the pull request head and went into the system prompt, which is the most
+trusted position in the request. A `path:` deny rule is matched against the
+model's tool calls, and this loader is not one. Be exact about what that buys,
+because the flattering reading is wrong: neither `--ci` verb runs a turn, so
+what the flag stops there is the *read and the assembly* rather than a
+delivery to a model, and a `--ci` run that skipped files says so in a line
+that also says it asked no model anything - the answer in that build log came
+from the `-p` step above it, which loads them. The
+user-level memory in `%USERPROFILE%\.pasclaude\CLAUDE.md` still loads: the
+question the flag asks is which *tree* wrote the prompt, and the template
+builds the agent from a clone in `RUNNER_TEMP` before checking the head out,
+so nothing in a pull request can write that path. The narrowing is real and
+so is its limit, stated rather than hidden: the step that actually runs the
+model is an ordinary `-p` in the checked-out head, and it still loads those
+files, because `-p` losing a project's instructions would break what
+**Scripted sessions** promises. This shrinks the surface; it does not close
+it.
 
 **The two modes.** `--ci prepare --ci-in <event> --ci-out <prompt>
 [--ci-pr <pr.json>]` decides whether to answer, writes the prompt file when it

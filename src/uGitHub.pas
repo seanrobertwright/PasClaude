@@ -15,7 +15,12 @@
   is the one knob that must not be configurable, because moving the endpoint
   is how a token leaves; telemetry made its endpoint user-scope-only and this
   is stricter still, because there is no legitimate second host.  GitHub
-  Enterprise is therefore not supported, deliberately.
+  Enterprise is therefore not supported, deliberately.  A constant is only
+  half of that defence: now that pagination follows a Link header, the OTHER
+  half is GhNextUrlOk, because a Link naming another host is exactly how the
+  invariant would be defeated from the wire, with no settings file involved
+  and nothing for the scope table to refuse.  A URL a server chose is followed
+  only when it is a URL this unit would have composed itself.
 
   THE TOKEN comes from GH_TOKEN, then GITHUB_TOKEN, then `gh auth token`, and
   from nowhere else.  Nothing is stored: gh already owns GitHub credential
@@ -63,12 +68,35 @@ const
   GhApiHost = 'api.github.com';
   GhApiBase = 'https://' + GhApiHost;
 
-  { GitHub's documented per-page maximum.  uHttp exposes no response headers
-    and therefore no Link header, so there is no pagination: a list that
-    comes back full is REPORTED as possibly incomplete rather than silently
-    truncated, which is the difference between a bounded answer and a wrong
-    one. }
+  { GitHub's documented per-page maximum, and now the PER-PAGE size asked for
+    rather than the cap on a list: uHttp returns the Link header, so
+    rel="next" is followed and a list can run to more than one page.  It is
+    still enforced on what arrives, because a server that ignores per_page
+    and answers with 5000 elements must not be able to spend our memory on
+    the strength of its own honesty. }
   GhMaxItems = 100;
+  { The two caps that bound following, and they bound different things.
+
+    GhMaxPages bounds REQUESTS.  Every page is a round trip carrying the
+    token, and a Link header pointing back at the page it came from - or at
+    the page before it - would otherwise loop for as long as the server cared
+    to keep answering.  GhNextUrlOk cannot see a cycle; only a count can.
+
+    GhMaxTotalItems bounds MEMORY.  300 comment bodies at GhMaxBodyBytes is
+    about 1.2 MB held for one list before rendering, and GhMaxTotalBytes
+    means the model sees 64 KB of it however many arrived, so the extra is
+    transient - but transient is not unbounded, and this is the only thing
+    holding it.
+
+    The arithmetic is deliberate rather than decorative: GhMaxPages *
+    GhMaxItems is exactly GhMaxTotalItems, so neither cap is a number that
+    could never bite, and whichever one stops a list, the notice can name it. }
+  GhMaxPages = 3;
+  GhMaxTotalItems = 300;
+  { The same bound GhParseRemote puts on an origin remote URL, for the same
+    reason: past a few hundred bytes a URL is not a URL a real endpoint
+    spelled, and a length check is the cheapest one to get right. }
+  GhMaxNextUrlBytes = 512;
   GhMaxBodyBytes = 4096;
   GhMaxTotalBytes = 65536;
   { A truncated body fails to parse as JSON and is reported as such.  That is
@@ -153,6 +181,30 @@ function GhRefLooksSafe(const Ref: string): Boolean;
 { 'diff <ref>...HEAD' - the merge-base form, "what this branch adds" - or ''
   when the ref is refused.  Composition happens only after validation. }
 function GhReviewDiffArgs(const Ref: string): string;
+
+{ The rel="next" target out of a Link response header, or '' when there is
+  none.  EXTRACTION ONLY: this says what the server named, and says NOTHING
+  about whether it may be requested - that is GhNextUrlOk's question and the
+  two are separate functions so that neither can be read as having answered
+  the other.  Everything this returns is still untrusted text.
+
+  It reads GitHub's dialect, not RFC 5988's grammar: angle-bracketed target,
+  parameters after it, rel matched case-insensitively, quoted or bare, as a
+  whole token so rel="nextpage" is not rel="next".  First match wins. }
+function GhLinkNext(const Link: string): string;
+
+{ May the page at Next be fetched, given that Prev is the page just read?
+  Only when Next is a URL this unit would have composed itself: https, host
+  EXACTLY GhApiHost with no port and no userinfo, printable ASCII with no
+  '..', within GhMaxNextUrlBytes, and THE SAME PATH as Prev with only the
+  query allowed to differ.
+
+  That last clause is the whole point.  A Link may say "the same endpoint,
+  further along" and nothing else: it can move neither the host - which is
+  what keeps "settable at no tier" true against the wire - nor the endpoint,
+  which is what stops a Link on /pulls/7/comments walking the token over to
+  /user/emails. }
+function GhNextUrlOk(const Prev, Next: string): Boolean;
 
 { ---- discovery (runs git / gh through the exec seam) ---- }
 
@@ -446,6 +498,171 @@ begin
   Result := 'diff ' + Ref + '...HEAD';
 end;
 
+{ The parameter text of ONE Link entry - everything after that entry's '>' and
+  before the next entry's '<' - answering only "does this entry call itself
+  next".  A whole-token match: 'next' and nothing longer, so rel="nextpage"
+  and rel="next-thing" both say no.  Bare and quoted are both accepted
+  because both are legal and neither is expensive to allow. }
+function RelIsNext(const Params: string): Boolean;
+var
+  Low, Val: string;
+  I, J: Integer;
+begin
+  Result := False;
+  Low := LowerCase(Params);
+  I := 1;
+  while I <= Length(Low) - 2 do
+  begin
+    if (Copy(Low, I, 3) = 'rel') and
+       ((I = 1) or not (Low[I - 1] in ['a'..'z', '0'..'9', '-', '_'])) then
+    begin
+      J := I + 3;
+      while (J <= Length(Low)) and (Low[J] in [' ', #9]) do Inc(J);
+      { 'rel' that is not followed by '=' is some other parameter whose name
+        happens to start with those letters - 'relation', say - and the token
+        test above has already let it through, so this is the second half of
+        the same check rather than a spare one. }
+      if (J <= Length(Low)) and (Low[J] = '=') then
+      begin
+        Inc(J);
+        while (J <= Length(Low)) and (Low[J] in [' ', #9]) do Inc(J);
+        Val := '';
+        if (J <= Length(Low)) and (Low[J] = '"') then
+        begin
+          Inc(J);
+          while (J <= Length(Low)) and (Low[J] <> '"') do
+          begin
+            Val := Val + Low[J];
+            Inc(J);
+          end;
+        end
+        else
+          while (J <= Length(Low)) and
+                not (Low[J] in [' ', #9, ';', ',']) do
+          begin
+            Val := Val + Low[J];
+            Inc(J);
+          end;
+        if Val = 'next' then Exit(True);
+      end;
+      I := J;
+    end
+    else
+      Inc(I);
+  end;
+end;
+
+function GhLinkNext(const Link: string): string;
+var
+  Open, Close, Stop: Integer;
+  Target, Params: string;
+begin
+  Result := '';
+  { Defence in depth: uHttp already refuses a header past this length, but a
+    substituted transport has not, and a test seam that can hand this function
+    a megabyte is a test seam that can hand the shipped code one. }
+  if (Link = '') or (Length(Link) > uHttp.HttpMaxLinkBytes) then Exit;
+  Open := 1;
+  while Open <= Length(Link) do
+  begin
+    if Link[Open] <> '<' then
+    begin
+      Inc(Open);
+      Continue;
+    end;
+    { Angle brackets delimit the target, and the scan runs '<' to its matching
+      '>' rather than splitting the header on commas first: a comma is legal
+      inside a URL's query, and comma-splitting would cut one entry into two
+      halves neither of which is the URL the server named. }
+    Close := Open + 1;
+    while (Close <= Length(Link)) and (Link[Close] <> '>') do Inc(Close);
+    if Close > Length(Link) then Exit;
+    Target := Copy(Link, Open + 1, Close - Open - 1);
+    Stop := Close + 1;
+    while (Stop <= Length(Link)) and (Link[Stop] <> '<') do Inc(Stop);
+    Params := Copy(Link, Close + 1, Stop - Close - 1);
+    if RelIsNext(Params) then
+    begin
+      { Refused rather than cut, for the same reason uHttp drops an oversized
+        header whole: a prefix of a URL is a different URL. }
+      if Length(Target) > GhMaxNextUrlBytes then Exit('');
+      Exit(Target);
+    end;
+    Open := Stop;
+  end;
+end;
+
+{ https://<host><path> split without reusing uHttp.SplitUrlEx, and the reason
+  matters.  SplitUrlEx scans the host for a colon and treats what follows as a
+  port, so 'api.github.com:443@evil.com' comes back with Host='api.github.com'
+  - which is safe in practice only because HttpExec re-parses the same string
+  the same way and connects to the same place.  Leaning on that equivalence
+  for the single most important check in this unit would be a bet on two
+  parsers staying identical.  Here a colon or an at-sign in the host segment
+  is simply a refusal, which is both stricter and readable: an api.github.com
+  URL has neither. }
+function SplitApiUrl(const U: string; out Host, Path: string): Boolean;
+var
+  Rest: string;
+  P: Integer;
+begin
+  Host := '';
+  Path := '';
+  Result := False;
+  if Copy(LowerCase(U), 1, 8) <> 'https://' then Exit;
+  Rest := Copy(U, 9, MaxInt);
+  P := Pos('/', Rest);
+  if P = 0 then
+  begin
+    Host := Rest;
+    Path := '/';
+  end
+  else
+  begin
+    Host := Copy(Rest, 1, P - 1);
+    Path := Copy(Rest, P, MaxInt);
+  end;
+  if Host = '' then Exit;
+  if (Pos(':', Host) > 0) or (Pos('@', Host) > 0) then Exit;
+  Host := LowerCase(Host);
+  P := Pos('?', Path);
+  if P > 0 then Path := Copy(Path, 1, P - 1);
+  P := Pos('#', Path);
+  if P > 0 then Path := Copy(Path, 1, P - 1);
+  Result := True;
+end;
+
+function GhNextUrlOk(const Prev, Next: string): Boolean;
+var
+  PrevHost, PrevPath, NextHost, NextPath: string;
+  I: Integer;
+begin
+  Result := False;
+  if (Next = '') or (Length(Next) > GhMaxNextUrlBytes) then Exit;
+  if (Prev = '') or (Length(Prev) > GhMaxNextUrlBytes) then Exit;
+  for I := 1 to Length(Next) do
+    { 33..126, the GhTokenLooksUsable screen applied to a URL.  A CR or an LF
+      in here is request-line injection into the path uHttp hands straight to
+      WinHttpOpenRequest, and a space is the shape of a header that was
+      assembled wrong. }
+    if (Next[I] < #33) or (Next[I] > #126) then Exit;
+  { By name, exactly as SegmentOk refuses it: '..' is made of legal characters
+    and is how a path walks out of the endpoint it was supposed to stay in. }
+  if Pos('..', Next) > 0 then Exit;
+  if not SplitApiUrl(Prev, PrevHost, PrevPath) then Exit;
+  if not SplitApiUrl(Next, NextHost, NextPath) then Exit;
+  if (PrevHost <> GhApiHost) or (NextHost <> GhApiHost) then Exit;
+  { Same path, only the query may move.  This is stricter than GitHub's
+    contract permits - if GitHub ever answered with a next link at a
+    differently-spelled canonical path, pagination would stop here and the
+    notice would report a refusal that was not an attack.  That is the
+    direction to be wrong in, and it is deliberate: the alternative is a rule
+    that cannot say what a followable link is without describing the whole
+    API. }
+  if NextPath <> PrevPath then Exit;
+  Result := True;
+end;
+
 { ------------------------------------------------------------- discovery -- }
 
 function GhRepoFromGit(out Repo: TGhRepo): Boolean;
@@ -719,14 +936,18 @@ begin
   Result := R.Ok;
 end;
 
-{ One GET, parsed.  The caller frees J when Result is True. }
-function GhGetJson(const Url: string; const A: TGhAuth; out J: TJson;
-  out Err: TGhError): Boolean;
+{ One GET, parsed, with the Link header handed back verbatim.  The caller
+  frees J when Result is True; Link is '' on every failure path, so a caller
+  that ignores the result cannot follow a link off a response that did not
+  arrive. }
+function GhGetJsonLink(const Url: string; const A: TGhAuth; out J: TJson;
+  out Link: string; out Err: TGhError): Boolean;
 var
   R: THttpResult;
   PErr: string;
 begin
   J := nil;
+  Link := '';
   Err.Kind := gekNone;
   Err.Text := '';
   Err.RetryAfterMs := 0;
@@ -745,7 +966,21 @@ begin
     Err.Text := '';
     Exit(False);
   end;
+  Link := R.Link;
   Result := True;
+end;
+
+{ The same call for the callers that fetch exactly one object and could not
+  use a second page if they were given one - the pull request itself and the
+  branch lookup.  Kept as a separate name rather than making them all pass a
+  variable they discard: a signature that offers a next page to code with no
+  loop in it is an invitation. }
+function GhGetJson(const Url: string; const A: TGhAuth; out J: TJson;
+  out Err: TGhError): Boolean;
+var
+  Ignored: string;
+begin
+  Result := GhGetJsonLink(Url, A, J, Ignored, Err);
 end;
 
 { ---------------------------------------------------------------- bodies -- }
@@ -857,9 +1092,11 @@ var
   Base, N: string;
   J, U: TJson;
   Cut: Boolean;
-  Full: array[0..2] of Boolean;
+  WasCut, WasRefused, WasUnsure: array[0..2] of Boolean;
   Names: array[0..2] of string;
   I, K: Integer;
+  AnyRefused: Boolean;
+  Maybe: string;
 
   procedure AddItem(const C: TGhComment);
   begin
@@ -867,37 +1104,119 @@ var
     Items[High(Items)] := C;
   end;
 
-  { One list endpoint.  Returns False only on an error worth reporting; a
-    body that is not an array contributes nothing, exactly as an empty list
-    would, because a shape surprise is not a reason to lose the other three
-    calls. }
+  { One list endpoint, followed across pages.  Returns False only on an error
+    worth reporting; a body that is not an array contributes nothing, exactly
+    as an empty list would, because a shape surprise is not a reason to lose
+    the other three calls.
+
+    Cut is set when one of OUR caps stopped the reading, which is a different
+    sentence from "the list ended" and is why the loop distinguishes them.
+    Refused is set when the server named a next page somewhere we would not
+    go: that is not truncation by policy, it is an attempted redirect, and the
+    user is told about it separately.
+
+    Unsure is the third one, and it is the old count-based guess kept alive on
+    the one input that still needs it.  Before pagination existed, a page that
+    came back full was reported as possibly incomplete because a full page was
+    the only fact available.  Following rel="next" replaces that with a real
+    answer - except when the header itself goes missing, and it can: uHttp's
+    WINHTTP_QUERY_CUSTOM call can fail, a Link over uHttp's cap is dropped
+    whole rather than cut, and GhLinkNext matches rel as a token rather than
+    by RFC 5988's grammar.  Every one of those turns "there are more pages"
+    into a silence indistinguishable from the end of the list.  A SHORT last
+    page cannot be that case - a server with more to give does not answer with
+    fewer items than the per_page it was asked for - so this fires only on the
+    exact boundary, where the header is the only thing that could have told
+    us, and it says "may not be all" rather than the flat claim Cut makes. }
   function ReadList(const Url: string; Kind: TGhCommentKind;
-    var WasFull: Boolean): Boolean;
+    var Cut, Refused, Unsure: Boolean): Boolean;
   var
     L: TJson;
-    Idx, Taken: Integer;
+    Idx, Taken, Pages, Total: Integer;
+    Full: Boolean;
     C: TGhComment;
+    Cur, Link, Next: string;
   begin
-    if not GhGetJson(Url, A, L, Err) then Exit(False);
-    try
-      if L.Kind <> jkArr then Exit(True);
-      WasFull := L.Count >= GhMaxItems;
-      Taken := L.Count;
-      if Taken > GhMaxItems then Taken := GhMaxItems;
-      for Idx := 0 to Taken - 1 do
-      begin
-        C := CommentFromJson(L.Item(Idx), Kind);
-        if Kind = gckReviewBody then
+    Cur := Url;
+    Pages := 0;
+    Total := 0;
+    repeat
+      if not GhGetJsonLink(Cur, A, L, Link, Err) then Exit(False);
+      try
+        if L.Kind <> jkArr then Exit(True);
+        Taken := L.Count;
+        { The page as the SERVER sent it, recorded before either cap clamps
+          Taken: what makes a missing Link ambiguous is how many items came
+          back, not how many of them we kept. }
+        Full := L.Count >= GhMaxItems;
+        if Taken > GhMaxItems then
         begin
-          { A review with no body and no verdict is the "commented" event
-            behind the inline comments, which are already listed. }
-          if (C.Body = '') and (UpperCase(C.State) = 'COMMENTED') then Continue;
+          { per_page=100 was asked for and something else arrived.  Take the
+            first hundred and stop following: a server that ignores the page
+            size it was given is not one whose idea of the next page is worth
+            spending another round trip on. }
+          Taken := GhMaxItems;
+          Cut := True;
+          Link := '';
         end;
-        AddItem(C);
+        if Total + Taken > GhMaxTotalItems then
+        begin
+          Taken := GhMaxTotalItems - Total;
+          Cut := True;
+          Link := '';
+        end;
+        for Idx := 0 to Taken - 1 do
+        begin
+          C := CommentFromJson(L.Item(Idx), Kind);
+          if Kind = gckReviewBody then
+          begin
+            { A review with no body and no verdict is the "commented" event
+              behind the inline comments, which are already listed. }
+            if (C.Body = '') and (UpperCase(C.State) = 'COMMENTED') then Continue;
+          end;
+          AddItem(C);
+        end;
+        { Elements EXAMINED, not elements kept: the cap exists to bound what
+          this program ingests, and a filtered-out review cost the same bytes
+          off the wire as a kept one. }
+        Inc(Total, Taken);
+      finally
+        L.Free;
       end;
-    finally
-      L.Free;
-    end;
+      Inc(Pages);
+
+      Next := GhLinkNext(Link);
+      { No next link is the good ending - as long as the page that came with
+        it was short.  On a full page it is the ambiguous one, and the flag
+        carries that distinction out to the notice rather than letting it
+        become silence.  `not Cut` because the two clamps above blank Link
+        themselves: a page they stopped has already said so in a stronger
+        sentence, and saying both would be one event described twice. }
+      if Next = '' then
+      begin
+        if Full and (not Cut) then Unsure := True;
+        Break;
+      end;
+      if not GhNextUrlOk(Cur, Next) then
+      begin
+        Refused := True;
+        Break;
+      end;
+      { The cheap cycle, named rather than left to the page cap to absorb: a
+        link to the page it came from would otherwise burn all three requests
+        re-reading the same hundred items. }
+      if Next = Cur then
+      begin
+        Cut := True;
+        Break;
+      end;
+      if Pages >= GhMaxPages then
+      begin
+        Cut := True;
+        Break;
+      end;
+      Cur := Next;
+    until False;
     Result := True;
   end;
 
@@ -909,7 +1228,12 @@ begin
   Info.Author := '';
   Info.HeadRef := '';
   Info.Notice := '';
-  for I := 0 to 2 do Full[I] := False;
+  for I := 0 to 2 do
+  begin
+    WasCut[I] := False;
+    WasRefused[I] := False;
+    WasUnsure[I] := False;
+  end;
   Names[0] := 'inline review comments';
   Names[1] := 'reviews';
   Names[2] := 'conversation comments';
@@ -945,25 +1269,85 @@ begin
   end;
 
   if not ReadList(Base + '/pulls/' + N + '/comments?per_page=100',
-    gckReview, Full[0]) then Exit(False);
+    gckReview, WasCut[0], WasRefused[0], WasUnsure[0]) then Exit(False);
   if not ReadList(Base + '/pulls/' + N + '/reviews?per_page=100',
-    gckReviewBody, Full[1]) then Exit(False);
+    gckReviewBody, WasCut[1], WasRefused[1], WasUnsure[1]) then Exit(False);
   if not ReadList(Base + '/issues/' + N + '/comments?per_page=100',
-    gckIssue, Full[2]) then Exit(False);
+    gckIssue, WasCut[2], WasRefused[2], WasUnsure[2]) then Exit(False);
 
+  { The notice names OUR cap, which is the honest sentence now that following
+    exists: a list that simply ran out of pages says nothing, and a list this
+    program stopped says so and says what stopped it. }
   K := 0;
   for I := 0 to 2 do
-    if Full[I] then
+    if WasCut[I] then
     begin
       if K = 0 then
-        Info.Notice := 'only the first ' + IntToStr(GhMaxItems) + ' ' + Names[I]
+        Info.Notice := 'not all of the ' + Names[I]
       else
         Info.Notice := Info.Notice + ' and ' + Names[I];
       Inc(K);
     end;
   if K > 0 then
-    Info.Notice := Info.Notice + ' were read; there may be more (pasclaude ' +
-      'reads one page and does not follow pagination)';
+    Info.Notice := Info.Notice + ' were read: pasclaude follows rel="next" ' +
+      'for at most ' + IntToStr(GhMaxPages) + ' pages of ' +
+      IntToStr(GhMaxItems) + ' and keeps at most ' +
+      IntToStr(GhMaxTotalItems) + ' items a list, and this pull request has ' +
+      'more';
+
+  { The weaker sentence, for the lists where the answer is genuinely not
+    known.  It is deliberately a SECOND sentence rather than a hedge folded
+    into the first: "we stopped reading" and "we may not have been told there
+    was more" are different facts about different lists, and a notice that
+    blurred them would be back to the single line this could write when a full
+    page was the only fact it had. }
+  K := 0;
+  Maybe := '';
+  for I := 0 to 2 do
+    if WasUnsure[I] and (not WasCut[I]) then
+    begin
+      if K = 0 then
+        Maybe := 'the ' + Names[I]
+      else
+        Maybe := Maybe + ' and ' + Names[I];
+      Inc(K);
+    end;
+  if K > 0 then
+  begin
+    Maybe := Maybe + ' may not be all of them: the last page came back full ' +
+      'and carried no rel="next" link this program could read, and a Link ' +
+      'header it could not read looks exactly like the end of a list';
+    if Info.Notice <> '' then
+      Info.Notice := Info.Notice + '. ' + Maybe
+    else
+      Info.Notice := Maybe;
+  end;
+
+  { A refusal is reported even when nothing was cut, because it is the one
+    user-visible trace of a server having tried to send this program - and the
+    token it carries - somewhere it would not go.
+
+    The rule is quoted, and what happened is not.  GhNextUrlOk refuses for
+    eight reasons - length, a non-printable byte, '..', an unparseable https
+    prefix, a colon or an at-sign in the host, the wrong host, and a path that
+    moved - and only one of them is the cross-host attack this sentence used
+    to name outright.  A same-host link to a differently-spelled canonical
+    path is refused too, and telling that user a server had tried to redirect
+    them off api.github.com would be a lie on the one line whose entire job is
+    to report that something attacked them.  Naming the invariant instead is
+    true of all eight and still says which link was dropped and why it might
+    matter. }
+  AnyRefused := False;
+  for I := 0 to 2 do
+    if WasRefused[I] then AnyRefused := True;
+  if AnyRefused then
+  begin
+    if Info.Notice <> '' then Info.Notice := Info.Notice + '.';
+    Info.Notice := Trim(Info.Notice + ' A page link was refused and that list ' +
+      'stops there: pasclaude follows rel="next" only to the same ' +
+      GhApiBase + ' path it just read, with the query the only part allowed ' +
+      'to move.');
+  end;
 
   Result := True;
 end;

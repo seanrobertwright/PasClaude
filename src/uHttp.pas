@@ -13,6 +13,20 @@ interface
 
 uses Windows;
 
+const
+  { The most Link header this unit will carry.  GitHub's four-rel Link for a
+    paginated list - next, prev, first, last - runs to under about 300 bytes
+    even with a long owner and repository name, so 4 KB is an order of
+    magnitude of headroom and still a bound a hostile server cannot spend a
+    megabyte against.
+
+    A header that does not fit is DROPPED WHOLE, never cut.  That rule is the
+    reason the cap can be this small: a truncated Link parses to a URL that is
+    nearly right, and a URL that is nearly right is the worst thing an
+    untrusted URL can be - it would be a host or a path one character from the
+    one the caller checked for. Nothing is better than almost something here. }
+  HttpMaxLinkBytes = 4096;
+
 type
   { Called for every chunk of body bytes.  Return False to abort the transfer. }
   TChunkProc = function(const Data: string; Ctx: Pointer): Boolean;
@@ -25,6 +39,19 @@ type
     { From the Retry-After response header, in milliseconds; 0 when absent.
       A 429 that names its own wait beats any guess the client makes. }
     RetryAfterMs: Integer;
+    { The Link response header, verbatim and unparsed, or '' when absent or
+      over HttpMaxLinkBytes.  This unit now reads exactly two headers beyond
+      the status - Retry-After and this one - and it reads this one as bytes
+      and forms no opinion about them.
+
+      rel= is the caller's dialect, and deliberately so: parsing rel="next"
+      here would mean this unit returning a ready-made URL, and a transport
+      that hands back a URL has to have a policy about which URLs may be
+      requested - which host, which path, which scheme.  That policy belongs
+      to whoever knows what it is talking to, and the bottom of the ladder
+      knows about no host in particular.  So the bytes go up and the trust
+      decision stays up there with them. }
+    Link: string;
   end;
 
 { POSTs Body to Url.  Headers is a CRLF-separated block ('' for none).
@@ -91,6 +118,9 @@ const
   WINHTTP_FLAG_SECURE                 = $00800000;
   WINHTTP_QUERY_STATUS_CODE           = 19;
   WINHTTP_QUERY_RETRY_AFTER           = 35;
+  { Query a header by name: the name goes in pwszName, the value comes back in
+    lpBuffer. }
+  WINHTTP_QUERY_CUSTOM                = 65;
   WINHTTP_QUERY_FLAG_NUMBER           = $20000000;
   INTERNET_DEFAULT_HTTPS_PORT         = 443;
   INTERNET_DEFAULT_HTTP_PORT          = 80;
@@ -234,7 +264,7 @@ var
   Host, Path: string;
   Port: Word;
   Sess, Conn, Req: Pointer;
-  HdrW, HostW, PathW, VerbW, RetryW: WideString;
+  HdrW, HostW, PathW, VerbW, RetryW, LinkW, NameW: WideString;
   Status, Len: DWORD;
   Buf: array[0..8191] of Byte;
   Got: DWORD;
@@ -249,6 +279,7 @@ begin
   Result.Body := '';
   Result.Error := '';
   Result.RetryAfterMs := 0;
+  Result.Link := '';
 
   if not LoadWinHttp then
   begin
@@ -337,6 +368,47 @@ begin
           if RetrySecs > 60 then RetrySecs := 60;
           if RetrySecs > 0 then
             Result.RetryAfterMs := RetrySecs * 1000;
+        end;
+
+        { Link, by name.  WINHTTP_QUERY_CUSTOM was chosen over
+          WINHTTP_QUERY_RAW_HEADERS_CRLF because the raw query hands back the
+          entire response header block - Set-Cookie and everything else a
+          server felt like sending - which would then need a header-block
+          parser HERE, in the unit that is supposed to know least, to get one
+          value back out, and would force a cap large enough to hold a whole
+          header block rather than one header.  That is the opposite of
+          bounding.  Asking for one header by name is one call and one value.
+
+          No index pointer is passed, so this is the FIRST Link header if a
+          server sent several; GitHub sends one.  An oversized header makes
+          the call fail rather than fill the buffer, which leaves Link empty -
+          that is the cap doing its job, and it is why there is no retry on
+          ERROR_INSUFFICIENT_BUFFER: growing the buffer would be undoing the
+          bound we just set. }
+        NameW := 'Link';
+        { HttpMaxLinkBytes WideChars plus one, and the arithmetic is the point:
+          the cap is stated in BYTES of UTF-8 and this buffer is measured in
+          UTF-16 units, so sizing it at `div SizeOf(WideChar)` would have
+          enforced half the documented cap - and the +1 is the terminating NUL,
+          which WinHttpQueryHeaders needs room for inside lpdwBufferLength or
+          it fails the whole call.  No UTF-8 encoding of a string is shorter
+          than its UTF-16 unit count, so anything that survives the byte check
+          below fits here, and anything that does not fit here was over the cap
+          in bytes as well.  The buffer is 8 KB of stack-free WideString for
+          the length of one call; the bound the constant names is the one
+          actually enforced, on the bytes the caller sees. }
+        SetLength(LinkW, HttpMaxLinkBytes + 1);
+        Len := DWORD(Length(LinkW) * SizeOf(WideChar));
+        if wQueryHeaders(Req, WINHTTP_QUERY_CUSTOM, PWideChar(NameW),
+          PWideChar(LinkW), Len, nil) then
+        begin
+          SetLength(LinkW, Len div SizeOf(WideChar));
+          Result.Link := UTF8Encode(LinkW);
+          { UTF-8 can be longer in bytes than the widechar count that fitted,
+            so the cap is re-checked on the bytes the caller will actually
+            see, and again the answer to too long is nothing rather than a
+            prefix. }
+          if Length(Result.Link) > HttpMaxLinkBytes then Result.Link := '';
         end;
 
         { On a non-2xx the body is an error document, not a stream, so it is

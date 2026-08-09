@@ -28,6 +28,15 @@ begin
     Halt(2);
   end;
 
+  { Before Create, because the prompt is fixed there and a flag set afterwards
+    would be a flag set too late.  Saying yes is the embedder's deliberate act
+    and not the unit's default, exactly as assigning Ask is: this program is
+    pointed at the directory it was started in, and the tree it finds there
+    gets to write part of the system prompt through AGENTS.md, CLAUDE.md or
+    .pasclaude.md.  An embedder that clones a stranger's repository into
+    GetCurrentDir leaves this line out and gets the guidelines only. }
+  SdkProjectContextAllowed := True;
+
   { Root, key, model - the model empty means the default.  The constructor
     performs the ordering that used to be spread through pasclaude.lpr: the
     root, the ignore rules, then the system prompt that names the root. }

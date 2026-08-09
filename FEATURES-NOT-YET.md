@@ -572,14 +572,40 @@ text preserves what was missing at the time. Unchecked items remain open.
   answer in the terminal, shows a change that has not happened, and stays
   open after `n` — a declined edit would leave a tab that looks applied.
   `RenderDiff`, `ChangePreview`, `PermitChange`, `ShowDetail` and
-  `AskPermission` are untouched. Still missing: JetBrains is detected from
-  documentation rather than from a running IDE and is never launched into
-  without an explicit `ide.command`, because nothing in that environment
-  names the launcher; `/ide diff` has nothing to show for a file larger
-  than the snapshot limit `/rewind` already documents; and the "before"
-  side is written under `%LOCALAPPDATA%\pasclaude\ide` and swept only on
-  the next launch, so a session that opens one diff and exits leaves one
-  file holding project text for up to a day.*
+  `AskPermission` are untouched. The **"before" side** is written under
+  `%LOCALAPPDATA%\pasclaude\ide`, never beside the file it is a copy of, and
+  `uIde` now owns it for exactly as long as an editor could want it: at most
+  one is live at a time because the next **launched** `/ide diff` deletes the
+  last, a diff that is declined at the prompt or fails to start deletes the
+  file *it* just wrote rather than the one an open tab is reading, a write
+  that fails part-way deletes its own wreckage, and the end of the session
+  deletes whatever is still held, through `uIde`'s **finalization**. The hold
+  happens after the launch and not before it, which is the whole of that
+  second clause: handing the file over first meant answering `n` destroyed the
+  previous baseline and blanked the left pane of a tab still open on screen,
+  on the strength of a command the user had just refused. That is where the
+  old objection stops applying - sweeping in a `finally` was rejected because
+  several exit paths go through `Halt`, which skips `finally`, and `Halt`
+  runs unit finalization, the same distinction `uTools.ClearJobs` and
+  `uMcp.McpShutdownAll` already rest on. Only `Ctrl+Break`, a console window
+  closed with its X and a kill skip even that. A **file over the snapshot
+  cap** says so and names the cap, from the same constant `/rewind` prints,
+  instead of the old line that offered two reasons and committed to neither.
+  Still missing: JetBrains is detected from documentation rather than from a
+  running IDE and is never launched into without an explicit `ide.command`,
+  because nothing in that environment names the launcher; a user who
+  runs `/ide diff` and exits within the same second can beat the editor to
+  the file, leaving a diff tab whose left pane says it is gone - a knowingly
+  smaller harm than project text sitting outside the project until
+  tomorrow; and the day-old sweep is a **collector, not a bound**. A previous
+  note here said the scratch file was "swept only on the next launch"; the
+  sweep in fact runs on the way into `/ide diff` and nowhere else, so the file
+  a hard kill leaves behind waits for the next time somebody asks for a diff,
+  and a user who never runs the command again never sweeps at all. Moving it
+  to startup was refused rather than overlooked: the startup path is
+  deliberately free of mutations under `--status`, `--doctor` and the two
+  `--ci` verbs, and a command whose name promises diagnosis must not delete
+  files merely by being run.*
 - [x] ~~**GitHub Actions / `@claude` mentions** — no CI integration.~~
   *Built: a template workflow in `examples\github\` and two new modes,
   `--ci prepare` and `--ci report`, that carry every decision the YAML would
@@ -661,12 +687,37 @@ text preserves what was missing at the time. Unchecked items remain open.
   refused rather than half-parsed; no compiler caching, because a cached
   compiler directory without the matching PATH state is a support burden;
   and no GitHub App, because there is none to install — see the
-  `/install-github-app` entry above. Two residuals are recorded rather than
-  fixed: a same-repo branch's `CLAUDE.md`, `AGENTS.md` or skill descriptions
-  enter the system prompt with no gate and the deny floor's `path:` rules do
-  not cover that loader, bounded only by its author having push access; and
-  the posted answer is not rewritten, so it can `@`-mention people, since
-  rewriting `@` would corrupt code in the answer.*
+  `/install-github-app` entry above. The instruction-file loader is now gated
+  the way hooks are, and by the same one byte read at the point of use:
+  `uSdk.SdkProjectContextAllowed` ships false and the host sets it true unless
+  the mode is one of the two `--ci` verbs, so neither verb opens
+  `AGENTS.md`, `CLAUDE.md` or `.pasclaude.md` out of the checkout and neither
+  follows an `@import` inside one. Be exact about the size of that, because
+  the flattering reading is wrong and this file is the wrong place for one:
+  **neither `--ci` verb runs a turn** — `RunCi` ends in `Halt` on every path —
+  so what the flag stops there is the *read and the assembly*, not a delivery
+  to a model. A run that skipped files says so in a grey line, and that line
+  says in the same breath that this step asked no model anything, because the
+  answer in a build log came from the `-p` step above it and a maintainer must
+  not read "not loaded" as a claim about the answer. The user-level memory in
+  `%USERPROFILE%` still
+  loads, because the gate asks which *tree* wrote the prompt and the template
+  builds the agent from a clone in `RUNNER_TEMP` before checking the head out,
+  so a pull request cannot write that path. Skill descriptions were never in
+  the system prompt at all — the catalogue rides in the `skill` tool's own
+  description, rebuilt with the schema on every request — and a ux check now
+  pins that in both configurations, with the project loader off and again with
+  it on, since a pin that only ever ran with the loader switched off would be
+  proving the absence of skills from a prompt nothing had been added to.
+  Two residuals are recorded rather than fixed: the answering step is an
+  ordinary `-p` in the checked-out head, so a same-repo branch's `CLAUDE.md`
+  still reaches *that* run's system prompt, bounded by its author having push
+  access — not fixed here because `-p` losing a project's instructions would
+  break the promise every scripted user relies on, and the fix, if it is ever
+  wanted, is an explicit flag on the Answer step rather than a mode inferred
+  from a string in the prompt; and the posted answer is not rewritten, so it
+  can `@`-mention people, since rewriting `@` would corrupt code in the
+  answer.*
 - [x] ~~**/review, /pr-comments, /install-github-app** — no built-in PR
   workflow commands (git itself works through bash, and `/diff` summarizes
   changes).~~
@@ -687,8 +738,9 @@ text preserves what was missing at the time. Unchecked items remain open.
   (letters, digits, `. _ - /`, no leading `-`, no `..`, 128 bytes) **before**
   anything is composed, and that validator has its own test. `/pr-comments`
   fetches the inline review comments, the review bodies and the conversation
-  thread of one pull request in four GETs to `api.github.com`, renders them
-  to the console, and **sends the model exactly the lines it printed** —
+  thread of one pull request in four GETs to `api.github.com`, or more when a
+  list paginates, renders them to the console, and **sends the model exactly
+  the lines it printed** —
   `/pr-comments <n> --show` renders and sends nothing. With no number it
   infers the pull request from the current branch and asks for a number when
   that is not exactly one match. `uGitHub` issues **GET and nothing else**:
@@ -706,12 +758,51 @@ text preserves what was missing at the time. Unchecked items remain open.
   validates no header byte; `gh`'s output is accepted only on exit code 0 and
   only as a single line, and is never copied into an error, a note or a
   report. `TDiagFacts` gains the repository name and the token **source
-  name** and no value, no hint and no length. Comment text is untrusted —
-  anyone with a GitHub account can write it — so it lands in a user message,
-  never the system prompt, inside a marked block preceded by one sentence
-  saying it is data and never an instruction, with any line forging either
-  marker dropped per line **after** truncation, capped at 100 items, 4 KB a
-  body and 64 KB a payload, every cut marked, and every byte `IsValidUtf8`
+  name** and no value, no hint and no length. A list can now run to more than
+  one page, and it is the *reason* it can that is bounded rather than the
+  count: `uHttp` returns the `Link` response header — one header asked for by
+  name, verbatim and unparsed, and dropped **whole** rather than cut past
+  4 KB, because a truncated `Link` parses to a URL that is nearly right and
+  nearly right is the worst thing an untrusted URL can be — and `uGitHub`
+  follows `rel="next"`. A next URL is a URL a *server* chose, so the compiled
+  constant is only half the host defence and `GhNextUrlOk` is the other half:
+  a link is followed only when it is one this unit would have composed itself
+  — `https`, host **exactly** `api.github.com` with no port and no userinfo,
+  printable ASCII 33..126, no `..`, 512 bytes, and **the same path as the page
+  just read, with only the query allowed to differ**. A `Link` may therefore
+  say "the same endpoint, further along" and nothing else: it can move neither
+  the host, which is precisely how "settable at no tier" would be defeated
+  from the wire with no settings file involved and nothing for the scope table
+  to refuse, nor the endpoint, which is what stops a link on
+  `/pulls/7/comments` walking the token over to `/user/emails`. Three caps
+  bound three different things — 100 a page against a server that ignores
+  `per_page`, **3 pages** against requests, since each is a round trip
+  carrying the token and a link pointing backwards would otherwise loop, and
+  **300 items** against memory — and `GhMaxPages * GhMaxItems` is exactly
+  `GhMaxTotalItems`, so neither of the last two is a number that could never
+  bite. A list stopped by one of *our* caps is named in the notice, which is a
+  stronger sentence than the one this could write before, when the only
+  available fact was that a page came back full. That older, weaker sentence
+  was **kept rather than deleted**, for the one case where the header cannot
+  answer: a list whose last page came back exactly full carrying no usable
+  `rel="next"` is reported as *possibly* incomplete, because a `Link` that was
+  dropped — over the transport cap, or through a header query that failed —
+  looks from here exactly like a list that ended, and reporting nothing there
+  would hand a reader 100 of 250 comments with no sign anything was missing. A
+  short last page cannot be that case and stays silent. A refused link is
+  named too, because it is the one user-visible trace of a server having tried
+  it, and the notice **quotes the rule rather than guessing which half of it
+  fired**: `GhNextUrlOk` says no for eight different reasons and only one of
+  them is another host, so a sentence that named the host every time would be
+  wrong about a same-host link to a different endpoint — on the one line whose
+  whole job is to report that something attacked you. Honest cost: a busy pull
+  request now spends up to ten GETs where it spent four, against sixty an hour
+  unauthenticated. Comment text is untrusted — anyone with a GitHub account
+  can write it — so it lands in a user message, never the system prompt,
+  inside a marked block preceded by one sentence saying it is data and never
+  an instruction, with any line forging either marker dropped per line
+  **after** truncation, capped at 100 items a page and 300 a list, 4 KB a body
+  and 64 KB a payload, every cut marked, and every byte `IsValidUtf8`
   checked. Neither command exists under `-p`: `HandleCommand` runs only in
   the REPL, and `GitHubAllowed` is False until the interactive path sets it
   below the print-mode halt, so a future wiring mistake fails closed and a
@@ -732,12 +823,18 @@ text preserves what was missing at the time. Unchecked items remain open.
   is a credential manager and never a credential issuer, and by the same
   argument it is not an app publisher. A command that only printed an
   explanation would put a non-feature in the command table and in `/help`,
-  which reads as half-built. Still missing: one page of 100 per list, because
-  `uHttp` exposes no response headers and therefore no `Link` header — a full
-  page is reported as possibly incomplete rather than silently truncated;
-  **github.com only**, no GitHub Enterprise, because a configurable host is
+  which reads as half-built. Still missing: **github.com only**, no GitHub
+  Enterprise, because a configurable host is
   exactly the knob a credential should not have; **read-only**, so no reply,
-  resolve, approve or merge; no pull-request diff review; and the residual
+  resolve, approve or merge; no pull-request diff review; only the **first**
+  `Link` header instance is read, and `rel` is matched as a token rather than
+  by RFC 5988 parameter grammar — no escaped quote inside a quoted `rel`, no
+  multi-valued `rel="next prev"` — which is what GitHub sends and not what the
+  RFC permits, and a miss yields no next URL rather than a wrong one, since
+  `GhNextUrlOk` sits on the other side of it either way — and a miss on a last
+  page that came back full is the case the "may not be all of them" sentence
+  above is for, so it is reported rather than silently swallowed; and the
+  residual
   the envelope does not fix — a comment can still persuade the model to
   *propose* an edit or a command, and the human answering the prompt is the
   last gate, so a user who habitually answers "a" has already widened it,
