@@ -11,7 +11,8 @@ program pasclaude;
 
 uses
   Windows, SysUtils, Classes, DateUtils, uTerm, uJson, uSettings, uAuth,
-  uHttp, uTelem, uMcp, uHooks, uSandbox, uTools, uImage, uAgent, uDiag, uSdk;
+  uHttp, uTelem, uMcp, uHooks, uSandbox, uIde, uTools, uImage, uAgent, uDiag,
+  uSdk;
 
 const
   Version = '0.1';
@@ -227,9 +228,12 @@ end;
 { ------------------------------------------------------------- completion -- }
 
 const
-  SlashCommands: array[0..39] of string = (
+  { Forty-one entries.  The bound is hand-maintained and a wrong one produces
+    NO compile error, only a command that silently stops tab-completing, so
+    it is counted rather than trusted. }
+  SlashCommands: array[0..40] of string = (
     '/help', '/clear', '/compact', '/config', '/deny', '/diff', '/hooks',
-    '/jobs', '/mcp', '/memory', '/init', '/mode', '/plan', '/rewind',
+    '/ide', '/jobs', '/mcp', '/memory', '/init', '/mode', '/plan', '/rewind',
     '/sandbox', '/sessions', '/skills', '/plugins', '/think', '/web',
     '/add-dir', '/remove-dir', '/resume', '/save', '/cwd', '/model', '/yolo',
     '/cost', '/telemetry', '/output-style', '/paste', '/vim', '/keys',
@@ -646,6 +650,10 @@ begin
   EmitCLn(clGrey,   '  /paste         attach the clipboard image to your next message');
   EmitCLn(clGrey,   '  /vim [on|off|save]  modal line editing; save keeps it');
   EmitCLn(clGrey,   '  /keys          the editing keys, and where to rebind them');
+  EmitCLn(clGrey,   '  /ide           the editor around this terminal, if any;');
+  EmitCLn(clGrey,   '                 diff [<path>] opens what this session changed,');
+  EmitCLn(clGrey,   '                 open <path>[:line] opens a file. Nothing is sent');
+  EmitCLn(clGrey,   '                 to the model and no selection is read back');
   EmitCLn(clGrey,   '  /config        settings and where each value came from;');
   EmitCLn(clGrey,   '                 get <k>, set [--local] <k> <v>, unset, reload');
   EmitCLn(clGrey,   '  /cost          tokens used so far');
@@ -1173,6 +1181,305 @@ begin
     finally
       L.Free;
     end;
+  end;
+end;
+
+{ ------------------------------------------------------------------ /ide -- }
+
+{ Session only, and deliberately never written to disk.  "a" here means "stop
+  asking me this session", not "this program may start editors from now on":
+  a persisted grant would be a standing licence to run a named program, and
+  the approvals file is for tools the MODEL asks for, answered per project.
+  A user who wants it permanent already has one - ide.command in their own
+  settings.json - and that one they had to type out in full. }
+var
+  IdeGrantedThisSession: Boolean = False;
+
+{ Out of the tree, always.  A baseline written beside the file it is a
+  baseline OF would be a file this program created inside the project that
+  the project's own tooling would then see, and it would sit inside the
+  reach every deny rule and every approval is written against.  '' when
+  there is nowhere out of tree to put it, and the command then refuses
+  rather than falling back into the checkout - the same rule ApprovalsPath
+  follows. }
+function IdeScratchDir: string;
+var
+  Home: string;
+begin
+  Result := '';
+  Home := Trim(SysUtils.GetEnvironmentVariable('LOCALAPPDATA'));
+  if Home = '' then Home := Trim(SysUtils.GetEnvironmentVariable('USERPROFILE'));
+  if Home = '' then Exit;
+  Result := IncludeTrailingPathDelimiter(Home) + 'pasclaude' + PathDelim +
+    'ide' + PathDelim;
+end;
+
+{ Files older than a day, on the way in.  Sweeping at exit was the other
+  option and it is worse: several exit paths go through Halt, which skips
+  finally, and one of them is the Ctrl+C path where the user is already
+  waiting. }
+procedure IdeSweepScratch(const Dir: string);
+var
+  R: TSearchRec;
+begin
+  if FindFirst(Dir + '*', faAnyFile, R) <> 0 then Exit;
+  try
+    repeat
+      if (R.Attr and faDirectory) <> 0 then Continue;
+      if FileDateToDateTime(R.Time) < Now - 1.0 then
+        SysUtils.DeleteFile(Dir + R.Name);
+    until FindNext(R) <> 0;
+  finally
+    FindClose(R);
+  end;
+end;
+
+{ Every byte outside [A-Za-z0-9._-] replaced, so a filename the MODEL chose
+  cannot climb out of the scratch directory no matter what it contains.  The
+  extension survives the substitution, which is what makes the editor colour
+  the left-hand pane of the diff. }
+function IdeScratchName(const Base: string): string;
+var
+  I: Integer;
+begin
+  Result := '';
+  for I := 1 to Length(Base) do
+    if Base[I] in ['A'..'Z', 'a'..'z', '0'..'9', '.', '_', '-'] then
+      Result := Result + Base[I]
+    else
+      Result := Result + '_';
+  if Result = '' then Result := 'baseline';
+  Result := 'base-' + Copy(Result, 1, 64);
+end;
+
+{ The whole gate for this feature, and it is here rather than in uTools
+  because there is nothing in uTools to reach: a user-typed slash command
+  never enters RunTool, so Permit, PermitBash and the deny rules have
+  nothing to say about it - the same standing RunShellQuiet has.  Rather
+  than leave it silently ungated, the exact line that is about to run is
+  printed and the existing prompt is used. }
+function IdeConfirmAndLaunch(const Line: string): Boolean;
+var
+  Err: string;
+begin
+  Result := False;
+  if not IdeGrantedThisSession then
+    case AskPermission('start your editor',
+      'pasclaude will run this command line:' + #10 + Line + #10 +
+      'Nothing it prints is read back, and no editor state is sent to the ' +
+      'model.') of
+      pmDeny: begin
+        EmitCLn(clGrey, '  not started');
+        Exit;
+      end;
+      pmAllowAlways: IdeGrantedThisSession := True;
+    end;
+  if uIde.IdeLaunch(Line, Err) then
+    Result := True
+  else
+    EmitCLn(clYellow, '  ' + Err);
+end;
+
+procedure DoIde(const Arg: string);
+var
+  Host: uIde.TIdeHost;
+  Cli, Verb, Rest, Full, Err, Line, Base, Text, Dir, Tmp: string;
+  Changed: TStringArray;
+  LineNo, P, I: Integer;
+  Existed: Boolean;
+  F: TFileStream;
+begin
+  Host := uIde.IdeDetect;
+  Cli := '';
+  { Both conditions, not either.  Detection alone was the tempting gate and
+    it takes the off switch away from the user; ide.enabled alone would let
+    a settings value start programs in a plain console, where the kept job
+    object stops being safe because no editor is running to signal. }
+  if uSettings.SettingIsSet('ide.enabled') and
+     not uSettings.SettingBool('ide.enabled') then
+  begin
+    EmitCLn(clGrey, '  ide.enabled is false in your settings.json');
+    Exit;
+  end;
+  if Host.Family <> ifNone then
+    Cli := uIde.IdeResolveCli(Host, uSettings.SettingStr('ide.command'));
+
+  Verb := LowerCase(Trim(Arg));
+  Rest := '';
+  P := Pos(' ', Verb);
+  if P > 0 then
+  begin
+    Rest := Trim(Copy(Trim(Arg), P + 1, MaxInt));
+    Verb := Copy(Verb, 1, P - 1);
+  end;
+
+  if Verb = '' then
+  begin
+    if Host.Family = ifNone then
+    begin
+      EmitCLn(clGrey, '  no editor detected around this terminal');
+      EmitCLn(clGrey, '    VS Code sets TERM_PROGRAM and VSCODE_INJECTION in ' +
+        'its integrated terminal;');
+      EmitCLn(clGrey, '    JetBrains sets TERMINAL_EMULATOR. Neither is set ' +
+        'here, so /ide does nothing.');
+      Exit;
+    end;
+    EmitCLn(clBright, '  editor: ' + Host.Name +
+      BoolToStr(Host.Version <> '', ' ' + Host.Version, ''));
+    if Host.Product <> '' then
+      EmitCLn(clGrey, '    reported by ' + Host.Product);
+    if Cli <> '' then
+      EmitCLn(clGrey, '    command line: ' + Cli)
+    else
+      EmitCLn(clYellow, '    no command-line program found; set ' +
+        '"ide.command" in your own settings.json');
+    EmitCLn(clGrey, '    /ide diff [<path>]     what this session changed, ' +
+      'in a diff tab');
+    EmitCLn(clGrey, '    /ide open <path>[:n]   open a file, optionally at a ' +
+      'line');
+    EmitCLn(clGrey, '    the editor is never read FROM: no selection, no ' +
+      'cursor, nothing sent to the model');
+    Exit;
+  end;
+
+  if (Verb <> 'diff') and (Verb <> 'open') then
+  begin
+    EmitCLn(clGrey, '  /ide, /ide diff [<path>], /ide open <path>[:line]');
+    Exit;
+  end;
+  if Host.Family = ifNone then
+  begin
+    EmitCLn(clGrey, '  no editor detected around this terminal; /ide alone ' +
+      'explains what is looked for');
+    Exit;
+  end;
+  if Cli = '' then
+  begin
+    EmitCLn(clYellow, '  no editor command-line program could be found; ' +
+      '/doctor says what to do about it');
+    Exit;
+  end;
+
+  if Verb = 'open' then
+  begin
+    LineNo := 0;
+    { A trailing :<n> is a line number only when every character after the
+      last colon is a digit, so a drive letter and a path that simply
+      contains a colon are both left alone. }
+    P := Length(Rest);
+    while (P > 0) and (Rest[P] in ['0'..'9']) do Dec(P);
+    if (P > 1) and (P < Length(Rest)) and (Rest[P] = ':') then
+    begin
+      LineNo := StrToIntDef(Copy(Rest, P + 1, MaxInt), 0);
+      Rest := Copy(Rest, 1, P - 1);
+    end;
+    if not uTools.ResolveInRoot(Rest, Full, Err) then
+    begin
+      EmitCLn(clYellow, '  ' + Err);
+      Exit;
+    end;
+    if not FileExists(Full) then
+    begin
+      EmitCLn(clYellow, '  no such file: ' + Rest);
+      Exit;
+    end;
+    if not uIde.IdeOpenLine(Host, Cli, Full, LineNo, Line, Err) then
+    begin
+      EmitCLn(clYellow, '  ' + Err);
+      Exit;
+    end;
+    if IdeConfirmAndLaunch(Line) then
+      EmitCLn(clGrey, '  opened ' + Rest);
+    Exit;
+  end;
+
+  { diff.  With no argument, the session's own ledger answers when it names
+    exactly one file; more than one and the user picks, because guessing
+    which of six edits they meant is worse than a list. }
+  if Rest = '' then
+  begin
+    Changed := uTools.ChangedFiles;
+    if Length(Changed) = 0 then
+    begin
+      EmitCLn(clGrey, '  no files written or edited this session');
+      Exit;
+    end;
+    if Length(Changed) > 1 then
+    begin
+      EmitCLn(clBright, '  name one of these:');
+      for I := 0 to High(Changed) do
+        EmitCLn(clGrey, '    /ide diff ' + Changed[I]);
+      Exit;
+    end;
+    Rest := Changed[0];
+  end;
+  if not uTools.ResolveInRoot(Rest, Full, Err) then
+  begin
+    EmitCLn(clYellow, '  ' + Err);
+    Exit;
+  end;
+  if not uTools.SessionBaseline(Full, Text, Existed) then
+  begin
+    EmitCLn(clGrey, '  no baseline for ' + Rest + ': this session has not ' +
+      'written it,');
+    EmitCLn(clGrey, '    or it was too large to hold when it was first ' +
+      'touched - the same limit /rewind reports');
+    Exit;
+  end;
+  if not FileExists(Full) then
+  begin
+    EmitCLn(clYellow, '  ' + Rest + ' is not there now; /rewind restores it');
+    Exit;
+  end;
+
+  Dir := IdeScratchDir;
+  if Dir = '' then
+  begin
+    EmitCLn(clYellow, '  neither %LOCALAPPDATA% nor %USERPROFILE% is set, ' +
+      'so there is nowhere outside');
+    EmitCLn(clYellow, '    this project to write the "before" side, and it ' +
+      'is not written inside one');
+    Exit;
+  end;
+  if not ForceDirectories(Dir) then
+  begin
+    EmitCLn(clYellow, '  could not create ' + Dir);
+    Exit;
+  end;
+  IdeSweepScratch(Dir);
+  Base := IdeScratchName(ExtractFileName(Full));
+  Tmp := Dir + Base;
+  try
+    F := TFileStream.Create(Tmp, fmCreate);
+    try
+      { Bytes verbatim: an editor is not a consumer of ours and repairing
+        the encoding here would show the user a "before" side that is not
+        what the file held. }
+      if Length(Text) > 0 then F.WriteBuffer(Text[1], Length(Text));
+    finally
+      F.Free;
+    end;
+  except
+    on E: Exception do
+    begin
+      EmitCLn(clYellow, '  could not write the "before" side: ' + E.Message);
+      Exit;
+    end;
+  end;
+
+  if not uIde.IdeDiffLine(Host, Cli, Tmp, Full, Line, Err) then
+  begin
+    EmitCLn(clYellow, '  ' + Err);
+    Exit;
+  end;
+  if IdeConfirmAndLaunch(Line) then
+  begin
+    if Existed then
+      EmitCLn(clGrey, '  ' + Rest +
+        ': before this session on the left, now on the right')
+    else
+      EmitCLn(clGrey, '  ' + Rest +
+        ': created this session, so the left pane is empty');
   end;
 end;
 
@@ -2371,65 +2678,325 @@ begin
   EmitCLn(clGrey, '  it goes with your next message; /paste drop cancels it');
 end;
 
-{ The logo: logo.png's </> mark as ASCII art, blue like the source image,
-  with the wordmark beside it.  Three lines tall - enough to read as the
-  mark, small enough that the banner is still a banner. }
-procedure ShowBanner;
-var
-  Auth, AliasTarget: string;
-  AliasKind: TModelAliasKind;
-  I: Integer;
+{ The banner.
+
+  Two columns in a rounded frame: who is answering and where on the left,
+  what to type on the right.  The split is not decoration - the left column
+  is the session's identity, which a user checks, and the right is the set of
+  commands, which a user learns once and then stops reading.  Putting them
+  side by side means the half that stops being useful never pushes the half
+  that stays useful off the screen.
+
+  What the frame does NOT hold is the warnings.  A permission mode, a deny
+  set and a lowered sandbox are things the user must notice, and a box is
+  exactly the shape the eye learns to skip; they go underneath, unboxed, in
+  the colour that means "read this". }
+
+{ The three rows of logo.png's </> mark. }
+function LogoRow(N: Integer): string;
 begin
-  EmitLn;
-  EmitC(clBlue,  '    /    ');  EmitC(clBright, '/');  EmitC(clBlue, '  \');
-  EmitLn;
-  EmitC(clBlue,  '   <    ');  EmitC(clBright, '/');  EmitC(clBlue, '    >');
-  EmitC(clBright, '     pasclaude');  EmitC(clGrey, ' v' + Version);
-  EmitLn;
-  EmitC(clBlue,  '    \  ');  EmitC(clBright, '/');  EmitC(clBlue, '    /');
-  EmitC(clGrey, '      a coding agent in Free Pascal');
-  EmitLn;
-  EmitLn;
-  Auth := Agent.Model;
+  case N of
+    0: Result := MkAmber + '/    ' + MkAmberLt + '/' + MkAmber + '  \';
+    1: Result := MkAmber + '<    ' + MkAmberLt + '/' + MkAmber + '    >';
+  else
+    Result := MkAmber + ' \  ' + MkAmberLt + '/' + MkAmber + '    /';
+  end;
+end;
+
+{ The name to greet, or '' when the machine will not say.  A greeting with a
+  blank in it is worse than no greeting. }
+function WelcomeName: string;
+begin
+  Result := Trim(GetEnvironmentVariable('USERNAME'));
+  if Result = '' then Result := Trim(GetEnvironmentVariable('USER'));
+end;
+
+{ The model, with whatever qualification it needs to be read correctly. }
+function BannerModel: string;
+var
+  AliasTarget: string;
+  AliasKind: TModelAliasKind;
+begin
+  Result := Agent.Model;
   { A profile is not an id, so the banner has to say what it means or the
     user is reading a word where they expect a model.  An ordinary alias is
     left alone: it resolves to one thing and /model already said so. }
   if ResolveModelAlias(Agent.Model, AliasTarget, AliasKind) and
      (AliasKind = makProfile) then
-    Auth := Auth + ' (' + AliasTarget + ' - the first in plan mode)';
-  if BannerAuth <> '' then Auth := Auth + ' (' + BannerAuth + ')';
-  EmitCLn(clGrey, '  ' + Auth);
-  { Only when a route is not what shipped.  Routing costs the user quality on
-    work they cannot see - the parent only ever reads a subagent's final
-    message - so a session that routes says so once, up front, rather than
-    leaving it to be discovered in /cost. }
+    Result := Result + ' (' + AliasTarget + ' - first in plan mode)';
+  if BannerAuth <> '' then Result := Result + ' (' + BannerAuth + ')';
+end;
+
+{ The routing note, '' when nothing was routed anywhere surprising.  Routing
+  costs the user quality on work they cannot see - the parent only ever reads
+  a subagent's final message - so a session that routes says so once, up
+  front, rather than leaving it to be discovered in /cost. }
+function BannerRoutes: string;
+begin
+  Result := '';
   if (ModelRoute(mrSubagent) <> 'sonnet') or
      (ModelRoute(mrCompact) <> 'sonnet') then
-    EmitCLn(clGrey, Format('  routes: subagent %s, compaction %s (/config)',
-      [Agent.EffectiveModel(mrSubagent), Agent.EffectiveModel(mrCompact)]))
+    Result := Format('routes: subagent %s, compaction %s',
+      [Agent.EffectiveModel(mrSubagent), Agent.EffectiveModel(mrCompact)])
   else if Agent.EffectiveModel(mrSubagent) <> Agent.EffectiveModel(mrMain) then
-    EmitCLn(clGrey, '  subagents and compaction run on ' +
-      Agent.EffectiveModel(mrSubagent));
-  EmitCLn(clGrey, '  ' + uTools.RootDir);
-  for I := 1 to uTools.RootCount - 1 do
-    EmitCLn(clGrey, '  + ' + uTools.RootAt(I));
-  { Only when there are any: a user in a stricter state than they believe is a
-    smaller problem than one in a looser state, but a refusal nobody can
-    explain is still a bug report. }
+    Result := 'subagents and compaction on ' + Agent.EffectiveModel(mrSubagent);
+end;
+
+{ The lines that go under the frame: everything a user would be unpleasantly
+  surprised to discover later. }
+procedure ShowBannerWarnings;
+begin
   { The mode, whenever it is not the plain one - including the case that has
     existed all along and was invisible, a previous session's "always" loading
     as accept-edits before anything has been typed. }
   if uTools.PermModeBanner <> '' then
-    EmitCLn(clYellow, '  ' + uTools.PermModeBanner);
+    UiPaintLn(MkYellow + '  ! ' + uTools.PermModeBanner);
   if uTools.DenyRulesInForce then
-    EmitCLn(clGrey, Format('  %d deny rules in force (/deny)',
+    UiPaintLn(MkGrey + Format('  %d deny rules in force (/deny)',
       [uTools.DenyRuleCount]));
   { Only when it is not the default, and in both directions: "off" is as much
     a thing a user should not be surprised by as "low" is. }
   if uSandbox.SandboxLevel <> uSandbox.slLimits then
-    EmitCLn(clGrey, '  sandbox: ' +
+    UiPaintLn(MkYellow + '  ! sandbox: ' +
       uSandbox.SandboxLevelName(uSandbox.SandboxLevel) + ' (/sandbox)');
-  EmitCLn(clGrey, '  /help for commands, /exit to quit, Esc stops a reply');
+end;
+
+{ The one-column banner, for a window too narrow to split.  Same facts, same
+  colours, no frame: a two-column layout in forty columns is two columns of
+  ellipses. }
+procedure ShowBannerNarrow;
+var
+  I: Integer;
+  Who: string;
+begin
+  EmitLn;
+  UiPaint('  ' + LogoRow(1) + '  ');
+  UiPaintLn(MkAmberLt + 'pasclaude ' + MkAmberDim + 'v' + Version);
+  Who := WelcomeName;
+  if Who <> '' then UiPaintLn(MkBright + '  Welcome back, ' + Who + '!');
+  UiPaintLn(MkGrey + '  ' + BannerModel);
+  if BannerRoutes <> '' then UiPaintLn(MkGrey + '  ' + BannerRoutes);
+  UiPaintLn(MkGrey + '  ' + uTools.RootDir);
+  for I := 1 to uTools.RootCount - 1 do
+    UiPaintLn(MkGrey + '  + ' + uTools.RootAt(I));
+  ShowBannerWarnings;
+  UiPaintLn(MkGrey + '  /help for commands, /exit to quit, Esc stops a reply');
+  EmitLn;
+end;
+
+{ ------------------------------------------------------- the status block --
+
+  What sits under the prompt.  Refreshed once per turn, never per keystroke:
+  everything here is either free to read or read from a small file, but a
+  status line that cost a syscall per character typed would be a status line
+  that made the editor feel broken. }
+
+{ The branch, read out of .git rather than out of git.  A subprocess per turn
+  would be affordable and a subprocess per keystroke would not, and the file
+  is the same answer for none of the cost.  '' when this is not a repository,
+  which is a normal thing for a directory to be.
+
+  Handles the three shapes .git comes in: a directory, a worktree's file
+  pointing elsewhere, and a detached HEAD, which has no branch to name and
+  is reported as the short commit instead. }
+function GitBranch: string;
+const
+  RefPrefix = 'ref: refs/heads/';
+var
+  Dir, DotGit, Head: string;
+  L: TStringList;
+  Depth: Integer;
+begin
+  Result := '';
+  Dir := IncludeTrailingPathDelimiter(uTools.RootDir);
+  DotGit := '';
+  { Up to the drive root, but bounded: a path long enough to loop here would
+    be a symlink cycle, and a banner is not worth hanging the session for. }
+  for Depth := 0 to 40 do
+  begin
+    if DirectoryExists(Dir + '.git') then
+    begin
+      DotGit := Dir + '.git';
+      Break;
+    end;
+    if FileExists(Dir + '.git') then
+    begin
+      { A worktree or submodule: the file says "gitdir: <path>". }
+      L := TStringList.Create;
+      try
+        try
+          L.LoadFromFile(Dir + '.git');
+          if (L.Count > 0) and (Copy(Trim(L[0]), 1, 8) = 'gitdir: ') then
+            DotGit := Trim(Copy(Trim(L[0]), 9, MaxInt));
+        except
+        end;
+      finally
+        L.Free;
+      end;
+      Break;
+    end;
+    if ExtractFileDir(ExcludeTrailingPathDelimiter(Dir)) =
+       ExcludeTrailingPathDelimiter(Dir) then Break;
+    Dir := IncludeTrailingPathDelimiter(
+      ExtractFileDir(ExcludeTrailingPathDelimiter(Dir)));
+    if Dir = PathDelim then Break;
+  end;
+  if DotGit = '' then Exit;
+
+  Head := IncludeTrailingPathDelimiter(DotGit) + 'HEAD';
+  if not FileExists(Head) then Exit;
+  L := TStringList.Create;
+  try
+    try
+      L.LoadFromFile(Head);
+      if L.Count = 0 then Exit;
+      Head := Trim(L[0]);
+      if Copy(Head, 1, Length(RefPrefix)) = RefPrefix then
+        Result := Copy(Head, Length(RefPrefix) + 1, MaxInt)
+      else if Length(Head) >= 7 then
+        Result := Copy(Head, 1, 7);       { detached: the commit is the answer }
+    except
+      { An unreadable HEAD means no branch shown, not a failed prompt. }
+    end;
+  finally
+    L.Free;
+  end;
+end;
+
+{ How many memory files were actually loaded.  The same names SdkProjectContext
+  reads, asked the same way, so the count cannot claim a file the model did
+  not get. }
+function MemoryFileCount: Integer;
+const
+  Names: array[0..2] of string = ('AGENTS.md', 'CLAUDE.md', '.pasclaude.md');
+var
+  I: Integer;
+begin
+  Result := 0;
+  if FileExists(IncludeTrailingPathDelimiter(GetEnvironmentVariable('USERPROFILE')) +
+     '.pasclaude' + PathDelim + 'CLAUDE.md') then Inc(Result);
+  for I := 0 to High(Names) do
+    if FileExists(IncludeTrailingPathDelimiter(uTools.RootDir) + Names[I]) then
+      Inc(Result);
+end;
+
+procedure RefreshStatus;
+var
+  S: TStatusInfo;
+begin
+  StatusClear(S);
+  S.Model := Agent.EffectiveModel(mrMain);
+  S.Dir := ExtractFileName(ExcludeTrailingPathDelimiter(uTools.RootDir));
+  if S.Dir = '' then S.Dir := uTools.RootDir;
+  S.Branch := GitBranch;
+  { Measured against the point this program compacts at, not against the
+    model's context window.  Compaction is what the user will actually
+    experience, so it is the number the meter should be filling towards. }
+  S.CtxTokens := Agent.ContextTokens;
+  S.CtxLimit := CompactTokens;
+  S.TokensIn := Agent.TokensIn + Agent.CacheReadTokens + Agent.CacheWriteTokens;
+  S.TokensOut := Agent.TokensOut;
+  S.Memories := MemoryFileCount;
+  S.Mcps := uTools.McpServerCount;
+  S.Hooks := uHooks.HookEntryCount;
+  { The indicator rather than the name: the '+' that says "standing grants
+    exist" belongs here more than anywhere, because this is the line that is
+    on screen when the user decides what to type.
+
+    Plain ask says nothing, which is the same rule ModePrompt has always
+    followed - and the same reason.  'ask' on every line of every session is
+    a word the eye stops seeing, and then the one session where it says
+    something else is the one where it goes unread. }
+  S.Mode := uTools.PermModeIndicator;
+  if S.Mode = 'ask' then S.Mode := '';
+  S.ModeHot := uTools.CurrentPermMode in [uTools.pmodeBypass,
+                                          uTools.pmodeAcceptEdits];
+  SetStatus(S);
+end;
+
+procedure ShowBanner;
+var
+  Width, LeftW, RightW, Rows, I: Integer;
+  Left, Right: array of string;
+  Who: string;
+
+  procedure AddL(const S: string);
+  begin
+    SetLength(Left, Length(Left) + 1);
+    Left[High(Left)] := S;
+  end;
+
+  procedure AddR(const S: string);
+  begin
+    SetLength(Right, Length(Right) + 1);
+    Right[High(Right)] := S;
+  end;
+
+  function AtL(N: Integer): string;
+  begin
+    if N <= High(Left) then Result := Left[N] else Result := '';
+  end;
+
+  function AtR(N: Integer): string;
+  begin
+    if N <= High(Right) then Result := Right[N] else Result := '';
+  end;
+
+begin
+  { Capped as well as fitted: a maximised terminal is 200 columns wide and a
+    banner that used all of them would be a banner nobody can read across. }
+  Width := TermWidth - 1;
+  if Width > 92 then Width := 92;
+  if Width < 64 then
+  begin
+    ShowBannerNarrow;
+    Exit;
+  end;
+  { The left column carries centred text and the right carries a list, so
+    the split is not even: a list reads badly when it wraps and centred text
+    reads fine when it is tight. }
+  LeftW := (UiBoxInner(Width, 2) * 42) div 100;
+  RightW := UiBoxInner(Width, 2) - LeftW;
+
+  Left := nil;
+  Right := nil;
+
+  Who := WelcomeName;
+  AddL('');
+  if Who <> '' then
+    AddL(UiCentre(MkBright + 'Welcome back, ' + Who + '!', LeftW))
+  else
+    AddL(UiCentre(MkBright + 'Welcome to pasclaude', LeftW));
+  AddL('');
+  for I := 0 to 2 do AddL(UiCentre(LogoRow(I), LeftW));
+  AddL('');
+  AddL(UiCentre(MkGrey + BannerModel, LeftW));
+  if BannerRoutes <> '' then AddL(UiCentre(MkGrey + BannerRoutes, LeftW));
+  AddL(UiCentre(MkGrey + uTools.RootDir, LeftW));
+  for I := 1 to uTools.RootCount - 1 do
+    AddL(UiCentre(MkGrey + '+ ' + uTools.RootAt(I), LeftW));
+
+  AddR(MkAmber + 'Tips for getting started');
+  AddR(MkWhite + 'Run /init to write a CLAUDE.md for this project');
+  AddR(MkWhite + 'Type @path to attach a file, # to remember a note');
+  AddR(MkWhite + 'Esc stops a reply, Ctrl+Enter is a newline');
+  AddR(MkAmberDim + UiRule(RightW));
+  AddR(MkAmber + 'Getting around');
+  AddR(MkWhite + '/help  ' + MkGrey + ' every command there is');
+  AddR(MkWhite + '/mode  ' + MkGrey + ' what gets asked before it happens');
+  AddR(MkWhite + '/cost  ' + MkGrey + ' what this session has spent');
+  AddR(MkWhite + '/exit  ' + MkGrey + ' quit');
+
+  EmitLn;
+  UiPaintLn(UiBoxTop(MkAmberLt + 'pasclaude ' + MkAmberDim + 'v' + Version,
+    Width));
+  Rows := Length(Left);
+  if Length(Right) > Rows then Rows := Length(Right);
+  for I := 0 to Rows - 1 do
+    UiPaintLn(UiBoxRow([AtL(I), AtR(I)], [LeftW, RightW]));
+  UiPaintLn(UiBoxBottom(Width));
+  EmitLn;
+  ShowBannerWarnings;
   EmitLn;
 end;
 
@@ -2823,6 +3390,16 @@ begin
   uDiag.DiagFacts.PermissionsPath := PermissionsPath;
   uDiag.DiagFacts.SessionFilePath := SessionPath(uTools.RootDir);
   uDiag.DiagFacts.SettingsSupported := True;
+  { 'on'/'off' rather than a Boolean so that a caller which never ran this
+    block leaves '' behind and uDiag reports "not probed" instead of
+    inventing an answer.  The command path is the only place that decides
+    whether an editor is really there; this says only what the setting is. }
+  if uSettings.SettingIsSet('ide.enabled') and
+     not uSettings.SettingBool('ide.enabled') then
+    uDiag.DiagFacts.IdeSetting := 'off'
+  else
+    uDiag.DiagFacts.IdeSetting := 'on';
+  uDiag.DiagFacts.IdeCommand := uSettings.SettingStr('ide.command');
   { One report builder, not two: /config colours these same rows.  A second
     derivation here is how /status and /config end up disagreeing about
     which tier a value came from. }
@@ -3087,6 +3664,8 @@ begin
       session's own list is the fallback. }
     ShowDiff;
   end
+  else if Cmd = '/ide' then
+    DoIde(Arg)
   else if Cmd = '/jobs' then
     ShowJobs
   else if Cmd = '/memory' then
@@ -4559,7 +5138,11 @@ begin
       repeat
         { The one call in the program that consults the binding table.  Every
           other prompt - the permission answer above all - reads through
-          ReadLineEdit, which passes the empty profile. }
+          ReadLineEdit, which passes the empty profile.
+
+          The status block is refreshed here, immediately before the read, so
+          what it says is what was true when the user looked at it. }
+        RefreshStatus;
         if not ReadPromptLine(ModePrompt, Line) then Break;
         Line := Trim(Line);
         if Line = '' then Continue;

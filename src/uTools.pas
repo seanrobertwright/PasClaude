@@ -824,6 +824,22 @@ function RestoreFilesSince(TurnNo: Integer; out Notes: string): Integer;
 procedure ClearSnapshots;
 { Test seam: how many snapshots are held. }
 function SnapshotCount: Integer;
+{ The file as it stood BEFORE this session first touched it - the OLDEST
+  snapshot for Full, not the newest.  A read-only view over the same array
+  /rewind uses, so it adds no state and nothing to clear.
+
+  Oldest rather than newest is the whole point: a file rewritten in turns 2
+  and 5 has two snapshots, and the answer to "what has this session done to
+  it" is the turn-2 one.  Returning the newest would report a multi-turn
+  rewrite as whatever the last edit happened to change.
+
+  False means no snapshot exists - the file was never written this session,
+  or it was larger than MaxReadBytes when SnapshotFile looked at it and was
+  skipped, the same limit /rewind already documents.  Existed=False with a
+  True result is the distinct third answer: this session CREATED the file,
+  so its baseline is genuinely empty. }
+function SessionBaseline(const Full: string;
+  out Text: string; out Existed: Boolean): Boolean;
 
 { Where the standing approvals for the current RootDir live, and deliberately
   NOT inside it.  The file answers "may this project's code run", so a copy of
@@ -5211,6 +5227,29 @@ begin
   end;
   SetLength(Snapshots, Length(Snapshots) + 1);
   Snapshots[High(Snapshots)] := S;
+end;
+
+function SessionBaseline(const Full: string;
+  out Text: string; out Existed: Boolean): Boolean;
+var
+  I, Best: Integer;
+begin
+  Text := '';
+  Existed := False;
+  Best := -1;
+  { CompareText, matching SnapshotFile's own comparison: the two must agree
+    about what "the same file" means or a baseline would be found for a path
+    that never got one. }
+  for I := 0 to High(Snapshots) do
+    if CompareText(Snapshots[I].Full, Full) = 0 then
+      if (Best < 0) or (Snapshots[I].Turn < Snapshots[Best].Turn) then
+        Best := I;
+  Result := Best >= 0;
+  if Result then
+  begin
+    Text := Snapshots[Best].Text;
+    Existed := Snapshots[Best].Existed;
+  end;
 end;
 
 function RestoreFilesSince(TurnNo: Integer; out Notes: string): Integer;

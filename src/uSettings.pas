@@ -80,7 +80,14 @@ type
       was every turn in that checkout failing with an HTTP 400 - a loader
       whose stated contract is that a hostile project file can never stop the
       program, stopping it.  0 stays legal because 0 means off. }
-    shThinkBudget);
+    shThinkBudget,
+    { An absolute path to a program a slash command will START.  Drive letter
+      or UNC prefix, extension in .cmd/.bat/.exe, printable ASCII 32..126 and
+      no '"'.  Absolute is the load-bearing half: a relative path resolves
+      against the process's current directory, which is the session root, so
+      without it a checked-in ide.command could name a file in the repository
+      even before the scope column was consulted. }
+    shIdeCommand);
 
   { Which direction of a number costs the user money.  The narrow-only rule is
     stated against the value the USER has in force, and this column says which
@@ -128,7 +135,7 @@ const
     is the natural way to add a setting, which is exactly why the Scope column
     has to be filled in at the same moment: the load position (above the
     print-mode halt) is legal ONLY because nothing here can grant. }
-  SettingCount = 41;
+  SettingCount = 44;
   SettingDefs: array[0..SettingCount - 1] of TSettingDef = (
     { ---- scAny: display and economy.  A project may set these. ---- }
     (Name: 'output_style'; Kind: skStr; Scope: scAny;
@@ -200,6 +207,24 @@ const
     (Name: 'telemetry.service_name'; Kind: skStr; Scope: scUserOnly;
      Lo: 0; Hi: 0; ProjMax: 0; Dflt: 0; Cheap: chNone; Shape: shServiceName;
      Note: 'service.name resource attribute'),
+
+    { ---- scUserOnly: the editor.  ide.command NAMES A PROGRAM THAT A SLASH
+      COMMAND STARTS, which makes it the highest-authority string in this
+      table after the model: a repository that could set it would have a
+      cloned checkout launching any executable on the machine the first time
+      somebody typed /ide.  That is the same shape of hole as a project-
+      settable telemetry endpoint and it gets the same answer.  ide.enabled
+      is user scope for the smaller reason that it gates the command that
+      reads the other one. ---- }
+    { Dflt 1: uIde.IdeEnabledDefault is True, and
+      TestSettingDefaultsMatchTheProgram fails the build if the two drift. }
+    (Name: 'ide.enabled'; Kind: skBool; Scope: scUserOnly;
+     Lo: 0; Hi: 0; ProjMax: 0; Dflt: 1; Cheap: chNone; Shape: shNone;
+     Note: 'let /ide open files and diffs in a detected editor'),
+    (Name: 'ide.command'; Kind: skStr; Scope: scUserOnly;
+     Lo: 0; Hi: 0; ProjMax: 0; Dflt: 0; Cheap: chNone; Shape: shIdeCommand;
+     Note: 'absolute path to the editor command-line program; only ' +
+       'consulted once an editor has already been detected'),
 
     { ---- scRefused.  Every one of these is a key somebody will paste from
       Claude Code's settings.json.  Honoured at no tier; each says where the
@@ -294,6 +319,10 @@ const
      Lo: 0; Hi: 0; ProjMax: 0; Dflt: 0; Cheap: chNone; Shape: shNone;
      Note: 'the telemetry keys are dotted: telemetry.enabled, ' +
        'telemetry.endpoint and the rest, and all are user scope'),
+    (Name: 'ide'; Kind: skStr; Scope: scRefused;
+     Lo: 0; Hi: 0; ProjMax: 0; Dflt: 0; Cheap: chNone; Shape: shNone;
+     Note: 'the IDE keys are dotted: ide.enabled and ide.command, and both ' +
+       'are user scope'),
     (Name: 'report_dir'; Kind: skStr; Scope: scRefused;
      Lo: 0; Hi: 0; ProjMax: 0; Dflt: 0; Cheap: chNone; Shape: shNone;
      Note: 'a settable report path is somewhere for a diagnostic to be ' +
@@ -560,6 +589,38 @@ begin
   Result := True;
 end;
 
+{ The path of a program /ide will START.  Four independent requirements, none
+  of which is sufficient alone:
+
+  absolute - a drive letter or a \\ UNC prefix.  A relative path resolves
+    against the current directory, which is the session root, so a relative
+    ide.command would name a file in the repository.
+  extension - .cmd, .bat or .exe.  Anything else is not a thing CreateProcess
+    or cmd.exe will start, so accepting it would only defer the failure.
+  printable ASCII 32..126 and no '"' - the same screen uIde applies before
+    composing a command line, applied a second time here so a value that
+    could never be launched is refused at the moment it is written rather
+    than at the moment somebody types /ide.
+
+  What this check does NOT do is decide whether the program is a reasonable
+  one to run.  That is the Scope column's job, and it says user only. }
+function IdeCommandOk(const S: string): Boolean;
+var
+  I: Integer;
+  E: string;
+begin
+  Result := False;
+  if (S = '') or (Length(S) > 512) then Exit;
+  for I := 1 to Length(S) do
+    if (S[I] < #32) or (S[I] > #126) or (S[I] = '"') then Exit;
+  if not (((Length(S) > 2) and (S[1] in ['A'..'Z', 'a'..'z']) and
+           (S[2] = ':') and (S[3] = '\')) or
+          (Copy(S, 1, 2) = '\\')) then Exit;
+  E := LowerCase(ExtractFileExt(S));
+  if (E <> '.cmd') and (E <> '.bat') and (E <> '.exe') then Exit;
+  Result := True;
+end;
+
 { A header value carrying CR or LF splits the request; NUL truncates it.  Both
   are header injection, so the check is on the bytes rather than on intent. }
 function HeaderTextOk(const S: string): Boolean;
@@ -759,6 +820,11 @@ begin
                 if not ServiceNameOk(Raw) then
                   Bad('"' + Name + '": lower-case letters, digits, dot, ' +
                     'underscore and dash, 64 characters at most');
+              shIdeCommand:
+                if not IdeCommandOk(Raw) then
+                  Bad('"' + Name + '": an absolute path (drive letter or ' +
+                    '\\\\server\\share) to a .cmd, .bat or .exe, printable ' +
+                    'ASCII and no quote characters');
             end;
           end;
         skMap:
@@ -1177,6 +1243,14 @@ begin
               begin
                 Err := Name + ': lower-case letters, digits, dot, underscore ' +
                   'and dash, 64 characters at most';
+                Exit;
+              end;
+            shIdeCommand:
+              if not IdeCommandOk(Value) then
+              begin
+                Err := Name + ': an absolute path (drive letter or ' +
+                  '\\server\share) to a .cmd, .bat or .exe, printable ASCII ' +
+                  'and no quote characters';
                 Exit;
               end;
           end;

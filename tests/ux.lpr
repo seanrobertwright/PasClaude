@@ -15,8 +15,8 @@ program ux;
 { Windows first, so SysUtils' DeleteFile and GetEnvironmentVariable win over
   the raw API of the same names. }
 uses Windows, SysUtils, Classes, DateUtils, uJson, uSettings, uAuth, uDiff,
-  uHttp, uTelem, uHooks, uSandbox, uTools, uImage, uAgent, uDiag, uTerm,
-  uNotebook, uSdk;
+  uHttp, uTelem, uHooks, uSandbox, uIde, uTools, uImage, uAgent, uDiag,
+  uTerm, uNotebook, uSdk;
 
 var
   Fails: Integer = 0;
@@ -4750,7 +4750,128 @@ begin
         'the auto_compact_tokens baseline is the hosts CompactTokens')
     else if SettingDefs[I].Name = 'thinking_budget' then
       Check(SettingDefs[I].Dflt = 0,
-        'and thinking is off until somebody asks for it');
+        'and thinking is off until somebody asks for it')
+    else if SettingDefs[I].Name = 'ide.enabled' then
+      Check(SettingDefs[I].Dflt = Ord(uIde.IdeEnabledDefault),
+        'and ide.enabled''s baseline is uIde.IdeEnabledDefault');
+end;
+
+{ SettingCount is a hand-maintained array bound that more than one feature
+  edits.  A bumped count with a missing tuple compiles clean and leaves a
+  zeroed def at the tail - Name '', Scope scAny, which TierAllowed then
+  treats as "any tier may set it".  TestSettingDefaultsMatchTheProgram
+  catches a wrong Dflt but would walk straight past that, so this is the
+  assertion that catches the round's most likely silent failure. }
+procedure TestSettingDefsAreComplete;
+var
+  I, J: Integer;
+begin
+  for I := 0 to SettingCount - 1 do
+  begin
+    Check(Trim(SettingDefs[I].Name) <> '',
+      Format('SettingDefs[%d] has a name', [I]));
+    if SettingDefs[I].Scope <> scRefused then
+      Check(Trim(SettingDefs[I].Note) <> '',
+        'and a note: ' + SettingDefs[I].Name);
+  end;
+  { And no duplicate, which SettingIndex's first-match walk would hide: the
+    second tuple would simply never be reachable, scope column and all. }
+  for I := 0 to SettingCount - 1 do
+    for J := I + 1 to SettingCount - 1 do
+      if SettingDefs[I].Name = SettingDefs[J].Name then
+        Check(False, 'a name appears twice: ' + SettingDefs[I].Name);
+end;
+
+{ ide.command names a program that a slash command STARTS.  A repository able
+  to set it would have a clone launching any executable on the machine the
+  first time somebody typed /ide, which is the same shape of hole as a
+  project-settable telemetry endpoint. }
+procedure TestIdeSettingsAreUserScopeOnly;
+var
+  P: TStringArray;
+  Doc: string;
+  I: Integer;
+begin
+  Doc := '{"ide.enabled":false,"ide.command":"C:\\x\\bin\\code.cmd"}';
+
+  { The table itself, directly.  The document tests below would still pass
+    with ide.command widened to scAny, because the all-or-nothing rule keeps
+    a mixed document out on ide.enabled's account alone - so the scope
+    column is asserted where it lives. }
+  for I := 0 to SettingCount - 1 do
+    if (SettingDefs[I].Name = 'ide.command') or
+       (SettingDefs[I].Name = 'ide.enabled') then
+    begin
+      Check(SettingDefs[I].Scope = scUserOnly,
+        SettingDefs[I].Name + ' is user scope in the table');
+      Check(not TierAllowed(SettingDefs[I], stProject),
+        '  and no project tier is allowed it');
+      Check(not TierAllowed(SettingDefs[I], stLocal),
+        '  nor the local one');
+    end;
+  Check(SettingDefs[SettingIndex('ide.command')].Shape = shIdeCommand,
+    'and ide.command carries the launcher shape check');
+
+  SettingsClear;
+  { Alone, so nothing else in the document can be the reason it was
+    refused: this is the assertion a widened scope column must fail. }
+  Check(not SettingsParseTier(stProject,
+    '{"ide.command":"C:\\x\\bin\\code.cmd"}', 'only.json', P),
+    'a project file naming only the launcher is still refused');
+  Check(SettingStr('ide.command') = '', 'and nothing is stored');
+  Check(not SettingsParseTier(stLocal,
+    '{"ide.command":"C:\\x\\bin\\code.cmd"}', 'only.local.json', P),
+    'and settings.local.json alone is refused too');
+  Check(SettingStr('ide.command') = '', 'and stores nothing either');
+
+  SettingsClear;
+  Check(not SettingsParseTier(stProject, Doc, 'proj.json', P),
+    'a project file may not set the IDE keys');
+  Check(Mentions(P, 'ide.command'), 'and the launcher key is named');
+  Check(SettingStr('ide.command') = '',
+    'and nothing is readable afterwards');
+  Check(SettingTierValue('ide.command', stProject) = '',
+    'the project tier holds nothing: never stored, not overridden');
+  Check(Mentions(SettingsRefusals, 'proj.json'),
+    'and the refusal names the file');
+
+  SettingsClear;
+  Check(not SettingsParseTier(stLocal, Doc, 'settings.local.json', P),
+    'and settings.local.json may not either - it carries project authority');
+  Check(not SettingIsSet('ide.command'), 'nothing stored from it');
+
+  SettingsClear;
+  Check(SettingsParseTier(stUser, Doc, 'user.json', P),
+    'the same document from the user''s own file is honoured');
+  Check(SettingStr('ide.command') = 'C:\x\bin\code.cmd',
+    'and the launcher reads back');
+  Check(SettingIsSet('ide.enabled') and not SettingBool('ide.enabled'),
+    'and the off switch');
+
+  { The shape check, which is the second of the four requirements and not a
+    substitute for the scope column. }
+  SettingsClear;
+  Check(not SettingsParseTier(stUser, '{"ide.command":"code.cmd"}', 'u', P),
+    'a relative launcher path is refused even from the user file');
+  Check(not SettingsParseTier(stUser,
+    '{"ide.command":"C:\\x\\bin\\code.ps1"}', 'u', P),
+    'and one Windows will not start');
+  Check(not SettingsParseTier(stUser,
+    '{"ide.command":"C:\\x\\bin\\co\"de.cmd"}', 'u', P),
+    'and one carrying a quote character');
+  Check(SettingsParseTier(stUser,
+    '{"ide.command":"\\\\srv\\share\\bin\\code.cmd"}', 'u', P),
+    'while a UNC path is accepted');
+  SettingsClear;
+
+  { The bare name, the same convention the bare 'telemetry' refusal uses, so
+    '"ide": {...}' produces a sentence naming the dotted keys rather than a
+    vaguer "unknown key". }
+  Check(not SettingsParseTier(stUser, '{"ide":{"command":"x"}}', 'u', P),
+    'the bare name "ide" is refused at the user tier too');
+  Check(Mentions(P, 'ide.enabled') and Mentions(P, 'ide.command'),
+    'and the message names the dotted keys');
+  SettingsClear;
 end;
 
 { Everything this unit hands back came out of a file, and one of those files
@@ -5207,6 +5328,159 @@ begin
   ClearDiagFacts;
 end;
 
+{ The row must be present whether or not an editor is there, and a record
+  nobody filled in must not produce a fact.  The environment is set
+  explicitly rather than trusted: this suite is itself very often run from
+  inside a VS Code terminal, so a test that read the ambient variables would
+  pass or fail depending on who ran it. }
+procedure TestStatusReportsIde;
+var
+  R: TStatusReport;
+  D: TDiagReport;
+  I: Integer;
+  Fake, SavedTp, SavedInj, SavedNode, SavedVer, SavedEmu: string;
+begin
+  SavedTp   := SysUtils.GetEnvironmentVariable('TERM_PROGRAM');
+  SavedVer  := SysUtils.GetEnvironmentVariable('TERM_PROGRAM_VERSION');
+  SavedInj  := SysUtils.GetEnvironmentVariable('VSCODE_INJECTION');
+  SavedNode := SysUtils.GetEnvironmentVariable('VSCODE_GIT_ASKPASS_NODE');
+  SavedEmu  := SysUtils.GetEnvironmentVariable('TERMINAL_EMULATOR');
+  try
+    ClearDiagNotes;
+    ClearDiagFacts;
+    { A zeroed record.  The row exists - a report that omitted it for a
+      plain console would be structurally different from every other one -
+      and it claims nothing. }
+    R := DiagBuildStatus(nil);
+    Check(StatusValue(R, 'ide') = 'not probed',
+      'a zeroed DiagFacts reports the IDE row as not probed');
+    Check(StatusValue(R, 'ide_command_source') = '',
+      'and names no launcher source');
+    D := DiagBuildDoctor(nil, False);
+    Check(DoctorLevel(D, 'ide_editor_cli') = dlSkipped,
+      'and the doctor check is skipped, not a green tick');
+
+    { A synthetic host, with a real file so the scan has something to find. }
+    Fake := IncludeTrailingPathDelimiter(TmpRoot) + 'fakeide' + PathDelim;
+    ForceDirectories(Fake + 'bin');
+    WriteFileText(Fake + 'Code.exe', 'x');
+    WriteFileText(Fake + 'bin' + PathDelim + 'code.cmd', 'x');
+    SetEnvironmentVariable('TERM_PROGRAM', 'vscode');
+    SetEnvironmentVariable('TERM_PROGRAM_VERSION', '9.9.9');
+    SetEnvironmentVariable('VSCODE_INJECTION', '1');
+    SetEnvironmentVariable('TERMINAL_EMULATOR', nil);
+    SetEnvironmentVariable('VSCODE_GIT_ASKPASS_NODE',
+      PChar(Fake + 'Code.exe'));
+    DiagFacts.IdeSetting := 'on';
+    R := DiagBuildStatus(nil);
+    Check(Pos('vscode', StatusValue(R, 'ide')) > 0, 'a probed host is named');
+    Check(Pos('9.9.9', StatusValue(R, 'ide')) > 0, 'with its version');
+    Check(Pos('Code.exe', StatusValue(R, 'ide')) > 0, 'and its product');
+    Check(Pos('code.cmd', StatusValue(R, 'ide')) > 0, 'and the resolved shim');
+    D := DiagBuildDoctor(nil, False);
+    Check(DoctorLevel(D, 'ide_editor_cli') = dlOk,
+      'and the doctor check passes when a shim resolved');
+
+    { The off switch, which /ide honours and which must not read as an
+      editor that could not be found. }
+    DiagFacts.IdeSetting := 'off';
+    R := DiagBuildStatus(nil);
+    Check(Pos('off', StatusValue(R, 'ide')) > 0, 'ide.enabled false says so');
+    D := DiagBuildDoctor(nil, False);
+    Check(DoctorLevel(D, 'ide_editor_cli') = dlSkipped,
+      'and is skipped rather than warned about');
+
+    { A detected host with nothing to launch is the one warning this check
+      can produce, and the builder's own invariant says it must carry a
+      remedy - nothing else in the suite exercises that for a new check. }
+    DiagFacts.IdeSetting := 'on';
+    SetEnvironmentVariable('VSCODE_GIT_ASKPASS_NODE', nil);
+    D := DiagBuildDoctor(nil, False);
+    Check(DoctorLevel(D, 'ide_editor_cli') = dlWarn,
+      'a host with no resolvable shim warns');
+    Check(Trim(DoctorField(D, 'ide_editor_cli', True)) <> '',
+      'and carries a remedy');
+    Check(Pos('ide.command', DoctorField(D, 'ide_editor_cli', True)) > 0,
+      'naming the user-scope key that fixes it');
+    for I := 0 to High(D) do
+      Check((DiagLevelRank(D[I].Level) = 0) or (Trim(D[I].Remedy) <> ''),
+        'every non-ok check still carries a remedy: ' + D[I].Id);
+
+    { The launcher source row, and the fact it names a FILE and never the
+      path - a program path belongs in the doctor detail, once. }
+    DiagFacts.IdeCommand := 'C:\x\bin\code.cmd';
+    R := DiagBuildStatus(nil);
+    Check(StatusValue(R, 'ide_command_source') = 'user settings.json',
+      'a set ide.command is attributed to the user file');
+  finally
+    SetEnvironmentVariable('TERM_PROGRAM', PChar(SavedTp));
+    SetEnvironmentVariable('TERM_PROGRAM_VERSION', PChar(SavedVer));
+    SetEnvironmentVariable('VSCODE_INJECTION', PChar(SavedInj));
+    SetEnvironmentVariable('VSCODE_GIT_ASKPASS_NODE', PChar(SavedNode));
+    SetEnvironmentVariable('TERMINAL_EMULATOR', PChar(SavedEmu));
+    ClearDiagFacts;
+  end;
+end;
+
+{ /ide diff shows what the SESSION did, so the baseline is the OLDEST
+  snapshot, not the newest.  Writing the loop the natural way - High downto
+  0, first match wins - would show only the last turn's change and report a
+  multi-turn rewrite as a one-line edit. }
+procedure TestIdeBaseline;
+var
+  J: TJson;
+  Out_, Text, P: string;
+  IsErr, Existed: Boolean;
+begin
+  uTools.AllowAllEdits := True;
+  uTools.ClearSnapshots;
+  P := IncludeTrailingPathDelimiter(TmpRoot) + 'baseline.txt';
+  WriteFileText(P, 'original');
+
+  uTools.BeginTurn(1);
+  J := TJson.NewObj;
+  J.AddStr('path', 'baseline.txt');
+  J.AddStr('content', 'after turn 1');
+  Out_ := uTools.RunTool('write_file', J, nil, IsErr);
+  J.Free;
+  Check(not IsErr, 'the turn-1 write applies: ' + Out_);
+
+  uTools.BeginTurn(2);
+  J := TJson.NewObj;
+  J.AddStr('path', 'baseline.txt');
+  J.AddStr('content', 'after turn 2');
+  Out_ := uTools.RunTool('write_file', J, nil, IsErr);
+  J.Free;
+  Check(not IsErr, 'and the turn-2 write');
+
+  Check(uTools.SessionBaseline(P, Text, Existed), 'a baseline is found');
+  Check(Text = 'original',
+    'and it is the state before the session, not before the last turn');
+  Check(Existed, 'and it says the file was already there');
+
+  { A file this session created: a real answer, distinct from "no
+    snapshot".  Conflating the two would open an empty pane against a file
+    /ide never touched and present it as wholly added. }
+  uTools.BeginTurn(3);
+  J := TJson.NewObj;
+  J.AddStr('path', 'made-now.txt');
+  J.AddStr('content', 'brand new');
+  uTools.RunTool('write_file', J, nil, IsErr);
+  J.Free;
+  Check(uTools.SessionBaseline(IncludeTrailingPathDelimiter(TmpRoot) +
+    'made-now.txt', Text, Existed), 'a created file has a baseline');
+  Check((Text = '') and not Existed, 'and it is empty, and says so');
+
+  Check(not uTools.SessionBaseline(IncludeTrailingPathDelimiter(TmpRoot) +
+    'never.txt', Text, Existed), 'an untouched file has none');
+  Check(not uTools.SessionBaseline('C:\somewhere\else.txt', Text, Existed),
+    'nor does a path outside the root');
+  uTools.ClearSnapshots;
+  Check(not uTools.SessionBaseline(P, Text, Existed),
+    'and none survives ClearSnapshots');
+  uTools.AllowAllEdits := False;
+end;
+
 procedure TestDoctorLevelsAndCosts;
 var
   R: TDiagReport;
@@ -5375,6 +5649,249 @@ begin
   ClearDiagFacts;
 end;
 
+{ ------------------------------------------------------------- the chrome --
+
+  The banner and the prompt block are laid out by arithmetic on widths, and
+  arithmetic on widths is exactly the thing that is wrong by one and looks
+  almost right.  These tests assert the properties a reader would have to
+  count columns on a screenshot to check. }
+
+procedure TestUiWidthCountsColumnsNotBytes;
+begin
+  Check(UiWidth('abc') = 3, 'ASCII is its own length');
+  { Three bytes, one column.  A banner padded by Length() would be two
+    columns short here, which is how a frame goes ragged. }
+  Check(UiWidth(#$E2#$94#$80) = 1, 'a box-drawing character is one column');
+  Check(Length(#$E2#$94#$80) = 3, 'though it is three bytes');
+  Check(UiWidth(MkAmber + 'abc' + MkOff) = 3, 'colour marks are not columns');
+  Check(UiPlain(MkAmber + 'abc' + MkOff) = 'abc', 'and strip out cleanly');
+  { A dangling mark is a caller's bug; it must not make the width negative
+    or a pad loop will run to SetLength(-1). }
+  Check(UiWidth('ab' + #1) = 2, 'a truncated mark costs no columns');
+end;
+
+procedure TestUiFitTruncatesWithoutLosingColour;
+var
+  S: string;
+begin
+  Check(UiFit('abc', 10) = 'abc', 'a string that fits is untouched');
+  Check(UiWidth(UiFit('abcdefghij', 5)) <= 5, 'a long one is cut to the width');
+  S := UiFit(MkAmber + 'aaaa' + MkRed + 'bbbb', 5);
+  { The colour that was still in force at the cut has to survive it, or the
+    next thing painted inherits it and the rest of the screen goes amber. }
+  Check(Pos(MkAmber, S) > 0, 'the marks before the cut are kept');
+  Check(UiWidth(S) <= 5, 'and the cut still respects the width');
+  Check(UiFit('abc', 0) = '', 'no room means no output');
+  Check(UiWidth(UiPad('ab', 6)) = 6, 'padding reaches the width exactly');
+  Check(UiWidth(UiCentre('ab', 6)) = 4, 'centring pads only on the left');
+end;
+
+procedure TestUiMeterAndCount;
+var
+  M: string;
+begin
+  UiSetGlyphs(ugAscii);
+  Check(UiWidth(UiMeter(50, 10, clAmber, clAmberDk)) = 10,
+    'a meter is exactly as wide as it was asked to be');
+  Check(UiWidth(UiMeter(0, 10, clAmber, clAmberDk)) = 10, 'empty included');
+  Check(UiWidth(UiMeter(100, 10, clAmber, clAmberDk)) = 10, 'and full');
+  Check(UiWidth(UiMeter(4000, 10, clAmber, clAmberDk)) = 10,
+    'and one handed a nonsense percentage, which is clamped');
+  { The first cell is the whole signal at the start of a session: a meter
+    that reads empty at 1% is a meter that does not appear to work. }
+  M := UiPlain(UiMeter(1, 20, clAmber, clAmberDk));
+  Check(Pos('=', M) = 1, 'one per cent lights the first cell');
+  Check(UiWidth(UiMeter(50, 0, clAmber, clAmberDk)) = 0,
+    'and no cells is no meter rather than a crash');
+
+  Check(UiCount(0) = '0', 'small counts are themselves');
+  Check(UiCount(999) = '999', 'up to the thousand');
+  Check(UiCount(1234) = '1.2k', 'then thousands');
+  Check(UiCount(1500000) = '1.5M', 'then millions');
+  UiSetGlyphs(ugAuto);
+end;
+
+{ The property that matters about a frame: every piece of it is the same
+  number of columns, whatever went inside and whichever glyph set is in
+  force.  Checked at several widths because an off-by-one in the top edge
+  only shows up when the title length and the width disagree. }
+procedure TestBoxPiecesLineUp;
+var
+  G: TUiGlyphs;
+  W, LeftW, RightW: Integer;
+  Long: string;
+begin
+  Long := StringOfChar('x', 300);
+  for G := ugAscii to ugUnicode do
+  begin
+    UiSetGlyphs(G);
+    for W := 40 to 60 do
+    begin
+      LeftW := (UiBoxInner(W, 2) * 42) div 100;
+      RightW := UiBoxInner(W, 2) - LeftW;
+      Check(UiWidth(UiBoxTop(MkAmber + 'pasclaude v0.1', W)) = W,
+        Format('top edge is %d wide', [W]));
+      Check(UiWidth(UiBoxBottom(W)) = W, Format('bottom edge is %d wide', [W]));
+      { Content far too long for its column: it must be cut, not allowed to
+        push the right border off the screen. }
+      Check(UiWidth(UiBoxRow([Long, Long], [LeftW, RightW])) = W,
+        Format('a row of over-long cells is still %d wide', [W]));
+      Check(UiWidth(UiBoxRow(['', ''], [LeftW, RightW])) = W,
+        Format('and a row of empty ones is too, at %d', [W]));
+    end;
+    { A single-column box, which the narrow path would want. }
+    Check(UiWidth(UiBoxRow([Long], [UiBoxInner(50, 1)])) = 50,
+      'the column count is honoured, not assumed to be two');
+  end;
+  UiSetGlyphs(ugAuto);
+end;
+
+{ The wrapping and the caret.  A wrap that drops a character is a prompt that
+  sends something the user did not type, and a caret one row from where the
+  eye is watching is worse than no cursor at all. }
+{ The vim tag alone, taken out of EditLead by removing the prompt it was
+  composed with.  The tag is not exported on its own; this is how the suite
+  gets at the thing the framed block's column arithmetic depends on. }
+function EditLeadTagOnly(Normal: Boolean): string;
+var
+  E: TEditState;
+begin
+  EditInit(E);
+  E.Vim := True;
+  if Normal then E.Mode := vmNormal else E.Mode := vmInsert;
+  Result := EditLead(E, '', True);
+end;
+
+procedure TestPromptWrapsAndPlacesTheCaret;
+var
+  Rows: TStringArray;
+  R, C: Integer;
+begin
+  Rows := PromptRows('hello world foo', 11, 0, R, C);
+  Check(Length(Rows) = 2, 'a line too long for the row is broken in two');
+  Check(Rows[0] = 'hello world', 'at the last space that fits');
+  Check(Rows[1] = 'foo', 'and the space itself is not shown again');
+
+  { The caret at the end of the first row stays on the first row.  Taking the
+    later of two equal positions would jump the cursor to the next line the
+    moment the user typed the character that filled this one. }
+  PromptRows('hello world foo', 11, 11, R, C);
+  Check((R = 0) and (C = 11), 'a caret at a row end stays on that row');
+  PromptRows('hello world foo', 11, 12, R, C);
+  Check(R = 1, 'and past the break it is on the next');
+  PromptRows('hello world foo', 11, 15, R, C);
+  Check((R = 1) and (C = 3), 'and at the very end it is after the last');
+
+  { A word with no space in it has to be cut at the margin.  Refusing would
+    either overflow the frame or loop forever. }
+  Rows := PromptRows('abcdefghijklmno', 6, 0, R, C);
+  Check(Length(Rows) = 3, 'an unbreakable word is cut at the margin');
+  Check((Rows[0] = 'abcdef') and (Rows[1] = 'ghijkl') and (Rows[2] = 'mno'),
+    'and no character is lost doing it');
+
+  Rows := PromptRows('a'#10'b', 20, 0, R, C);
+  Check((Length(Rows) = 2) and (Rows[0] = 'a') and (Rows[1] = 'b'),
+    'a typed newline always breaks');
+  Rows := PromptRows(''#10'', 20, 0, R, C);
+  Check(Length(Rows) = 2, 'and an empty line is a row, not nothing');
+
+  { The framed block puts the vim tag in front of the prompt mark, and it can
+    only do that without shifting the text sideways on every Esc because both
+    tags are the same width.  Asserted through EditLead, which composes the
+    same tag the block does. }
+  Check(UiWidth(EditLeadTagOnly(True)) = UiWidth(EditLeadTagOnly(False)),
+    'both vim tags are the same width, so the text never shifts');
+  Check(UiWidth(EditLeadTagOnly(True)) = 4, 'and that width is four columns');
+
+  { The empty prompt.  There has to be a row for the caret to sit in. }
+  Rows := PromptRows('', 20, 0, R, C);
+  Check(Length(Rows) = 1, 'an empty prompt still has one row');
+  Check((R = 0) and (C = 0), 'with the caret at its start');
+  { A width no sane terminal would give, asked for anyway. }
+  Rows := PromptRows('abc', 0, 3, R, C);
+  Check(Length(Rows) >= 1, 'a zero width does not hang or crash');
+end;
+
+{ The status line says nothing it does not know, and everything it says fits.
+  Both halves matter: a line of zeroes teaches the user to stop reading it,
+  and a line that overruns the window wraps and doubles the block's height
+  on every keystroke. }
+procedure TestStatusLinesSayOnlyWhatIsKnown;
+var
+  S: TStatusInfo;
+  L: TStringArray;
+  I, W: Integer;
+  Joined: string;
+begin
+  UiSetGlyphs(ugAscii);
+  StatusClear(S);
+  L := StatusLines(S, 80);
+  Check(Length(L) = 0, 'a session that knows nothing shows no status at all');
+
+  S.Model := 'claude-opus-5';
+  S.Dir := 'pasclaude';
+  S.Branch := 'feat/config-diagnostics';
+  S.CtxTokens := 18400;
+  S.CtxLimit := 150000;
+  S.TokensIn := 121500;
+  S.TokensOut := 8430;
+  S.Memories := 1;
+  S.Mcps := 3;
+  S.Hooks := 16;
+  S.Mode := 'bypass';
+  S.ModeHot := True;
+  L := StatusLines(S, 120);
+  Joined := '';
+  for I := 0 to High(L) do Joined := Joined + UiPlain(L[I]) + #10;
+  Check(Pos('[claude-opus-5]', Joined) > 0, 'the model is named');
+  Check(Pos('git:(feat/config-diagnostics)', Joined) > 0, 'and the branch');
+  Check(Pos('12%', Joined) > 0, 'the context is a percentage of the limit');
+  Check(Pos('18.4k', Joined) > 0, 'with the token count beside it');
+  Check(Pos('121.5k in', Joined) > 0, 'the session totals are abbreviated');
+  Check(Pos('1 CLAUDE.md', Joined) > 0, 'one memory file is singular');
+  Check(Pos('3 MCPs', Joined) > 0, 'and three servers plural');
+  Check(Pos('16 hooks', Joined) > 0, 'and the hooks are counted');
+  Check(Pos('bypass', Joined) > 0, 'and the mode is said out loud');
+
+  { The mode is last so that it is the line a narrow window keeps.  It is
+    also the only line whose absence is dangerous. }
+  Check(Pos('bypass', UiPlain(L[High(L)])) > 0,
+    'the mode is the last line, where nothing can push it off');
+
+  { Every width a window might have.  Nothing may exceed the width it was
+    given, or the terminal wraps it and the block grows a row it does not
+    know about. }
+  Joined := '';
+  for W := 12 to 140 do
+  begin
+    L := StatusLines(S, W);
+    for I := 0 to High(L) do
+      if UiWidth(L[I]) > W then
+        Joined := Joined + Format(' line %d at width %d;', [I, W]);
+  end;
+  Check(Joined = '', 'no status line overruns its width:' + Joined);
+  L := StatusLines(S, 4);
+  Check(Length(L) = 0, 'a window too narrow to say anything says nothing');
+
+  { A single hook and a single server read as one, not as "1 hooks". }
+  StatusClear(S);
+  S.Mcps := 1;
+  S.Hooks := 1;
+  L := StatusLines(S, 80);
+  Check((Length(L) = 1) and (Pos('1 MCP ', UiPlain(L[0]) + ' ') > 0) and
+        (Pos('1 hook ', UiPlain(L[0]) + ' ') > 0),
+    'singular counts are written singular');
+
+  { Zero is not a fact worth a column. }
+  StatusClear(S);
+  S.Memories := 0;
+  S.Mcps := 0;
+  S.Hooks := 0;
+  L := StatusLines(S, 80);
+  Check(Length(L) = 0, 'and a count of zero is left out rather than shown');
+  UiSetGlyphs(ugAuto);
+end;
+
 procedure TestBugReportEndToEnd;
 var
   Opts: TBugOptions;
@@ -5525,6 +6042,8 @@ begin
     TestSettingsPrecedence;
     TestSettingsProjectCeiling;
     TestSettingDefaultsMatchTheProgram;
+    TestSettingDefsAreComplete;
+    TestIdeSettingsAreUserScopeOnly;
     TestSettingsTextIsSanitised;
     TestSettingsLocalHasProjectAuthority;
     TestSettingsGrantsNothing;
@@ -5538,11 +6057,19 @@ begin
     TestTelemetryPreviewIsWhatShips;
     TestTelemetrySelfDisableIsSaidOnce;
     TestStatusBorrowsTheOwningUnits;
+    TestStatusReportsIde;
+    TestIdeBaseline;
     TestDoctorLevelsAndCosts;
     TestDoctorReplaysTheLedger;
     TestProbeWritableLeavesNothing;
     TestDiagTakesNothingFromTheProject;
     TestBugReportEndToEnd;
+    TestUiWidthCountsColumnsNotBytes;
+    TestUiFitTruncatesWithoutLosingColour;
+    TestUiMeterAndCount;
+    TestBoxPiecesLineUp;
+    TestPromptWrapsAndPlacesTheCaret;
+    TestStatusLinesSayOnlyWhatIsKnown;
   finally
     { Before the cleanup, not after: a live child holding a spool handle under
       TmpRoot would make the recursive delete fail. }
@@ -5570,6 +6097,9 @@ begin
       by a decision this suite made. }
     uSandbox.SandboxLevel := slLimits;
     uSandbox.SandboxShutdown;
+    { The spawn seam back to nil: a suite that left one installed would
+      hand it to whatever ran next. }
+    uIde.IdeSpawnOverride := nil;
     uTools.RootDir := '';
     Cleanup(TmpRoot);
   end;

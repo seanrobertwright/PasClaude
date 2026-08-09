@@ -13,8 +13,21 @@ interface
 uses SysUtils;
 
 type
+  { The first nine are the original palette and map to the bright ANSI
+    foregrounds, which is all a legacy console can render.  The four after
+    them are the amber theme, and they are the reason this enum grew: a
+    16-colour palette has exactly one amber - clYellow - and a UI built from
+    one amber is a UI with no shading.  These four go out as 24-bit
+    sequences on a VT console and collapse onto clYellow and clGrey where
+    they cannot, which is a duller banner and never a broken one.
+
+    New entries go at the END.  Attr and VtSeq both close with an else, so
+    an unmapped colour is the saved attribute rather than a compile error -
+    an ordering mistake here would be silent. }
   TColor = (clGrey, clWhite, clBright, clCyan, clGreen, clYellow, clRed,
-            clMagenta, clBlue);
+            clMagenta, clBlue,
+            { the amber ramp, lightest first }
+            clAmberLt, clAmber, clAmberDim, clAmberDk);
 
 procedure TermInit;
 procedure TermDone;
@@ -36,6 +49,142 @@ procedure EmitCLn(C: TColor; const S: string = '');
 { Bright white text on a blue field, for the logo.  One write on the VT
   path; attribute round trip on legacy consoles. }
 procedure EmitLogo(const S: string);
+
+{ ------------------------------------------------------------- the chrome --
+
+  The banner and the prompt block are laid out in columns, and a column is a
+  width.  Everything below exists because Length() is not a width: this
+  program's strings are UTF-8, so '─' is three bytes and one column, and a
+  banner padded by Length() is a banner with a ragged right edge.
+
+  Rows are written as ONE string with inline colour marks rather than as a
+  run of EmitC calls, because a row that is six calls long cannot be measured
+  or padded before it is painted - and measuring is the whole job.  A mark is
+  #1 followed by one letter; #1 cannot occur in text the user or the model
+  produced, so no escaping rule is needed and none is enforced. }
+
+const
+  MkOff      = #1'0';    { back to the terminal's own colour }
+  MkGrey     = #1'g';
+  MkWhite    = #1'w';
+  MkBright   = #1'B';
+  MkCyan     = #1'c';
+  MkGreen    = #1'G';
+  MkYellow   = #1'y';
+  MkRed      = #1'r';
+  MkAmberLt  = #1'L';
+  MkAmber    = #1'A';
+  MkAmberDim = #1'D';
+  MkAmberDk  = #1'K';
+
+{ Columns the string occupies once the marks are removed.  Counts UTF-8
+  characters, not bytes.  Every glyph this program draws is single-width;
+  a wide CJK character would be counted as one and pad short, which is a
+  cosmetic bug in a banner and not worth a character-width table. }
+function UiWidth(const S: string): Integer;
+{ The string with the marks stripped - what a log or a test sees. }
+function UiPlain(const S: string): string;
+{ Padded on the right to exactly W columns (never truncated: use UiFit). }
+function UiPad(const S: string; W: Integer): string;
+{ Truncated to at most W columns, with a trailing ellipsis when it had to
+  cut.  Marks are preserved and never counted, and a cut never lands inside
+  a mark or inside a UTF-8 sequence. }
+function UiFit(const S: string; W: Integer): string;
+{ Centred within W columns. }
+function UiCentre(const S: string; W: Integer): string;
+{ Paints a marked-up string.  Colour marks turn into EmitC runs. }
+procedure UiPaint(const S: string);
+procedure UiPaintLn(const S: string = '');
+{ The same string with the marks turned into VT escapes, for a caller that
+  must paint in ONE write - the prompt block repaints six rows on every
+  keystroke, and six rows of per-run console calls is a prompt that feels
+  like it is thinking.  '' when VT is off, because there is nothing useful
+  to return: the attribute path cannot be expressed as text. }
+function UiVt(const S: string): string;
+
+{ True when the console can be trusted with box-drawing and block glyphs.
+  Tied to VT by default, which every console that has the fonts also has and
+  which the raster-font conhost that would render them as blanks does not. }
+function UiFancy: Boolean;
+
+type
+  { ugAuto follows VT.  The other two override it, which the tests need -
+    a suite that can only ever reach the ASCII branch is a suite that tests
+    half of this - and which a user on a terminal that renders box-drawing
+    badly can be given later without another decision being made here. }
+  TUiGlyphs = (ugAuto, ugAscii, ugUnicode);
+
+procedure UiSetGlyphs(G: TUiGlyphs);
+function UiGlyphs: TUiGlyphs;
+{ Glyph repeated N times.  N below 1 is the empty string, so a caller doing
+  arithmetic on a terminal width cannot produce a negative-length loop. }
+function UiRepeat(const Glyph: string; N: Integer): string;
+{ A horizontal rule of Cells columns. }
+function UiRule(Cells: Integer): string;
+{ A proportional bar: Pct of Cells columns in Fill, the rest in Trough.
+  Pct is clamped to 0..100, and a non-zero percentage always lights at least
+  one cell - a meter that reads 0 at 1% is a meter that lies about the
+  direction things are moving. }
+function UiMeter(Pct, Cells: Integer; Fill, Trough: TColor): string;
+{ 1234 as '1.2k', 1500000 as '1.5M'.  For the status line, where the number
+  is a sense of scale and four significant figures are noise. }
+function UiCount(N: Int64): string;
+
+{ A rounded frame, exactly Width columns wide in every part, so the three
+  pieces line up without the caller doing arithmetic.  The title is set into
+  the top edge, where it reads as a label rather than as a first row.
+
+  UiBoxRow takes one string per column and the width of each; a column is
+  fitted and padded to its width, so a long path shortens instead of pushing
+  the right border off the screen.  For N columns the frame costs
+  3*N + 1 columns of chrome, which is what UiBoxInner works out for the
+  caller. }
+function UiBoxTop(const Title: string; Width: Integer): string;
+function UiBoxBottom(Width: Integer): string;
+function UiBoxRow(const Cells: array of string;
+  const Widths: array of Integer): string;
+{ Columns left for content in a Width-wide box of Columns columns. }
+function UiBoxInner(Width, Columns: Integer): Integer;
+
+{ ---------------------------------------------------------- the statusline --
+
+  What the block under the prompt says.  uTerm is at the bottom of the unit
+  ladder and cannot ask uAgent for a token count or uTools for the permission
+  mode, so the facts are PUSHED here by the REPL before each read rather than
+  pulled from here.  That inversion is not a workaround: it is what keeps the
+  console unit free of the program's state, and it means the composer below
+  is a pure function of a record and can be tested without a console.
+
+  Every field has a "say nothing" value - '' or a negative number - and a
+  field that says nothing takes no space in the output.  A status line is
+  read at a glance or not at all, so a run with no git, no MCP servers and no
+  memory file gets a shorter line, not a line of zeroes and dashes. }
+type
+  TStatusInfo = record
+    Model: string;         { the model or alias in force }
+    Dir: string;           { the working directory, already shortened }
+    Branch: string;        { git branch; '' when the tree is not a repo }
+    CtxTokens: Int64;      { the last measured prompt size }
+    CtxLimit: Int64;       { what it is measured against; 0 hides the meter }
+    TokensIn: Int64;       { the session totals, cache included }
+    TokensOut: Int64;
+    Memories: Integer;     { CLAUDE.md files loaded; -1 hides }
+    Mcps: Integer;         { live MCP servers; -1 hides }
+    Hooks: Integer;        { configured hook entries; -1 hides }
+    Mode: string;          { permission mode word; '' hides the whole line }
+    ModeHot: Boolean;      { paint the mode as a warning, not as a label }
+    Note: string;          { one free line, already marked up; '' hides }
+  end;
+
+{ Clears every field to its "say nothing" value.  Callers build on top of
+  this rather than declaring a record and filling what they remember, so a
+  field added later defaults to hidden instead of to garbage. }
+procedure StatusClear(out S: TStatusInfo);
+{ Installs what the block paints.  Read only while a prompt is on screen. }
+procedure SetStatus(const S: TStatusInfo);
+{ The rows the record renders to, marked up and already fitted to Width.
+  Pure: no console, no module state beyond the palette. }
+function StatusLines(const S: TStatusInfo; Width: Integer): TStringArray;
 
 { ------------------------------------------------------- markdown streaming --
 
@@ -320,8 +469,21 @@ function PromptProfile: TKeyProfile;
 
 { The REPL's reader, and the ONLY caller of the profile.  Everything else in
   the program keeps ReadLineEdit, whose signature and behaviour are unchanged
-  by any of this. }
+  by any of this.  This is also the only reader that draws the framed block
+  described above; on a console that refused VT it is the plain line, and
+  nothing above this comment changes. }
 function ReadPromptLine(const Prompt: string; out Line: string): Boolean;
+
+{ The visual rows the framed prompt breaks Text into at InnerW columns, and
+  where in them the caret sits.  Rows come back as UTF-8, without the lead
+  or the frame - this is the wrapping alone.
+
+  Exposed for the same reason the editor's own decisions are: a wrap that
+  loses a character, or a caret that lands one row from where the user's eye
+  is, is invisible in review and obvious in use, and neither can be argued
+  about against a console.  Row and column are both zero-based. }
+function PromptRows(const Text: WideString; InnerW, Caret: Integer;
+  out CaretRow, CaretCol: Integer): TStringArray;
 
 implementation
 
@@ -368,6 +530,14 @@ begin
     clRed:     Result := #27'[91m';
     clMagenta: Result := #27'[95m';
     clBlue:    Result := #27'[94m';
+    { The amber ramp.  Truecolor, because the whole point of these four is
+      the distance between them and a palette that has one yellow cannot
+      express it.  A terminal that advertises VT but only has 256 colours
+      quantises these itself, and lands somewhere in the same family. }
+    clAmberLt:  Result := #27'[38;2;255;203;139m';   { highlights }
+    clAmber:    Result := #27'[38;2;255;169;64m';    { the accent }
+    clAmberDim: Result := #27'[38;2;191;122;38m';    { borders }
+    clAmberDk:  Result := #27'[38;2;122;80;34m';     { rules, meter troughs }
   else
     Result := '';
   end;
@@ -412,6 +582,14 @@ begin
     clRed:     Result := FOREGROUND_RED or FOREGROUND_INTENSITY;
     clMagenta: Result := FOREGROUND_RED or FOREGROUND_BLUE or FOREGROUND_INTENSITY;
     clBlue:    Result := FOREGROUND_BLUE or FOREGROUND_INTENSITY;
+    { Sixteen colours have one amber between them, so the ramp collapses:
+      the two bright ends onto intense yellow, the two dark ones onto the
+      dim pair that reads as "structure, not text".  The banner loses its
+      shading and keeps its shape. }
+    clAmberLt, clAmber:
+      Result := FOREGROUND_RED or FOREGROUND_GREEN or FOREGROUND_INTENSITY;
+    clAmberDim: Result := FOREGROUND_RED or FOREGROUND_GREEN;
+    clAmberDk:  Result := FOREGROUND_INTENSITY;
   else
     Result := SavedAttr;
   end;
@@ -530,6 +708,473 @@ begin
     RawWrite(S);
     if HOut <> 0 then SetConsoleTextAttribute(HOut, SavedAttr);
   end;
+end;
+
+{ ------------------------------------------------------------- the chrome -- }
+
+var
+  GlyphMode: TUiGlyphs = ugAuto;
+
+procedure UiSetGlyphs(G: TUiGlyphs);
+begin
+  GlyphMode := G;
+end;
+
+function UiGlyphs: TUiGlyphs;
+begin
+  Result := GlyphMode;
+end;
+
+function UiFancy: Boolean;
+begin
+  case GlyphMode of
+    ugAscii:   Result := False;
+    ugUnicode: Result := True;
+  else
+    Result := VtActive;
+  end;
+end;
+
+{ A byte starts a character unless it is a UTF-8 continuation byte, which is
+  the whole of the width rule for the single-width text this draws. }
+function IsLead(B: Byte): Boolean;
+begin
+  Result := (B and $C0) <> $80;
+end;
+
+function UiWidth(const S: string): Integer;
+var
+  I: Integer;
+begin
+  Result := 0;
+  I := 1;
+  while I <= Length(S) do
+  begin
+    if S[I] = #1 then
+    begin
+      { A mark is two bytes and zero columns.  A trailing #1 with nothing
+        after it is a caller's bug; it is skipped rather than counted, so a
+        truncated row cannot make the padding negative. }
+      Inc(I, 2);
+      Continue;
+    end;
+    if IsLead(Byte(S[I])) then Inc(Result);
+    Inc(I);
+  end;
+end;
+
+function UiPlain(const S: string): string;
+var
+  I: Integer;
+begin
+  Result := '';
+  I := 1;
+  while I <= Length(S) do
+  begin
+    if S[I] = #1 then
+    begin
+      Inc(I, 2);
+      Continue;
+    end;
+    Result := Result + S[I];
+    Inc(I);
+  end;
+end;
+
+function UiRepeat(const Glyph: string; N: Integer): string;
+var
+  I: Integer;
+begin
+  Result := '';
+  for I := 1 to N do Result := Result + Glyph;
+end;
+
+function UiPad(const S: string; W: Integer): string;
+begin
+  Result := S + UiRepeat(' ', W - UiWidth(S));
+end;
+
+function UiFit(const S: string; W: Integer): string;
+var
+  I, Col: Integer;
+begin
+  if W <= 0 then Exit('');
+  if UiWidth(S) <= W then Exit(S);
+  { One column is given back to the ellipsis, so a fitted string is at most
+    W wide including the mark that it was cut. }
+  Result := '';
+  Col := 0;
+  I := 1;
+  while I <= Length(S) do
+  begin
+    if S[I] = #1 then
+    begin
+      { Marks are copied through without costing a column: a truncated row
+        that dropped its colour marks would leak the last colour onto
+        everything painted after it. }
+      Result := Result + Copy(S, I, 2);
+      Inc(I, 2);
+      Continue;
+    end;
+    if IsLead(Byte(S[I])) then
+    begin
+      if Col >= W - 1 then Break;
+      Inc(Col);
+    end;
+    Result := Result + S[I];
+    Inc(I);
+  end;
+  if UiFancy then Result := Result + #$E2#$80#$A6 else Result := Result + '.';
+end;
+
+function UiCentre(const S: string; W: Integer): string;
+var
+  Left: Integer;
+begin
+  Left := (W - UiWidth(S)) div 2;
+  if Left < 0 then Left := 0;
+  Result := UiRepeat(' ', Left) + S;
+end;
+
+type
+  { What WalkMarks hands each run to. }
+  TMarkSink = procedure(const Run: string; Col: TColor; Coloured: Boolean);
+
+function MarkColor(C: Char; out Col: TColor): Boolean;
+begin
+  Result := True;
+  case C of
+    'g': Col := clGrey;
+    'w': Col := clWhite;
+    'B': Col := clBright;
+    'c': Col := clCyan;
+    'G': Col := clGreen;
+    'y': Col := clYellow;
+    'r': Col := clRed;
+    'L': Col := clAmberLt;
+    'A': Col := clAmber;
+    'D': Col := clAmberDim;
+    'K': Col := clAmberDk;
+  else
+    Col := clWhite;
+    Result := False;    { '0', and anything unknown, means "no colour" }
+  end;
+end;
+
+{ The one walk over the marks, shared by both painters.  Each run is handed
+  to Run with the colour in force, or with Coloured false where the string
+  asked for the terminal's own foreground. }
+procedure WalkMarks(const S: string; Sink: TMarkSink);
+var
+  I, Start: Integer;
+  Col: TColor;
+  Coloured: Boolean;
+
+  procedure FlushRun(Upto: Integer);
+  begin
+    if Upto < Start then Exit;
+    if Upto = Start - 1 then Exit;
+    Sink(Copy(S, Start, Upto - Start + 1), Col, Coloured);
+  end;
+
+begin
+  Coloured := False;
+  Col := clWhite;
+  Start := 1;
+  I := 1;
+  while I <= Length(S) do
+  begin
+    if S[I] = #1 then
+    begin
+      FlushRun(I - 1);
+      if I + 1 <= Length(S) then
+        Coloured := MarkColor(S[I + 1], Col)
+      else
+        Coloured := False;
+      Inc(I, 2);
+      Start := I;
+      Continue;
+    end;
+    Inc(I);
+  end;
+  FlushRun(Length(S));
+end;
+
+var
+  { WalkMarks hands its runs to a closure-free callback, so the two painters
+    each keep one module-level accumulator.  Neither is re-entrant, and
+    neither needs to be: both are called from the one thread that owns the
+    console. }
+  VtBuf: string = '';
+
+procedure VtSink(const Run: string; Col: TColor; Coloured: Boolean);
+begin
+  if Coloured then VtBuf := VtBuf + VtSeq(Col) + Run + VtReset
+  else VtBuf := VtBuf + Run;
+end;
+
+procedure PaintSink(const Run: string; Col: TColor; Coloured: Boolean);
+begin
+  if Coloured then EmitC(Col, Run) else Emit(Run);
+end;
+
+function UiVt(const S: string): string;
+begin
+  if not VtActive then Exit('');
+  VtBuf := '';
+  WalkMarks(S, @VtSink);
+  Result := VtBuf;
+  VtBuf := '';
+end;
+
+procedure UiPaint(const S: string);
+begin
+  { One write on a VT console, a call per run on a legacy one - where the
+    colour IS a call and there is no way around it. }
+  if VtActive then
+    RawWrite(UiVt(S))
+  else
+    WalkMarks(S, @PaintSink);
+end;
+
+procedure UiPaintLn(const S: string);
+begin
+  UiPaint(S);
+  EmitLn;
+end;
+
+function UiRule(Cells: Integer): string;
+begin
+  if UiFancy then
+    Result := UiRepeat(#$E2#$94#$80, Cells)     { U+2500 }
+  else
+    Result := UiRepeat('-', Cells);
+end;
+
+function UiMeter(Pct, Cells: Integer; Fill, Trough: TColor): string;
+var
+  Lit: Integer;
+  Block: string;
+  FillMark, TroughMark: string;
+
+  function MarkOf(C: TColor): string;
+  begin
+    case C of
+      clGrey:     Result := MkGrey;
+      clWhite:    Result := MkWhite;
+      clBright:   Result := MkBright;
+      clCyan:     Result := MkCyan;
+      clGreen:    Result := MkGreen;
+      clYellow:   Result := MkYellow;
+      clRed:      Result := MkRed;
+      clAmberLt:  Result := MkAmberLt;
+      clAmber:    Result := MkAmber;
+      clAmberDim: Result := MkAmberDim;
+      clAmberDk:  Result := MkAmberDk;
+    else
+      Result := MkOff;
+    end;
+  end;
+
+begin
+  if Cells < 1 then Exit('');
+  if Pct < 0 then Pct := 0;
+  if Pct > 100 then Pct := 100;
+  Lit := (Pct * Cells) div 100;
+  { A percentage that has moved off zero lights a cell.  The rounding this
+    breaks is worth less than the signal: the first thing a user wants from
+    a context meter is to see it start. }
+  if (Lit = 0) and (Pct > 0) then Lit := 1;
+  if Lit > Cells then Lit := Cells;
+  if UiFancy then Block := #$E2#$96#$88 else Block := '=';   { U+2588 }
+  FillMark := MarkOf(Fill);
+  TroughMark := MarkOf(Trough);
+  Result := FillMark + UiRepeat(Block, Lit) +
+            TroughMark + UiRepeat(Block, Cells - Lit) + MkOff;
+end;
+
+function UiCount(N: Int64): string;
+begin
+  if N < 0 then Exit('0');
+  if N < 1000 then Exit(IntToStr(N));
+  if N < 1000000 then
+    Exit(Format('%.1fk', [N / 1000]));
+  Result := Format('%.1fM', [N / 1000000]);
+end;
+
+{ The four rounded corners and the two bars, or ASCII where the console
+  cannot be trusted with them.  Kept together so the fallback set is
+  obviously complete rather than six scattered ifs. }
+function GlyphTL: string; begin if UiFancy then Result := #$E2#$95#$AD else Result := '.'; end;
+function GlyphTR: string; begin if UiFancy then Result := #$E2#$95#$AE else Result := '.'; end;
+function GlyphBL: string; begin if UiFancy then Result := #$E2#$95#$B0 else Result := '`'; end;
+function GlyphBR: string; begin if UiFancy then Result := #$E2#$95#$AF else Result := #39;  end;
+function GlyphV: string;  begin if UiFancy then Result := #$E2#$94#$82 else Result := '|'; end;
+
+function UiBoxInner(Width, Columns: Integer): Integer;
+begin
+  { Two border bars, one separator per extra column, and a space on each
+    side of every column. }
+  Result := Width - (3 * Columns + 1);
+  if Result < 0 then Result := 0;
+end;
+
+function UiBoxTop(const Title: string; Width: Integer): string;
+var
+  Rest: Integer;
+begin
+  if Title = '' then
+  begin
+    Result := MkAmberDim + GlyphTL + UiRule(Width - 2) + GlyphTR + MkOff;
+    Exit;
+  end;
+  Rest := Width - 5 - UiWidth(Title);
+  if Rest < 0 then Rest := 0;
+  Result := MkAmberDim + GlyphTL + UiRule(1) + ' ' +
+            Title + MkAmberDim + ' ' + UiRule(Rest) + GlyphTR + MkOff;
+end;
+
+function UiBoxBottom(Width: Integer): string;
+begin
+  Result := MkAmberDim + GlyphBL + UiRule(Width - 2) + GlyphBR + MkOff;
+end;
+
+function UiBoxRow(const Cells: array of string;
+  const Widths: array of Integer): string;
+var
+  I, W: Integer;
+begin
+  Result := MkAmberDim + GlyphV + MkOff + ' ';
+  for I := 0 to High(Cells) do
+  begin
+    if I > 0 then Result := Result + MkAmberDim + GlyphV + MkOff + ' ';
+    if I <= High(Widths) then W := Widths[I] else W := 0;
+    Result := Result + UiPad(UiFit(Cells[I], W), W) + ' ';
+  end;
+  Result := Result + MkAmberDim + GlyphV + MkOff;
+end;
+
+{ ---------------------------------------------------------- the statusline -- }
+
+var
+  Status: TStatusInfo;
+
+procedure StatusClear(out S: TStatusInfo);
+begin
+  S.Model := '';
+  S.Dir := '';
+  S.Branch := '';
+  S.CtxTokens := 0;
+  S.CtxLimit := 0;
+  S.TokensIn := 0;
+  S.TokensOut := 0;
+  S.Memories := -1;
+  S.Mcps := -1;
+  S.Hooks := -1;
+  S.Mode := '';
+  S.ModeHot := False;
+  S.Note := '';
+end;
+
+procedure SetStatus(const S: TStatusInfo);
+begin
+  Status := S;
+end;
+
+{ 'thing' or 'things', so a line can say "1 hook" without saying "1 hooks". }
+function Plural(N: Integer; const One, Many: string): string;
+begin
+  if N = 1 then Result := IntToStr(N) + ' ' + One
+  else Result := IntToStr(N) + ' ' + Many;
+end;
+
+function StatusLines(const S: TStatusInfo; Width: Integer): TStringArray;
+var
+  Row, Sep, Facts: string;
+  Pct: Integer;
+
+  procedure Add(const Line: string);
+  begin
+    if Trim(UiPlain(Line)) = '' then Exit;
+    SetLength(Result, Length(Result) + 1);
+    Result[High(Result)] := UiFit(Line, Width);
+  end;
+
+begin
+  Result := nil;
+  if Width < 12 then Exit;
+  if UiFancy then Sep := MkAmberDk + ' ' + #$E2#$94#$82 + ' ' else Sep := MkAmberDk + ' | ';
+
+  { Line one: who is answering and where.  The two facts a user checks
+    before typing, and the two that are wrong most expensively. }
+  Row := '';
+  if S.Model <> '' then Row := MkCyan + '[' + S.Model + ']';
+  if S.Dir <> '' then
+  begin
+    if Row <> '' then Row := Row + Sep;
+    Row := Row + MkAmberLt + S.Dir;
+  end;
+  if S.Branch <> '' then
+    Row := Row + MkGrey + ' git:(' + MkAmber + S.Branch + MkGrey + ')';
+  Add(Row + MkOff);
+
+  { Line two: the meters.  Context first, because it is the one that ends
+    the session when it fills. }
+  Row := '';
+  if S.CtxLimit > 0 then
+  begin
+    Pct := Round((S.CtxTokens * 100) / S.CtxLimit);
+    Row := MkGrey + 'Context ' +
+           UiMeter(Pct, 12, clAmber, clAmberDk) + ' ' +
+           MkAmberLt + IntToStr(Pct) + '%' +
+           MkGrey + ' (' + UiCount(S.CtxTokens) + ')';
+  end;
+  if (S.TokensIn > 0) or (S.TokensOut > 0) then
+  begin
+    if Row <> '' then Row := Row + Sep;
+    Row := Row + MkGrey + 'Session ' + MkAmberLt + UiCount(S.TokensIn) +
+           MkGrey + ' in ' + MkAmberLt + UiCount(S.TokensOut) + MkGrey + ' out';
+  end;
+  Add(Row + MkOff);
+
+  { Line three: what was loaded.  Nothing here changes during a session, so
+    it is the line a reader stops noticing - which is why it is last of the
+    three and why a zero is omitted rather than shown. }
+  Facts := '';
+  if S.Memories > 0 then Facts := Plural(S.Memories, 'CLAUDE.md', 'CLAUDE.md');
+  if S.Mcps > 0 then
+  begin
+    if Facts <> '' then Facts := Facts + Sep + MkGrey;
+    Facts := Facts + Plural(S.Mcps, 'MCP', 'MCPs');
+  end;
+  if S.Hooks > 0 then
+  begin
+    if Facts <> '' then Facts := Facts + Sep + MkGrey;
+    Facts := Facts + Plural(S.Hooks, 'hook', 'hooks');
+  end;
+  if Facts <> '' then Add(MkGrey + Facts + MkOff);
+
+  { The mode, last and loudest.  It is the line that says what will happen
+    without being asked, so it is the one that must survive a narrow
+    terminal - hence last, where nothing pushes it off.
+
+    The caller sets Mode to '' for the ordinary ask-me state.  An indicator
+    that is always on is not an indicator, and the prompt has always taken
+    that view; the status line takes it too. }
+  if S.Mode <> '' then
+  begin
+    if S.ModeHot then
+    begin
+      if UiFancy then Row := MkRed + #$E2#$96#$B8#$E2#$96#$B8 + ' '
+      else Row := MkRed + '>> ';
+      Row := Row + S.Mode + MkGrey + '  (/mode to change)';
+    end
+    else
+      Row := MkAmberDim + S.Mode + MkGrey + '  (/mode to change)';
+    Add(Row + MkOff);
+  end;
+
+  if S.Note <> '' then Add(S.Note + MkOff);
 end;
 
 { ------------------------------------------------------- markdown streaming -- }
@@ -1823,12 +2468,296 @@ begin
   PrevLen := Painted;
 end;
 
+{ ------------------------------------------------------- the prompt block --
+
+  Redraw above paints one line and stays on it.  The REPL's prompt is a
+  block: a rule, the text, a rule, and the status lines under it.  That means
+  painting rows BELOW the caret and then going back up to it, which is a
+  thing only VT escapes can do - so this path exists alongside the one above
+  rather than replacing it, and a console that refused VT keeps the single
+  line it has always had.
+
+  The block is for the REPL and nothing else.  A permission question inside a
+  status frame is a permission question nobody reads, so ReadLineEdit - which
+  is what every other prompt in the program calls - never takes this path. }
+
+type
+  { A visual row of the input text: a span of the wide string, 1-based.
+    Spans rather than copies, so the caret can be located by arithmetic
+    instead of by re-searching the text. }
+  TWrapSpan = record
+    Start, Len: Integer;
+  end;
+  TWrapSpans = array of TWrapSpan;
+
+  TBlockState = record
+    Rows: Integer;       { rows painted last time, so a shrink can be erased }
+    CaretRow: Integer;   { where the cursor was left, counted from row 0 }
+  end;
+
+{ Breaks the text into visual rows of at most InnerW columns.  Hard newlines
+  always break; beyond that the break is at the last space that fits, and at
+  InnerW itself when a single word is longer than the row.  Always returns at
+  least one span, possibly empty, because a block with no rows has nowhere to
+  put the caret. }
+function WrapText(const W: WideString; InnerW: Integer): TWrapSpans;
+var
+  LineStart, I, SegEndIx, Look: Integer;
+
+  procedure Emit_(A, L: Integer);
+  begin
+    if L < 0 then L := 0;
+    SetLength(Result, Length(Result) + 1);
+    Result[High(Result)].Start := A;
+    Result[High(Result)].Len := L;
+  end;
+
+begin
+  Result := nil;
+  if InnerW < 1 then InnerW := 1;
+  LineStart := 1;
+  I := 1;
+  while I <= Length(W) + 1 do
+  begin
+    if (I = Length(W) + 1) or (W[I] = #10) then
+    begin
+      { One logical line: LineStart .. I-1.  Wrapped into as many rows as
+        it needs, and into one empty row when it is empty - a blank line the
+        user typed is a blank line they should see. }
+      SegEndIx := I - 1;
+      while SegEndIx - LineStart + 1 > InnerW do
+      begin
+        { The row can hold LineStart .. LineStart+InnerW-1, so the character
+          at LineStart+InnerW is the first that does not fit.  Walking back
+          from there finds the space to break at - and that space is itself a
+          legal break, because it is dropped rather than shown. }
+        Look := LineStart + InnerW;
+        while (Look > LineStart) and (W[Look] <> ' ') do Dec(Look);
+        if Look > LineStart then
+        begin
+          Emit_(LineStart, Look - LineStart);
+          LineStart := Look + 1;
+        end
+        else
+        begin
+          { A word longer than the row is cut at the margin.  Refusing to
+            break it would either overflow the frame or loop forever, and
+            the loop is the worse of the two. }
+          Emit_(LineStart, InnerW);
+          LineStart := LineStart + InnerW;
+        end;
+      end;
+      Emit_(LineStart, SegEndIx - LineStart + 1);
+      LineStart := I + 1;
+    end;
+    Inc(I);
+  end;
+  if Length(Result) = 0 then Emit_(1, 0);
+end;
+
+{ Which row the caret sits on and how far into it.  The caret is an index
+  BETWEEN characters (0 = before the first), so a caret at a row's end and
+  one at the next row's start are the same position; the earlier row wins,
+  which is what a user who just typed the last character expects to see. }
+procedure CaretAt(const Spans: TWrapSpans; Caret: Integer;
+  out Row, Col: Integer);
+var
+  I: Integer;
+begin
+  for I := 0 to High(Spans) do
+    if Caret <= Spans[I].Start + Spans[I].Len - 1 then
+    begin
+      Row := I;
+      Col := Caret - Spans[I].Start + 1;
+      if Col < 0 then Col := 0;
+      Exit;
+    end;
+  Row := High(Spans);
+  if Row < 0 then Row := 0;
+  Col := 0;
+  if Length(Spans) > 0 then Col := Spans[Row].Len;
+end;
+
+function PromptRows(const Text: WideString; InnerW, Caret: Integer;
+  out CaretRow, CaretCol: Integer): TStringArray;
+var
+  Spans: TWrapSpans;
+  I: Integer;
+begin
+  Result := nil;
+  Spans := WrapText(Text, InnerW);
+  CaretAt(Spans, Caret, CaretRow, CaretCol);
+  SetLength(Result, Length(Spans));
+  for I := 0 to High(Spans) do
+    Result[I] := UTF8Encode(Copy(Text, Spans[I].Start, Spans[I].Len));
+end;
+
+{ The rows the block paints, marked up and fitted.  Pure but for TermWidth
+  and the installed status record, which is what makes the layout arguable
+  in a test without a console. }
+function BlockRows(const E: TEditState; Width: Integer;
+  out CaretRow, CaretCol: Integer): TStringArray;
+var
+  Body: TStringArray;
+  Lead, Cont, Tag: string;
+  InnerW, I, LeadW: Integer;
+  Stat: TStringArray;
+
+  procedure Add(const S: string);
+  begin
+    SetLength(Result, Length(Result) + 1);
+    Result[High(Result)] := S;
+  end;
+
+begin
+  Result := nil;
+  if UiFancy then Lead := MkAmber + #$E2#$9D#$AF + ' ' else Lead := MkAmber + '> ';
+  LeadW := 2;
+  Cont := '  ';
+
+  { The vim tag, in front of the prompt mark exactly as it is on the single
+    line.  It cannot be dropped here and left to the status line: with vim on
+    there is no safe default state, because every printable key means
+    something different in each mode - which is why this is the one indicator
+    shown in BOTH its states rather than only the unusual one.
+
+    It costs nothing in reflow because both tags are four columns wide, so
+    the text column does not move when the mode changes.  A tag of some other
+    width would shift the whole block sideways on every Esc. }
+  if E.Vim then
+  begin
+    if E.Mode = vmNormal then Tag := MkYellow + '[N] ' else Tag := MkGrey + '[I] ';
+    Lead := Tag + Lead;
+    Cont := '    ' + Cont;
+    LeadW := LeadW + 4;
+  end;
+
+  InnerW := Width - LeadW;
+  if InnerW < 8 then InnerW := 8;
+
+  Body := PromptRows(E.Text, InnerW, E.Caret, CaretRow, CaretCol);
+
+  { Row 0 is the rule above the text, so the caret row reported to the
+    painter is one further down than the text row, and the column is one
+    lead further along. }
+  Add(MkAmberDk + UiRule(Width) + MkOff);
+  Inc(CaretRow);
+  CaretCol := CaretCol + LeadW;
+
+  for I := 0 to High(Body) do
+    { The text carries no colour mark at all, so it arrives in the terminal's
+      own foreground.  Anything else would fight whatever theme the user
+      chose for the window they type into. }
+    if I = 0 then
+      Add(Lead + MkOff + Body[I])
+    else
+      Add(Cont + Body[I]);
+
+  Add(MkAmberDk + UiRule(Width) + MkOff);
+  Stat := StatusLines(Status, Width);
+  for I := 0 to High(Stat) do Add(Stat[I]);
+end;
+
+{ Where the cursor sits, so the first paint can tell whether the row it is
+  about to take over already has something on it.  False when the console
+  will not say, which is treated as "not at the start" - one spare blank
+  line is a cheaper mistake than an erased line of output. }
+function CursorAtLineStart: Boolean;
+var
+  Info: CONSOLE_SCREEN_BUFFER_INFO;
+begin
+  Result := False;
+  if (HOut <> 0) and GetConsoleScreenBufferInfo(HOut, Info) then
+    Result := Info.dwCursorPosition.X = 0;
+end;
+
+{ Paints the block, leaving the cursor in the text where the caret is.
+  Every move is relative - up N, down N - never absolute, so a paint that
+  scrolled the window is still correct: the block scrolled with it. }
+procedure BlockDraw(const E: TEditState; var St: TBlockState);
+var
+  Rows: TStringArray;
+  Width, CaretRow, CaretCol, Total, I: Integer;
+  Buf: string;
+begin
+  Width := TermWidth - 1;      { one column spare, or the last cell wraps }
+  if Width < 12 then Width := 12;
+  Rows := BlockRows(E, Width, CaretRow, CaretCol);
+
+  { The whole repaint is assembled and written ONCE.  Six rows painted run by
+    run is thirty console calls per keystroke, which the user experiences as
+    a prompt that stutters while they type - and a terminal handed the update
+    in pieces has thirty chances to show a half-drawn frame. }
+  Buf := '';
+
+  { The first paint claims rows it does not own yet, and it claims them by
+    erasing them - so it has to start on a row that is genuinely free.  The
+    blank line after that is not decoration: the block is a frame, and a
+    frame flush against the last line of a reply reads as part of it. }
+  if St.Rows = 0 then
+  begin
+    if not CursorAtLineStart then Buf := sLineBreak;
+    Buf := Buf + sLineBreak;
+  end;
+
+  { Back to the top of the block from wherever the caret was left. }
+  if St.CaretRow > 0 then Buf := Buf + #27'[' + IntToStr(St.CaretRow) + 'A';
+  Buf := Buf + #13;
+
+  { A block that shrank still has the old rows on screen, so the paint runs
+    to whichever count is larger and blanks the difference. }
+  Total := Length(Rows);
+  if St.Rows > Total then Total := St.Rows;
+  for I := 0 to Total - 1 do
+  begin
+    if I > 0 then Buf := Buf + sLineBreak;
+    Buf := Buf + #27'[2K';
+    if I <= High(Rows) then Buf := Buf + UiVt(UiFit(Rows[I], Width));
+  end;
+
+  { Down at the last row now; back up to the caret's row and along to it. }
+  if Total - 1 > CaretRow then
+    Buf := Buf + #27'[' + IntToStr(Total - 1 - CaretRow) + 'A';
+  Buf := Buf + #13;
+  if CaretCol > 0 then Buf := Buf + #27'[' + IntToStr(CaretCol) + 'C';
+
+  Emit(Buf);
+  St.Rows := Length(Rows);
+  St.CaretRow := CaretRow;
+end;
+
+{ Takes the block off the screen and leaves the cursor at column zero of the
+  row it started on, ready for whatever the REPL prints next. }
+procedure BlockErase(var St: TBlockState);
+var
+  I: Integer;
+  Buf: string;
+begin
+  if St.Rows = 0 then Exit;
+  Buf := '';
+  if St.CaretRow > 0 then Buf := #27'[' + IntToStr(St.CaretRow) + 'A';
+  Buf := Buf + #13;
+  for I := 0 to St.Rows - 1 do
+  begin
+    if I > 0 then Buf := Buf + sLineBreak;
+    Buf := Buf + #27'[2K';
+  end;
+  if St.Rows > 1 then Buf := Buf + #27'[' + IntToStr(St.Rows - 1) + 'A';
+  Emit(Buf + #13);
+  St.Rows := 0;
+  St.CaretRow := 0;
+end;
+
 { The one console key loop, taking its profile as a REQUIRED PARAMETER and
   reading no module state.  That is the structural half of the wall: the two
   wrappers below are the only things that supply a profile, and the one that
-  every prompt in the program already calls supplies the empty one. }
+  every prompt in the program already calls supplies the empty one.
+
+  Block asks for the framed multi-row prompt.  It is honoured only where it
+  can be: a console with no VT, or a redirected stdin, falls back to the
+  single line, and the caller cannot tell the difference except by looking. }
 function ReadLineCore(const Prompt: string; const P: TKeyProfile;
-  out Line: string): Boolean;
+  Block: Boolean; out Line: string): Boolean;
 var
   Rec: INPUT_RECORD;
   NRead: DWORD = 0;
@@ -1842,28 +2771,62 @@ var
   Cands: TStringArray;
   Ctrl, Alt, Shift: Boolean;
   Bound: TEditKey;
+  Blk: TBlockState;
+  Framed: Boolean;
 
   { Applies a key and repaints.  Every editing key goes through here, so the
     console and the state cannot drift apart. }
   procedure Apply(Key: TEditKey; C: WideChar);
   begin
     EditApply(E, Key, C);
-    Redraw(Prompt, E, PrevLen);
+    if Framed then BlockDraw(E, Blk) else Redraw(Prompt, E, PrevLen);
+  end;
+
+  { A repaint with no state change - after an absorbed vim operator, or a
+    completion that changed nothing.  Same split as Apply. }
+  procedure Repaint;
+  begin
+    if Framed then BlockDraw(E, Blk) else Redraw(Prompt, E, PrevLen);
+  end;
+
+  { The block comes down and the submitted text goes into the scrollback as
+    an ordinary line, which is where the user will look for it three screens
+    later.  Without this the frame would scroll away carrying the question
+    with it, and the transcript would be a column of answers. }
+  procedure CloseBlock;
+  var
+    Mark: string;
+  begin
+    BlockErase(Blk);
+    if UiFancy then Mark := #$E2#$9D#$AF + ' ' else Mark := '> ';
+    EmitC(clAmberDim, Mark);
+    EmitCLn(clWhite, UTF8Encode(E.Text));
   end;
 
 begin
   Line := '';
   PrevLen := 0;
   EditInitProfile(E, P);
-  { The tag is part of the lead from the first keystroke, so the width the
-    erase loop measures against is right even before the first Redraw. }
-  if E.Vim then
+  { The frame needs VT for the cursor moves and a real console to read from;
+    without either, the caller silently gets the line editor this program has
+    always had.  Deciding it once here means no key handler has to ask. }
+  Framed := Block and VtActive and (HIn <> 0) and StdinIsConsole;
+  Blk.Rows := 0;
+  Blk.CaretRow := 0;
+  if Framed then
+    BlockDraw(E, Blk)
+  else
   begin
-    EmitC(clGrey, EditVimTag(E));
-    PrevLen := Length(EditVimTag(E));
+    { The tag is part of the lead from the first keystroke, so the width the
+      erase loop measures against is right even before the first Redraw. }
+    if E.Vim then
+    begin
+      EmitC(clGrey, EditVimTag(E));
+      PrevLen := Length(EditVimTag(E));
+    end;
+    EmitC(clCyan, Prompt);
+    PrevLen := PrevLen + Length(Prompt);
   end;
-  EmitC(clCyan, Prompt);
-  PrevLen := PrevLen + Length(Prompt);
 
   { Raw mode: cooked mode would swallow the per-key handling this editor
     needs, and ENABLE_PROCESSED_INPUT would route Ctrl+C to the control
@@ -1917,7 +2880,7 @@ begin
               Apply(ekNewline, #0);
               Continue;
             end;
-            EmitLn;
+            if Framed then CloseBlock else EmitLn;
             Line := UTF8Encode(E.Text);
             HistoryAdd(Line);
             Exit(True);
@@ -1928,8 +2891,7 @@ begin
             begin
               Token := TokenAtCaret(E, AtStart);
               Cands := CompleteProvider(Token, AtStart);
-              if CompleteToken(E, Cands) then
-                Redraw(Prompt, E, PrevLen);
+              if CompleteToken(E, Cands) then Repaint;
             end;
             Continue;
           end;
@@ -1939,6 +2901,9 @@ begin
         set as well, so this is belt and braces on purpose. }
       if (Ch = #3) or ((Rec.Event.KeyEvent.wVirtualKeyCode = Ord('C')) and Ctrl) then
       begin
+        { Erased rather than closed: nothing was submitted, so nothing
+          belongs in the scrollback. }
+        if Framed then BlockErase(Blk);
         EmitLn;
         Exit(False);
       end;
@@ -1997,15 +2962,21 @@ begin
           else
             { An absorbed operator or a discarded key still repaints: the
               caret may have moved nowhere but the tag must stay honest. }
-            Redraw(Prompt, E, PrevLen);
+            Repaint;
           Continue;
         end;
         EditApply(E, ekChar, Ch);
         { Appending at the end is the common case and needs no redraw, which
           keeps ordinary typing free of flicker.  PrevLen is total painted
           width, so this is an increment, not the text length - which also
-          fixes the multi-line case, where the two were never the same. }
-        if E.Caret = Length(E.Text) then
+          fixes the multi-line case, where the two were never the same.
+
+          The framed path cannot take that shortcut: a character can push the
+          text onto a new row, which moves the rules and the status lines
+          under it, so the block is repainted whole every time. }
+        if Framed then
+          BlockDraw(E, Blk)
+        else if E.Caret = Length(E.Text) then
         begin
           Emit(UTF8Encode(WideString(Ch)));
           Inc(PrevLen);
@@ -2024,14 +2995,18 @@ begin
   { KeysNone, always.  This is the reader the permission prompt, the model
     picker, the session picker and the rewind picker use, and it is the
     reader anyone adding a sixth prompt will reach for because it is the one
-    that already exists under the obvious name. }
-  Result := ReadLineCore(Prompt, KeysNone, Line);
+    that already exists under the obvious name.
+
+    False for the frame, always, and for the same reason: these prompts ask a
+    question whose answer matters, and a question wrapped in a status bar is
+    a question that gets skimmed. }
+  Result := ReadLineCore(Prompt, KeysNone, False, Line);
 end;
 
 function ReadPromptLine(const Prompt: string; out Line: string): Boolean;
 begin
-  { THE one read of PromptProfile in the program. }
-  Result := ReadLineCore(Prompt, PromptProfile, Line);
+  { THE one read of PromptProfile in the program, and the one framed prompt. }
+  Result := ReadLineCore(Prompt, PromptProfile, True, Line);
 end;
 
 function ReadSecretLine(const Prompt: string; out Secret: string): Boolean;

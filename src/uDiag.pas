@@ -45,8 +45,8 @@ unit uDiag;
 
 interface
 
-uses SysUtils, Windows, DateUtils, uJson, uHttp, uHooks, uSandbox, uTools,
-  uAgent;
+uses SysUtils, Windows, DateUtils, uJson, uHttp, uHooks, uSandbox, uIde,
+  uTools, uAgent;
 
 type
   { ok / warning / problem / skipped.  dlSkipped is NOT a failure: it means
@@ -124,6 +124,16 @@ type
     SettingsSummary: TStringArray;   { uSettings.SettingsReport rows }
     SettingsRefused: TStringArray;   { uSettings.SettingsRefusals }
     TelemetrySummary: string;        { one line, or '' when off }
+    { '' = nobody probed, 'on' / 'off' = what ide.enabled resolved to.  A
+      string rather than a Boolean precisely so the zeroed record can say
+      "not probed": a Boolean would have to be False, and False here reads
+      as "the user turned it off", which is a fact nobody established.
+      Detection itself is only consulted when this is non-empty, so a report
+      built from a zeroed record never claims to have found an editor. }
+    IdeSetting: string;
+    { The ide.command path, when one is set.  A path, beside KeysPath and
+      PermissionsPath - and like them, never a credential of any kind. }
+    IdeCommand: string;
   end;
 
   TBugOptions = record
@@ -754,6 +764,33 @@ type
     it inside a try/except that names it. }
   TDiagCheckProc = procedure is nested;
 
+{ The one derivation of the IDE row, shared by /status and /doctor so the two
+  cannot drift into disagreeing about which editor is in front of the user.
+
+  Detection is only run when DiagFacts.IdeSetting has been filled in.  That
+  is not caution about the cost - reading five environment variables is
+  free - it is the record's own contract: a zeroed TDiagFacts must not
+  produce a fact.  Gating on the host-supplied field is what keeps a report
+  built by a suite, or by any caller that never filled the record, honest
+  about having looked. }
+function DiagIdeState(out Host: TIdeHost; out Cli: string): string;
+begin
+  Host := Default(TIdeHost);
+  Cli := '';
+  if DiagFacts.IdeSetting = '' then Exit('not probed');
+  if DiagFacts.IdeSetting = 'off' then Exit('off (ide.enabled is false)');
+  Host := uIde.IdeDetect;
+  if Host.Family = ifNone then Exit('not detected');
+  Cli := uIde.IdeResolveCli(Host, DiagFacts.IdeCommand);
+  Result := Host.Name;
+  if Host.Version <> '' then Result := Result + ' ' + Host.Version;
+  if Host.Product <> '' then Result := Result + ' (' + Host.Product + ')';
+  if Cli <> '' then
+    Result := Result + ', ' + ExtractFileName(Cli)
+  else
+    Result := Result + ', launcher not known';
+end;
+
 function DiagBuildStatus(A: TAgent): TStatusReport;
 var
   N: Integer;
@@ -788,6 +825,8 @@ var
   Skills: TSkillInfoArray;
   Plugins: TPluginInfoArray;
   EnabledCount: Integer;
+  IdeHost: TIdeHost;
+  IdeCli: string;
 begin
   Result := nil;
   N := 0;
@@ -832,6 +871,17 @@ begin
   if uTools.OutputStyleSource <> '' then
     Item('output_style_source', 'style from', uTools.OutputStyleSource);
   Item('vim', 'vim mode', BoolToStr(DiagFacts.VimOn, 'on', 'off'));
+  { Always emitted, including outside an editor.  A row that appeared only
+    when an IDE was found would make every /bug report from a plain console
+    structurally different from every other one, and a maintainer reading
+    the difference could not tell "no editor" from "an older pasclaude". }
+  Item('ide', 'IDE host', DiagIdeState(IdeHost, IdeCli));
+  { Conditional, because "where the launcher came from" is only a question
+    when the user answered it.  The value names the FILE, never the path:
+    the path itself is one Item below in the doctor detail, and repeating it
+    here would put a program path in the shortest report twice. }
+  if DiagFacts.IdeCommand <> '' then
+    Item('ide_command_source', 'IDE launcher from', 'user settings.json');
   if not uHooks.HooksConfigured then
     Item('hooks', 'hooks', 'none configured')
   else if not uHooks.HooksEnabled then
@@ -993,6 +1043,61 @@ var
         dlWarn, dcNone)
     else
       Emit('credential_expiry', 'credential expiry', Detail, '', L, dcNone);
+  end;
+
+  { dlWarn is the worst this can ever be, and that is a deliberate ceiling:
+    pasclaude is completely functional with no editor anywhere on the
+    machine, and a red line for a missing convenience would train a reader
+    to skim past red lines that matter. }
+  procedure CheckIde;
+  var
+    Host: TIdeHost;
+    Cli, State: string;
+  begin
+    State := DiagIdeState(Host, Cli);
+    if DiagFacts.IdeSetting = '' then
+    begin
+      Emit('ide_editor_cli', 'editor command line',
+        'not probed', '', dlSkipped, dcDisk);
+      Exit;
+    end;
+    if DiagFacts.IdeSetting = 'off' then
+    begin
+      Emit('ide_editor_cli', 'editor command line',
+        'ide.enabled is false in your settings.json, so /ide is switched off',
+        '', dlSkipped, dcDisk);
+      Exit;
+    end;
+    if Host.Family = ifNone then
+    begin
+      Emit('ide_editor_cli', 'editor command line',
+        'this terminal is not inside an editor pasclaude recognises, so ' +
+        '/ide has nothing to open', '', dlSkipped, dcDisk);
+      Exit;
+    end;
+    if Cli <> '' then
+    begin
+      Emit('ide_editor_cli', 'editor command line',
+        State + ' at ' + Cli, '', dlOk, dcDisk);
+      Exit;
+    end;
+    if Host.Family = ifJetBrains then
+      { Not a defect and not fixable by looking harder: no variable a
+        JetBrains terminal sets names the launcher, and idea64 / pycharm64 /
+        rider64 cannot be told apart from the outside. }
+      Emit('ide_editor_cli', 'editor command line',
+        State + '; nothing a JetBrains terminal sets names the launcher, so ' +
+        'it cannot be found by looking',
+        'set "ide.command" in your own settings.json to the full path of ' +
+        'the IDE launcher (for example C:\...\bin\idea64.exe); a project ' +
+        'file may not set it', dlWarn, dcDisk)
+    else
+      Emit('ide_editor_cli', 'editor command line',
+        State + '; no code.cmd, code-insiders.cmd or equivalent was found ' +
+        'beside ' + Host.ExePath,
+        'run "Shell Command: Install ''code'' command in PATH" from the ' +
+        'editor''s command palette, or set "ide.command" in your own ' +
+        'settings.json to the shim''s full path', dlWarn, dcDisk);
   end;
 
   procedure CheckStateDir;
@@ -1349,6 +1454,7 @@ begin
   Guard('mcp_servers', 'MCP servers', @CheckMcp);
   Guard('hook_commands', 'hook commands', @CheckHookCommands);
   Guard('console', 'console', @CheckConsole);
+  Guard('ide_editor_cli', 'editor command line', @CheckIde);
   Guard('session_file', 'session file', @CheckSessionFile);
   Guard('disk_reports', 'bug reports on disk', @CheckReportsDir);
   Guard('model_access', 'model access', @CheckModelAccess);

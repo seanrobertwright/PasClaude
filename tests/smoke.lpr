@@ -9,7 +9,7 @@ program smoke;
   suite calls SysUtils' one throughout.  A later unit wins, so SysUtils has to
   come after it. }
 uses Windows, SysUtils, Classes, uJson, uSettings, uAuth, uHttp, uTelem, uMcp,
-  uHooks, uSandbox, uTools, uAgent, uDiag, uRegex, uSdk, uTerm;
+  uHooks, uSandbox, uIde, uTools, uAgent, uDiag, uRegex, uSdk, uTerm;
 
 var
   Fails: Integer = 0;
@@ -4937,6 +4937,295 @@ begin
   Check(DiagWorstLevel(R) = dlOk, 'a skipped check is not a failure');
 end;
 
+{ ------------------------------------------------------------------- IDE -- }
+
+{ The spawn seam.  A top-level function, not a nested one and not a method:
+  TIdeSpawnProc is a plain procedural type and neither of the others will
+  compile against it - the same constraint TPostProc has. }
+var
+  IdeSawLine: string = '';
+  IdeSawCount: Integer = 0;
+  IdeSawLevel: TSandboxLevel = slLimits;
+  IdeSpawnAnswer: Boolean = True;
+
+function FakeIdeSpawn(const CmdLine: string): Boolean;
+begin
+  IdeSawLine := CmdLine;
+  Inc(IdeSawCount);
+  { Read from INSIDE the call, the way TelemTransport records HttpTimeoutMs:
+    asserting the level after the fact would pass against a version that
+    never lowered it at all. }
+  IdeSawLevel := uSandbox.SandboxLevel;
+  Result := IdeSpawnAnswer;
+end;
+
+function IdeRoot: string;
+begin
+  Result := IncludeTrailingPathDelimiter(GetTempDir) + 'pasclaude-ide' +
+    PathDelim;
+end;
+
+procedure Touch(const Path: string);
+var
+  F: TFileStream;
+begin
+  ForceDirectories(ExtractFilePath(Path));
+  F := TFileStream.Create(Path, fmCreate);
+  F.Free;
+end;
+
+procedure TestIdeDetect;
+var
+  H: TIdeHost;
+begin
+  { The exact five strings recorded from this machine's live VS Code
+    integrated terminal. }
+  H := IdeIdentify('vscode', '1.128.1',
+    'C:\Users\me\AppData\Local\Programs\Microsoft VS Code\Code.exe', '', '1');
+  Check(H.Family = ifVsCode, 'the recorded VS Code environment is detected');
+  Check(H.Name = 'vscode', 'and named');
+  Check(H.Product = 'Code.exe', 'and the product is the observed basename');
+  Check(H.Version = '1.128.1', 'and the version is carried');
+
+  { Exact equality, never a prefix, a substring or a case fold.  Loosening
+    this is the same class of mistake SplitUrlEx's exact-host loopback rule
+    exists to prevent. }
+  Check(IdeIdentify('vscode-ish', '1', '', '', '1').Family = ifNone,
+    'a suffixed TERM_PROGRAM is not VS Code');
+  Check(IdeIdentify('VSCODE', '1', '', '', '1').Family = ifNone,
+    'and neither is a differently cased one');
+  Check(IdeIdentify('xvscode', '1', '', '', '1').Family = ifNone,
+    'nor a prefixed one');
+  Check(IdeIdentify('vscode ', '1', '', '', '1').Family = ifNone,
+    'nor one with a trailing space');
+  { An empty TERM_PROGRAM firing would make every ordinary console a
+    detected editor this program offers to start programs for. }
+  Check(IdeIdentify('', '', '', '', '').Family = ifNone,
+    'an empty environment detects nothing');
+  Check(IdeIdentify('vscode', '1', '', '', '').Family = ifNone,
+    'and TERM_PROGRAM without the injection marker is not enough');
+
+  H := IdeIdentify('', '2024.1', '', 'JetBrains-JediTerm', '');
+  Check(H.Family = ifJetBrains, 'JediTerm is detected');
+  Check(H.Product = '', 'and reports no product, because nothing names one');
+  H := IdeIdentify('vscode', '1.128.1', 'C:\x\Code.exe',
+    'JetBrains-JediTerm', '1');
+  Check(H.Family = ifVsCode,
+    'both at once resolves to VS Code, the more specific evidence');
+end;
+
+procedure TestIdeResolveCli;
+var
+  A, B, C: string;
+  H: TIdeHost;
+begin
+  { Three temp trees reproducing three REAL installations. }
+  A := IdeRoot + 'stable' + PathDelim;
+  Touch(A + 'Code.exe');
+  Touch(A + 'bin' + PathDelim + 'code.cmd');
+  Touch(A + 'bin' + PathDelim + 'new_code.cmd');
+  Touch(A + 'bin' + PathDelim + 'code');
+  Touch(A + 'bin' + PathDelim + 'new_code');
+  Touch(A + 'bin' + PathDelim + 'code-tunnel.exe');
+
+  B := IdeRoot + 'insiders' + PathDelim;
+  Touch(B + 'Code - Insiders.exe');
+  Touch(B + 'bin' + PathDelim + 'code-insiders.cmd');
+  Touch(B + 'bin' + PathDelim + 'new_code-insiders.cmd');
+  Touch(B + 'bin' + PathDelim + 'code-tunnel-insiders.exe');
+
+  C := IdeRoot + 'cursor' + PathDelim;
+  Touch(C + 'Cursor.exe');
+  Touch(C + 'resources' + PathDelim + 'app' + PathDelim + 'bin' + PathDelim +
+    'cursor.cmd');
+  Touch(C + 'resources' + PathDelim + 'app' + PathDelim + 'bin' + PathDelim +
+    'code-tunnel.exe');
+
+  H := IdeIdentify('vscode', '1', A + 'Code.exe', '', '1');
+  Check(IdeResolveCli(H, '') = A + 'bin' + PathDelim + 'code.cmd',
+    'stable resolves to code.cmd, not the updater copy or the tunnel');
+  H := IdeIdentify('vscode', '1', B + 'Code - Insiders.exe', '', '1');
+  Check(IdeResolveCli(H, '') = B + 'bin' + PathDelim + 'code-insiders.cmd',
+    'Insiders resolves, which no exe-stem rule could manage');
+  H := IdeIdentify('vscode', '1', C + 'Cursor.exe', '', '1');
+  Check(IdeResolveCli(H, '') = C + 'resources' + PathDelim + 'app' +
+    PathDelim + 'bin' + PathDelim + 'cursor.cmd',
+    'Cursor resolves out of the other subtree');
+
+  Touch(IdeRoot + 'empty' + PathDelim + 'Code.exe');
+  H := IdeIdentify('vscode', '1', IdeRoot + 'empty' + PathDelim + 'Code.exe',
+    '', '1');
+  Check(IdeResolveCli(H, '') = '', 'no bin directory resolves to nothing');
+  H := IdeIdentify('vscode', '1', IdeRoot + 'nope' + PathDelim + 'Code.exe',
+    '', '1');
+  Check(IdeResolveCli(H, '') = '', 'a missing exe resolves to nothing');
+  H := IdeIdentify('vscode', '1', IdeRoot + 'stable', '', '1');
+  Check(IdeResolveCli(H, '') = '',
+    'and an askpass value naming a directory resolves to nothing');
+
+  H := IdeIdentify('vscode', '1', A + 'Code.exe', '', '1');
+  Check(IdeResolveCli(H, B + 'bin' + PathDelim + 'code-insiders.cmd') =
+    B + 'bin' + PathDelim + 'code-insiders.cmd',
+    'a configured path that exists wins over the scan');
+  Check(IdeResolveCli(H, A + 'bin' + PathDelim + 'gone.cmd') =
+    A + 'bin' + PathDelim + 'code.cmd',
+    'and one that does not exist falls back to the scan');
+
+  { JetBrains never scans: nothing in that environment names a launcher, so
+    a resolved path would be one this program invented. }
+  H := IdeIdentify('', '1', '', 'JetBrains-JediTerm', '');
+  Check(IdeResolveCli(H, '') = '', 'JetBrains resolves nothing by itself');
+  Check(IdeResolveCli(H, A + 'bin' + PathDelim + 'code.cmd') =
+    A + 'bin' + PathDelim + 'code.cmd',
+    'but honours an explicit ide.command');
+end;
+
+procedure TestIdeCommandLine;
+var
+  H: TIdeHost;
+  Line, Err, Shell: string;
+begin
+  Shell := SysUtils.GetEnvironmentVariable('ComSpec');
+  if Trim(Shell) = '' then Shell := 'cmd.exe';
+  H := IdeIdentify('vscode', '1.1', 'C:\x\Code.exe', '', '1');
+
+  Check(IdeDiffLine(H, 'C:\x\bin\code.cmd', 'C:\a b\old.pas',
+    'C:\a b\new.pas', Line, Err), 'a .cmd diff composes');
+  { Byte-exact.  /S is what makes cmd.exe's quote stripping independent of
+    how many quotes the line happens to contain, and the inner pair is what
+    keeps a path with a space one argument. }
+  Check(Line = '"' + Shell + '" /S /C ""C:\x\bin\code.cmd" --diff ' +
+    '"C:\a b\old.pas" "C:\a b\new.pas""', 'exactly, with /S and both quote pairs');
+
+  Check(IdeDiffLine(H, 'C:\x\code.exe', 'C:\a\o', 'C:\a\n', Line, Err),
+    'an .exe diff composes');
+  Check(Line = '"C:\x\code.exe" --diff "C:\a\o" "C:\a\n"',
+    'and is spawned with no cmd.exe wrapper at all');
+
+  Check(IdeOpenLine(H, 'C:\x\code.exe', 'C:\a\f.pas', 42, Line, Err) and
+    (Line = '"C:\x\code.exe" -g "C:\a\f.pas:42"'), '-g carries the line');
+  Check(IdeOpenLine(H, 'C:\x\code.exe', 'C:\a\f.pas', 0, Line, Err) and
+    (Line = '"C:\x\code.exe" -g "C:\a\f.pas"'), 'and works without one');
+
+  H := IdeIdentify('', '1', '', 'JetBrains-JediTerm', '');
+  Check(IdeDiffLine(H, 'C:\j\idea64.exe', 'a', 'b', Line, Err) and
+    (Line = '"C:\j\idea64.exe" diff "a" "b"'),
+    'JetBrains gets its own diff verb, not VS Code''s --diff');
+  Check(IdeOpenLine(H, 'C:\j\idea64.exe', 'C:\a\f.pas', 42, Line, Err) and
+    (Line = '"C:\j\idea64.exe" --line 42 "C:\a\f.pas"'),
+    'and its own line flag');
+end;
+
+procedure TestIdeRefusesHostileArgs;
+const
+  { The path where a filename the MODEL chose becomes a Windows command
+    line.  Every one of these is refused OUTRIGHT, before composition. }
+  Hostile: array[0..7] of string = (
+    'C:\a\he"re.pas', 'C:\a\%TEMP%\x.pas', 'C:\a\x|y.pas', 'C:\a\x>y.pas',
+    'C:\a\x<y.pas', 'C:\a\x'#13'y.pas', 'C:\a\x'#10'y.pas', 'C:\a\x'#1'y.pas');
+var
+  H: TIdeHost;
+  Line, Err: string;
+  I, Before: Integer;
+begin
+  H := IdeIdentify('vscode', '1', 'C:\x\Code.exe', '', '1');
+  IdeSpawnOverride := @FakeIdeSpawn;
+  Before := IdeSawCount;
+  try
+    for I := 0 to High(Hostile) do
+    begin
+      Check(not IdeScreenArg(Hostile[I]), 'refused in isolation: ' +
+        StringReplace(StringReplace(Hostile[I], #13, '\r', [rfReplaceAll]),
+          #10, '\n', [rfReplaceAll]));
+      Line := 'unset';
+      Check(not IdeDiffLine(H, 'C:\x\bin\code.cmd', Hostile[I], 'C:\a\b.pas',
+        Line, Err), 'and refused by IdeDiffLine');
+      { Composed AFTER the check, so a refused path never exists as part of
+        a command line even for an instant. }
+      Check(Line = '', 'with no line composed');
+      Check(Err <> '', 'and a reason given');
+      Line := 'unset';
+      Check(not IdeOpenLine(H, 'C:\x\bin\code.cmd', Hostile[I], 3, Line, Err)
+        and (Line = ''), 'and refused by IdeOpenLine, with no line');
+    end;
+    Check(IdeSawCount = Before, 'and the spawn seam was never reached');
+
+    { & and ^ are legal in a Windows filename and inert inside quotes, so
+      they must pass rather than be refused - and the composed line must
+      keep them inside the quote pair, which is what makes them inert. }
+    Check(IdeScreenArg('C:\a\x&calc.pas'), 'an & in a filename is accepted');
+    Check(IdeOpenLine(H, 'C:\x\code.exe', 'C:\a\x&calc.pas', 0, Line, Err) and
+      (Line = '"C:\x\code.exe" -g "C:\a\x&calc.pas"'),
+      'and stays inside the quotes that neutralise it');
+    Check(IdeScreenArg('C:\a b\Ünïcödé näme.pas'),
+      'and a path with spaces and a Unicode basename is accepted');
+  finally
+    IdeSpawnOverride := nil;
+  end;
+end;
+
+procedure TestIdeNotDetectedRefusesLaunch;
+var
+  H: TIdeHost;
+  Line, Err, Real_: string;
+  Before: Integer;
+begin
+  Real_ := IdeRoot + 'stable' + PathDelim + 'bin' + PathDelim + 'code.cmd';
+  Touch(Real_);
+  H := IdeIdentify('', '', '', '', '');
+  Check(H.Family = ifNone, 'an empty environment detects no host');
+  { Even with a real, existing, configured launcher.  Relaxing this is what
+    would make the kept job object dangerous: with no editor running, the
+    shim would start one inside the job and KILL_ON_JOB_CLOSE would close
+    the user's window at /exit. }
+  Check(IdeResolveCli(H, Real_) = '',
+    'no host resolves nothing even when ide.command names a real file');
+  IdeSpawnOverride := @FakeIdeSpawn;
+  Before := IdeSawCount;
+  try
+    Check(not IdeDiffLine(H, Real_, 'C:\a\o.pas', 'C:\a\n.pas', Line, Err),
+      'and no diff line is composed');
+    Check(not IdeOpenLine(H, Real_, 'C:\a\o.pas', 0, Line, Err),
+      'and no open line is composed');
+    Check(IdeSawCount = Before, 'and nothing was spawned');
+  finally
+    IdeSpawnOverride := nil;
+  end;
+end;
+
+procedure TestIdeLaunchLevelRestored;
+var
+  Err: string;
+  Saved: TSandboxLevel;
+begin
+  Saved := uSandbox.SandboxLevel;
+  IdeSpawnOverride := @FakeIdeSpawn;
+  try
+    uSandbox.SandboxLevel := slLow;
+    IdeSpawnAnswer := True;
+    IdeSawLevel := slLow;
+    Check(IdeLaunch('"cmd.exe" /S /C "x"', Err), 'the launch reports success');
+    Check(IdeSawLine = '"cmd.exe" /S /C "x"', 'the line reaches the spawn');
+    { A GUI shim under slLow gets a low-integrity token and a redirected
+      %TEMP% and cannot talk to the user's own editor process. }
+    Check(IdeSawLevel = slOff, 'the level was slOff during the spawn');
+    Check(uSandbox.SandboxLevel = slLow, 'and is restored afterwards');
+
+    { And on the failure path, which is where a restore outside a finally
+      would leave every later bash call, hook and MCP server unsandboxed
+      with nothing in /status disagreeing. }
+    IdeSpawnAnswer := False;
+    Check(not IdeLaunch('"cmd.exe" /S /C "x"', Err), 'a refused launch fails');
+    Check(Err <> '', 'with a reason');
+    Check(uSandbox.SandboxLevel = slLow,
+      'and the level is restored on that path too');
+    IdeSpawnAnswer := True;
+  finally
+    IdeSpawnOverride := nil;
+    uSandbox.SandboxLevel := Saved;
+  end;
+end;
+
 procedure TestDiagEnvironment;
 begin
   { Reported in every bug report, so a silent '' here would be discovered by
@@ -5024,6 +5313,17 @@ begin
   TestSdkDiagnosticLine;
   TestDiagWorstLevel;
   TestDiagEnvironment;
+  WipeTree(ExcludeTrailingPathDelimiter(IdeRoot));
+  TestIdeDetect;
+  TestIdeResolveCli;
+  TestIdeCommandLine;
+  TestIdeRefusesHostileArgs;
+  TestIdeNotDetectedRefusesLaunch;
+  TestIdeLaunchLevelRestored;
+  { The seam back to nil and the temp trees gone: nothing this suite put in
+    module state or on disk may outlive it, which is what keeps -gh at zero. }
+  uIde.IdeSpawnOverride := nil;
+  WipeTree(ExcludeTrailingPathDelimiter(IdeRoot));
   Schema := ToolsSchema;
   try
     Check(Pos('"input_schema"', Schema.ToJson) > 0, 'the schema serialises');

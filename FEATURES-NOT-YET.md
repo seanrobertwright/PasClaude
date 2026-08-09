@@ -69,8 +69,11 @@ needs, built once as a record and rendered twice so the two views cannot
 disagree.
 
 That leaves **Integrations** as the only section here with anything unchecked
-in it: IDE extensions, GitHub Actions, and the PR workflow commands. Every
-other section is complete.
+in it: GitHub Actions and the PR workflow commands. IDE integration is done
+as far as it honestly goes from a console program — the editor around the
+terminal is detected and `/ide` opens files and session diffs in it, while an
+extension and reading the editor's selection are refused with their reasons.
+Every other section is complete.
 
 Checked items have been built since this list was compiled; the strikethrough
 text preserves what was missing at the time. Unchecked items remain open.
@@ -511,8 +514,58 @@ text preserves what was missing at the time. Unchecked items remain open.
 
 ## Integrations
 
-- [ ] **IDE integrations** — no VS Code or JetBrains extension awareness
-  (diff-in-editor, selection as context).
+- [x] ~~**IDE integrations** — no VS Code or JetBrains extension awareness
+  (diff-in-editor, selection as context).~~
+  *Built: host detection and `/ide`, and two of the four things that phrase
+  names turned out to have no honest implementation from a console program,
+  so they are refused here rather than half-shipped. What exists: `uIde`
+  identifies the editor around the terminal from the environment it already
+  exports — `TERM_PROGRAM=vscode` with `VSCODE_INJECTION=1` for the VS Code
+  family, `TERMINAL_EMULATOR=JetBrains-JediTerm` for JetBrains — compared
+  for exact equality, never a prefix, for the same reason `SplitUrlEx`
+  tests its loopback host exactly. `/ide` reports what was found, `/ide
+  open <path>[:line]` opens a file, and `/ide diff [<path>]` opens a real
+  diff tab of the file **as it was before this session first touched it**
+  against the file as it stands, using the snapshots `/rewind` already
+  keeps. The editor's command-line program is found by scanning `bin` and
+  `resources\app\bin` beside the exe the environment names, skipping the
+  updater's `new_*` copies and the `*-tunnel*` clients, because deriving
+  the shim's name from the exe's works for VS Code stable and silently
+  fails for Insiders and Cursor. Every path is screened for characters that
+  cannot survive a command line before anything is composed, the launch
+  goes through `uSandbox.SandboxSpawn` with the level forced to `off` for
+  the duration and restored in a `finally`, and the exact command line is
+  printed and approved once per session — a user-typed slash command never
+  reaches the permission gate, so this is the only layer that could ask.
+  `ide.enabled` and `ide.command` are user scope only: a repository naming
+  a program that a slash command then starts is the same hole as a
+  project-settable telemetry endpoint. Nothing here is reachable under `-p`
+  or by the model, nothing an editor prints is captured, and no detection
+  string reaches a request. Deliberately NOT built: **no extension** —
+  TypeScript, npm and `vsce` is a second toolchain in a repository whose
+  only non-Pascal files are `.gitignore`, `LICENSE` and `logo.png`,
+  `build.cmd` and `test.cmd` could not compile it, run it or notice it
+  rotting against a new API, and this codebase hand-wrote a PNG encoder
+  over STORED deflate rather than take paszlib. **Selection as context is
+  not applicable**: nothing VS Code injects into a terminal names a file, a
+  line, a column or a selection — the one IPC handle is the git extension's
+  askpass socket, whose protocol carries credential and commit-message
+  prompts and no editor state — so there is no channel and none was
+  invented; `@path` mentions and `/paste` are the nearest real things and
+  both already exist. **No diff in the approval prompt**: `--wait` blocks
+  the spawning thread until the tab closes, so the y/a/n prompt could not
+  be answered, and without it a tab opens beside a prompt the user must
+  answer in the terminal, shows a change that has not happened, and stays
+  open after `n` — a declined edit would leave a tab that looks applied.
+  `RenderDiff`, `ChangePreview`, `PermitChange`, `ShowDetail` and
+  `AskPermission` are untouched. Still missing: JetBrains is detected from
+  documentation rather than from a running IDE and is never launched into
+  without an explicit `ide.command`, because nothing in that environment
+  names the launcher; `/ide diff` has nothing to show for a file larger
+  than the snapshot limit `/rewind` already documents; and the "before"
+  side is written under `%LOCALAPPDATA%\pasclaude\ide` and swept only on
+  the next launch, so a session that opens one diff and exits leaves one
+  file holding project text for up to a day.*
 - [ ] **GitHub Actions / `@claude` mentions** — no CI integration.
 - [ ] **/review, /pr-comments, /install-github-app** — no built-in PR
   workflow commands (git itself works through bash, and `/diff` summarizes

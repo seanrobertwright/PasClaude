@@ -9,7 +9,7 @@ program fuzz;
 {$mode objfpc}{$H+}
 
 uses SysUtils, Classes, Windows, uJson, uSettings, uAuth, uTelem, uMcp, uHooks,
-  uSandbox, uTools, uImage, uAgent, uDiag, uHttp, uSdk;
+  uSandbox, uIde, uTools, uImage, uAgent, uDiag, uHttp, uSdk;
 
 var
   Fails: Integer = 0;
@@ -4113,6 +4113,66 @@ end;
 { A crash log is the single most likely thing to be pasted into a bug
   report, and it is exactly the input an off-by-one in a scanner's lookahead
   raises on. }
+{ The process environment is supplied by whatever started pasclaude.  Two of
+  the five detection variables have real reach: TERM_PROGRAM_VERSION becomes
+  a /status row and therefore lands in a /bug report the user pastes into an
+  issue tracker, and VSCODE_GIT_ASKPASS_NODE becomes a directory to scan. }
+procedure TestIdeHostileEnv;
+var
+  Junk, Big, Esc: string;
+  H: TIdeHost;
+  I: Integer;
+  Raised: Boolean;
+begin
+  Big := StringOfChar('A', 8192);
+  Junk := 'x'#0'y'#13#10#9'z'#$80#$FF#$C3'q';
+  Esc := #27'[2J'#27']0;hijacked'#7'1.0';
+
+  Raised := False;
+  try
+    { Every variable hostile at once, and then each in turn. }
+    H := IdeIdentify(Big, Big + Esc, Junk + Big, Big, Big);
+    Check(H.Family = ifNone, 'an 8 KB TERM_PROGRAM is not vscode');
+    H := IdeIdentify('vscode', Esc, Junk, 'JetBrains-JediTerm', '1');
+    Check(Length(H.Version) <= IdeMaxVersionLen,
+      'the reported version is capped at IdeMaxVersionLen');
+    for I := 1 to Length(H.Version) do
+      if (H.Version[I] < #32) or (H.Version[I] > #126) then
+        Check(False, 'a non-printable byte survived into the version');
+    Check(Pos(#27, H.Version) = 0,
+      'an escape sequence cannot reach a /status row');
+    Check((Pos('\', H.Product) = 0) and (Pos('/', H.Product) = 0) and
+      (Pos(':', H.Product) = 0),
+      'and the product name carries no path separator');
+
+    H := IdeIdentify('vscode', Big, Big, '', '1');
+    Check(Length(H.Version) <= IdeMaxVersionLen, 'an 8 KB version is cut');
+
+    { A traversal-shaped askpass value is meaningless because the scan roots
+      come from ExtractFilePath of a file that EXISTS, never from the text.
+      Composing them from the value itself is what would make it matter. }
+    H := IdeIdentify('vscode', '1', '..\..\..\Windows\System32\cmd.exe', '',
+      '1');
+    Check(IdeResolveCli(H, '') = '', 'a traversal-shaped askpass resolves to nothing');
+    H := IdeIdentify('vscode', '1', '\\?\GLOBALROOT\Device\x\y.exe', '', '1');
+    Check(IdeResolveCli(H, '') = '', 'nor does a device path');
+    H := IdeIdentify('vscode', '1', 'C:\a' + #0 + '\b.exe', '', '1');
+    Check(IdeResolveCli(H, '') = '', 'nor one with an embedded NUL');
+    H := IdeIdentify('vscode', '1', 'C:\' + StringOfChar('a', 32768) + '.exe',
+      '', '1');
+    Check(IdeResolveCli(H, '') = '', 'nor a 32 KB one');
+    { And a configured value is only honoured when the file is really
+      there, so a hostile settings value cannot conjure a program. }
+    Check(IdeResolveCli(H, 'C:\nope\nothing-here.cmd') = '',
+      'and a configured path that does not exist resolves to nothing');
+  except
+    Raised := True;
+  end;
+  { An unguarded exception in detection would crash every startup inside a
+    hostile environment, before TermDone ever ran. }
+  Check(not Raised, 'and nothing in detection ever raised');
+end;
+
 procedure TestDiagRedactorsSurviveGarbage;
 var
   Junk, R: string;
@@ -4201,7 +4261,9 @@ begin
   TestTelemetryCardinality;
   TestDiagRendersHostileStrings;
   TestDiagRedactorsSurviveGarbage;
+  TestIdeHostileEnv;
   uTools.ClearWorkingDirs;
+  uIde.IdeSpawnOverride := nil;
   uSandbox.SandboxShutdown;
 
   WriteLn;
