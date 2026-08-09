@@ -46,6 +46,9 @@ bin\pasclaude.exe [directory] [--resume] [--web] [--add-dir <dir>]
                   [-p "prompt"] [--session-file <path>]
                   [--output-format text|json|stream-json] [--input-format text|stream-json]
                   [--status] [--doctor [--online]]
+                  [--ci prepare|report --ci-in <path> --ci-out <path>
+                   [--ci-pr <path>] [--ci-trigger <phrase>]
+                   [--ci-allow collaborator|member|owner]]
 ```
 
 Without a key, a Claude subscription works instead: if Claude Code has been
@@ -110,6 +113,9 @@ contents are appended to the system prompt as binding instructions.
 | `/compact` | drop the oldest turns, keep the recent ones |
 | `/compact full` | replace the transcript with a model-written summary |
 | `/diff` | list the files this session has changed |
+| `/ide` | the editor around this terminal; `/ide diff [<path>]`, `/ide open <path>[:line]` |
+| `/review [--staged\|<ref>]` | have the model review a local diff; no network, no token |
+| `/pr-comments [<n>] [--show]` | the comments on one GitHub pull request, printed then sent |
 | `/hooks` | the commands this project runs automatically; `/hooks off` stops them |
 | `/jobs` | background commands still running |
 | `/mcp` | MCP servers: status, `/mcp restart <name>`, `/mcp refresh` |
@@ -198,9 +204,12 @@ the approvals file being read, so a scripted run inherits every refusal and
 no grant - strictly stricter than the interactive session that started with
 the same flags, which is the rule. `--dangerously-skip-permissions` is the
 one way past that, and it prints a warning to stderr when it is used.
-It also loads no hooks and spawns no MCP server,
-not by a new rule but by where it halts: a scripted run cannot be the thing
-that first executes a project's code.
+It also loads no hooks and spawns no MCP server:
+a scripted run cannot be the thing that first executes a project's code. The
+MCP half of that is where it halts; the hooks half is now a flag,
+`uHooks.HooksAllowed`, false unless the run is the REPL - see **Hooks** for
+which four modes that took it away from and why a `finally` position was not
+enough.
 
 Pressing `Esc` while a reply is streaming stops it, and so does `Ctrl+C`:
 outside the prompt the default Ctrl+C handler would kill the process
@@ -253,6 +262,39 @@ edit at a time: the files this session's `write_file`/`edit_file` actually
 touched (denied and failed calls are not recorded), followed by
 `git diff --stat HEAD` when the directory is a repository - which also sees
 hand edits the session list cannot.
+
+pasclaude notices when it is running inside an editor's terminal, and only
+then. VS Code sets `TERM_PROGRAM` and `VSCODE_INJECTION` in its integrated
+terminal; JetBrains sets `TERMINAL_EMULATOR`. Both are tested for exact
+equality, so a terminal that merely has `vscode` somewhere in its name is not
+an editor. Outside one, `/ide` says so and does nothing, and every other
+surface reads "not detected" rather than inventing a host.
+
+`/ide diff` opens what this *session* changed: the file as it stood before
+pasclaude first touched it, in a real diff tab, against the file as it is now.
+That is not the diff you approved - it is the accumulated one, from the same
+snapshots `/rewind` restores from, which is exactly the thing that is hard to
+see at the end of a long session. `/ide open <path>:42` opens a file at a
+line. Nothing goes the other way: the editor is never read from, no selection,
+no cursor, and nothing an editor prints is captured. There is no extension,
+there is no selection support, and there is no plan for either - a VS Code
+integrated terminal exports nothing naming a file, a line, a column or a
+selection, so there is no channel to read one over and none was invented.
+
+The approval prompt was left alone on purpose. Opening the proposed change in
+the editor sounds better than a diff in the terminal and is worse in practice:
+`--wait` blocks until you close the tab, so the y/a/n prompt cannot be
+answered, and without `--wait` the tab shows a change that has not happened
+and stays open after you decline it. A rejected edit leaving a tab that looks
+applied is a worse mistake than any amount of terminal diff.
+
+Starting the editor is starting a program. It goes through the same spawn
+every other child does, with the sandbox level forced off for the duration and
+restored afterwards - a GUI shim under low integrity cannot reach your own
+editor process. A slash command you typed never reaches the permission gate,
+so rather than leave that silent, pasclaude prints the exact command line and
+asks once per session. `a` there lasts the session and is never written to
+disk: standing approvals are for tools, not for licences to run programs.
 
 `Tab` completes: slash commands at the start of the line, file and directory
 names anywhere else, resolved against the session root. Several matches extend
@@ -1303,6 +1345,23 @@ twice the surface to fuzz.
 `/hooks` shows the file, whether hooks are running, the fingerprint and one
 line per hook. `/hooks off` turns them off for the session.
 
+**Hooks are an interactive-only feature**, and that is a flag rather than an
+accident of where a branch halts. `uHooks.HooksAllowed` ships false; the host
+sets it true only when the run is neither `-p` nor one of `--status`,
+`--doctor`, `--ci prepare` and `--ci report`. `LoadHooks` exits on it, so an
+unattended run does not even parse the file, and `HooksEnabled` re-reads it,
+so clearing it mid-run stops all six firing sites at once. The reason it had
+to be a flag: the trust prompt sits above the `-p` halt but far above
+`RunCi`, so both `--ci` verbs and both diagnostic modes were reaching
+`TrustHooks` - where an empty line reads as allow and a non-console stdin
+gives one. `--ci report` runs after `actions/checkout`, in a working
+directory whose `.pasclaude\hooks.json` came from the pull request head. The
+narrowing is real and is stated rather than hidden: `--doctor` no longer
+loads or fires hooks, and reports `hooks.json is present but not enabled for
+this session` instead. Note also that the CI deny floor cannot cover a hook
+at all - `uHooks` sits below `uTools`, so no hook command is ever matched
+against a rule - which is why the answer here is structural and not a rule.
+
 ## Skills and plugins
 
 A skill is a directory under `.pasclaude\skills\` holding a `SKILL.md`: a small
@@ -1913,6 +1972,212 @@ That unit is also where the system prompt now lives. It was lifted out of
 specifically that user memory loads *before* the project's own instruction
 files, so nearer still wins.
 
+## Pull requests: /review and /pr-comments
+
+```
+/review                  :: git diff HEAD - the working tree
+/review --staged         :: git diff --cached - the index
+/review <ref>            :: git diff <ref>...HEAD - what this branch adds
+/pr-comments [<n>]       :: one pull request's comments, printed then sent
+/pr-comments <n> --show  :: printed, and nothing sent
+```
+
+`/review` is local. It runs `git`, sends the diff as an ordinary user message
+and touches no network and no token at all, so any edit the model then
+proposes shows its own diff and asks like every other. The stat is printed
+first, so you see the size and the file list before a turn is spent on it.
+`/review 123` is refused by name: fetching a pull request's diff would pull an
+arbitrarily large, arbitrarily hostile change written by whoever opened it
+into the context of an agent holding thirteen tools, for a result
+`gh pr checkout 123` and then `/review main` already gives from code you chose
+to check out.
+
+A `<ref>` is user text entering a `cmd.exe` line that answers to nobody -
+there is no permission gate, no deny check and no sandbox on a slash command
+you typed - so it is charset-validated before anything is composed: letters,
+digits, `. _ - /`, no leading `-`, no `..`, 128 bytes. The validator has its
+own test, and it is one requirement with the resolver below rather than two
+ideas: both, or neither ships.
+
+`/pr-comments` fetches the inline review comments, the review bodies and the
+conversation thread of one pull request in four GETs, renders them to the
+console, and sends the model exactly the lines it printed. With no number it
+infers the pull request from the current branch and asks for one when that is
+not exactly one match. `--show` prints and sends nothing. Consent is per
+invocation and per pull request: there is no `github` tool, so the model can
+never fetch one itself, and there is no polling.
+
+Read-only is a property of the client rather than of the caller. `uGitHub`
+issues GET and nothing else - there is no POST, PUT, PATCH or DELETE anywhere
+in the unit - so no comment, review, approval, merge, label or branch can be
+produced by any amount of injected text, in any mode, by any answer to any
+prompt. A read-only client cannot be talked into an action, which is a
+stronger statement than any amount of prompt hygiene and is why the hygiene is
+the second line rather than the first. The consequences are stated rather than
+worked around: no replying, no resolving, no approving, and one page of 100
+per list, because `uHttp` exposes no response headers and therefore no `Link`
+header - a full page is reported as possibly incomplete rather than silently
+truncated.
+
+Every program pasclaude runs by name - `git`, `gh` - is resolved on `PATH`
+first. `cmd.exe` searches the current directory before `PATH`, so a repository
+shipping a `git.cmd` used to have it run at startup; that was measured with a
+probe rather than theorised. `ProgramCommand` walks `PATH` and `PATHEXT` and
+never considers the current directory or a working root, and the three
+pre-existing git call sites go through it too.
+
+## The GitHub token, and text a stranger wrote
+
+A GitHub token comes from `GH_TOKEN`, then `GITHUB_TOKEN`, then
+`gh auth token`, and from nowhere else - not from a settings file at any tier,
+not from a flag, not from a prompt, not from any file under a root. pasclaude
+stores none: `gh` already owns GitHub credential storage, and a second DPAPI
+blob would be a second credential lifetime to keep correct for no gain. So
+`uAuth` grows no source, its writers still take no path argument, and
+`AuthResolve`'s declaration order still answers only "which credential signs
+the model request". The API host is compiled in and is settable at no tier,
+which is why there is no GitHub Enterprise support and no `github.api_base`:
+moving an endpoint is how a token leaves, so that knob does not exist.
+
+The token is screened before it is used, not after. `uHttp` hands the header
+block straight to `WinHttpSendRequest` and validates no byte of it, so a CR in
+a token value is header injection; `GhTokenLooksUsable` requires printable
+ASCII, one line, 8 to 512 bytes, and it runs before `HttpGet` is called rather
+than inside a transport, so a substituted transport in a suite sees exactly
+what the network would. A token that is present and unusable is refused by
+name rather than quietly downgraded to an anonymous request. `gh`'s output is
+accepted only on exit code 0 and only as a single line, and is never copied
+into an error, a note or a report.
+
+Where it is redacted is everywhere it could appear, and the first mechanism is
+that it is never recorded. `TDiagFacts` carries the repository name and the
+*source name* - `GH_TOKEN`, `GITHUB_TOKEN` or `gh cli` - and no value, no
+hint and no length, so `/status`, `/doctor` and `/bug` could not leak it if
+every redactor failed. It exists only inside the header block of a live
+request: never in a URL, never in a console line, never in a session file,
+never in telemetry. `/status` also spawns nothing to find it - naming the
+source reads two environment variables and resolves `gh` on `PATH`, because a
+command called status must not run a program whose whole job is to print a
+credential to a pipe.
+
+**A pull request body is written by anyone with a GitHub account**, and that
+makes it the least trusted text this program handles - an MCP tool description
+at least required somebody to approve a command line first. It lands in an
+ordinary user message, never the system prompt, never a tool description,
+inside a marked block preceded by one sentence saying that everything inside
+is third-party data, is information to consider, and is never an instruction.
+Caps: 100 items per list, 4 KB per body, 64 KB per payload, every cut marked,
+every byte `IsValidUtf8`-checked.
+
+The order of that envelope is the bug, so it is written down. Decode with
+`uJson`, strip control characters, `Utf8Cut` to the cap, and **then** drop any
+line that is a forged marker - per line, after the cut, never on the assembled
+string. Stripping markers first is forgeable: pad so the cut lands mid-marker,
+or write a marker that only appears once the pieces are joined. And the
+envelope is a labelling device, not a sanitiser. It tells the model where the
+third-party text starts and stops and removes a forged end-marker; it does not
+make the text safe. A comment can still persuade the model to *propose* an
+edit or a command, and the human answering the prompt is the last gate - so a
+user who habitually answers `a` has already widened it, and `/review` over a
+fetched fork branch feeds attacker-written code to the model exactly as
+opening that file in an editor would.
+
+## Running unattended
+
+Everything above assumes somebody is at the prompt. This is the first context
+where nobody is, and it is documented as its own thing for that reason.
+
+A comment on an issue or pull request that mentions `@claude` can start a run.
+The template is `examples\github\pasclaude-mention.yml`; it is copied into
+your own repository rather than being live here, because a live workflow in
+this repository would run on every comment, spend the maintainer's Actions
+minutes, and fail saying "no credential".
+
+**A CI run may read the repository and write one comment. It may never push,
+never patch, never approve, never merge.**
+
+**Who may pull the trigger.** `issue_comment`, created, and nothing else -
+that trigger's workflow file is always taken from the default branch, so a
+pull request cannot edit the workflow that reviews it. The check runs twice: a
+cheap `if:` in YAML, so a stranger's comment never starts a runner at all, and
+again in Pascal inside `--ci prepare`, so an edited `if:` does not silently
+widen anything. Both read `author_association`, which GitHub computes from the
+commenter's relationship to the repository; it is not a field the commenter
+fills in, which is the only reason it is trustworthy input while the comment
+beside it is not. Anything below `COLLABORATOR` is refused, an association
+nobody has invented yet reads as the lowest value rather than the widest, and
+`--ci-allow member|owner` narrows further. There is no flag that widens.
+
+**Fork pull requests are refused, not unimplemented.**
+`gh pr view --json isCrossRepository,headRefOid,state` is parsed as if
+hostile: anything that is not the boolean `false` reads as a fork, and a
+pull-request comment with no `--ci-pr` file is refused too, so deleting that
+step fails closed rather than open. The argument for allowing forks is that
+with bash denied nothing from the fork is executed, only read - but that rests
+on the job having no build step, and one added `npm ci` line destroys it
+silently.
+
+**The token, key by key.** `contents: read` for the checkout, `issues: write`
+to post the comment (the issue-comments endpoint serves pull requests too, and
+this is the narrower of the two keys that satisfy it), `pull-requests: read`
+for `gh pr view`. Naming any key sets every unnamed one to `none`, so with
+exactly those three an injected instruction could read this repository, read
+pull-request metadata and post comments here - and could not push to a branch,
+create a branch or a tag, approve or submit a review, merge, edit a workflow,
+publish a release, or reach another repository. It holds no token in any case:
+`GH_TOKEN` is set on exactly the two fixed `gh` steps, and the step that runs
+the model has `ANTHROPIC_API_KEY` and no GitHub credential.
+`persist-credentials: false` keeps one out of `.git\config` where `read_file`
+could find it.
+
+**Why bypass mode is not the CI recipe.** `--dangerously-skip-permissions`
+appears nowhere in the template and the ux suite fails if it ever does. Under
+`-p` there is nobody to ask, so `Ask` is nil and a gated tool returns an
+ordinary error result while the turn continues - plan mode over a deny floor
+is not a degraded agent, it is one that reads and answers. The floor is
+written out of tree, to `%LOCALAPPDATA%\pasclaude\deny.json`, so nothing in
+the checkout can supply or edit it: `tool:bash`, `tool:bash_output`,
+`tool:kill_bash`, `tool:fetch`, `tool:web_search`, `tool:write_file`,
+`tool:edit_file`, `tool:notebook_edit`, `tool:task`, `path:**/.git/**`,
+`path:**/.env*`, `path:**/*.pem`. Nothing overrides a deny rule - not a mode,
+not a persisted "always", not a hook's allow, not a file in the tree - which
+is exactly the property worth having where nobody is watching. `--ci prepare`
+runs after the rules load and exits 2 naming every missing one. The one thing
+that floor cannot cover is a hook, because `uHooks` sits below `uTools` and no
+hook command is ever matched against a rule; hooks are therefore switched off
+structurally instead, as **Hooks** above describes.
+
+**The two modes.** `--ci prepare --ci-in <event> --ci-out <prompt>
+[--ci-pr <pr.json>]` decides whether to answer, writes the prompt file when it
+will, writes a fixed refusal comment to `<prompt>.md` when it will not, and
+appends `proceed`/`code`/`reason`/`number`/`head_sha` to `%GITHUB_OUTPUT%`.
+`--ci report --ci-in <result.json> --ci-out <comment.md>` turns one line of
+`--output-format json` into the comment and appends a run summary to
+`%GITHUB_STEP_SUMMARY%`. Exit codes are the existing three: 0 for any decision
+reached, 2 for a usage error, an unreadable or oversized input, an unwritable
+output, or a deny floor that is not in force.
+
+Comment text never passes through YAML expansion or a command line - pasclaude
+opens `GITHUB_EVENT_PATH` itself, which is exactly how the classic Actions
+injection is avoided - and nothing untrusted reaches `GITHUB_OUTPUT`,
+`GITHUB_ENV` or a `run:` line. Every value written there is from a fixed
+vocabulary or validated, and `head_sha` must be exactly 40 hex characters or
+it is not emitted, because it chooses the commit `actions/checkout` writes
+into the workspace.
+
+**How the YAML is checked.** `build.cmd` and `test.cmd` cannot run YAML and
+RTL-only forbids adding a parser, so `ux` reads the template as text - absent
+is a failure, not a skip - and asserts every deny rule verbatim,
+`persist-credentials: false`, the three permission keys and no fourth
+`: write` line, fewer than 120 lines, and the absence of the `_target`
+trigger, comment-body and title interpolation, and the bypass flag. It is a
+grep, and it is honest about being one: everything semantically load-bearing
+lives in `src/uCi.pas` where the suites can drive it.
+
+**Cost.** `windows-latest`, Chocolatey's `freepascal`, and no release
+pipeline, so the workflow clones and runs `build.cmd`: about four minutes
+wall, eight billed on a private repository, free on a public one.
+
 ## Settings, and the scope table
 
 ```
@@ -1947,8 +2212,10 @@ and it now has a name and a table instead of an argument repeated per feature.
 | `model.alias` | **user file only** | name -> id | four built-ins |
 | `model.route.subagent`, `model.route.compaction` | **user file only** | a model name | `sonnet` |
 | `telemetry.enabled`, `.endpoint`, `.headers`, `.interval_turns`, `.timeout_ms`, `.service_name` | **user file only** | | off |
+| `ide.enabled` | **user file only** | let `/ide` open files and diffs in a detected editor | on |
+| `ide.command` | **user file only** | absolute path to the editor's command-line program | none |
 
-Fourteen keys, four of which a project may set. The three economy numbers are
+Sixteen keys, four of which a project may set. The three economy numbers are
 **narrow-only** from a project or local file, measured against the value *you*
 have in force - your own settings file if it names the key, the compiled
 default if it does not. A project may lower `thinking_budget` and
@@ -1963,6 +2230,17 @@ refused, not clamped - a clamp teaches the repository that the key half-works
 and teaches you nothing. A `thinking_budget` between 1 and 1023 is refused at
 every tier, because the API's floor is 1024 and it rejects the request, so the
 number would fail every turn in that checkout.
+
+Both `ide` keys are user scope for the reason the whole table exists.
+`ide.command` names a program a slash command starts, so a cloned repository
+able to set it would be a cloned repository able to run anything on your
+machine - the same shape of hole as a project-settable telemetry endpoint, and
+it gets the same answer. It also has to be absolute, has to end in `.cmd`,
+`.bat` or `.exe`, has to exist, and is only consulted once an editor has
+already been detected. None of those four is sufficient on its own, and the
+shape check is re-applied by `SettingsWrite`, so `/config set` cannot write
+what startup would refuse. It is also the only way a JetBrains user gets a
+launch, because nothing a JetBrains terminal exports names `idea64.exe`.
 
 `model` is user scope because a project that picks the model does not merely
 spend your money on its own say-so: it can name the weakest available id to
@@ -1991,17 +2269,20 @@ else, and `SettingsParseTier` takes **bytes**, never a path - the
 `uTerm.KeysParse` rule - so the unit can never learn a configuration location
 and every suite drives it with no filesystem.
 
-Twenty-seven more names are in the same table as refusals, honoured at no tier
+Twenty-nine more names are in the same table as refusals, honoured at no tier
 including the user one: `permissions`, `allow_edits`, `allow_bash`,
 `allow_fetch`, `bash_programs`, `trusted`, `deny`, `sandbox`,
 `permission_mode`, `add_dir`, `additionalDirectories`, `env`, `apiKey`,
 `apiKeyHelper`, `auth`, `credential`, `login`, `mcpServers`, `plugins`, `vim`,
-`bindings`, `hooks`, bare `telemetry`, `report_dir`, `redact`, `doctor`, `bug`.
+`bindings`, `hooks`, bare `telemetry`, bare `ide`, `github`, `report_dir`,
+`redact`, `doctor`, `bug`.
 They are there on purpose. The realistic failure is not an attack, it is
 somebody pasting Claude Code's `settings.json` and believing it took effect, so
 each one produces a sentence naming the file that really owns it - `vim` and
 `bindings` point at `keys.json`, `hooks` at `.pasclaude\hooks.json`, `deny` at
-`deny.json`, `permissions` at the approvals file under `%LOCALAPPDATA%`.
+`deny.json`, `permissions` at the approvals file under `%LOCALAPPDATA%`, bare
+`ide` at the two dotted keys, and `github` at `GH_TOKEN`, `GITHUB_TOKEN` and
+the `gh` CLI, since no file names the token and none names the host.
 `report_dir` and `redact` are pre-refused so that adding them later is a
 review conflict rather than a one-line insertion.
 
@@ -2164,6 +2445,13 @@ model's own `read_file` and `bash` cannot reach a credential either, and
 settings keys. A repository cannot ship one, cannot pick which one is used, and
 cannot make `/login` run.
 
+A GitHub token is a different question and is answered somewhere else
+entirely. It comes from `GH_TOKEN`, then `GITHUB_TOKEN`, then `gh auth token`,
+and from nowhere else; pasclaude stores none, `uAuth` gained no seventh source
+and no second store, and the six sources above still answer only "which
+credential signs the model request". See **The GitHub token, and text a
+stranger wrote**.
+
 A refused credential now produces a sentence rather than `HTTP 401 -
 authentication_error`: which of the six sources it came from, which file,
 whether it has expired since the session started, and what to do. A token the
@@ -2293,16 +2581,16 @@ the MCP config - plus `settings.json`, and the command that refreshes each.
 `/status` reports the **session**, which after a mid-session edit is not what
 is on disk, and that is exactly when somebody types it.
 
-`/doctor` is the judgement. Thirteen checks with fixed ids, each carrying a
+`/doctor` is the judgement. Fifteen checks with fixed ids, each carrying a
 level, a cost and - whenever it is not ok - a remedy that the builder asserts
 is non-empty, because a health check that says "problem" without saying what
 to do is a riddle. What each costs:
 
 | check | cost |
 |---|---|
-| `winhttp` `credential` `credential_expiry` `config_files` `settings_scope` `console` | nothing; memory only |
+| `winhttp` `credential` `credential_expiry` `config_files` `settings_scope` `console` `github` | nothing; memory only |
 | `state_dir_writable` `project_state_dir_writable` | one file created and deleted in a `finally` |
-| `mcp_servers` `hook_commands` `session_file` `disk_reports` | reads PATH and file metadata; **nothing is spawned** |
+| `mcp_servers` `hook_commands` `session_file` `disk_reports` `ide_editor_cli` | reads PATH and file metadata; **nothing is spawned** |
 | `model_access` | one `GET /v1/models`, and only with `--online` |
 
 Nothing is spawned and nothing is sent unless you type `--online`. That is the
@@ -2311,6 +2599,10 @@ is a channel, and a command must not open one because its name sounded
 harmless. Resolving an MCP server's or a hook's program on `PATH` is a
 heuristic - a shell builtin or an unusual `PATHEXT` can look like a missing
 program - so those checks report `warning` and never `problem`, and say so.
+`github` names the token's *source* and never runs `gh` to get one, which is
+what lets it declare no cost at all; and `hook_commands` now reports that a
+present `hooks.json` is not enabled for this session, because `--doctor` no
+longer loads or fires hooks.
 
 `/doctor` never re-reads a configuration file. Startup records a note wherever
 it already prints a yellow warning - a bad deny rule, a settings refusal, a
@@ -2374,11 +2666,12 @@ gets the protocol and nothing else, because the loudest of those notices come
 from a `settings.json` in the project tree and a cloned repository must not be
 able to put a byte in front of a driver's parser. Nothing is lost - every
 suppressed line is in the ledger `--doctor` prints. Both modes refuse to
-combine with `-p`, a prompt, `--resume` or a driver, and neither approves or
-connects an MCP server: approving a spawn is a permission answer, and a health
-check must not be a way to obtain one. They
+combine with `-p`, a prompt, `--resume` or a driver - as do both `--ci` verbs,
+which is why the exclusivity message now names three flags - and neither
+approves or connects an MCP server: approving a spawn is a permission answer,
+and a health check must not be a way to obtain one. They
 are also the only two modes that continue past a missing credential or a
-missing `winhttp.dll` and report it as one problem among thirteen instead of
+missing `winhttp.dll` and report it as one problem among fifteen instead of
 exiting 2 - safe only because the branch ends in `Halt` and cannot reach a
 turn or a tool.
 
