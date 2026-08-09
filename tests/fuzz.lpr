@@ -4459,6 +4459,10 @@ begin
 end;
 
 begin
+  { Hooks are off unless a host says otherwise - see the shipped default in
+    uHooks and TestHooksAreInteractiveOnly in the smoke suite.  This suite
+    stands in for the REPL, which is the one caller that sets it. }
+  uHooks.HooksAllowed := True;
   TestImageDecodersHostile;
   TestBinaryFileDoesNotCorruptBody;
   TestNulByteIsEscaped;

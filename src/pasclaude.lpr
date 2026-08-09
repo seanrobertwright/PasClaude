@@ -5208,14 +5208,27 @@ begin
       setter for its system prompt, deliberately, since changing it mid-session
       would throw away the prompt cache on every turn afterwards.
 
-      Print mode is excluded outright rather than by a flag it could be talked
-      out of: a scripted run has nobody to answer the trust question, and
-      deny-by-default means a config that cannot be asked about does not run.
-      There is no override in v1 - that is a decision to make with a user in
-      the room, not a default. }
+      EVERY unattended mode is excluded, not just print mode: a scripted run
+      has nobody to answer the trust question, and deny-by-default means a
+      config that cannot be asked about does not run.  There is no override in
+      v1 - that is a decision to make with a user in the room, not a default.
+
+      `if not PrintMode` used to be the whole of that, and it was wrong by
+      four modes.  --status, --doctor and both --ci verbs are refused -p at
+      the argument parser, so they are NOT print mode by construction and ran
+      this block: --ci report in the mention workflow runs after checkout,
+      with the current directory set to the pull request head, so the tree
+      under review supplied .pasclaude\hooks.json and the trust prompt was
+      answered by whatever the runner happened to attach to stdin - allow on
+      an empty line, deny on EOF, and a hang on a pipe nobody closes.  The CI
+      deny floor cannot cover it either: uHooks sits below uTools and no hook
+      is ever checked against a rule.  uHooks.HooksAllowed carries the same
+      decision into the unit, where it also gates the five other sites that
+      fire or display hooks. }
     HookSystemExtra := '';
     uSdk.SdkSystemExtra := @SdkExtra;
-    if not PrintMode then
+    uHooks.HooksAllowed := (not PrintMode) and (DiagMode = dmNone);
+    if uHooks.HooksAllowed then
     begin
       uHooks.OnHookNotice := @HookNotice;
       if TrustHooks then

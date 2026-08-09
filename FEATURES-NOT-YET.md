@@ -178,8 +178,18 @@ text preserves what was missing at the time. Unchecked items remain open.
   decision in the exit code (0 proceeds, 2 blocks, anything else is a failure
   and never a block), and an optional `{"decision":...}` object on stdout.
   Gated on a fingerprint of the file's bytes, so editing it asks again; `/yolo`
-  does not answer that question and `-p` never loads hooks at all. `/hooks`
-  shows the file and one line per hook; `/hooks off` stops them.
+  does not answer that question. `/hooks` shows the file and one line per hook;
+  `/hooks off` stops them. **Hooks are an interactive-only feature.** They load
+  and fire on the REPL path and nowhere else: `uHooks.HooksAllowed` is false by
+  default and the host sets it true only when the run is neither `-p` nor one
+  of `--status`, `--doctor`, `--ci prepare` and `--ci report`. That is a
+  narrowing — `--doctor` used to load and fire `SessionStart`, and now reports
+  `hooks.json is present but not enabled for this session` instead — and it is
+  deliberate: every one of those modes runs with nobody able to answer the
+  trust question, `--ci report` runs with the current directory set to a
+  checked-out pull request head, and the CI deny floor cannot cover hooks at
+  all because `uHooks` sits below `uTools` and no hook command is ever matched
+  against a rule.
   Still missing: SessionEnd, SubagentStop, PreCompact and Notification are not
   fired, each a deliberate omission rather than a gap — there is no honest
   firing point for SessionEnd (Ctrl+C, a closed window and print mode's `Halt`
@@ -612,7 +622,14 @@ text preserves what was missing at the time. Unchecked items remain open.
   `**/.git/**`, `**/.env*`, `**/*.pem` — because nothing overrides a deny
   rule: not a mode, not a persisted "always", not a hook's allow, not a file
   in the checkout. What is left is read, list, search and todo, which is the
-  whole job. **No shell is what makes `ANTHROPIC_API_KEY` in that step
+  whole job. The one thing that floor **cannot** cover is a hook: `uHooks`
+  sits below `uTools` and no hook command is ever matched against a rule. So
+  hooks are shut off structurally instead — `uHooks.HooksAllowed` is false
+  under both `--ci` verbs as well as under `-p`, which matters because
+  `--ci report` runs after `actions/checkout`, in a working directory whose
+  `.pasclaude\hooks.json` came from the pull request head, and the trust
+  prompt there would have been answered by whatever the runner attached to
+  stdin. **No shell is what makes `ANTHROPIC_API_KEY` in that step
   unreadable, and it is the single assumption doing the most work**, so
   `--ci prepare` runs after the deny rules load and exits 2 naming every
   missing rule: a workflow edited to drop the deny step stops working

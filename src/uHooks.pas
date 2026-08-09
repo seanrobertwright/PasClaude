@@ -87,6 +87,26 @@ const
   HookTrustKey         = 'hooks.json';
 
 var
+  { False by default: no unattended run may execute this project's hooks.
+    Same shape and same argument as uGitHub.GitHubAllowed - the host sets it
+    True on the INTERACTIVE path only, so a wiring mistake fails closed.
+
+    It exists because the guard it replaces was `if not PrintMode`, which was
+    true of exactly one unattended mode and missed the other four.  --status,
+    --doctor and both --ci verbs run the whole of startup and are refused -p
+    at the argument parser, so they arrived at the hooks block as "not print
+    mode" and would load and FIRE .pasclaude\hooks.json out of whatever tree
+    the current directory happened to be.  In CI that tree is the checked-out
+    pull request head, the trust question has nobody to answer it, and what
+    happened next depended on how the runner attached stdin - allow, deny or
+    block until the job timed out.  Hooks are also the one thing the CI deny
+    floor cannot cover: this unit sits below uTools and cannot see a rule.
+
+    A flag here rather than a wider condition at the one call site because
+    FireHooks has three other firing sites and /hooks another two, and every
+    one of them is now gated by the same byte. }
+  HooksAllowed: Boolean = False;
+
   { One line to the user when a hook fails or a matcher gives up.  Nil is
     silence, not an error - the same shape uTools uses for MCP progress. }
   OnHookNotice: THookNotice = nil;
@@ -410,7 +430,10 @@ end;
 
 function HooksEnabled: Boolean;
 begin
-  Result := Loaded and (Length(Hooks) > 0);
+  { HooksAllowed is re-read here rather than trusted to have been false at
+    load time: it is what every firing site and every /hooks display consults,
+    so clearing it mid-run turns the feature off everywhere at once. }
+  Result := HooksAllowed and Loaded and (Length(Hooks) > 0);
 end;
 
 function HookCount(Ev: THookEvent): Integer;
@@ -591,8 +614,11 @@ begin
   Notes := '';
   SweepTmp;
   { Deny by default, and structurally: an untrusted file is not parsed at all,
-    so there is no path by which a matcher from it could even be compiled. }
-  if not Trusted then Exit;
+    so there is no path by which a matcher from it could even be compiled.
+    HooksAllowed is checked in the same breath and for the same reason - a run
+    with nobody in the room cannot answer the trust question, so its answer is
+    no, and the file is not parsed there either. }
+  if not (Trusted and HooksAllowed) then Exit;
   if not ReadWholeFile(HooksFilePath, Text) then Exit;
 
   Root := JsonParse(Text);

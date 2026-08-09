@@ -1948,6 +1948,63 @@ begin
   end;
 end;
 
+{ Hooks are an INTERACTIVE-only feature, and this is the assertion that says
+  so.  It runs first in this suite because it is the only place the shipped
+  DEFAULT of HooksAllowed is observable: every other hook test needs the flag
+  on, and turning it on is the first thing the main block does.
+
+  What it pins: the guard in pasclaude.lpr used to be `if not PrintMode`,
+  which was true of exactly one unattended mode and missed four.  --status,
+  --doctor, --ci prepare and --ci report are all refused -p at the argument
+  parser, so they were NOT print mode and ran the trust prompt and the
+  SessionStart hook.  For --ci report that happens after actions/checkout,
+  with the current directory set to the pull request head - so the tree under
+  review supplied .pasclaude\hooks.json, and whether its command ran was
+  decided by whatever the runner had attached to stdin.  No deny rule could
+  have caught it: this unit is below uTools and a hook command is never
+  matched against one.  Anything that re-widens this gate has to delete an
+  assertion here to do it. }
+procedure TestHooksAreInteractiveOnly;
+var
+  Notes: string;
+  O: uHooks.THookOutcome;
+begin
+  Check(not uHooks.HooksAllowed,
+    'HooksAllowed ships false, so a host that never sets it runs no hooks');
+
+  ForceDirectories(HookRoot);
+  uTools.RootDir := HookRoot;
+  WriteHooksFile('{"hooks":{"SessionStart":[{"command":"echo started"}]}}');
+  Check(uHooks.HooksConfigured, 'the project does configure a hook');
+
+  { Trusted TRUE and still nothing: this is the unattended case, where the
+    trust answer cannot be obtained, so deny-by-default supplies it. }
+  uHooks.LoadHooks(True, Notes);
+  Check(not uHooks.HooksEnabled,
+    'an unattended run loads nothing even from a trusted file');
+  Check(uHooks.HookCount(heSessionStart) = 0, 'not one entry is compiled');
+  O := uHooks.FireHooks(uHooks.HookCall(heSessionStart));
+  Check(O.Ran = 0, 'and firing SessionStart runs no child at all');
+  Check(not O.Blocked, 'nor can it block the run it was not allowed to join');
+
+  { And the interactive case, so the assertion above is not passing merely
+    because the fixture is broken. }
+  uHooks.HooksAllowed := True;
+  uHooks.LoadHooks(True, Notes);
+  Check(uHooks.HooksEnabled, 'the same file loads on the REPL path');
+  Check(uHooks.HookCount(heSessionStart) = 1, 'with its one entry');
+
+  { Cleared mid-run without a reload: HooksEnabled re-reads the flag, so one
+    byte turns off all six sites that fire or display a hook. }
+  uHooks.HooksAllowed := False;
+  Check(not uHooks.HooksEnabled, 'clearing the flag stops it in place');
+  O := uHooks.FireHooks(uHooks.HookCall(heSessionStart));
+  Check(O.Ran = 0, 'and the loaded table fires nothing');
+
+  uHooks.HooksAllowed := True;
+  uHooks.ClearHooks;
+end;
+
 { The primitive on its own, which is where the transport decisions are either
   true or not.  Everything above it is policy; this is the part that either
   deadlocks or does not. }
@@ -6154,6 +6211,10 @@ begin
     every CountBuiltinTools check in this suite would be one out on a machine
     whose real home directory happens to hold a skill. }
   HomeAside;
+  { First, because it is the only test that can see HooksAllowed's shipped
+    default - it leaves the flag on, which is what every other hook test in
+    this suite needs and what the REPL sets. }
+  TestHooksAreInteractiveOnly;
   TestJson;
   TestRegexEngine;
   TestTools;
