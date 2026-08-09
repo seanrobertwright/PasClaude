@@ -214,14 +214,24 @@ var
 
 var
   I, Lines: Integer;
+  Git: string;
 begin
   Result := '';
-  Head := uTools.RunShellQuiet('git rev-parse --abbrev-ref HEAD', Code);
+  { Resolved on PATH rather than composed as a bare 'git'.  cmd.exe /C
+    searches the CURRENT DIRECTORY first, so the bare form ran a git.cmd the
+    cloned repository shipped - at startup, before the user typed anything.
+    A git that does not resolve contributes nothing here, exactly as a
+    directory that is not a repository already does. }
+  Git := uTools.ProgramCommand('git', 'rev-parse --abbrev-ref HEAD');
+  if Git = '' then Exit;
+  Head := uTools.RunShellQuiet(Git, Code);
   if Code <> 0 then Exit;
   Head := OneLine(Head);
   if Head = '' then Exit;
 
-  Stat := uTools.RunShellQuiet('git status --porcelain', Code);
+  Git := uTools.ProgramCommand('git', 'status --porcelain');
+  if Git = '' then Exit;
+  Stat := uTools.RunShellQuiet(Git, Code);
   Lines := 0;
   if Code = 0 then
     for I := 1 to Length(Stat) do

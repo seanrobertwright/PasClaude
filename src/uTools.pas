@@ -572,6 +572,30 @@ function IsIgnored(const RelPath: string; IsDir: Boolean): Boolean;
   for the reason written above the implementation. }
 function RunShellQuiet(const Cmd: string; out ExitCode: Integer): string;
 
+{ ---- program resolution ----
+  The absolute path of a program on PATH, honouring PATHEXT.  The CURRENT
+  DIRECTORY IS NEVER SEARCHED, and neither is any working root.
+
+  The reason is measured, not theoretical.  RunShell composes
+  "<ComSpec>" /C <Cmd> with the working directory at the session root, and
+  cmd.exe resolves the current directory BEFORE PATH.  A CreateProcess probe
+  in a directory containing git.cmd, with NoDefaultCurrentDirectoryInExePath
+  unset (the Windows default), ran that git.cmd for the command
+  "git rev-parse --abbrev-ref HEAD".  uSdk.SdkGitContext issues exactly that
+  at startup, so cloning a repository that ships git.cmd and opening
+  pasclaude in it is arbitrary code execution before the user types
+  anything.  Composing through here is what closes it.
+
+  A PATH entry that IS a working root - a repository that put itself on PATH
+  - is skipped for the same reason: it would reintroduce the hazard through
+  the front door.
+
+  ProgramCommand returns '"<abs>" <Args>', or '' when the program does not
+  resolve.  '' contributes nothing to a caller, exactly as a directory that
+  is not a repository already does; it is never composed as a bare name. }
+function ResolveProgram(const Name: string; out FullPath: string): Boolean;
+function ProgramCommand(const Name, Args: string): string;
+
 { The foreground shell itself.  Public because the output contract - exit
   code, interleaved stderr, nothing truncated, the tail after exit - is the
   thing most easily broken by a change to the drain loop, and a test that had
@@ -2777,6 +2801,90 @@ begin
   finally
     uSandbox.SandboxLevel := Saved;
   end;
+end;
+
+{ ------------------------------------------------- program resolution ----- }
+
+{ Splits a semicolon list, dropping empties and surrounding quotes.  PATH
+  entries are quoted surprisingly often on real machines. }
+function SplitPathList(const S: string): TStringArray;
+var
+  I, Start: Integer;
+  Part: string;
+begin
+  Result := nil;
+  Start := 1;
+  for I := 1 to Length(S) + 1 do
+    if (I > Length(S)) or (S[I] = ';') then
+    begin
+      Part := Trim(Copy(S, Start, I - Start));
+      Start := I + 1;
+      if (Length(Part) >= 2) and (Part[1] = '"') and
+         (Part[Length(Part)] = '"') then
+        Part := Copy(Part, 2, Length(Part) - 2);
+      if Part = '' then Continue;
+      SetLength(Result, Length(Result) + 1);
+      Result[High(Result)] := Part;
+    end;
+end;
+
+function ResolveProgram(const Name: string; out FullPath: string): Boolean;
+var
+  Dirs, Exts: TStringArray;
+  I, J, K: Integer;
+  Dir, Cand, ExtList: string;
+  Bad: Boolean;
+begin
+  FullPath := '';
+  Result := False;
+  { A NAME only.  Anything with a separator, a drive colon, a quote or a
+    control byte is not something this function will look up: the caller
+    would be asking for a path, and a path is exactly what must not come
+    from anywhere but PATH here. }
+  if (Name = '') or (Length(Name) > 64) then Exit;
+  for I := 1 to Length(Name) do
+    if not (Name[I] in ['A'..'Z', 'a'..'z', '0'..'9', '.', '_', '-']) then Exit;
+
+  { SysUtils. qualified: the Windows unit exports a raw API of the same name
+    that shadows it and returns a DWORD. }
+  Dirs := SplitPathList(SysUtils.GetEnvironmentVariable('PATH'));
+  ExtList := SysUtils.GetEnvironmentVariable('PATHEXT');
+  if Trim(ExtList) = '' then ExtList := '.COM;.EXE;.BAT;.CMD';
+  Exts := SplitPathList(ExtList);
+
+  for I := 0 to High(Dirs) do
+  begin
+    Dir := Dirs[I];
+    { Absolute only: a relative PATH entry resolves against the current
+      directory, which is the thing this function exists to not consult. }
+    if not ((Length(Dir) >= 3) and (Dir[2] = ':') and
+            ((Dir[3] = '\') or (Dir[3] = '/'))) and
+       not ((Length(Dir) >= 2) and (Dir[1] = '\') and (Dir[2] = '\')) then
+      Continue;
+    Dir := ExcludeTrailingPathDelimiter(Dir);
+    Bad := False;
+    for K := 0 to RootCount - 1 do
+      if WithinRoot(Dir, RootAt(K)) then Bad := True;
+    if Bad then Continue;
+    for J := 0 to High(Exts) do
+    begin
+      Cand := Dir + PathDelim + Name + Exts[J];
+      if FileExists(Cand) then
+      begin
+        FullPath := Cand;
+        Exit(True);
+      end;
+    end;
+  end;
+end;
+
+function ProgramCommand(const Name, Args: string): string;
+var
+  Full: string;
+begin
+  if not ResolveProgram(Name, Full) then Exit('');
+  Result := '"' + Full + '"';
+  if Args <> '' then Result := Result + ' ' + Args;
 end;
 
 { pasclaude's own "git status" and "git rev-parse", never the model's command,

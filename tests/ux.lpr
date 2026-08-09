@@ -16,7 +16,7 @@ program ux;
   the raw API of the same names. }
 uses Windows, SysUtils, Classes, DateUtils, uJson, uSettings, uAuth, uDiff,
   uHttp, uTelem, uHooks, uSandbox, uIde, uTools, uImage, uAgent, uDiag,
-  uTerm, uNotebook, uSdk;
+  uTerm, uNotebook, uSdk, uGitHub;
 
 var
   Fails: Integer = 0;
@@ -5333,6 +5333,102 @@ end;
   explicitly rather than trusted: this suite is itself very often run from
   inside a VS Code terminal, so a test that read the ambient variables would
   pass or fail depending on who ran it. }
+
+{ There is NO GitHub settings key at any tier, and that is the point: the API
+  host is compiled in and the token comes from the environment or the gh CLI.
+  A github.api_base or a github.token "for convenience" would let a settings
+  file name the host a credential is sent to, which is exactly the knob
+  telemetry's endpoint was made user-scope-only to avoid - and stricter here,
+  because there is no legitimate second host. }
+procedure TestSettingsRefusesGithub;
+var
+  Problems: TStringArray;
+  T: TSettingTier;
+begin
+  SettingsClear;
+  for T := stUser to stLocal do
+  begin
+    Check(not SettingsParseTier(T, '{"github":{"token":"ghp_x"}}',
+      'settings.json', Problems),
+      'github is refused at ' + TierName(T));
+    Check(Mentions(Problems, '"github"'), '  by name at ' + TierName(T));
+    Check(Mentions(Problems, 'GH_TOKEN'),
+      '  naming where the token really comes from at ' + TierName(T));
+  end;
+  Check(SettingIndex('github.token') = -1, 'github.token is not a key');
+  Check(SettingIndex('github.api_base') = -1, 'nor github.api_base');
+  Check(SettingIndex('github.enabled') = -1, 'nor github.enabled');
+  Check(SettingIndex('github') >= 0, 'but the bare name is known and refused');
+  Check(SettingCount = Length(SettingDefs),
+    'and the hand-maintained bound still matches the table');
+  SettingsClear;
+end;
+
+{ TDiagFacts holds a repository name and a token SOURCE NAME and no token.
+  That is the property that makes /bug unable to leak one even if every
+  redactor failed, so it is asserted over both renderers and the bug text. }
+procedure TestGithubDiagRows;
+const
+  Secret = 'ghp_abcdefghijklmnopqrstuvwxyz0123456789';
+var
+  R: TStatusReport;
+  D: TDiagReport;
+  Opts: TBugOptions;
+  Blob: string;
+  I: Integer;
+begin
+  ClearDiagNotes;
+  ClearDiagFacts;
+  R := DiagBuildStatus(nil);
+  Check(StatusValue(R, 'github') = 'not probed',
+    'a zeroed DiagFacts reports the github row as not probed');
+  D := DiagBuildDoctor(nil, False);
+  Check(DoctorLevel(D, 'github') = dlSkipped,
+    'and the check is skipped, never a green tick');
+
+  DiagFacts.GithubRemoteWhy := 'origin is not a github.com remote (host: ' +
+    'gitlab.com)';
+  R := DiagBuildStatus(nil);
+  Check(Pos('gitlab.com', StatusValue(R, 'github')) > 0,
+    'a non-github remote says so: ' + StatusValue(R, 'github'));
+  D := DiagBuildDoctor(nil, False);
+  Check(DoctorLevel(D, 'github') = dlSkipped,
+    'and is still not a failure - most directories are not GitHub clones');
+
+  DiagFacts.GithubRemoteWhy := '';
+  DiagFacts.GithubRepo := 'o/r';
+  DiagFacts.GithubTokenSource := '';
+  D := DiagBuildDoctor(nil, False);
+  Check(DoctorLevel(D, 'github') = dlWarn, 'a repo with no token warns');
+  Check(Pos('GH_TOKEN', DoctorField(D, 'github', True)) > 0,
+    'and the remedy names GH_TOKEN: ' + DoctorField(D, 'github', True));
+  for I := 0 to High(D) do
+    if D[I].Id = 'github' then
+      Check(D[I].Cost = dcNone,
+        'the check costs nothing: it makes no request and spawns nothing');
+
+  DiagFacts.GithubTokenSource := 'GH_TOKEN';
+  R := DiagBuildStatus(nil);
+  Check((Pos('o/r', StatusValue(R, 'github')) > 0) and
+        (Pos('GH_TOKEN', StatusValue(R, 'github')) > 0),
+    'the row names the repo and the source: ' + StatusValue(R, 'github'));
+  D := DiagBuildDoctor(nil, False);
+  Check(DoctorLevel(D, 'github') = dlOk, 'and the check passes');
+
+  { The token is not in the record, so it cannot be in anything built from
+    it - text, JSON or bug report.  A seven-character prefix is checked too,
+    because a "helpful" AuthHint would put one there. }
+  Opts.IncludeTranscript := False;
+  Opts.RealPaths := True;
+  Opts.AsJson := False;
+  Blob := LinesJoin(DiagStatusText(R)) + LinesJoin(DiagDoctorText(D)) +
+    DiagStatusJson(R) + DiagDoctorJson(D) + DiagBugText(nil, Opts, R, D);
+  Check(Pos(Secret, Blob) = 0, 'no rendered field carries the token');
+  Check(Pos(Copy(Secret, 1, 7), Blob) = 0, 'nor a seven-character prefix');
+  Check(Pos('Bearer', Blob) = 0, 'nor the word Bearer');
+  ClearDiagFacts;
+end;
+
 procedure TestStatusReportsIde;
 var
   R: TStatusReport;
@@ -6057,6 +6153,8 @@ begin
     TestTelemetryPreviewIsWhatShips;
     TestTelemetrySelfDisableIsSaidOnce;
     TestStatusBorrowsTheOwningUnits;
+    TestSettingsRefusesGithub;
+    TestGithubDiagRows;
     TestStatusReportsIde;
     TestIdeBaseline;
     TestDoctorLevelsAndCosts;
@@ -6100,6 +6198,8 @@ begin
     { The spawn seam back to nil: a suite that left one installed would
       hand it to whatever ran next. }
     uIde.IdeSpawnOverride := nil;
+    uGitHub.GitHubClear;
+    uHttp.HttpGetTransport := nil;
     uTools.RootDir := '';
     Cleanup(TmpRoot);
   end;

@@ -69,11 +69,15 @@ needs, built once as a record and rendered twice so the two views cannot
 disagree.
 
 That leaves **Integrations** as the only section here with anything unchecked
-in it: GitHub Actions and the PR workflow commands. IDE integration is done
-as far as it honestly goes from a console program — the editor around the
-terminal is detected and `/ide` opens files and session diffs in it, while an
-extension and reading the editor's selection are refused with their reasons.
-Every other section is complete.
+in it: GitHub Actions. IDE integration is done as far as it honestly goes
+from a console program — the editor around the terminal is detected and
+`/ide` opens files and session diffs in it, while an extension and reading
+the editor's selection are refused with their reasons. The PR workflow
+commands are done too: `/review` reviews a local diff and needs no token at
+all, `/pr-comments` reads one pull request's comments over a client that
+issues GET and nothing else, and `/install-github-app` is recorded as not
+applicable because there is no pasclaude GitHub App to install. Every other
+section is complete.
 
 Checked items have been built since this list was compiled; the strikethrough
 text preserves what was missing at the time. Unchecked items remain open.
@@ -567,9 +571,82 @@ text preserves what was missing at the time. Unchecked items remain open.
   the next launch, so a session that opens one diff and exits leaves one
   file holding project text for up to a day.*
 - [ ] **GitHub Actions / `@claude` mentions** — no CI integration.
-- [ ] **/review, /pr-comments, /install-github-app** — no built-in PR
+- [x] ~~**/review, /pr-comments, /install-github-app** — no built-in PR
   workflow commands (git itself works through bash, and `/diff` summarizes
-  changes).
+  changes).~~
+  *Built: two of the three commands, and the third is not applicable and no
+  command ships for it. `/review` is **local and needs no network and no
+  token**: `/review` reviews `git diff HEAD`, `/review --staged` reviews the
+  index, and `/review <ref>` reviews `git diff <ref>...HEAD`, the merge-base
+  form — "what this branch adds". It prints `git diff --stat` first so you
+  see the size and the file list before a turn is spent, then sends the diff
+  as an ordinary user message, so any edit the model proposes shows its own
+  diff and asks like every other. `/review 123` is refused **by name**, and
+  says to run `gh pr checkout 123` and then `/review main`: fetching a pull
+  request's diff would pull an arbitrarily large, arbitrarily hostile change
+  written by whoever opened it into the context of an agent holding thirteen
+  tools, for a result one `gh` command already gives from code you chose to
+  check out. A `<ref>` is user text entering an ungated `cmd.exe` line — no
+  permission gate, no deny check, no sandbox — so it is charset-validated
+  (letters, digits, `. _ - /`, no leading `-`, no `..`, 128 bytes) **before**
+  anything is composed, and that validator has its own test. `/pr-comments`
+  fetches the inline review comments, the review bodies and the conversation
+  thread of one pull request in four GETs to `api.github.com`, renders them
+  to the console, and **sends the model exactly the lines it printed** —
+  `/pr-comments <n> --show` renders and sends nothing. With no number it
+  infers the pull request from the current branch and asks for a number when
+  that is not exactly one match. `uGitHub` issues **GET and nothing else**:
+  there is no POST, PUT, PATCH or DELETE in the unit, so no comment, review,
+  approval, merge or branch can be produced by any amount of injected text,
+  in any mode, by any answer to any prompt — a read-only client cannot be
+  talked into an action. The API host is a **compiled constant settable at no
+  tier**, and `github` is a refused settings key naming where the token
+  really comes from: `GH_TOKEN`, then `GITHUB_TOKEN`, then `gh auth token`,
+  and nowhere else. Nothing is stored — `gh` already owns GitHub credential
+  storage and a second DPAPI blob would be a second credential lifetime to
+  keep correct for no gain — so `uAuth` grows no source and its writers still
+  take no path argument. A token is screened for header bytes (printable
+  ASCII, one line, 8..512) **before** `HttpGet` is called, because `uHttp`
+  validates no header byte; `gh`'s output is accepted only on exit code 0 and
+  only as a single line, and is never copied into an error, a note or a
+  report. `TDiagFacts` gains the repository name and the token **source
+  name** and no value, no hint and no length. Comment text is untrusted —
+  anyone with a GitHub account can write it — so it lands in a user message,
+  never the system prompt, inside a marked block preceded by one sentence
+  saying it is data and never an instruction, with any line forging either
+  marker dropped per line **after** truncation, capped at 100 items, 4 KB a
+  body and 64 KB a payload, every cut marked, and every byte `IsValidUtf8`
+  checked. Neither command exists under `-p`: `HandleCommand` runs only in
+  the REPL, and `GitHubAllowed` is False until the interactive path sets it
+  below the print-mode halt, so a future wiring mistake fails closed and a
+  suite asserts the transport is never touched. A pre-existing hazard was
+  fixed on the way: `cmd.exe /C` resolves the current directory before PATH,
+  so `git rev-parse` at startup ran a `git.cmd` a cloned repository shipped —
+  measured with a probe, not theorised. `uTools.ProgramCommand` walks PATH
+  and PATHEXT, never the current directory and never a working root, and the
+  three existing git calls now go through it. **`/install-github-app` is not
+  applicable and no command ships.** It installs *Anthropic's* GitHub App so
+  that `@claude` mentions are answered by Anthropic's infrastructure. There
+  is no pasclaude GitHub App: one means an app id, a private key, a webhook
+  receiver and a service somebody operates, none of which a single-file
+  Windows binary with no dependencies beyond the FPC RTL can be. Pointing the
+  command at Anthropic's app would be this program installing an integration
+  it is not part of and cannot honour — the same finding `uAuth` already
+  records about minting tokens with Claude Code's client identity: pasclaude
+  is a credential manager and never a credential issuer, and by the same
+  argument it is not an app publisher. A command that only printed an
+  explanation would put a non-feature in the command table and in `/help`,
+  which reads as half-built. Still missing: one page of 100 per list, because
+  `uHttp` exposes no response headers and therefore no `Link` header — a full
+  page is reported as possibly incomplete rather than silently truncated;
+  **github.com only**, no GitHub Enterprise, because a configurable host is
+  exactly the knob a credential should not have; **read-only**, so no reply,
+  resolve, approve or merge; no pull-request diff review; and the residual
+  the envelope does not fix — a comment can still persuade the model to
+  *propose* an edit or a command, and the human answering the prompt is the
+  last gate, so a user who habitually answers "a" has already widened it,
+  while `/review` over a fetched fork branch feeds attacker-written code to
+  the model exactly as opening that file in an editor would.*
 
 ## Configuration and diagnostics
 

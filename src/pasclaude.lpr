@@ -12,7 +12,7 @@ program pasclaude;
 uses
   Windows, SysUtils, Classes, DateUtils, uTerm, uJson, uSettings, uAuth,
   uHttp, uTelem, uMcp, uHooks, uSandbox, uIde, uTools, uImage, uAgent, uDiag,
-  uSdk;
+  uSdk, uGitHub;
 
 const
   Version = '0.1';
@@ -228,12 +228,13 @@ end;
 { ------------------------------------------------------------- completion -- }
 
 const
-  { Forty-one entries.  The bound is hand-maintained and a wrong one produces
-    NO compile error, only a command that silently stops tab-completing, so
-    it is counted rather than trusted. }
-  SlashCommands: array[0..40] of string = (
+  { Forty-three entries.  The bound is hand-maintained and a wrong one
+    produces NO compile error, only a command that silently stops
+    tab-completing, so it is counted rather than trusted. }
+  SlashCommands: array[0..42] of string = (
     '/help', '/clear', '/compact', '/config', '/deny', '/diff', '/hooks',
     '/ide', '/jobs', '/mcp', '/memory', '/init', '/mode', '/plan', '/rewind',
+    '/review', '/pr-comments',
     '/sandbox', '/sessions', '/skills', '/plugins', '/think', '/web',
     '/add-dir', '/remove-dir', '/resume', '/save', '/cwd', '/model', '/yolo',
     '/cost', '/telemetry', '/output-style', '/paste', '/vim', '/keys',
@@ -624,6 +625,14 @@ begin
   EmitCLn(clGrey,   '  /compact       drop the oldest turns, keep the recent ones');
   EmitCLn(clGrey,   '  /compact full  replace the transcript with a model-written summary');
   EmitCLn(clGrey,   '  /diff          list the files this session has changed');
+  EmitCLn(clGrey,   '  /review        have the model review a local diff:');
+  EmitCLn(clGrey,   '                 no argument is the working tree, --staged');
+  EmitCLn(clGrey,   '                 is the index, <ref> is what this branch');
+  EmitCLn(clGrey,   '                 adds. No network and no token');
+  EmitCLn(clGrey,   '  /pr-comments   review comments on a GitHub pull request:');
+  EmitCLn(clGrey,   '                 <n>, or the PR for this branch. Printed');
+  EmitCLn(clGrey,   '                 first, then sent to the model as data;');
+  EmitCLn(clGrey,   '                 --show prints and sends nothing. Read only');
   EmitCLn(clGrey,   '  /hooks         hooks this project defines; /hooks off disables them');
   EmitCLn(clGrey,   '  /jobs          background commands still running');
   EmitCLn(clGrey,   '  /mcp           MCP servers: status, restart, refresh');
@@ -1154,7 +1163,7 @@ procedure ShowDiff;
 var
   Changed: TStringArray;
   I, Code: Integer;
-  Stat: string;
+  Stat, GitCmd: string;
   L: TStringList;
 begin
   Changed := uTools.ChangedFiles;
@@ -1168,7 +1177,12 @@ begin
       EmitCLn(clGrey, '    ' + Changed[I]);
   end;
 
-  Stat := uTools.RunShellQuiet('git diff --stat HEAD', Code);
+  { Composed through ProgramCommand: a bare 'git' in a cmd.exe /C line runs
+    the current directory's git.cmd first, and the current directory here is
+    the session root - a cloned repository. }
+  GitCmd := uTools.ProgramCommand('git', 'diff --stat HEAD');
+  if GitCmd = '' then Exit;
+  Stat := uTools.RunShellQuiet(GitCmd, Code);
   if (Code = 0) and (Trim(Stat) <> '') then
   begin
     EmitCLn(clBright, '  git diff --stat HEAD:');
@@ -3363,6 +3377,7 @@ end;
 procedure FillDiagFacts;
 var
   Sub, Comp: string;
+  GhRepo: uGitHub.TGhRepo;
 begin
   uDiag.DiagFacts.Version := Version;
   if ActiveAuth.Source = uAuth.asNone then
@@ -3400,6 +3415,22 @@ begin
   else
     uDiag.DiagFacts.IdeSetting := 'on';
   uDiag.DiagFacts.IdeCommand := uSettings.SettingStr('ide.command');
+  { Identity and the NAME of a token source - never a token, never a hint,
+    never a length.  GhTokenSourceOffline spawns nothing: /status must not
+    run a program whose whole job is to print a credential to a pipe, which
+    is also what lets the doctor check declare dcNone. }
+  if uGitHub.GhRepoFromGit(GhRepo) then
+  begin
+    uDiag.DiagFacts.GithubRepo := GhRepo.Owner + '/' + GhRepo.Name;
+    uDiag.DiagFacts.GithubRemoteWhy := '';
+    uDiag.DiagFacts.GithubTokenSource := uGitHub.GhTokenSourceOffline;
+  end
+  else
+  begin
+    uDiag.DiagFacts.GithubRepo := '';
+    uDiag.DiagFacts.GithubTokenSource := '';
+    uDiag.DiagFacts.GithubRemoteWhy := GhRepo.Why;
+  end;
   { One report builder, not two: /config colours these same rows.  A second
     derivation here is how /status and /config end up disagreeing about
     which tier a value came from. }
@@ -3557,6 +3588,216 @@ begin
   EmitCLn(clGrey, '  form.');
 end;
 
+{ ---------------------------------------------------------------- /review -- }
+
+{ A LOCAL review, and only a local one.  Reviewing a GitHub pull request
+  through the API would mean pulling an arbitrarily large, arbitrarily
+  hostile diff written by whoever opened it into the context of an agent that
+  holds thirteen tools - for a result "gh pr checkout <n>" followed by
+  "/review main" already gives, with code the user chose to check out.  A
+  digit-only argument is therefore refused BY NAME and told what to type,
+  rather than quietly doing something adjacent. }
+procedure DoReview(const Arg: string);
+var
+  A, Args, StatArgs, Cmd, Stat, Diff, Err: string;
+  I, Code: Integer;
+  L: TStringList;
+  AllDigits: Boolean;
+begin
+  A := Trim(Arg);
+  AllDigits := A <> '';
+  for I := 1 to Length(A) do
+    if not (A[I] in ['0'..'9']) then AllDigits := False;
+  if AllDigits then
+  begin
+    EmitCLn(clYellow, '  /review does not fetch a pull request.');
+    EmitCLn(clGrey,   '  gh pr checkout ' + A + '   and then   /review main');
+    EmitCLn(clGrey,   '  reviews the same change, from code you chose to');
+    EmitCLn(clGrey,   '  check out and can read first.');
+    Exit;
+  end;
+
+  if A = '' then
+    Args := 'diff HEAD'
+  else if (A = '--staged') or (A = '--cached') then
+    Args := 'diff --cached'
+  else
+  begin
+    { The ref is user text about to enter an UNGATED cmd.exe command line:
+      no permission prompt, no deny check, no sandbox.  It is charset-checked
+      BEFORE composition and composed nowhere else, because "/review main &
+      whoami" is command injection into the one shell in this program that
+      answers to nobody. }
+    Args := uGitHub.GhReviewDiffArgs(A);
+    if Args = '' then
+    begin
+      EmitCLn(clRed,  '  that is not a ref pasclaude will put on a command line');
+      EmitCLn(clGrey, '  letters, digits and . _ - / only, up to 128 ' +
+        'characters, and no ".."');
+      Exit;
+    end;
+  end;
+  StatArgs := 'diff --stat' + Copy(Args, 5, MaxInt);
+
+  Cmd := uTools.ProgramCommand('git', StatArgs);
+  if Cmd = '' then
+  begin
+    EmitCLn(clRed, '  git is not on PATH, so there is nothing to diff');
+    Exit;
+  end;
+  Stat := uTools.RunShellQuiet(Cmd, Code);
+  if Code <> 0 then
+  begin
+    EmitCLn(clRed, '  git could not produce that diff - is this a ' +
+      'repository, and does that ref exist?');
+    Exit;
+  end;
+  if Trim(Stat) = '' then
+  begin
+    EmitCLn(clGrey, '  nothing to review: that diff is empty');
+    Exit;
+  end;
+
+  { The stat first, so the user sees the size and the file list BEFORE a
+    turn is spent on it. }
+  EmitCLn(clBright, '  git ' + StatArgs + ':');
+  L := TStringList.Create;
+  try
+    L.Text := Stat;
+    for I := 0 to L.Count - 1 do
+      if Trim(L[I]) <> '' then EmitCLn(clGrey, '    ' + L[I]);
+  finally
+    L.Free;
+  end;
+
+  Diff := uTools.RunShellQuiet(uTools.ProgramCommand('git', Args), Code);
+  if Length(Diff) > uGitHub.GhMaxTotalBytes then
+    { Utf8Cut, never Copy: a cut inside a multi-byte sequence would put
+      invalid UTF-8 into every later request in the session. }
+    Diff := uJson.Utf8Cut(Diff, uGitHub.GhMaxTotalBytes) + #10 +
+      '[... the diff was cut at ' + IntToStr(uGitHub.GhMaxTotalBytes) +
+      ' bytes ...]';
+
+  { An ordinary turn, exactly the /init shape: anything the model then wants
+    to change shows its diff and asks like any other edit. }
+  AtLineStart := True;
+  MdReset;
+  if not Agent.Send(
+    'Review the following diff of this project (from "git ' + Args + '"). ' +
+    'Point out correctness bugs, missing error handling, and anything that ' +
+    'contradicts the conventions you can see in the code. Be specific about ' +
+    'file and line. Do not rewrite anything unless I ask.'#10#10 +
+    Diff, Err) then
+  begin
+    NeedNewLine;
+    EmitCLn(clRed, '  ' + Err);
+  end;
+end;
+
+{ ----------------------------------------------------------- /pr-comments -- }
+
+{ Read-only, and consent is per invocation and per pull request: there is no
+  github tool, so the model can never fetch one itself, and there is no
+  polling.  The rendered lines go to the console FIRST and the model is sent
+  exactly those lines - nothing reaches it that the user did not see. }
+procedure DoPrComments(const Arg: string);
+var
+  Repo: uGitHub.TGhRepo;
+  Auth: uGitHub.TGhAuth;
+  Info: uGitHub.TGhPrInfo;
+  Items: uGitHub.TGhCommentArray;
+  E: uGitHub.TGhError;
+  Lines: TStringArray;
+  A, Tok, Branch, Cmd, Err: string;
+  Num, I, Code, Sp: Integer;
+  ShowOnly: Boolean;
+begin
+  A := Trim(Arg);
+  ShowOnly := False;
+  Num := 0;
+  { Each command parses its own Arg; there is no shared option parser and
+    HandleCommand split on the first space only. }
+  while A <> '' do
+  begin
+    Sp := Pos(' ', A);
+    if Sp = 0 then
+    begin
+      Tok := A;
+      A := '';
+    end
+    else
+    begin
+      Tok := Copy(A, 1, Sp - 1);
+      A := Trim(Copy(A, Sp + 1, MaxInt));
+    end;
+    if Tok = '--show' then
+      ShowOnly := True
+    else if StrToIntDef(Tok, -1) > 0 then
+      Num := StrToIntDef(Tok, 0)
+    else
+    begin
+      EmitCLn(clRed,  '  unknown argument: ' + Tok);
+      EmitCLn(clGrey, '  /pr-comments [<number>] [--show]');
+      Exit;
+    end;
+  end;
+
+  if not uGitHub.GhRepoFromGit(Repo) then
+  begin
+    EmitCLn(clYellow, '  ' + Repo.Why);
+    Exit;
+  end;
+  uGitHub.GhResolveToken(Auth);
+
+  if Num = 0 then
+  begin
+    Cmd := uTools.ProgramCommand('git', 'rev-parse --abbrev-ref HEAD');
+    if Cmd = '' then
+    begin
+      EmitCLn(clRed, '  git is not on PATH, so the branch is unknown; ' +
+        'name the pull request number');
+      Exit;
+    end;
+    Branch := Trim(uTools.RunShellQuiet(Cmd, Code));
+    I := Pos(#10, Branch);
+    if I > 0 then SetLength(Branch, I - 1);
+    Branch := Trim(Branch);
+    if not uGitHub.GhFindPrForBranch(Repo, Branch, Auth, Num, E) then
+    begin
+      EmitCLn(clRed, '  ' + uGitHub.GhErrorText(E, Repo, Auth.Present));
+      Exit;
+    end;
+  end;
+
+  if not uGitHub.GhFetchPrComments(Repo, Num, Auth, Info, Items, E) then
+  begin
+    EmitCLn(clRed, '  ' + uGitHub.GhErrorText(E, Repo, Auth.Present));
+    Exit;
+  end;
+
+  Lines := uGitHub.GhRenderComments(Repo, Info, Items);
+  for I := 0 to High(Lines) do
+    EmitCLn(clGrey, '  ' + Lines[I]);
+  if ShowOnly then
+  begin
+    EmitCLn(clGrey, '  --show: nothing was sent to the model');
+    Exit;
+  end;
+  { Said out loud, every time.  The envelope tells the MODEL where the
+    third-party text is; this tells the USER that it is going. }
+  EmitCLn(clYellow, '  sending the lines above to the model as data. They ' +
+    'were written by');
+  EmitCLn(clYellow, '  whoever commented on that pull request, and every ' +
+    'tool still asks.');
+  AtLineStart := True;
+  MdReset;
+  if not Agent.Send(uGitHub.GhCommentsPrompt(Repo, Info, Items), Err) then
+  begin
+    NeedNewLine;
+    EmitCLn(clRed, '  ' + Err);
+  end;
+end;
+
 function HandleCommand(const Line: string; out Handled: Boolean): Boolean;
 var
   Cmd, Arg: string;
@@ -3666,6 +3907,10 @@ begin
   end
   else if Cmd = '/ide' then
     DoIde(Arg)
+  else if Cmd = '/review' then
+    DoReview(Arg)
+  else if Cmd = '/pr-comments' then
+    DoPrComments(Arg)
   else if Cmd = '/jobs' then
     ShowJobs
   else if Cmd = '/memory' then
@@ -4890,6 +5135,14 @@ begin
       { Standing approvals survive restarts.  Print mode skips this: a
         scripted run must not inherit interactive grants, nor write any. }
       LoadPermissions(PermissionsPath);
+      { The GitHub client is armed HERE and nowhere else - below the
+        print-mode halt, on the interactive path, beside the one other piece
+        of state a scripted run must never inherit.  Putting it up beside
+        Agent.Ask := @AskPermission would arm it in every -p run, because
+        that line is ABOVE the branch that nils Ask, and the whole
+        unattended argument would collapse.  GitHubExecOverride stays nil:
+        the unit calls uTools.RunShellQuiet itself. }
+      uGitHub.GitHubAllowed := True;
       { Second application: LoadPermissions widens, so without this a flag
         saying "ask me" would be quietly overruled by a grant the user made
         weeks ago and has since forgotten. }

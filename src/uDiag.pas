@@ -134,6 +134,15 @@ type
     { The ide.command path, when one is set.  A path, beside KeysPath and
       PermissionsPath - and like them, never a credential of any kind. }
     IdeCommand: string;
+    { 'owner/name' when origin is a github.com remote, '' otherwise.  Public
+      repository identity, not a credential. }
+    GithubRepo: string;
+    { The SOURCE NAME only: 'GH_TOKEN' | 'GITHUB_TOKEN' | 'gh cli' | ''.  No
+      hint, no length, no prefix, no value.  The record holds no secret by
+      design, which is why /bug cannot leak one even if every redactor
+      failed; adding a hint here "for diagnostics" would give that up. }
+    GithubTokenSource: string;
+    GithubRemoteWhy: string;   { why the remote is not usable, when it is not }
   end;
 
   TBugOptions = record
@@ -882,6 +891,23 @@ begin
     here would put a program path in the shortest report twice. }
   if DiagFacts.IdeCommand <> '' then
     Item('ide_command_source', 'IDE launcher from', 'user settings.json');
+  { The repository identity and where a token would come from - never the
+    token.  Always emitted, for the same reason the IDE row is: a row that
+    appeared only in a GitHub checkout would make every other report
+    structurally different. }
+  if DiagFacts.GithubRepo <> '' then
+  begin
+    S := DiagFacts.GithubRepo;
+    if DiagFacts.GithubTokenSource <> '' then
+      S := S + '; token from ' + DiagFacts.GithubTokenSource
+    else
+      S := S + '; no token (public requests only)';
+    Item('github', 'github', S);
+  end
+  else if DiagFacts.GithubRemoteWhy <> '' then
+    Item('github', 'github', DiagFacts.GithubRemoteWhy)
+  else
+    Item('github', 'github', 'not probed');
   if not uHooks.HooksConfigured then
     Item('hooks', 'hooks', 'none configured')
   else if not uHooks.HooksEnabled then
@@ -1098,6 +1124,34 @@ var
         'run "Shell Command: Install ''code'' command in PATH" from the ' +
         'editor''s command palette, or set "ide.command" in your own ' +
         'settings.json to the shim''s full path', dlWarn, dcDisk);
+  end;
+
+  { Offline and dcNone: the facts were gathered by the host, and this check
+    adds no request of its own.  /doctor --online must not start spending a
+    GitHub rate limit, and it must never run a program whose whole job is to
+    print a credential to a pipe. }
+  procedure CheckGithub;
+  begin
+    if (DiagFacts.GithubRepo = '') and (DiagFacts.GithubRemoteWhy = '') then
+    begin
+      Emit('github', 'github repository', 'not probed', '', dlSkipped, dcNone);
+      Exit;
+    end;
+    if DiagFacts.GithubRepo = '' then
+    begin
+      Emit('github', 'github repository', DiagFacts.GithubRemoteWhy,
+        '', dlSkipped, dcNone);
+      Exit;
+    end;
+    if DiagFacts.GithubTokenSource <> '' then
+      Emit('github', 'github repository',
+        DiagFacts.GithubRepo + ', token from ' + DiagFacts.GithubTokenSource,
+        '', dlOk, dcNone)
+    else
+      Emit('github', 'github repository',
+        DiagFacts.GithubRepo + ', and no GitHub token was found',
+        'set GH_TOKEN or run gh auth login; public pull requests still work ' +
+        'without one, at 60 requests an hour', dlWarn, dcNone);
   end;
 
   procedure CheckStateDir;
@@ -1455,6 +1509,7 @@ begin
   Guard('hook_commands', 'hook commands', @CheckHookCommands);
   Guard('console', 'console', @CheckConsole);
   Guard('ide_editor_cli', 'editor command line', @CheckIde);
+  Guard('github', 'github repository', @CheckGithub);
   Guard('session_file', 'session file', @CheckSessionFile);
   Guard('disk_reports', 'bug reports on disk', @CheckReportsDir);
   Guard('model_access', 'model access', @CheckModelAccess);

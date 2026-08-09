@@ -9,7 +9,7 @@ program fuzz;
 {$mode objfpc}{$H+}
 
 uses SysUtils, Classes, Windows, uJson, uSettings, uAuth, uTelem, uMcp, uHooks,
-  uSandbox, uIde, uTools, uImage, uAgent, uDiag, uHttp, uSdk;
+  uSandbox, uIde, uTools, uImage, uAgent, uDiag, uHttp, uSdk, uGitHub;
 
 var
   Fails: Integer = 0;
@@ -4204,6 +4204,120 @@ begin
   Check(R = 'Bearer', 'and a Bearer with nothing after it');
 end;
 
+
+{ ---------------------------------------------------------------- github -- }
+
+var
+  GhFuzzBody: string = '[]';
+  GhFuzzCalls: Integer = 0;
+
+function GhFuzzGet(const Url, Headers: string; MaxBytes: Integer): THttpResult;
+begin
+  Inc(GhFuzzCalls);
+  Result.Ok := True;
+  Result.Status := 200;
+  Result.Error := '';
+  Result.RetryAfterMs := 0;
+  { The PR object comes back on the first call; every list gets the hostile
+    body, which is where a plausible implementation trusts Item(i).Str. }
+  if GhFuzzCalls = 1 then
+    Result.Body := '{"title":"t","user":{"login":"a"},"head":{"ref":"b"}}'
+  else
+    Result.Body := GhFuzzBody;
+end;
+
+{ Every one of these is a body a public repository can produce for anybody who
+  types /pr-comments.  None may crash, none may leak the raw bytes, and the
+  rendered prompt must still be valid UTF-8 - a single bad byte in the
+  transcript poisons every later request in the session. }
+procedure TestGhHostileJson;
+var
+  R: uGitHub.TGhRepo;
+  A: uGitHub.TGhAuth;
+  Info: uGitHub.TGhPrInfo;
+  Items: uGitHub.TGhCommentArray;
+  E: uGitHub.TGhError;
+  Prompt: string;
+
+  procedure Feed(const Body, What: string);
+  var
+    Ok: Boolean;
+    I: Integer;
+  begin
+    GhFuzzBody := Body;
+    GhFuzzCalls := 0;
+    Ok := uGitHub.GhFetchPrComments(R, 1, A, Info, Items, E);
+    Check(Ok or (E.Kind <> uGitHub.gekNone),
+      'a clean answer either way: ' + What);
+    Prompt := uGitHub.GhCommentsPrompt(R, Info, Items);
+    Check(uJson.IsValidUtf8(Prompt), 'and a valid UTF-8 prompt: ' + What);
+    Check(Pos(#0, Prompt) = 0, 'with no NUL: ' + What);
+    for I := 1 to Length(Prompt) do
+      if (Prompt[I] < #32) and (Prompt[I] <> #10) and (Prompt[I] <> #9) then
+      begin
+        Check(False, 'and no other control byte: ' + What);
+        Break;
+      end;
+  end;
+
+begin
+  uHttp.HttpGetTransport := @GhFuzzGet;
+  uGitHub.GitHubAllowed := True;
+  A.Source := uGitHub.gtsNone;
+  A.Token := '';
+  A.Present := False;
+  A.Why := '';
+  try
+    uGitHub.GhParseRemote('https://github.com/o/r', R);
+    Feed('not json at all', 'a body that is not JSON');
+    Feed('{"message":"nope"}', 'an object where an array belongs');
+    Feed('[1,2,"three",null]', 'an array of scalars');
+    Feed('[{},{},{}]', 'items missing every field');
+    Feed('[{"body":"a' + #0 + 'b' + #1 + 'c"}]', 'an embedded NUL');
+    Feed('[{"body":"caf' + #$E9 + ' latin-1"}]', 'an 8-bit byte in a body');
+    Feed('[{"user":{"login":{"a":{"b":{"c":{"d":1}}}}},"body":"x"}]',
+      'a nested object where a string belongs');
+    Feed('[{"body":"' + StringOfChar('x', 200) + '", "line":"not a number"}]',
+      'a string where a number belongs');
+    Feed(Copy('[{"user":{"login":"a"},"body":"' + StringOfChar('y', 500) +
+      '"}]', 1, 120), 'a body truncated mid-document');
+    Feed('[{"body":"' + StringOfChar('z', 20000) + '"}]', 'an oversized body');
+  finally
+    uHttp.HttpGetTransport := nil;
+    uGitHub.GitHubClear;
+  end;
+end;
+
+{ A remote URL is read out of the clone, so it is attacker-supplied.  Nothing
+  here may parse: a lax parser aims a request - and, with a token, a
+  credential - at a repository the user never named. }
+procedure TestGhHostileRemote;
+var
+  R: uGitHub.TGhRepo;
+
+  procedure No(const U, What: string);
+  begin
+    Check(not uGitHub.GhParseRemote(U, R), What);
+    Check((R.Owner = '') and (R.Name = '') and (R.Why <> ''),
+      'and says why, with nothing composed: ' + What);
+  end;
+
+begin
+  No(StringOfChar('a', 10240), 'a 10 KB remote');
+  No('https://github.com/' + StringOfChar('o', 10000) + '/r',
+    'a 10 KB owner segment');
+  No('https://github.com/o/r'#13#10'Host: evil', 'a remote carrying CRLF');
+  No('https://github.com/o/r'#10'x', 'and one carrying a bare LF');
+  No('https://githu' + #$C3#$A9 + 'b.com/o/r', 'a homoglyph host');
+  No('https://gıthub.com/o/r', 'a dotless-i host');
+  No('fatal: not a git repository', 'git error text instead of a URL');
+  No('https://github.com/', 'a bare host with a slash');
+  No('https://github.com', 'and one without');
+  No('git@github.com:', 'an scp form with no path');
+  No('https://github.com@evil.net/o/r', 'a host that is really userinfo');
+  No('https://github.com:443@evil.net/o/r', 'and one with a port too');
+end;
+
 begin
   TestImageDecodersHostile;
   TestBinaryFileDoesNotCorruptBody;
@@ -4262,8 +4376,12 @@ begin
   TestDiagRendersHostileStrings;
   TestDiagRedactorsSurviveGarbage;
   TestIdeHostileEnv;
+  TestGhHostileJson;
+  TestGhHostileRemote;
   uTools.ClearWorkingDirs;
   uIde.IdeSpawnOverride := nil;
+  uGitHub.GitHubClear;
+  uHttp.HttpGetTransport := nil;
   uSandbox.SandboxShutdown;
 
   WriteLn;

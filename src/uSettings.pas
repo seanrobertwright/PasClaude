@@ -135,7 +135,7 @@ const
     is the natural way to add a setting, which is exactly why the Scope column
     has to be filled in at the same moment: the load position (above the
     print-mode halt) is legal ONLY because nothing here can grant. }
-  SettingCount = 44;
+  SettingCount = 45;
   SettingDefs: array[0..SettingCount - 1] of TSettingDef = (
     { ---- scAny: display and economy.  A project may set these. ---- }
     (Name: 'output_style'; Kind: skStr; Scope: scAny;
@@ -335,7 +335,12 @@ const
      Note: 'diagnostics are commands, not configuration'),
     (Name: 'bug'; Kind: skStr; Scope: scRefused;
      Lo: 0; Hi: 0; ProjMax: 0; Dflt: 0; Cheap: chNone; Shape: shNone;
-     Note: 'diagnostics are commands, not configuration')
+     Note: 'diagnostics are commands, not configuration'),
+    (Name: 'github'; Kind: skStr; Scope: scRefused;
+     Lo: 0; Hi: 0; ProjMax: 0; Dflt: 0; Cheap: chNone; Shape: shNone;
+     Note: 'there is no GitHub settings key: the API host is compiled in ' +
+       'and the token comes from GH_TOKEN, GITHUB_TOKEN or the gh CLI; no ' +
+       'file names either')
   );
 
 function SettingIndex(const Name: string): Integer;      { -1 = unknown }
