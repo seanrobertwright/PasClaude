@@ -1545,6 +1545,92 @@ and only base64 sources are used. Print mode's plain `-p` never expands
 stream-json` driver can send image blocks in its own `user` message, under the
 same caps and the same four media types.
 
+## The screen
+
+Three pieces of chrome, all drawn by `uTerm` and all amber.
+
+**The banner** is a rounded two-column frame. On the left is what this session
+*is* - who it greets, the model and how it authenticates, the session root and
+any added ones. On the right is what to type. The split is not decoration: the
+left column is the half a user checks and the right is the half they learn once
+and stop reading, so side by side means the half that goes stale never pushes
+the half that stays useful off the screen.
+
+What the frame deliberately does *not* hold is the warnings. A permission mode
+that is not plain ask, a deny set in force, a sandbox below the default - those
+go **underneath** it, unboxed. A box is exactly the shape an eye learns to skip,
+and those are the three lines that must not be skipped. Under 64 columns the
+frame is dropped for a single stacked column: two columns in forty columns is
+two columns of ellipses.
+
+**The prompt block** is a rule, the text, a rule, and the status lines under it.
+The text word-wraps and the block grows downward, which means every repaint
+paints rows *below* the caret and then walks back up to it - so the block exists
+only where VT escapes do. A console that refuses VT gets the single-line editor
+this program has always had, and so does every prompt that is not the REPL: the
+permission question, the model picker, the session picker and the rewind picker
+all read through `ReadLineEdit`, which never frames. A question wrapped in a
+status bar is a question that gets skimmed.
+
+Each repaint is assembled and written **once**. Six rows painted run by run is
+thirty console calls per keystroke, which a user experiences as a prompt that
+stutters while they type.
+
+**The status line** says, in order: the model and where you are, the meters, what
+was loaded, and the permission mode. Every field has a "say nothing" value, and
+a field that says nothing takes no column - a session with no git, no MCP
+servers and no memory file gets a shorter line, not a line of zeroes. The mode
+is last because it is the line a narrow window must keep, and it is omitted
+entirely for plain ask, on the same reasoning the prompt has always followed:
+an indicator that is always on is not an indicator.
+
+```
+────────────────────────────────────────────────────────────────
+❯ what shall we build
+────────────────────────────────────────────────────────────────
+[claude-opus-5] │ pasclaude git:(feat/config-diagnostics)
+Context ███░░░░░░░░░ 12% (18.4k) │ Session 121.5k in 8.4k out
+1 CLAUDE.md │ 3 MCPs │ 16 hooks
+▸▸ bypass  (/mode to change)
+```
+
+The context meter fills towards the point *this program compacts at*, not the
+model's context window: compaction is what you will actually experience, so it
+is the number worth watching. A non-zero percentage always lights at least one
+cell - a meter that reads empty at 1% is a meter that does not appear to work.
+
+The branch comes out of `.git\HEAD`, not out of `git`. A subprocess per turn
+would be affordable; the status is refreshed once per turn and never per
+keystroke, but reading a file is the same answer for none of the cost, and it
+handles the three shapes `.git` comes in (a directory, a worktree's pointer
+file, and a detached HEAD, which is shown as the short commit).
+
+**The palette.** Four amber tones - `clAmberLt`, `clAmber`, `clAmberDim`,
+`clAmberDk` - go out as 24-bit escapes on a VT console. A sixteen-colour palette
+has exactly one amber, so on a legacy console the two bright ends collapse onto
+intense yellow and the two dark ones onto the dim pair that reads as structure
+rather than text. The banner loses its shading and keeps its shape.
+
+**How the rows are built.** A row is one string with zero-width colour marks in
+it (`#1` plus a letter), not a run of coloured writes. That is what makes a row
+*measurable*: `UiWidth` counts columns rather than bytes - `─` is three bytes and
+one column, and a frame padded by `Length()` is a frame with a ragged edge -
+`UiFit` truncates to a width while copying the marks through, and `UiPaint`
+colours it. Dropping the marks on a cut would leak the last colour onto
+everything painted after it, which is how one long path turns the rest of a
+screen amber. `#1` is safe as the sentinel because nothing a user types or a
+model returns contains it.
+
+`uTerm` sits at the bottom of the unit ladder and cannot ask `uAgent` for a
+token count or `uTools` for the permission mode, so the status facts are
+**pushed** into it as a plain record before each read rather than pulled out of
+it. That inversion is what keeps the console unit free of the program's state,
+and it is why the composer is a pure function of a record that the suite drives
+without a console: `StatusLines` at every width from 12 to 140, `UiBoxTop`,
+`UiBoxRow` and `UiBoxBottom` asserted to be the same number of columns for both
+glyph sets and for content far too long for its column, and `PromptRows`
+asserted to lose no character and to leave the caret where the eye is.
+
 ## Editing the prompt
 
 The line editor has always had arrows, Home/End and Ctrl+A/E/U. It now also has
@@ -1555,7 +1641,11 @@ halves of those are rebindable.
 `/vim` turns on a modal editor. A line always starts in insert mode, so
 forgetting the setting is on costs nothing; Esc (or Ctrl+[) enters normal mode
 and the prompt says which one you are in, `[I]` or `[N]`, in front of whatever
-the permission mode already puts there. Normal mode has `h l w b e 0 ^ $` for
+the permission mode already puts there. In the framed block described under
+**The screen** the permission mode has moved to the status line, so the tag is
+all that stands in front of the mark - but it is still there, and in both its
+states. Both tags are four columns wide, so the text does not shift sideways
+when you press Esc. Normal mode has `h l w b e 0 ^ $` for
 motion, `j` and `k` for history - a prompt is one line, so those are worth more
 as history than as motion - `i a I A` to insert, `x D C S` and the `d` and `c`
 compounds (`dw db de d0 d$ dd`, and the same with `c`) to edit, and `u` and
