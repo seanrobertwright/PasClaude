@@ -137,13 +137,24 @@ there rather than with the checkboxes, all of which are ticked.
   see what is running. At most eight at once, 16 MB of output each, and the
   16 MB is re-checked on a throttled tick that every tool call, every network
   chunk of a streaming reply and every prompt reaches, so enforcement no
-  longer waits on the model calling another tool. Still missing: a job left
-  running at exit is stopped by design, so there is no truly detached server;
-  nothing can stop a child writing between two ticks, so the guarantee is the
-  cap plus a quarter-second of writing rather than the cap itself; while the
-  user sits at the prompt the program is blocked in a console read with no
-  timeout, so nothing ticks at all and a job left running while nobody types
-  is still unbounded; and a grandchild spawned in the moment between
+  longer waits on the model calling another tool. The prompt-idle window is
+  closed too: the console read now waits 250 ms at a time instead of blocking
+  forever, and runs the same throttled sweep on each wake that timed out, so a
+  job left running while nobody types is bounded by the same clock as
+  everywhere else. The permission question and the four pickers — `/model`,
+  `/sessions`, `/rewind` and the source chooser inside `/login` — tick as
+  well, because they share that reader, which is the point: a permission
+  prompt is where a user sits longest. Still missing: a job left running at
+  exit is stopped by design, so there is no truly detached server; nothing can
+  stop a child writing between two ticks, so the guarantee is the cap plus a
+  quarter-second of writing rather than the cap itself, at the prompt now as
+  anywhere else; a wake the KEYBOARD caused ticks nothing at all, so a paste
+  or a held key suspends the sweep until the typing pauses for a quarter
+  second — deliberate, because the sweep waits two seconds per job it has to
+  kill and no user should meet that between two characters of a line;
+  the secret reader behind `/login` is the one console read that still blocks
+  with no timeout, so a key being fetched from a password manager is still an
+  unbounded pause; and a grandchild spawned in the moment between
   `CreateProcess` and the job assignment escapes `kill_bash`.*
 - [x] ~~**Notebook editing** — no Jupyter (`.ipynb`) aware read/edit.~~
   *Built: `read_file` renders a `.ipynb` as numbered cells with outputs
@@ -171,10 +182,38 @@ there rather than with the checkboxes, all of which are ticked.
   no-op an edit has to be, and it rewrites every line of a document whose one
   guarantee is that an edit touches the cell it names. What changed is the
   refusal itself, which now names the conversion
-  (`nbformat.read(path, as_version=4)`) instead of only saying no. Also still
-  true: a notebook that arrives with `\uXXXX` escapes in it, written by some
-  other tool, is normalised to raw UTF-8 on the first edit — a change to
-  lines nobody touched, though a change towards what Jupyter would write.*
+  (`nbformat.read(path, as_version=4)`) instead of only saying no. The clause
+  about arriving escapes is now closed: a string that arrived with `\uXXXX`
+  escapes in it is written back with the escapes it arrived with, so a file
+  some other tool wrote with `ensure_ascii` left on keeps its lines and only
+  the edited cell moves. A preference was reversed to get there, and it is
+  worth saying so plainly rather than pretending the old sentence merely
+  became more accurate: normalising towards Jupyter's spelling used to be the
+  goal, and the minimal diff is now the goal, because a line rewritten into a
+  better spelling is still a line the user did not ask about. The fidelity is
+  per string and not per file, so a mixed document keeps both forms — the
+  escaped cell escaped, the raw cell raw — and what we compose ourselves is
+  still raw UTF-8, which is still what nbformat writes. The mechanism is one
+  new entry point at the bottom of the ladder, `uJson.JsonParseVerbatim`,
+  which `uNotebook.OpenDoc` is the only caller of; every other parse in the
+  program is byte-for-byte what it was, so a request body is still composed
+  and emitted the way it always was. An incidental behaviour change fell out
+  of it and is recorded here because it is one: a lone surrogate escape used
+  to be written as the three invalid bytes it decodes to, which made our own
+  next read of that notebook fail the UTF-8 gate; it now goes back out as the
+  escape it came in as. Still missing, precisely: the memory covers string
+  VALUES and not object KEYS, because keys live in a parallel array that four
+  operations shift and a raw-key array shifted out of step would write a field
+  name belonging to a different field — a corrupted notebook, which is worse
+  than the residual it would fix; what is reproduced is the literal, not
+  the layout, so indent, key order and the trailing newline are still
+  canonicalised and the permission prompt still announces that; and a string
+  that arrived with a RAW byte below `0x20` between its quotes — which this
+  parser accepts and strict JSON forbids — keeps none of its arrival form, so
+  its other escapes are normalised along with the raw byte. That last one is a
+  refusal rather than an oversight: handing the raw byte back writes a file
+  `nbformat` will not read, and an unopenable notebook is worse than any
+  diff. It is asserted in `smoke` so it stays a stated limit.*
 - [x] ~~**Regex search** — `search` does case-insensitive substrings and `*`
   globs, not the full regex Grep of Claude Code; `list_dir` is capped at
   depth 4.~~
@@ -232,15 +271,51 @@ there rather than with the checkboxes, all of which are ticked.
   `%LOCALAPPDATA%\pasclaude\mcp-cache.json` and never into the project, so a
   repository cannot ship a cache entry that declares its own tool names under
   the user's trusted server name. `/mcp` and `/doctor` name each server's
-  scope.
+  scope. Their stderr spool has followed the cache out of the project, to
+  `%LOCALAPPDATA%\pasclaude\mcp\<name>-<session key>.err`. Three levels make
+  that path unambiguous: SCOPE picks the root, so a project `github` and a user
+  `github` can never name one file; the NAME leads, so one listing of that
+  directory groups every project's copy of your server together, which is the
+  thing you could not do before; and the SESSION KEY trails, because the spool
+  is opened `CREATE_ALWAYS` and one shared file would mean the second PROJECT
+  truncating the first mid-write and the two children writing over each other
+  at independent offsets. Project and not session, despite the name the
+  function carries — what that leaves open is in the Still missing below,
+  where it belongs, rather than glossed over here by the word "session".
+  `%LOCALAPPDATA%` and not the `%USERPROFILE%` the
+  `mcp.json` itself lives in, which looks like a mistake until you have the
+  rule the whole layout follows: `%USERPROFILE%` is hand-authored configuration
+  a person has to find and edit, `%LOCALAPPDATA%` is state the program writes,
+  keyed to the project it was written for. PROJECT-scope spools deliberately
+  did not move — a program
+  the repository chose leaves its diagnostics in the repository, where that
+  project's state already lives. And a session whose only servers are your own
+  no longer creates an empty `.pasclaude\mcp\` inside somebody else's
+  repository at all: the directory that gets created is exactly the one about
+  to be written.
   Still missing on that half: the per-CALL permission still applies to every
   user-scope tool, which is deliberate and not a gap — deciding to run a
   program of your own is not approving every call the model makes to it. With
   neither `%LOCALAPPDATA%` nor `%USERPROFILE%` set there is no user cache at
-  all, so those servers connect at every launch. A user server's stderr spool
-  still lives in the project's `.pasclaude\mcp\<name>.err`, so a session in one
-  project cannot see what one of your servers said in another. And `-p` reads
-  NEITHER file, so a scripted run still has no MCP tools at all.*
+  all, so those servers connect at every launch. `/mcp` now names that spool
+  directory once at the foot of the panel whenever you have a server of your
+  own, and names the exact file on a server that died — but it only NAMES it:
+  nothing reads the other projects' spools back to you, so seeing what your
+  server said in another project is still opening that directory yourself.
+  Nothing migrates or deletes an existing in-project `.pasclaude\mcp\<name>.err`
+  left over from a user server, so one dead file stays behind — deleting a file
+  inside somebody's repository to tidy up after a path change is the worse act.
+  Two pasclaude windows open on the SAME directory still write one spool, and
+  `CREATE_ALWAYS` means the second truncates the first: the key separates
+  projects and the word "session" in its name overstates it. Unchanged from the
+  in-project layout rather than introduced by moving it, and left alone because
+  the fix — a pid in the leaf — makes the file unfindable by the person who
+  went looking for it, which is the only reason it is kept.
+  With no home at all the spool path is empty and the child's stderr goes to
+  `NUL`, which is written and tested but unreachable for a user server today,
+  since a user server can only exist if `%USERPROFILE%` named the `mcp.json`
+  that declared it. And `-p` reads NEITHER file, so a scripted run still has no
+  MCP tools at all.*
 - [x] ~~**Hooks** — no PreToolUse/PostToolUse or other lifecycle hooks.~~
   *Built: `.pasclaude\hooks.json` runs commands at PreToolUse, PostToolUse,
   UserPromptSubmit, Stop and SessionStart, with an optional regex matcher on
@@ -654,10 +729,13 @@ there rather than with the checkboxes, all of which are ticked.
   size it added. The chosen name and the source it resolved from persist
   under `%LOCALAPPDATA%`, never in the project; a name that now resolves
   somewhere else falls back to `default` with a yellow line. An edited style
-  file now applies by itself, from the next turn: `StyleNote` stats the file
-  it read and re-reads it when the stamp or the size moved, which keeps the
-  per-request cost at one directory lookup instead of a read and a
-  frontmatter parse — and keeps a parse failure off the request path. A
+  file now applies by itself, from the next turn: `StyleNote` fingerprints
+  the file it read — the size the directory reports and FNV-1a 64 over its
+  bytes — and re-parses only when that fingerprint moved, which keeps the
+  frontmatter parse, and the parse FAILURE, off the request path. The read
+  itself is one bounded open of a file capped at 64 KB, and the hash covers
+  the bytes inside that cap and not one past it — the same 64 KB the parser
+  sees, so no body can depend on a byte the fingerprint missed. A
   built-in has no file and never touches the disk; a file that has become
   unreadable, unparseable or deleted keeps the body that was working and
   says so in yellow before the next prompt, once, not once a turn.
@@ -667,10 +745,11 @@ there rather than with the checkboxes, all of which are ticked.
   half-sending; it is command line only, with no `settings.json` key,
   because a project file that could append to the system prompt is a project
   file that can rewrite the agent's standing instructions. Still missing: no
-  built-in `Explanatory`/`Learning` insert markers in the reply itself; and
-  the change check compares a two-second DOS stamp beside the size, so an
-  edit landing in the same tick that leaves the file exactly the same length
-  still needs `/output-style <name>` re-run.*
+  built-in `Explanatory`/`Learning` insert markers in the reply itself. The
+  change check no longer compares a two-second DOS stamp — it compares the
+  file's bytes, so an edit that lands in the same tick and leaves the file
+  exactly the same length applies like any other, and `/output-style <name>`
+  is no longer needed as the escape hatch.*
 
 ## Integrations
 
@@ -867,7 +946,15 @@ there rather than with the checkboxes, all of which are ticked.
   two reasons to close, not a second mechanism to audit. The two terms meet in
   `uSdk.SdkProjectContextDecide`, a pure predicate, because the line that
   decides this used to live in `pasclaude.lpr`'s main block where no suite can
-  link it. `-p` WITHOUT the flag loads a project's files unchanged, exactly as
+  link it. Both of its INPUTS have since followed it out of that block: the
+  flag is read by `uArgs.ArgsParse`, a pure function over an array of argument
+  strings, and the "is this a `--ci` verb" question is `uArgs.ArgsIsCiVerb`,
+  one spelling with a truth table where the host used to write the set
+  expression out at five separate sites. So argv to the gate is now a single
+  chain a suite drives end to end, and `smoke` drives it — the flag typed, the
+  flag absent, and a `--ci prepare` command line — rather than the predicate
+  alone with its arguments taken on trust. `-p` WITHOUT the flag loads a
+  project's files unchanged, exactly as
   the REPL does, because that is the promise every scripted user relies on,
   and both directions are asserted over real files. What is NOT closed, and is
   now the whole of what a same-repo branch contributes to that request: the

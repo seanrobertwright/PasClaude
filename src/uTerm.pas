@@ -275,8 +275,9 @@ function TermWidth: Integer;
        PromptProfile - the argument in ReadPromptLine - and exactly one call
        site reaches ReadPromptLine, the REPL.  Everything else calls
        ReadLineEdit, which passes the constant KeysNone, so the permission
-       prompt and the three pickers are structurally unable to see a binding
-       or a vim mode.  The audit is one line:
+       prompt and the four pickers - /model, /sessions, /rewind and the
+       source chooser inside /login - are structurally unable to see a
+       binding or a vim mode.  The audit is one line:
 
          grep -n "ReadPromptLine\|PromptProfile\|KeysNone" src/*.pas src/*.lpr
 
@@ -409,6 +410,100 @@ const
   is still one word away. }
 function EscEscFires(AtPrompt, Armed, LineEmpty, Vim: Boolean;
   SinceMs: QWord): Boolean;
+
+type
+  { The periodic work a host wants done while this unit is blocked waiting for
+    a key.  A bare procedure and nothing else, because uTerm is below uTools
+    and must never learn that background jobs, spool files or caps exist: the
+    only fact pushed down here is "there is something to do on a clock", and
+    what that something IS stays entirely above. }
+  TIdleProc = procedure;
+
+var
+  { Nil means DO NOTHING, and it does it by not waiting at all - with this
+    unwired, the read in ReadLineCore is byte-for-byte the untimed
+    ReadConsoleInputW this program has always had, because Assigned() gates
+    the entire wait rather than merely skipping the call inside it.
+
+    Same one-word shape and same fail-closed default as uHooks.HooksAllowed
+    and uSdk.SdkProjectContextAllowed, and for the same reason: a wiring
+    mistake costs a feature instead of costing correctness.  RE-READ at the
+    point of use rather than captured when the line started, so a host that
+    wires it late, or clears it mid-run, gets what it asked for and not what
+    was true when the prompt was drawn.  Set from pasclaude.lpr beside
+    CompleteProvider and EscEscCommand, which is where the other two facts
+    this unit is not allowed to know are pushed down. }
+  IdleTick: TIdleProc = nil;
+
+const
+  { How long one wait may block before the loop wakes up to tick.  This is
+    deliberately uTools.SweepTickMs' own number: the prompt now enforces the
+    background spool cap on the same clock as every other tick site, and the
+    prompt ceasing to be the one place where the clock stops is the entire
+    point of the seam.  uTerm cannot say that by referring to the constant -
+    that reference is exactly the upward dependency this design exists to
+    avoid - so the number is repeated here and the reason is written down
+    instead of being inferred from the coincidence. }
+  IdleWaitMs = 250;
+
+  { The shortest gap between two ticks, and it sits BELOW the wait on purpose.
+    GetTickCount64 advances in steps of about 15.6 ms, so a 250 ms wait
+    routinely measures as 234 ms of elapsed clock.  With the gap equal to the
+    wait, roughly half of all timeouts would measure short, skip, and drift
+    the real interval at an idle prompt out towards half a second - the bug
+    would be half-closed and would look closed.  Set under the wait, a wait
+    that timed out is ALWAYS due.
+
+    Which is to say that in the shipped wiring this gate never actually stops
+    a tick, and that is worth writing down rather than leaving to be worked
+    out from two constants.  It had a second job when ReadLineCore ticked on
+    every wake including the ones a keystroke caused - it was what stopped the
+    key path ticking hot, since autorepeat and a pasted block deliver records
+    far faster than 250 ms - and that loop now breaks out to the read before
+    it ticks at all.  The WAIT is the throttle; this is a floor under it, and
+    the floor stays for two reasons.  Lowering IdleWaitMs, which is the
+    obvious thing to reach for the day the prompt has to notice something
+    sooner, would otherwise raise the sweep rate silently along with it.  And
+    IdleTickFires is a pure decision a suite drives with numbers, so the day
+    something does tick on arrival the rule is already here rather than being
+    invented a second time. }
+  IdleTickMs = 200;
+
+{ Should this wakeup run the tick?  Every condition is here rather than inline
+  in the read loop for the same reason EscEscFires' are: no suite can enter
+  ReadLineCore - there is no console under a test runner - so a rule that
+  lives inside that loop is a rule nothing can ever assert.  This one can be
+  called with numbers.
+
+  NowMs is a PARAMETER and not a GetTickCount64 taken inside, which is the
+  whole reason the interval is assertable without a test that sleeps.  Wired
+  is passed in rather than read here so the caller does the Assigned() at the
+  point of use and this stays a pure decision.
+
+  LastMs = 0 means "not yet on this line", and it fires: the same convention
+  uTools.LastSweepTick uses for the same reason - a prompt that has just
+  opened should not have to sit out a gap it never used. }
+function IdleTickFires(Wired: Boolean; LastMs, NowMs: QWord): Boolean;
+
+{ The decision and the call in one place, so whatever advances the clock is
+  whatever ran the tick and the two cannot drift apart.  True when the tick
+  actually ran.  LastMs advances ONLY then: a wakeup inside the gap leaves the
+  clock where it was rather than pushing the next tick further out, which is
+  the difference between a gate and a slow leak. }
+function IdleTickRun(var LastMs: QWord; NowMs: QWord): Boolean;
+
+{ How many RawWrite calls actually painted something.  Exposed for exactly one
+  purpose: the idle tick is contracted to print nothing, and this is what
+  turns that contract from a promise into something the read loop can check
+  after the fact and a test can assert outright.  It counts writes and not
+  bytes - the only question is "did anything reach the screen while I was
+  away", and a counter answers it in one compare.
+
+  It sees only what goes through this unit's own funnel.  A callee that wrote
+  to Output directly would tear the frame and never be noticed; that is a bug
+  in the callee, and this guard should not be described as if it were
+  airtight. }
+function EmitCount: QWord;
 
 { Starts an edit with an empty line, vim off and an empty undo stack. }
 procedure EditInit(out E: TEditState);
@@ -686,6 +781,18 @@ begin
   if Result < 20 then Result := 20;
 end;
 
+var
+  { Every byte this unit puts on the screen passes through RawWrite, so one
+    counter here is the whole program's "did anything paint".  Counted after
+    the empty-string exit below, because a write of nothing did not paint and
+    the read loop's frame repair must not fire on one. }
+  EmitSeq: QWord = 0;
+
+function EmitCount: QWord;
+begin
+  Result := EmitSeq;
+end;
+
 { WriteConsoleW takes UTF-16, so text is converted rather than written as raw
   bytes; that keeps output correct even if the codepage switch was refused.
   It fails outright on a redirected handle, in which case the UTF-8 bytes go
@@ -696,6 +803,10 @@ var
   Written: DWORD;
 begin
   if S = '' then Exit;
+  { Bumped whether the console call or the stream fallback below does the
+    work: both of them painted, and the counter's consumer only asks whether
+    the screen changed under it. }
+  Inc(EmitSeq);
   if HOut <> 0 then
   begin
     W := UTF8Decode(S);
@@ -2802,6 +2913,27 @@ begin
             (EscEscCommand <> '') and (SinceMs <= EscEscWindowMs);
 end;
 
+function IdleTickFires(Wired: Boolean; LastMs, NowMs: QWord): Boolean;
+begin
+  { NowMs > LastMs guards the subtraction rather than the logic: these are
+    unsigned, and two wakeups landing inside one 15.6 ms clock step give
+    NowMs = LastMs, which would otherwise be a fine comparison and is written
+    out here only so a reader does not have to work out that it cannot wrap. }
+  Result := Wired and ((LastMs = 0) or
+            ((NowMs > LastMs) and (NowMs - LastMs >= IdleTickMs)));
+end;
+
+function IdleTickRun(var LastMs: QWord; NowMs: QWord): Boolean;
+begin
+  { Assigned() read HERE, at the point of use, and not captured when the line
+    started - the same rule EscEscCommand and uHooks.HooksAllowed are held to,
+    and it matters more here because a prompt can stay open for minutes. }
+  Result := IdleTickFires(Assigned(IdleTick), LastMs, NowMs);
+  if not Result then Exit;
+  LastMs := NowMs;
+  IdleTick();
+end;
+
 { The one console key loop, taking its profile as a REQUIRED PARAMETER and
   reading no module state.  That is the structural half of the wall: the two
   wrappers below are the only things that supply a profile, and the one that
@@ -2827,6 +2959,19 @@ var
   Bound: TEditKey;
   Blk: TBlockState;
   Framed: Boolean;
+  { True when there is a real console to block on, which is the only case the
+    bounded wait is entered in.  Split out of the Framed decision below
+    because the two questions had been one line and are not the same
+    question: the frame additionally needs VT, and the wait must NOT be
+    entered off a pipe, where a handle's signalled state means something else
+    entirely and waiting on it would be a guess. }
+  Waiting: Boolean;
+  Waited: DWORD;
+  { When the last idle tick ran, on this line and no other.  A local beside
+    EscTick, and for the same reason: the state dies with the line, so a
+    prompt that opened after a long reply ticks immediately rather than
+    inheriting a clock from a prompt three screens ago. }
+  LastIdle: QWord;
   { The double-Escape latch.  Armed only by an Escape that arrived on an
     already-empty line at the REPL prompt with vim off; EscTick is when.
     Both are locals, so the state dies with the line and an Escape left
@@ -2865,17 +3010,68 @@ var
     EmitCLn(clWhite, UTF8Encode(E.Text));
   end;
 
+  { One wakeup's worth of periodic work, run between two console reads.
+
+    The block is NOT taken down around the tick, and that is the decision
+    here rather than an oversight.  The obvious reading of "the frame must not
+    flicker" is BlockErase -> tick -> BlockDraw, and it is wrong for this
+    callee: the tick the host wires prints nothing at all, so bracketing would
+    blank and repaint the prompt four times a second while nobody is typing.
+    A prompt that blinks at an empty room is a worse bug than an unbounded
+    spool, which is precisely the trade this must not get backwards.
+
+    The silence is CHECKED rather than trusted, because a contract nobody
+    verifies is a comment.  If the callee did write, the frame on screen has
+    already been written over - there is nothing left to erase, and erasing
+    would eat the output instead.  The recovery is therefore to claim fresh
+    rows BELOW the damage: zeroing St.Rows is exactly what BlockDraw treats as
+    a first paint, blank line and CursorAtLineStart check included, so the
+    wreckage scrolls away as ordinary output like any other line the REPL
+    prints between two prompts.  On the unframed path the same repair is one
+    newline and a Redraw, which is what every other "something else printed"
+    site in this file already does.
+
+    Cost in the shipped configuration: one QWord read and one compare per
+    tick, and the repair branch is unreachable by construction.  That is the
+    intent - the assertion is the product, not the recovery. }
+  procedure Wake;
+  var
+    Seq: QWord;
+  begin
+    Seq := EmitCount;
+    if not IdleTickRun(LastIdle, GetTickCount64) then Exit;
+    if EmitCount = Seq then Exit;
+    if Framed then
+    begin
+      Blk.Rows := 0;
+      Blk.CaretRow := 0;
+      BlockDraw(E, Blk);
+    end
+    else
+    begin
+      if not CursorAtLineStart then EmitLn;
+      PrevLen := 0;
+      Redraw(Prompt, E, PrevLen);
+    end;
+  end;
+
 begin
   Line := '';
   PrevLen := 0;
   EscArmed := False;
   EscPrev := False;
   EscTick := 0;
+  LastIdle := 0;
   EditInitProfile(E, P);
   { The frame needs VT for the cursor moves and a real console to read from;
     without either, the caller silently gets the line editor this program has
-    always had.  Deciding it once here means no key handler has to ask. }
-  Framed := Block and VtActive and (HIn <> 0) and StdinIsConsole;
+    always had.  Deciding it once here means no key handler has to ask.
+
+    Split in two without changing a value: Framed is Block and VtActive and
+    Waiting exactly as it was, and StdinIsConsole is now asked once instead of
+    once per entry to two different questions. }
+  Waiting := (HIn <> 0) and StdinIsConsole;
+  Framed := Block and VtActive and Waiting;
   Blk.Rows := 0;
   Blk.CaretRow := 0;
   if Framed then
@@ -2905,6 +3101,70 @@ begin
   end;
   try
     repeat
+      { The bounded wait that closes the prompt-idle window, sitting in FRONT
+        of the read below rather than replacing it.  There is no timeout form
+        of ReadConsoleInput, so wait-then-read is the only mechanism available
+        - and it is also the right one, because the console input handle is a
+        synchronisation object that Windows signals the instant a record
+        lands.  A keystroke therefore costs one WaitForSingleObject on an
+        already-signalled handle and one GetTickCount64, and no latency: the
+        wait returns immediately rather than at the end of an interval, which
+        is what rules out the obvious PeekConsoleInput-plus-Sleep shape.  That
+        one would add the sleep to every keystroke, burn a wake whether or not
+        anything was pending, and hand the paste burst at VK_RETURN below a
+        second way to be wrong.
+
+        Nothing can steal the record between the wait and the read.
+        ReadLineCore is the only reader of HIn on the only thread while this
+        loop is live - EscPressed drains HIn too, but only from the streaming
+        path, which by definition is not running while a prompt is open.
+
+        ONLY WAIT_TIMEOUT is special.  WAIT_OBJECT_0, WAIT_ABANDONED and
+        WAIT_FAILED all break out and fall into the read that has always been
+        here, so every failure mode of the wait degrades to the loop this
+        program shipped before it existed.  A handle that somehow never
+        signalled would spin at 4 Hz rather than hang, which is the direction
+        to fail in.
+
+        Wake runs ONLY on the timeout, and the Break is ahead of it, and that
+        order is the second version of these four lines.  The first ran Wake
+        after every return, gated by IdleTickMs, on the argument that ticking
+        only on the timeout is starved exactly when it matters: autorepeat and
+        a pasted block deliver records faster than 250 ms, so the wait never
+        expires and the tick never runs at the very moment a job is producing
+        output.  That argument is real and it is still true of this code - it
+        is simply worth less than what it cost.
+
+        What it cost was a keystroke.  The tick is TickBackgroundJobs, which
+        sweeps, and a sweep that finds a job over the spool cap terminates it
+        and then waits JobKillWaitMs - two seconds - for the process to die,
+        ONCE PER JOB, up to the eight a session may have.  With Wake ahead of
+        the Break that ran between a character landing in the console input
+        buffer and this loop reading it, so a user typing into a session with
+        several capped jobs could watch the prompt freeze for up to sixteen
+        seconds with nothing echoed.  The character was never lost - the input
+        buffer holds records while we are away - but "never lost" was the
+        weaker half of the promise this whole change was made under, and the
+        other half was that a keystroke is never DELAYED by the wait either.
+        Now nothing at all happens between a record arriving and the read of
+        it: the wait returns, the Break fires, and the code below is the code
+        this program has always had.
+
+        The starvation the old order bought off is what we pay instead, and it
+        is bounded by the burst rather than by the job: while records keep
+        arriving inside 250 ms of each other no tick runs, and the first pause
+        of a quarter second runs one.  A paste and an autorepeat both end, and
+        the cap is re-checked the moment they do.  Set against what this
+        replaced - a prompt that ticked NEVER, however long it was left open -
+        the hole is a fraction of the one that was here a round ago, and it is
+        the only shape of it that cannot make the editor stutter. }
+      if Waiting then
+        while Assigned(IdleTick) do
+        begin
+          Waited := WaitForSingleObject(HIn, IdleWaitMs);
+          if Waited <> WAIT_TIMEOUT then Break;
+          Wake;
+        end;
       if (HIn = 0) or not ReadConsoleInputW(HIn, Rec, 1, NRead) or (NRead = 0) then
       begin
         { Not a console (piped input): fall back to a plain read. }
@@ -3121,7 +3381,16 @@ begin
 
     False for the frame, always, and for the same reason: these prompts ask a
     question whose answer matters, and a question wrapped in a status bar is
-    a question that gets skimmed. }
+    a question that gets skimmed.
+
+    These prompts DO tick, because the tick is in ReadLineCore and is
+    deliberately not gated on Block the way EscEscFires is gated on AtPrompt.
+    That gate exists because /rewind MEANS something different inside the
+    rewind picker; a tick means nothing at all, only "time passed, do the
+    periodic thing".  The permission question is where the user sits longest -
+    reading a diff, thinking, often with a job already running - so making it
+    the one remaining place where the clock stops would rebuild the bug one
+    prompt over. }
   Result := ReadLineCore(Prompt, KeysNone, False, Line);
 end;
 
@@ -3142,6 +3411,13 @@ var
 begin
   Secret := '';
   Result := False;
+  { The one console read in this unit that still blocks with no timeout, and
+    it is left that way on purpose rather than by omission.  This is a third
+    loop with its own console-mode handling, reached only from /login, and
+    duplicating the wait and the tick here would be diff spent on a window
+    measured in the seconds a user takes to paste a key.  Named as a residual
+    in FEATURES-NOT-YET.md instead of being quietly left out; the fix is the
+    same three lines if it ever matters. }
   { Refused rather than attempted off a pipe.  ReadLineCore falls back to
     ReadLn there; this must not, because the fallback would echo the secret
     into whatever is reading the console's output and because a -p run has

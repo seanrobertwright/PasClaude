@@ -12,7 +12,7 @@ program pasclaude;
 uses
   Windows, SysUtils, Classes, DateUtils, uTerm, uJson, uSettings, uAuth,
   uHttp, uTelem, uMcp, uHooks, uSandbox, uIde, uTools, uImage, uAgent, uDiag,
-  uSdk, uGitHub, uCi;
+  uSdk, uGitHub, uCi, uArgs;
 
 const
   Version = '0.1';
@@ -2272,6 +2272,7 @@ var
   Status, Err, Sub, Rest: string;
   Col: TColor;
   Sp: Integer;
+  HasUser: Boolean;
 begin
   Sp := Pos(' ', Arg);
   if Sp > 0 then
@@ -2314,9 +2315,11 @@ begin
       EmitCLn(clGrey, '  ' + uTools.UserMcpConfigPath);
     Exit;
   end;
+  HasUser := False;
   for I := 0 to High(Rows) do
   begin
     Status := Field(Rows[I], 1);
+    if Field(Rows[I], 6) = 'user' then HasUser := True;
     if Status = 'connected' then Col := clGreen
     else if (Status = 'dead') or (Status = 'denied') or
             (Status = 'failed to start') then Col := clRed
@@ -2333,6 +2336,15 @@ begin
     if Field(Rows[I], 5) <> '' then
       EmitCLn(clGrey, '      ' + Field(Rows[I], 5));
   end;
+  { Your own servers' stderr no longer lands in this project, so /mcp has to
+    say where it went - otherwise the improvement reads as the log having
+    vanished.  A footer and not a column, and only when you actually have a
+    server of your own: the per-row note already names the exact file the
+    moment one dies, which is when the path matters, and the panel is three
+    lines a server before anything is added to it.  This answers the other
+    question, the one nothing was answering - where a HEALTHY server's log is. }
+  if HasUser and (uTools.UserMcpSpoolDir <> '') then
+    EmitCLn(clGrey, '  your servers'' stderr: ' + uTools.UserMcpSpoolDir);
 end;
 
 { /model <name>.  An alias is resolved and said out loud; anything else is
@@ -2896,10 +2908,9 @@ end;
 function LogoRow(N: Integer): string;
 begin
   case N of
-    0: Result := MkAmber + '/    ' + MkAmberLt + '/' + MkAmber + '  \';
-    1: Result := MkAmber + '<    ' + MkAmberLt + '/' + MkAmber + '    >';
-  else
-    Result := MkAmber + ' \  ' + MkAmberLt + '/' + MkAmber + '    /';
+    0: Result := MkAmber + ' ▛▀▀▜ ' + MkAmberLt + ' ▟█▙ ' + MkAmber + ' ▞▀▞ ';
+    1: Result := MkAmber + ' ▌  ▐ ' + MkAmberLt + ' █  █ ' + MkAmber + ' ▌  ▐ ';
+    2: Result := MkAmber + ' ▙▄▄▟ ' + MkAmberLt + ' ▝██▛ ' + MkAmber + ' ▙▄▄▟ ';
   end;
 end;
 
@@ -4408,24 +4419,15 @@ var
   OutFormat: uSdk.TSdkFormat = uSdk.sfText;
   StreamInput: Boolean = False;
 
-type
-  { --status and --doctor as top-level modes.  A local enum set ONLY in the
-    argv loop, and that is load-bearing: it is the single condition under
-    which the missing-credential and missing-winhttp refusals below become
-    recorded notes instead of a startup halt, and the branch it selects ends
-    in Halt with no path past it to the REPL.  Nothing in a file, an
-    environment variable or a settings key can reach it.
-
-    The two --ci verbs join the enum rather than becoming a mode of their
-    own, and that inheritance is the whole reason the host diff for CI is
-    sixty lines: they get the refusals ("cannot be combined with -p, a
-    prompt, --resume or a driver"), the one relaxation that lets a run
-    continue past a missing credential - safe only because the branch ends in
-    Halt - and the skipped MCP connect, approvals load and session backup,
-    all of which a run with nobody at the console must not do. }
-  TDiagMode = (dmNone, dmStatus, dmDoctor, dmCiPrepare, dmCiReport);
 var
-  DiagMode: TDiagMode = dmNone;
+  { uArgs.TDiagMode, and it used to be declared right here.  It moved out with
+    the argument loop, because the claim its comment makes - "set by one thing,
+    reachable from no file, no environment variable and no settings key" - was
+    a claim about code no suite could link, and is now a claim about a pure
+    function two suites do.  The enum's own comment travelled with it to
+    uArgs; this is still the one variable in the program that holds the
+    answer. }
+  DiagMode: uArgs.TDiagMode = uArgs.dmNone;
   DiagOnline: Boolean = False;
   { The --ci-* flag values.  Every one of them is a PATH or a fixed word:
     no byte of comment text ever arrives on this program's command line,
@@ -4676,7 +4678,13 @@ begin
 end;
 
 var
-  ApiKey, ModelName, Line, Err, Dir, SaveErr, Arg, ResumeErr: string;
+  ApiKey, ModelName, Line, Err, Dir, SaveErr, ResumeErr: string;
+  { argv as data, and what uArgs made of it.  Argv holds ParamStr(1) upwards
+    and nothing else: the parser is deliberately not given the program name,
+    so no part of it can be off by one about which element is the first
+    argument. }
+  Argv: TStringArray;
+  Cli: uArgs.TArgsOpts;
   MentionNotes: string;
   SkillNames: string;
   SkillList: uTools.TSkillInfoArray;
@@ -4728,18 +4736,20 @@ var
   SessionFileArg: string = '';
   SessionFileFull: string = '';
   ResumeMsgs: Integer = 0;
-  SkipNext: Boolean = False;
   { The mode asked for on the command line, held rather than applied: it has
     to beat a grant loaded from the approvals file, and that file is read much
     later.  ModeGiven distinguishes "the user asked for ask" from "nobody
     said", which are different answers once allow_edits is on disk. }
   ModeWanted: uTools.TPermMode = uTools.pmodeAsk;
   ModeGiven: Boolean = False;
-  { Recorded separately from ModeWanted, which only one of them can win, so
-    the two can be seen to contradict each other whichever order they arrive
-    in. }
-  PlanFlag: Boolean = False;
-  BypassFlag: Boolean = False;
+  { The two flags that used to be held here beside ModeWanted - recorded
+    separately from it, which only one of them can win, so the two could be
+    seen to contradict each other whichever order they arrived in - now live
+    only in uArgs.TArgsOpts.  The contradiction is the ONLY thing that ever
+    read them, and the contradiction is a refusal, which means it went out
+    with the rest of the argument loop.  A host variable nothing reads is a
+    variable somebody eventually writes a second meaning into, so they are
+    gone rather than assigned and ignored. }
   { Held the same way and for a mirror-image reason: the approvals file may
     RAISE the sandbox level, so a --sandbox given on argv has to be applied
     both before that file is read (a -p run never gets past the halt) and
@@ -4809,496 +4819,220 @@ end;
 begin
   TermInit;
   try
-    Dir := '';
-    AddDirs := nil;
-    SkipNext := False;
-    for ArgI := 1 to ParamCount do
+    { argv, collected into an array and handed to a function, instead of
+      decided here.  Everything between this line and the apply block below
+      used to be four hundred lines of if/else inside this main block, which
+      no test suite can link - so every refusal it makes, including the four
+      that --continue depends on, was verified by running the executable and
+      reading the console.  Three rounds recorded that as a residual before
+      anybody moved it.  uArgs.ArgsParse takes the arguments as data, writes
+      no global, prints nothing, halts nothing and opens nothing, and smoke
+      drives it over a hundred argument arrays.
+
+      The program name is deliberately not passed: a parser that had to skip
+      element zero would be a parser with an off-by-one waiting in it. }
+    SetLength(Argv, ParamCount);
+    for ArgI := 1 to ParamCount do Argv[ArgI - 1] := ParamStr(ArgI);
+    Cli := uArgs.ArgsParse(Argv);
+    { BEFORE the Ok test, and that order is load-bearing rather than tidy.
+      FailStart chooses red prose or one SdkErrorLine by reading OutFormat, and
+      the format used to be a global set half way down the loop - so a run that
+      said "--output-format json --bogus" got a JSON error line and one that
+      said "--bogus --output-format json" got prose, because the loop halted
+      before it reached the format.  ArgsParse stops exactly where the loop
+      halted and returns the state it had reached, so assigning the format
+      first reproduces both, bit for bit.  Move this line below the test and
+      every refusal after a format flag reverts to prose, silently, for a
+      driver with one parser - and no suite would see it, because no suite
+      spawns this executable. }
+    OutFormat := Cli.OutFormat;
+    if not Cli.Ok then FailStart(Cli.ErrMsg, Cli.ErrHint, Cli.ErrCode);
+    if Cli.Help then
     begin
-      Arg := ParamStr(ArgI);
-      { The previous flag consumed this argument as its value.  A latch rather
-        than a backwards look at ParamStr(ArgI - 1), because there are now
-        three flags that take a value and asking "was the one before me any of
-        them" gets longer and wronger with each. }
-      if SkipNext then
-      begin
-        SkipNext := False;
-        Continue;
-      end;
-      if (Arg = '--resume') or (Arg = '-r') then
-        Resume := True
-      { Claude Code's pair, and the same division of labour: --continue takes
-        the most recent conversation and asks nothing, --resume is the one you
-        reach for when you want to choose.  The shapes are not identical and
-        pretending otherwise would be the lie: --resume here has always meant
-        exactly this directory's session.json and still does, because changing
-        what an existing flag loads is not a thing a new flag gets to do.  The
-        choosing is /sessions, which was already the picker and is what --help
-        points at. }
-      else if (Arg = '--continue') or (Arg = '-c') then
-        ContinueFlag := True
-      else if Arg = '--append-system-prompt' then
-      begin
-        if ArgI >= ParamCount then
-          FailStart('--append-system-prompt needs text', '', 2);
-        { Refused at the door rather than truncated or ignored.  Every other
-          way of getting this wrong - too long, empty - ends the run here with
-          the reason, because the flag's whole job is to put words in the
-          system prompt and a run that half-did that is a run whose replies
-          cannot be explained. }
-        if not uSdk.SdkAppendSystemPush(ParamStr(ArgI + 1), Err) then
-          FailStart('--append-system-prompt: ' + Err,
-            'it adds to the system prompt and can never replace it; put a ' +
-            'long standing instruction in CLAUDE.md instead', 2);
-        SkipNext := True;
-      end
-      else if Arg = '--web' then
-        { Print mode leaves Ask nil, so nothing there can be approved
-          interactively; without a flag a -p run could never search. }
-        WebFlag := True
-      else if (Arg = '-p') or (Arg = '--print') then
-      begin
-        PrintMode := True;
-        ScriptedRun := True;
-        { A leading '-' means the next token is another flag, not this one's
-          value.  Taking it unconditionally made every flag after -p unusable
-          in the order --help showed: "-p --output-format json" sent
-          '--output-format' to the model as the question and then died on
-          'json' as a directory name, and "-p --web" quietly asked the model
-          about the string '--web' with the web never enabled.  A prompt that
-          genuinely starts with a dash is what -- style quoting is for, and is
-          worth far less than flags that work in the documented order. }
-        if (ArgI < ParamCount) and (Copy(ParamStr(ArgI + 1), 1, 1) <> '-') then
-        begin
-          PrintPrompt := ParamStr(ArgI + 1);
-          SkipNext := True;
-        end;
-      end
-      else if Arg = '--permission-mode' then
-      begin
-        if ArgI >= ParamCount then
-          FailStart('--permission-mode needs a value: ask, plan or accept-edits',
-            '', 2);
-        if not uTools.PermModeParse(ParamStr(ArgI + 1), ModeWanted) then
-        begin
-          { Named explicitly, because a user who typed 'bypass' knows what
-            they wanted and the only thing worth telling them is how it is
-            spelled here.  It is not an alias: the long form is the whole
-            defence against the mode arriving in a script by accident. }
-          if LowerCase(ParamStr(ArgI + 1)) = 'bypass' then
-            FailStart('bypass is spelled --dangerously-skip-permissions',
-              'and it means it: nothing is asked about at all', 2)
-          else
-            FailStart('unknown permission mode: ' + ParamStr(ArgI + 1),
-              'ask, plan or accept-edits', 2);
-        end;
-        ModeGiven := True;
-        PlanFlag := PlanFlag or (ModeWanted = uTools.pmodePlan);
-        SkipNext := True;
-      end
-      else if Arg = '--output-style' then
-      begin
-        if ArgI >= ParamCount then
-          FailStart('--output-style needs a name: default, explanatory, ' +
-            'learning or one of your own', '', 2);
-        StyleWanted := ParamStr(ArgI + 1);
-        SkipNext := True;
-      end
-      else if Arg = '--sandbox' then
-      begin
-        if ArgI >= ParamCount then
-          FailStart('--sandbox needs a value: off, limits or low', '', 2);
-        if not uSandbox.SandboxParseLevel(ParamStr(ArgI + 1), SandboxWanted) then
-          FailStart('unknown sandbox level: ' + ParamStr(ArgI + 1),
-            'off, limits or low', 2);
-        SandboxGiven := True;
-        SkipNext := True;
-      end
-      else if (Arg = '--add-dir') or (Copy(Arg, 1, 10) = '--add-dir=') then
-      begin
-        if Copy(Arg, 1, 10) = '--add-dir=' then
-          AddArg := Copy(Arg, 11, MaxInt)
-        else
-        begin
-          if ArgI >= ParamCount then
-            FailStart('--add-dir needs a directory', '', 2);
-          AddArg := ParamStr(ArgI + 1);
-          SkipNext := True;
-        end;
-        SetLength(AddDirs, Length(AddDirs) + 1);
-        AddDirs[High(AddDirs)] := AddArg;
-      end
-      { Beside --add-dir because they answer the same question from opposite
-        ends: one says what this tree may REACH, this one says what this tree
-        may SAY.  A plain boolean with no value and no = form - --add-dir has
-        one because a path is what people paste, and there is nothing here to
-        paste or to validate.  It is refused against no other flag either: it
-        is meaningful in the REPL, under -p, and redundantly under a --ci
-        verb, and this program refuses combinations that are dangerous or
-        meaningless rather than ones that are merely unusual. }
-      else if Arg = '--no-project-context' then
-        NoProjectContext := True
-      else if Arg = '--status' then
-        DiagMode := dmStatus
-      else if Arg = '--doctor' then
-        DiagMode := dmDoctor
-      else if Arg = '--online' then
-        DiagOnline := True
-      { The six GitHub Actions flags.  Every value is a path or a fixed word;
-        none of them can carry comment text, because the workflow never
-        interpolates a github.event expression into a command line at all -
-        the
-        event reaches this program as a FILE it opens itself. }
-      else if Arg = '--ci' then
-      begin
-        if ArgI >= ParamCount then
-          FailStart('--ci needs a value: prepare or report', '', 2);
-        if ParamStr(ArgI + 1) = 'prepare' then
-          DiagMode := dmCiPrepare
-        else if ParamStr(ArgI + 1) = 'report' then
-          DiagMode := dmCiReport
-        else
-          FailStart('unknown --ci verb: ' + ParamStr(ArgI + 1),
-            'prepare or report', 2);
-        SkipNext := True;
-      end
-      else if Arg = '--ci-in' then
-      begin
-        if ArgI >= ParamCount then FailStart('--ci-in needs a path', '', 2);
-        CiInPath := ParamStr(ArgI + 1);
-        SkipNext := True;
-      end
-      else if Arg = '--ci-pr' then
-      begin
-        if ArgI >= ParamCount then FailStart('--ci-pr needs a path', '', 2);
-        CiPrPath := ParamStr(ArgI + 1);
-        SkipNext := True;
-      end
-      else if Arg = '--ci-out' then
-      begin
-        if ArgI >= ParamCount then FailStart('--ci-out needs a path', '', 2);
-        CiOutPath := ParamStr(ArgI + 1);
-        SkipNext := True;
-      end
-      else if Arg = '--ci-trigger' then
-      begin
-        if ArgI >= ParamCount then
-          FailStart('--ci-trigger needs a phrase', '', 2);
-        CiTrigger := ParamStr(ArgI + 1);
-        if not uCi.CiTriggerValid(CiTrigger, AddArg) then
-          FailStart('--ci-trigger: ' + AddArg, '', 2);
-        SkipNext := True;
-      end
-      else if Arg = '--ci-allow' then
-      begin
-        if ArgI >= ParamCount then
-          FailStart('--ci-allow needs a value: collaborator, member or owner',
-            '', 2);
-        { It narrows and only narrows.  There is deliberately no flag that
-          widens the association gate: a workflow that could be told to answer
-          anybody is the failure this whole feature is designed against. }
-        if not uCi.CiFloorParse(ParamStr(ArgI + 1), CiFloor) then
-          FailStart('unknown --ci-allow value: ' + ParamStr(ArgI + 1),
-            'collaborator (the default), member or owner', 2);
-        SkipNext := True;
-      end
-      else if Arg = '--dangerously-skip-permissions' then
-      begin
-        ModeWanted := uTools.pmodeBypass;
-        ModeGiven := True;
-        BypassFlag := True;
-      end
-      else if Arg = '--output-format' then
-      begin
-        if ArgI >= ParamCount then
-          FailStart('--output-format needs a value: text, json or stream-json',
-            '', 2);
-        if not uSdk.SdkParseFormat(ParamStr(ArgI + 1), OutFormat) then
-          FailStart('unknown output format: ' + ParamStr(ArgI + 1),
-            'text, json or stream-json', 2);
-        { A protocol on stdout is a driver, not a person: the interactive
-          credential commands refuse there for the same reason the permission
-          prompt does. }
-        if OutFormat <> uSdk.sfText then ScriptedRun := True;
-        SkipNext := True;
-      end
-      else if Arg = '--session-file' then
-      begin
-        if ArgI >= ParamCount then
-          FailStart('--session-file needs a path', '', 2);
-        SessionFileArg := ParamStr(ArgI + 1);
-        SkipNext := True;
-      end
-      else if Arg = '--input-format' then
-      begin
-        if ArgI >= ParamCount then
-          FailStart('--input-format needs a value: text or stream-json', '', 2);
-        if ParamStr(ArgI + 1) = 'text' then
-          StreamInput := False
-        else if ParamStr(ArgI + 1) = 'stream-json' then
-          StreamInput := True
-        else
-          FailStart('unknown input format: ' + ParamStr(ArgI + 1),
-            'text or stream-json', 2);
-        SkipNext := True;
-      end
-      else if (Arg = '--help') or (Arg = '-h') or (Arg = '/?') then
-      begin
-        EmitCLn(clBright, 'pasclaude [directory] [--resume] [--web] [--add-dir <dir>] [-p "prompt"]');
-        EmitCLn(clGrey, '  --resume  continue the conversation saved in that directory');
-        EmitCLn(clGrey, '            (-r; under -p it needs --session-file, below)');
-        EmitCLn(clGrey, '  --continue');
-        EmitCLn(clGrey, '            continue the most recently saved conversation in that');
-        EmitCLn(clGrey, '            directory, whichever it is - the live one, the safety');
-        EmitCLn(clGrey, '            copy, or a /save - and do not ask (-c). To CHOOSE one,');
-        EmitCLn(clGrey, '            start without it and type /sessions. Interactive only:');
-        EmitCLn(clGrey, '            under -p name the transcript with --session-file.');
-        EmitCLn(clGrey, '  --web     let the model search the web (off by default)');
-        EmitCLn(clGrey, '  -p        answer one prompt and exit (reads stdin when piped)');
-        EmitCLn(clGrey, '            (-p never loads hooks: nobody is there to approve them)');
-        EmitCLn(clGrey, '  --permission-mode ask|plan|accept-edits');
-        EmitCLn(clGrey, '            ask (the default) prompts for every write, edit and command;');
-        EmitCLn(clGrey, '            plan lets the model only read and investigate, and refuses');
-        EmitCLn(clGrey, '            everything else until you leave it with /mode;');
-        EmitCLn(clGrey, '            accept-edits stops asking about file writes (but not about');
-        EmitCLn(clGrey, '            shell commands or fetch), and needs somebody to be there,');
-        EmitCLn(clGrey, '            so under -p it needs --input-format stream-json.');
-        EmitCLn(clGrey, '            Plan mode stops the MODEL, not the machine: your own');
-        EmitCLn(clGrey, '            hooks still run.');
-        EmitCLn(clGrey, '  --sandbox off|limits|low');
-        EmitCLn(clGrey, '            how confined the child processes are - shell commands,');
-        EmitCLn(clGrey, '            background jobs, hooks and MCP servers.  limits (the');
-        EmitCLn(clGrey, '            default) puts each in a job object: at most 64 processes,');
-        EmitCLn(clGrey, '            no breakaway, killed with the session.  low additionally');
-        EmitCLn(clGrey, '            runs them at low integrity, which stops them writing your');
-        EmitCLn(clGrey, '            profile, HKCU and this project, and gives them a scratch');
-        EmitCLn(clGrey, '            %TEMP% of their own.  Neither level stops a command');
-        EmitCLn(clGrey, '            READING your files and neither stops it using the network:');
-        EmitCLn(clGrey, '            scoping a process to a directory needs a filesystem filter');
-        EmitCLn(clGrey, '            driver and blocking its network needs a firewall rule.');
-        EmitCLn(clGrey, '            The sandbox is defence in depth and does NOT change what');
-        EmitCLn(clGrey, '            you are asked to approve.');
-        EmitCLn(clGrey, '  --dangerously-skip-permissions');
-        EmitCLn(clGrey, '            approve everything, asking nothing, for this run only.');
-        EmitCLn(clGrey, '            Nothing is persisted.  Deny rules, the session root and');
-        EmitCLn(clGrey, '            the subagent read-only list still apply; nothing else does.');
-        EmitCLn(clGrey, '  --add-dir <dir>');
-        EmitCLn(clGrey, '            also work in that directory, repeatable. Paths there must');
-        EmitCLn(clGrey, '            be given absolute; a bare relative path always means the');
-        EmitCLn(clGrey, '            session root. An added directory grants file access only:');
-        EmitCLn(clGrey, '            its hooks, skills, commands, agents and .mcp.json are not');
-        EmitCLn(clGrey, '            read. Nothing is persisted, so say it again next session.');
-        EmitCLn(clGrey, '  --no-project-context');
-        EmitCLn(clGrey, '            do not read this tree''s AGENTS.md, CLAUDE.md or');
-        EmitCLn(clGrey, '            .pasclaude.md into the system prompt, and follow no @import');
-        EmitCLn(clGrey, '            inside one.  For a checkout somebody else wrote: the Answer');
-        EmitCLn(clGrey, '            step in examples\github\ passes it, because that step runs in');
-        EmitCLn(clGrey, '            the pull request''s own head.  Without it, -p loads them');
-        EmitCLn(clGrey, '            exactly as the REPL does and scripts rely on that.  Your own');
-        EmitCLn(clGrey, '            %USERPROFILE%\.pasclaude\CLAUDE.md still loads - the question');
-        EmitCLn(clGrey, '            the flag asks is which TREE wrote the prompt.  Skills are not');
-        EmitCLn(clGrey, '            affected: their descriptions ride in the skill tool''s own');
-        EmitCLn(clGrey, '            description and were never in the system prompt.');
-        EmitCLn(clGrey, '  --output-style <name>');
-        EmitCLn(clGrey, '            how replies are written: default, explanatory, learning,');
-        EmitCLn(clGrey, '            or a .pasclaude\styles\<name>.md of your own (the user');
-        EmitCLn(clGrey, '            copy under %USERPROFILE% counts too).  A style adds a');
-        EmitCLn(clGrey, '            paragraph to the system prompt and never replaces one; it');
-        EmitCLn(clGrey, '            grants nothing and cannot change what you are asked to');
-        EmitCLn(clGrey, '            approve.  Interactively the name is remembered; under -p');
-        EmitCLn(clGrey, '            nothing is remembered and this flag is the only way in.');
-        EmitCLn(clGrey, '            Edit the file and it applies from the next turn; if the');
-        EmitCLn(clGrey, '            edit cannot be read the old text stays and you are told.');
-        EmitCLn(clGrey, '  --append-system-prompt <text>');
-        EmitCLn(clGrey, '            add your own paragraph to the end of the system prompt for');
-        EmitCLn(clGrey, '            this run.  It ADDS and never replaces: the guidelines and');
-        EmitCLn(clGrey, '            this project''s CLAUDE.md are still there, above it.  Give');
-        EmitCLn(clGrey, '            it more than once and the pieces accumulate in order,');
-        EmitCLn(clGrey, '            separated by a blank line; 4096 bytes in total, and past');
-        EmitCLn(clGrey, '            that the run stops rather than sending half of it.  There');
-        EmitCLn(clGrey, '            is no settings.json key for this on purpose - a file in a');
-        EmitCLn(clGrey, '            cloned project that could rewrite the system prompt is the');
-        EmitCLn(clGrey, '            thing that must not exist.  Something long belongs in');
-        EmitCLn(clGrey, '            CLAUDE.md, where /memory can show it to you.');
-        EmitCLn(clGrey, '  --session-file <path>   (needs -p)');
-        EmitCLn(clGrey, '            names the transcript a -p run saves to after every turn,');
-        EmitCLn(clGrey, '            and with --resume the one it continues.  Without it -p');
-        EmitCLn(clGrey, '            saves nothing at all, as it always has: a throwaway');
-        EmitCLn(clGrey, '            question does not disturb the directory''s conversation.');
-        EmitCLn(clGrey, '            The path must be inside the session root or an --add-dir');
-        EmitCLn(clGrey, '            root.  A file that is not there yet is a fresh start; one');
-        EmitCLn(clGrey, '            that is there and unreadable, or written by a newer build,');
-        EmitCLn(clGrey, '            stops the run with exit 2 rather than starting blank -');
-        EmitCLn(clGrey, '            interactive --resume warns and carries on instead, because');
-        EmitCLn(clGrey, '            somebody is there to read the warning.  A resumed session');
-        EmitCLn(clGrey, '            restores messages, model and counters and NOTHING else: no');
-        EmitCLn(clGrey, '            mode, no approvals, no roots, so it can never come back');
-        EmitCLn(clGrey, '            more permissive than a fresh one.  Nothing is compacted on');
-        EmitCLn(clGrey, '            this path, so a session that outgrows the context window is');
-        EmitCLn(clGrey, '            answered with a new file.  Two processes sharing one file');
-        EmitCLn(clGrey, '            race: each write is atomic, but the loser''s turn is lost.');
-        EmitCLn(clGrey, '  --status        print what is true right now and exit 0.');
-        EmitCLn(clGrey, '  --doctor [--online]');
-        EmitCLn(clGrey, '            check for problems and exit 1 if there are any, so');
-        EmitCLn(clGrey, '            "pasclaude --doctor || setup" works in a script.');
-        EmitCLn(clGrey, '            Offline and makes no request; --online adds one GET');
-        EmitCLn(clGrey, '            asking which models the credential can use.  Both');
-        EmitCLn(clGrey, '            modes run alone - never with -p, a prompt, --resume');
-        EmitCLn(clGrey, '            or a driver - and neither can run a turn or a tool,');
-        EmitCLn(clGrey, '            which is why they continue past a missing credential');
-        EmitCLn(clGrey, '            and report it instead of refusing to start.  Both');
-        EmitCLn(clGrey, '            take --output-format json|stream-json.');
-        EmitCLn(clBright, '  GitHub Actions (see examples\github\)');
-        EmitCLn(clGrey, '  --ci prepare|report');
-        EmitCLn(clGrey, '            the unattended path, run from a workflow step and never');
-        EmitCLn(clGrey, '            with -p, a prompt, --resume or a driver.  prepare reads');
-        EmitCLn(clGrey, '            the event payload, decides whether to answer at all, and');
-        EmitCLn(clGrey, '            writes the prompt; report turns one line of');
-        EmitCLn(clGrey, '            --output-format json into the comment markdown.  prepare');
-        EmitCLn(clGrey, '            refuses to run unless the CI deny floor is in force, so a');
-        EmitCLn(clGrey, '            workflow edited to drop it fails closed.');
-        EmitCLn(clGrey, '  --ci-in <path>     the event payload, or the result line');
-        EmitCLn(clGrey, '  --ci-out <path>    the prompt file, or the comment markdown');
-        EmitCLn(clGrey, '  --ci-pr <path>     gh pr view --json isCrossRepository,headRefOid,state');
-        EmitCLn(clGrey, '  --ci-trigger <phrase>   default @claude');
-        EmitCLn(clGrey, '  --ci-allow collaborator|member|owner');
-        EmitCLn(clGrey, '            the lowest author association that may start a run.  It');
-        EmitCLn(clGrey, '            narrows only: there is no flag that widens it.');
-        EmitCLn(clGrey, '  --output-format text|json|stream-json   (needs -p)');
-        EmitCLn(clGrey, '  --input-format  text|stream-json        (needs -p and stream-json out)');
-        EmitCLn(clGrey, '            json/stream-json put one JSON object per line on stdout,');
-        EmitCLn(clGrey, '            for driving pasclaude from another program.  Without');
-        EmitCLn(clGrey, '            --input-format stream-json there is nobody to approve');
-        EmitCLn(clGrey, '            anything, so every write, edit and shell command is refused.');
-        EmitCLn(clGrey, '            -p takes the next argument as its prompt unless that starts');
-        EmitCLn(clGrey, '            with "-", so the flags may go on either side of it.');
-        { Halt skips the finally block, so the console has to be put back
-          here or the caller's codepage stays switched to UTF-8. }
-        TermDone;
-        Halt(0);
-      end
-      else if Copy(Arg, 1, 1) = '-' then
-        FailStart('unknown option: ' + Arg, '', 2)
-      else
-        Dir := Arg;
+      { The text is output rather than a decision, so it stayed here.  A
+        hundred and thirty lines of console prose in uArgs would be strings no
+        assertion ever reads, in a unit whose whole value is that it has
+        none. }
+      EmitCLn(clBright, 'pasclaude [directory] [--resume] [--web] [--add-dir <dir>] [-p "prompt"]');
+      EmitCLn(clGrey, '  --resume  continue the conversation saved in that directory');
+      EmitCLn(clGrey, '            (-r; under -p it needs --session-file, below)');
+      EmitCLn(clGrey, '  --continue');
+      EmitCLn(clGrey, '            continue the most recently saved conversation in that');
+      EmitCLn(clGrey, '            directory, whichever it is - the live one, the safety');
+      EmitCLn(clGrey, '            copy, or a /save - and do not ask (-c). To CHOOSE one,');
+      EmitCLn(clGrey, '            start without it and type /sessions. Interactive only:');
+      EmitCLn(clGrey, '            under -p name the transcript with --session-file.');
+      EmitCLn(clGrey, '  --web     let the model search the web (off by default)');
+      EmitCLn(clGrey, '  -p        answer one prompt and exit (reads stdin when piped)');
+      EmitCLn(clGrey, '            (-p never loads hooks: nobody is there to approve them)');
+      EmitCLn(clGrey, '  --permission-mode ask|plan|accept-edits');
+      EmitCLn(clGrey, '            ask (the default) prompts for every write, edit and command;');
+      EmitCLn(clGrey, '            plan lets the model only read and investigate, and refuses');
+      EmitCLn(clGrey, '            everything else until you leave it with /mode;');
+      EmitCLn(clGrey, '            accept-edits stops asking about file writes (but not about');
+      EmitCLn(clGrey, '            shell commands or fetch), and needs somebody to be there,');
+      EmitCLn(clGrey, '            so under -p it needs --input-format stream-json.');
+      EmitCLn(clGrey, '            Plan mode stops the MODEL, not the machine: your own');
+      EmitCLn(clGrey, '            hooks still run.');
+      EmitCLn(clGrey, '  --sandbox off|limits|low');
+      EmitCLn(clGrey, '            how confined the child processes are - shell commands,');
+      EmitCLn(clGrey, '            background jobs, hooks and MCP servers.  limits (the');
+      EmitCLn(clGrey, '            default) puts each in a job object: at most 64 processes,');
+      EmitCLn(clGrey, '            no breakaway, killed with the session.  low additionally');
+      EmitCLn(clGrey, '            runs them at low integrity, which stops them writing your');
+      EmitCLn(clGrey, '            profile, HKCU and this project, and gives them a scratch');
+      EmitCLn(clGrey, '            %TEMP% of their own.  Neither level stops a command');
+      EmitCLn(clGrey, '            READING your files and neither stops it using the network:');
+      EmitCLn(clGrey, '            scoping a process to a directory needs a filesystem filter');
+      EmitCLn(clGrey, '            driver and blocking its network needs a firewall rule.');
+      EmitCLn(clGrey, '            The sandbox is defence in depth and does NOT change what');
+      EmitCLn(clGrey, '            you are asked to approve.');
+      EmitCLn(clGrey, '  --dangerously-skip-permissions');
+      EmitCLn(clGrey, '            approve everything, asking nothing, for this run only.');
+      EmitCLn(clGrey, '            Nothing is persisted.  Deny rules, the session root and');
+      EmitCLn(clGrey, '            the subagent read-only list still apply; nothing else does.');
+      EmitCLn(clGrey, '  --add-dir <dir>');
+      EmitCLn(clGrey, '            also work in that directory, repeatable. Paths there must');
+      EmitCLn(clGrey, '            be given absolute; a bare relative path always means the');
+      EmitCLn(clGrey, '            session root. An added directory grants file access only:');
+      EmitCLn(clGrey, '            its hooks, skills, commands, agents and .mcp.json are not');
+      EmitCLn(clGrey, '            read. Nothing is persisted, so say it again next session.');
+      EmitCLn(clGrey, '  --no-project-context');
+      EmitCLn(clGrey, '            do not read this tree''s AGENTS.md, CLAUDE.md or');
+      EmitCLn(clGrey, '            .pasclaude.md into the system prompt, and follow no @import');
+      EmitCLn(clGrey, '            inside one.  For a checkout somebody else wrote: the Answer');
+      EmitCLn(clGrey, '            step in examples\github\ passes it, because that step runs in');
+      EmitCLn(clGrey, '            the pull request''s own head.  Without it, -p loads them');
+      EmitCLn(clGrey, '            exactly as the REPL does and scripts rely on that.  Your own');
+      EmitCLn(clGrey, '            %USERPROFILE%\.pasclaude\CLAUDE.md still loads - the question');
+      EmitCLn(clGrey, '            the flag asks is which TREE wrote the prompt.  Skills are not');
+      EmitCLn(clGrey, '            affected: their descriptions ride in the skill tool''s own');
+      EmitCLn(clGrey, '            description and were never in the system prompt.');
+      EmitCLn(clGrey, '  --output-style <name>');
+      EmitCLn(clGrey, '            how replies are written: default, explanatory, learning,');
+      EmitCLn(clGrey, '            or a .pasclaude\styles\<name>.md of your own (the user');
+      EmitCLn(clGrey, '            copy under %USERPROFILE% counts too).  A style adds a');
+      EmitCLn(clGrey, '            paragraph to the system prompt and never replaces one; it');
+      EmitCLn(clGrey, '            grants nothing and cannot change what you are asked to');
+      EmitCLn(clGrey, '            approve.  Interactively the name is remembered; under -p');
+      EmitCLn(clGrey, '            nothing is remembered and this flag is the only way in.');
+      EmitCLn(clGrey, '            Edit the file and it applies from the next turn; if the');
+      EmitCLn(clGrey, '            edit cannot be read the old text stays and you are told.');
+      EmitCLn(clGrey, '  --append-system-prompt <text>');
+      EmitCLn(clGrey, '            add your own paragraph to the end of the system prompt for');
+      EmitCLn(clGrey, '            this run.  It ADDS and never replaces: the guidelines and');
+      EmitCLn(clGrey, '            this project''s CLAUDE.md are still there, above it.  Give');
+      EmitCLn(clGrey, '            it more than once and the pieces accumulate in order,');
+      EmitCLn(clGrey, '            separated by a blank line; 4096 bytes in total, and past');
+      EmitCLn(clGrey, '            that the run stops rather than sending half of it.  There');
+      EmitCLn(clGrey, '            is no settings.json key for this on purpose - a file in a');
+      EmitCLn(clGrey, '            cloned project that could rewrite the system prompt is the');
+      EmitCLn(clGrey, '            thing that must not exist.  Something long belongs in');
+      EmitCLn(clGrey, '            CLAUDE.md, where /memory can show it to you.');
+      EmitCLn(clGrey, '  --session-file <path>   (needs -p)');
+      EmitCLn(clGrey, '            names the transcript a -p run saves to after every turn,');
+      EmitCLn(clGrey, '            and with --resume the one it continues.  Without it -p');
+      EmitCLn(clGrey, '            saves nothing at all, as it always has: a throwaway');
+      EmitCLn(clGrey, '            question does not disturb the directory''s conversation.');
+      EmitCLn(clGrey, '            The path must be inside the session root or an --add-dir');
+      EmitCLn(clGrey, '            root.  A file that is not there yet is a fresh start; one');
+      EmitCLn(clGrey, '            that is there and unreadable, or written by a newer build,');
+      EmitCLn(clGrey, '            stops the run with exit 2 rather than starting blank -');
+      EmitCLn(clGrey, '            interactive --resume warns and carries on instead, because');
+      EmitCLn(clGrey, '            somebody is there to read the warning.  A resumed session');
+      EmitCLn(clGrey, '            restores messages, model and counters and NOTHING else: no');
+      EmitCLn(clGrey, '            mode, no approvals, no roots, so it can never come back');
+      EmitCLn(clGrey, '            more permissive than a fresh one.  Nothing is compacted on');
+      EmitCLn(clGrey, '            this path, so a session that outgrows the context window is');
+      EmitCLn(clGrey, '            answered with a new file.  Two processes sharing one file');
+      EmitCLn(clGrey, '            race: each write is atomic, but the loser''s turn is lost.');
+      EmitCLn(clGrey, '  --status        print what is true right now and exit 0.');
+      EmitCLn(clGrey, '  --doctor [--online]');
+      EmitCLn(clGrey, '            check for problems and exit 1 if there are any, so');
+      EmitCLn(clGrey, '            "pasclaude --doctor || setup" works in a script.');
+      EmitCLn(clGrey, '            Offline and makes no request; --online adds one GET');
+      EmitCLn(clGrey, '            asking which models the credential can use.  Both');
+      EmitCLn(clGrey, '            modes run alone - never with -p, a prompt, --resume');
+      EmitCLn(clGrey, '            or a driver - and neither can run a turn or a tool,');
+      EmitCLn(clGrey, '            which is why they continue past a missing credential');
+      EmitCLn(clGrey, '            and report it instead of refusing to start.  Both');
+      EmitCLn(clGrey, '            take --output-format json|stream-json.');
+      EmitCLn(clBright, '  GitHub Actions (see examples\github\)');
+      EmitCLn(clGrey, '  --ci prepare|report');
+      EmitCLn(clGrey, '            the unattended path, run from a workflow step and never');
+      EmitCLn(clGrey, '            with -p, a prompt, --resume or a driver.  prepare reads');
+      EmitCLn(clGrey, '            the event payload, decides whether to answer at all, and');
+      EmitCLn(clGrey, '            writes the prompt; report turns one line of');
+      EmitCLn(clGrey, '            --output-format json into the comment markdown.  prepare');
+      EmitCLn(clGrey, '            refuses to run unless the CI deny floor is in force, so a');
+      EmitCLn(clGrey, '            workflow edited to drop it fails closed.');
+      EmitCLn(clGrey, '  --ci-in <path>     the event payload, or the result line');
+      EmitCLn(clGrey, '  --ci-out <path>    the prompt file, or the comment markdown');
+      EmitCLn(clGrey, '  --ci-pr <path>     gh pr view --json isCrossRepository,headRefOid,state');
+      EmitCLn(clGrey, '  --ci-trigger <phrase>   default @claude');
+      EmitCLn(clGrey, '  --ci-allow collaborator|member|owner');
+      EmitCLn(clGrey, '            the lowest author association that may start a run.  It');
+      EmitCLn(clGrey, '            narrows only: there is no flag that widens it.');
+      EmitCLn(clGrey, '  --output-format text|json|stream-json   (needs -p)');
+      EmitCLn(clGrey, '  --input-format  text|stream-json        (needs -p and stream-json out)');
+      EmitCLn(clGrey, '            json/stream-json put one JSON object per line on stdout,');
+      EmitCLn(clGrey, '            for driving pasclaude from another program.  Without');
+      EmitCLn(clGrey, '            --input-format stream-json there is nobody to approve');
+      EmitCLn(clGrey, '            anything, so every write, edit and shell command is refused.');
+      EmitCLn(clGrey, '            -p takes the next argument as its prompt unless that starts');
+      EmitCLn(clGrey, '            with "-", so the flags may go on either side of it.');
+      { Halt skips the finally block, so the console has to be put back
+        here or the caller's codepage stays switched to UTF-8. }
+      TermDone;
+      Halt(0);
     end;
-    { The formats only mean anything on the one-shot path.  Refusing rather
-      than ignoring, because a driver that mistyped its invocation would
-      otherwise sit waiting for a protocol nobody is speaking. }
-    if not PrintMode then
-    begin
-      { --status and --doctor are the exception, and a deliberate one: a
-        driver that can ask "am I healthy" and parse the answer is worth
-        more than one that scrapes prose, and these two modes answer without
-        a turn ever happening. }
-      if (OutFormat <> uSdk.sfText) and (DiagMode = dmNone) then
-        FailStart('--output-format needs -p, --status or --doctor', '', 2);
-      if StreamInput then
-        FailStart('--input-format needs -p', '', 2);
-      { Interactive already has /resume and the session picker.  A second way
-        to name the same file is a second thing to keep consistent with the
-        first, so it is refused rather than quietly honoured. }
-      if SessionFileArg <> '' then
-        FailStart('--session-file needs -p',
-          'interactive sessions use /resume and the session picker', 2);
-    end;
-    { The load-bearing refusal.  Defaulting to SessionPath(RootDir) here is
-      exactly what -p has always declined to do: a scripted run must name the
-      conversation it continues, and the directory's saved session is left
-      alone unless somebody types its path. }
-    if Resume and PrintMode and (SessionFileArg = '') then
-      FailStart('--resume under -p needs --session-file <path>',
-        'a scripted run must name the conversation it continues; the ' +
-        'directory''s saved session is left alone', 2);
-    { And --continue is refused under -p outright, with no --session-file
-      escape, because it is a STRONGER version of the thing the refusal above
-      exists for: --resume at least names one fixed file, where this one takes
-      whichever transcript happens to have been written last.  A script that
-      continued "the most recent conversation" would continue a different one
-      depending on what the user did in the REPL an hour ago, which is not
-      something a scripted run can be said to have chosen.  --session-file is
-      the answer under -p, and it is what the message says. }
-    if ContinueFlag and PrintMode then
-      FailStart('--continue is interactive; under -p name the transcript',
-        'use --session-file <path>, optionally with --resume: a scripted run ' +
-        'must not depend on which conversation was saved last', 2);
-    { Contradictory rather than ordered, exactly as --permission-mode plan and
-      --dangerously-skip-permissions are.  They load DIFFERENT files - one the
-      directory's session.json, the other whichever save is newest - so either
-      precedence would be a guess about which conversation the user meant, and
-      the wrong guess silently continues the wrong one. }
-    if Resume and ContinueFlag then
-      FailStart('--resume and --continue name different conversations',
-        '--resume loads this directory''s saved session, --continue loads ' +
-        'whichever was written last; pick one', 2);
-    if StreamInput and (OutFormat <> uSdk.sfStreamJson) then
-      FailStart('--input-format stream-json needs --output-format stream-json',
-        'a driver that sends messages has to be able to read the answers', 2);
-    { A mode that cannot work under -p is a startup error rather than a quiet
-      downgrade: a script that asked to stop being prompted and was silently
-      given the prompting mode would fail later, in the middle of the work,
-      with a refusal that looks like a bug. }
-    if PrintMode and not uTools.PermModeReachableUnderPrint(ModeWanted,
-      PrintMode and StreamInput) then
-      FailStart('--permission-mode ' + uTools.PermModeName(ModeWanted) +
-        ' needs somebody to accept: -p has nobody',
-        'attach a driver with --input-format stream-json, or say' +
-        ' --dangerously-skip-permissions and mean it', 2);
-    { Contradictory rather than ordered.  Either precedence would be a guess
-      about which flag the user meant, and both guesses are dangerous: one
-      silently plans nothing, the other silently approves everything. }
-    if PlanFlag and BypassFlag then
-      FailStart('--permission-mode plan and --dangerously-skip-permissions '
-        + 'contradict each other', 'pick one', 2);
-    { The refusals that keep the diagnostic relaxation honest.  --status and
-      --doctor continue past a missing credential and past a missing
-      winhttp.dll, because a doctor that exits saying "ANTHROPIC_API_KEY is
-      not set" instead of listing that as one problem among thirteen is the
-      riddle the whole feature exists to avoid.  That is only safe because
-      the mode structurally cannot run a turn or a tool - so it must not be
-      combinable with anything that can. }
-    if DiagMode <> dmNone then
-    begin
-      if PrintMode then
-        FailStart('--status, --doctor and --ci cannot be combined with -p',
-          'they are modes of their own: run them alone', 2);
-      if Trim(PrintPrompt) <> '' then
-        FailStart('--status, --doctor and --ci take no prompt', '', 2);
-      { Both flags, and for the one reason: whichever transcript is loaded,
-        it changes the message count, the token counters and the model the
-        report would print. }
-      if Resume or ContinueFlag then
-        FailStart('--status, --doctor and --ci cannot be combined with ' +
-          '--resume or --continue',
-          'they report on a fresh session, and loading a transcript would ' +
-          'change what they report', 2);
-      if StreamInput then
-        FailStart('--status, --doctor and --ci cannot be combined with ' +
-          '--input-format stream-json', '', 2);
-    end;
-    { The two CI verbs take their own flags and refuse the driver formats:
-      what they write is a prompt file and a comment file, and their stdout
-      is a build log a person reads.  A JSON protocol there would be a second
-      contract to keep, for a caller that is a YAML step. }
-    if DiagMode in [dmCiPrepare, dmCiReport] then
-    begin
-      if OutFormat <> uSdk.sfText then
-        FailStart('--ci cannot be combined with --output-format',
-          'it writes files named by --ci-out; stdout is the build log', 2);
-      if CiInPath = '' then
-        FailStart('--ci needs --ci-in <path>',
-          'prepare reads the event payload (%GITHUB_EVENT_PATH%); report ' +
-          'reads one line of --output-format json', 2);
-      if CiOutPath = '' then
-        FailStart('--ci needs --ci-out <path>',
-          'prepare writes the prompt there; report writes the comment', 2);
-      if (DiagMode = dmCiReport) and (CiPrPath <> '') then
-        FailStart('--ci-pr belongs to --ci prepare', '', 2);
-    end
-    else if (CiInPath <> '') or (CiOutPath <> '') or (CiPrPath <> '') then
-      FailStart('the --ci-* flags need --ci prepare or --ci report', '', 2);
-    if DiagOnline and (DiagMode <> dmDoctor) then
-      FailStart('--online needs --doctor',
-        'it is the opt-in for the one check that makes a request', 2);
+    { The apply half: a column of plain assignments and nothing else.  Every
+      one of these globals keeps the comment above its declaration explaining
+      WHY it is held rather than acted on - the approvals file may widen a
+      mode, the session root is not known yet, the style name may also be in
+      a file - and every one of those reasons is still exactly right.  What
+      changed is only that the value now arrives from a function a suite can
+      call, instead of being written in place by a loop nobody could reach.
+
+      This half is what is still hand-verified: it touches the disk from the
+      next block down, so it is not, and cannot be, a pure function. }
+    Dir := Cli.Dir;
+    AddDirs := Cli.AddDirs;
+    Resume := Cli.Resume;
+    ContinueFlag := Cli.ContinueFlag;
+    WebFlag := Cli.WebFlag;
+    PrintMode := Cli.PrintMode;
+    PrintPrompt := Cli.PrintPrompt;
+    ScriptedRun := Cli.ScriptedRun;
+    NoProjectContext := Cli.NoProjectContext;
+    ModeWanted := Cli.ModeWanted;
+    ModeGiven := Cli.ModeGiven;
+    SandboxWanted := Cli.SandboxWanted;
+    SandboxGiven := Cli.SandboxGiven;
+    StyleWanted := Cli.StyleWanted;
+    SessionFileArg := Cli.SessionFileArg;
+    StreamInput := Cli.StreamInput;
+    DiagMode := Cli.DiagMode;
+    DiagOnline := Cli.DiagOnline;
+    CiInPath := Cli.CiInPath;
+    CiPrPath := Cli.CiPrPath;
+    CiOutPath := Cli.CiOutPath;
+    CiTrigger := Cli.CiTrigger;
+    CiFloor := Cli.CiFloor;
+    { The one field that is not an assignment, because uSdk owns the storage.
+      The parser accumulated the --append-system-prompt values through
+      uSdk.SdkAppendJoin - the same trim, the same blank-line join, the same
+      cap measured on the total - so this push cannot fail: the text is
+      already under the cap and AppendSystem_ is still empty.  It is checked
+      anyway.  A push whose Boolean nobody looks at is precisely how a flag
+      comes to be dropped in silence, and the whole point of this flag is that
+      a run which half-applied it is a run whose replies cannot be
+      explained. }
+    if Cli.AppendSystem <> '' then
+      if not uSdk.SdkAppendSystemPush(Cli.AppendSystem, Err) then
+        FailStart('--append-system-prompt: ' + Err,
+          'it adds to the system prompt and can never replace it; put a ' +
+          'long standing instruction in CLAUDE.md instead', 2);
     if Dir <> '' then
     begin
       if not DirectoryExists(Dir) then
@@ -5608,7 +5342,7 @@ begin
       where a count of two memories the model never received would be exactly
       the claim that function's own comment promises it cannot make. }
     uSdk.SdkProjectContextAllowed := uSdk.SdkProjectContextDecide(
-      NoProjectContext, DiagMode in [dmCiPrepare, dmCiReport]);
+      NoProjectContext, uArgs.ArgsIsCiVerb(DiagMode));
     if (not uSdk.SdkProjectContextAllowed) and
        (uSdk.SdkProjectContextFiles <> '') then
     begin
@@ -5712,6 +5446,33 @@ begin
       Agent.ShouldCancel := @UserWantsStop;
       if WebFlag then Agent.WebSearch := True;
       uTerm.CompleteProvider := @Complete;
+      { The third fact pushed down into the editor, and the one that closes the
+        prompt-idle window: while the user sits at a prompt, uTerm's read now
+        wakes every quarter second and calls this, so the background spool cap
+        is enforced on the same clock at the prompt as it is everywhere else.
+        Every quarter second NOBODY TYPES, precisely - a wake caused by a key
+        goes straight to the read - and the bound that buys is stated at the
+        tick call in the REPL loop below rather than twice here.
+        uTerm is below uTools and has no idea what a background job is; all it
+        gets is "there is periodic work", and the default is nil, which means
+        do nothing and means the read is byte-for-byte the untimed one this
+        program has always had.
+
+        TickBackgroundJobs and emphatically not SweepJobs(True).  A purge from
+        a tick could forget a finished job in the window between the model
+        being told about it and the model reading it, and - since this can now
+        fire from a permission prompt nested inside a running tool call - it
+        could also resize the Jobs array under a caller holding an index into
+        it.  uTools' own comment on TickBackgroundJobs argues both.
+
+        Set ABOVE the `if PrintMode` below, with the other two push-downs, and
+        here that placement is right rather than merely harmless.  The comment
+        on EscEscCommand just below frets about being armed in every mode,
+        correctly, because a shortcut means something.  A tick means the same
+        thing in every mode there is, and the modes that cannot block on a
+        console never enter the wait at all - ReadLineCore only waits when
+        stdin IS a console, so a -p run off a pipe never reaches it. }
+      uTerm.IdleTick := @uTools.TickBackgroundJobs;
       { Escape twice on an already-empty prompt line opens /rewind.  The word
         is pushed DOWN into the editor exactly like the completion provider
         above it: uTerm is below uTools and has no idea what a slash command
@@ -5912,7 +5673,7 @@ begin
         that line is ABOVE the branch that nils Ask, and the whole
         unattended argument would collapse.  GitHubExecOverride stays nil:
         the unit calls uTools.RunShellQuiet itself. }
-      if not (DiagMode in [dmCiPrepare, dmCiReport]) then
+      if not uArgs.ArgsIsCiVerb(DiagMode) then
         uGitHub.GitHubAllowed := True;
       { Second application: LoadPermissions widens, so without this a flag
         saying "ask me" would be quietly overruled by a grant the user made
@@ -6045,7 +5806,7 @@ begin
         build log, nobody is reading it for reassurance, and an amber logo
         between two YAML steps is noise.  It says one grey line instead. }
       if (OutFormat = uSdk.sfText) and
-         not (DiagMode in [dmCiPrepare, dmCiReport]) then ShowBanner;
+         not uArgs.ArgsIsCiVerb(DiagMode) then ShowBanner;
 
       { Keybindings, from %USERPROFILE% and nowhere else - below the banner
         because any note it prints is about a file the user wrote and belongs
@@ -6172,7 +5933,7 @@ begin
         the same reason: --ci prepare's whole job is to assert that the deny
         floor loaded above is really in force, and a check that ran before
         LoadDenyRules would be asserting nothing. }
-      if DiagMode in [dmCiPrepare, dmCiReport] then RunCi;
+      if uArgs.ArgsIsCiVerb(DiagMode) then RunCi;
       if DiagMode <> dmNone then
       begin
         FillDiagFacts;
@@ -6235,14 +5996,25 @@ begin
 
           The status block is refreshed here, immediately before the read, so
           what it says is what was true when the user looked at it. }
-        { The last moment before the program blocks in ReadConsoleInputW for
-          an unbounded time, and therefore the last chance to enforce the
-          background spool cap on this side of it.  Before RefreshStatus, so
-          the job count the status block prints is the count after any kill
-          rather than one that was true a moment ago.  What this does not do
-          is cover the read below: once it begins nothing ticks until the user
-          types, so a job left running through lunch is bounded by nothing
-          here. }
+        { The last moment before the read below, and it stays here for the
+          reason it always had: it runs BEFORE RefreshStatus, so the job count
+          the status block prints is the count after any kill rather than one
+          that was true a moment ago.  This call is what makes the FIRST frame
+          honest.
+
+          What this comment used to add - that nothing ticks once the read
+          begins, so a job left running through lunch is bounded by nothing -
+          is no longer true.  The read now wakes every uTerm.IdleWaitMs and
+          calls the same tick through uTerm.IdleTick, wired above, so the
+          prompt is bounded by the same clock as a streaming reply.  On a wake
+          the KEYBOARD caused it calls nothing: that loop breaks straight into
+          the read, because a sweep that has to kill a job waits two seconds
+          per job for it to die and no user should meet that between two
+          characters of a line they are typing.  What the idle tick
+          deliberately does NOT do is repaint the status block: a job killed
+          during the wait leaves a stale count on screen until the next
+          prompt, and redrawing it four times a second is exactly the flicker
+          that would have been worse than the bug. }
         uTools.TickBackgroundJobs;
         { The style file behind the session changed and the new contents could
           not be used.  Drained HERE, before the status block is drawn and

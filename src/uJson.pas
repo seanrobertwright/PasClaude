@@ -3,7 +3,18 @@
   Values are reference-free: a TJson owns its children and frees them.  Strings
   are UTF-8 AnsiStrings throughout; \uXXXX escapes (including surrogate pairs)
   are decoded to UTF-8 on parse and non-ASCII is emitted raw on write, which is
-  legal JSON and keeps the payload small. }
+  legal JSON and keeps the payload small.
+
+  That normalising parse is exactly right for the job it does nearly all the
+  time: composing a request body, where nothing on the far side has ever seen
+  the bytes before and the only question is whether the JSON is legal.  It is
+  wrong for the one caller that is not composing a document but REWRITING
+  somebody else's - a notebook, which lives in a git history and whose author
+  chose how to spell it.  JsonParseVerbatim exists for that caller alone: it
+  additionally remembers the literal a string arrived as whenever writing it
+  back our way would change it, so an edit to one cell does not restyle the
+  ones nobody touched.  JsonParse itself is byte-for-byte what it always was,
+  because everything in the program above this unit calls that one. }
 unit uJson;
 
 {$mode objfpc}{$H+}
@@ -23,6 +34,24 @@ type
     FBool: Boolean;
     FNum: Double;
     FStr: string;
+    { For a jkStr node, the exact source text that stood between the quotes -
+      but only when this node came from JsonParseVerbatim AND re-emitting it
+      our own way would have changed it.  '' means "nothing to remember", which
+      is every node in every DOM but a notebook's.
+
+      THE INVARIANT THIS RESTS ON, and it is load-bearing: a jkStr node's value
+      can never change under the literal.  It cannot today, because FStr is
+      written in exactly one place - NewStr, below - so a node either arrived
+      from the parser with value and literal captured together, or was built by
+      a caller and carries no literal at all.  SetAt replaces the whole node,
+      Take swaps in a fresh null, Drop frees; none of them can leave a literal
+      beside a value it did not come from.  If anybody ever adds a setter for
+      FStr it MUST clear this field, or a notebook is written with the old text
+      while the DOM shows the new one - a silent corruption of a user's file,
+      in the unit every other unit depends on.  A managed AnsiString field of
+      the object, so it is finalised with the instance: nothing to free, and
+      nothing for -gh to find. }
+    FRawLit: string;
     FItems: TJsonArray;
     FKeys: TKeyArray;
   public
@@ -92,6 +121,31 @@ type
 { Parses Text.  Returns nil on malformed input and sets Err. }
 function JsonParse(const Text: string; out Err: string): TJson; overload;
 function JsonParse(const Text: string): TJson; overload;
+
+{ The same parse, the same DOM, the same ownership and the same errors, with
+  one addition: a string literal whose arrival form differs from the form we
+  would write is remembered, and written back as it arrived.
+
+  It exists because a notebook we rewrite is a file in somebody's git history,
+  and a string we neither parsed for meaning nor changed should come back as
+  the bytes it went in as.  Another tool's writer may have escaped things
+  Jupyter would not - json.dumps with ensure_ascii left at its default escapes
+  every non-ASCII character, and nbformat is the one that turns that off - and
+  normalising those on the first edit is a change to lines the user did not
+  ask about, even though it is a change towards Jupyter's own spelling.  The
+  ordinary entry point above is untouched so that no caller further up the
+  ladder can be surprised by a payload that suddenly reproduces whatever a
+  server sent us.
+
+  What it does NOT cover: object KEYS.  Keys live in a parallel array that Add,
+  Push, Drop and InsertAt all shift, and a parallel raw-key array shifted out
+  of step in any one of those four would emit a field name belonging to a
+  different field.  That is a corrupted document, which is a far worse failure
+  than the one this fixes, and the fidelity it would buy is for spellings like
+  "cell_type" that no writer produces.  A node-owned field moves with the
+  node through all four operations for free, which is the whole reason values
+  are cheap here and keys are not. }
+function JsonParseVerbatim(const Text: string; out Err: string): TJson;
 
 { Escapes S as a JSON string literal, quotes included. }
 function JsonQuote(const S: string): string;
@@ -523,7 +577,17 @@ begin
     jkNull: Result := 'null';
     jkBool: if FBool then Result := 'true' else Result := 'false';
     jkNum: Result := NumToJson(FNum);
-    jkStr: Result := JsonQuote(FStr);
+    { The remembered literal, when there is one.  It is set only by
+      JsonParseVerbatim and only when it differs from JsonQuote(FStr), so for
+      every DOM in the program but a notebook's this is the same branch it
+      always was.  EmitPretty needs no change at all to get this: it delegates
+      every scalar straight back to ToJson (see the comment at its head), which
+      is also what keeps the compact and pretty forms parse-identical.  Object
+      keys below deliberately do not get it - see JsonParseVerbatim's header
+      for why a parallel raw-key array is the wrong trade. }
+    jkStr:
+      if FRawLit <> '' then Result := '"' + FRawLit + '"'
+      else Result := JsonQuote(FStr);
     jkArr:
       begin
         Result := '[';
@@ -621,6 +685,18 @@ type
     S: string;
     P: Integer;
     Err: string;
+    { Whether this parse remembers arrival forms.  A field of a record that is
+      created fresh for one parse, deliberately, and not a unit-level variable
+      set from pasclaude.lpr the way HooksAllowed and SdkProjectContextAllowed
+      are.  That pattern is for a POLICY fact a lower unit cannot know and must
+      fail closed on; this is a per-call mode chosen by the caller doing the
+      parse, and a global would have to be set and cleared around each one.  A
+      parse that fails between the two - or a call site somebody adds inside
+      the window later - would leak escape preservation into an outgoing
+      request body, and nothing would catch it, because the result is still
+      valid JSON.  A field in the record has the same effect with no window at
+      all, and no re-entrancy question either. }
+    Verbatim: Boolean;
   end;
 
 function ParseValue(var Ps: TParser): TJson; forward;
@@ -676,25 +752,87 @@ begin
   Result := True;
 end;
 
-function ParseString(var Ps: TParser; out Value: string): Boolean;
+{ Raw comes back holding the exact source text between the quotes when this
+  parse is remembering arrival forms AND re-emitting the decoded value would
+  change that text; '' otherwise, which is the overwhelmingly common case.
+
+  Four clauses decide it, and each earns its place:
+
+    Ps.Verbatim - nobody but the notebook path asked for this, and the whole
+      safety of the change is that the mechanism is inert for every other
+      caller of the unit at the bottom of the ladder.
+
+    Esc - an arrival form is a thing an ESCAPE did, so a literal with no
+      backslash anywhere in it has nothing for this mechanism to remember,
+      and it is dismissed for the price of one Boolean.  It is a cheap
+      PRE-FILTER and deliberately not a sufficient test.  The wording that
+      stood here claimed otherwise - it said a backslash-free literal already
+      IS what we write, byte for byte - and that is false: JsonQuote also
+      rewrites #8, #9, #10, #12, #13 and every other byte below $20 into an
+      escape sequence, so a literal carrying a raw linefeed holds no
+      backslash and still comes back out with one.  The not-Ctl clause below
+      is what covers that literal, and the two clauses are INDEPENDENT -
+      dropping either one on the strength of the other is the mistake this
+      paragraph now exists to stop.
+
+    not Ctl - this parser accepts bytes below $20 raw inside a string, which
+      strict JSON forbids and Python's json refuses outright.  Handing such a
+      literal back would produce a notebook Jupyter will not open, which is far
+      worse than the spurious diff this whole thing exists to remove.  So a raw
+      control byte is always re-escaped, however it arrived - and that is the
+      one place the promise "the escapes it arrived with" is knowingly not
+      kept.  It is written into README and FEATURES-NOT-YET in those words
+      rather than left here for a reader to discover.
+
+    the JsonQuote comparison - a literal that passed all three tests above can
+      still be exactly the text we would have written anyway, because most
+      escapes ARE our spelling: \n for #10, \t for #9, \" for the quote and
+      \\ for the backslash all round trip unchanged.  Keeping those would be
+      a second copy of most of a document in order to emit identical bytes.  A
+      memory optimisation rather than a correctness one, which is why nothing
+      asserts it directly.  The sentence that used to stand here listed those
+      same escapes and carried a stray NUL byte among them, which cost the
+      character it replaced and made every grep over this file report a binary
+      match instead of lines - the house instrument for checking a fact in the
+      unit at the bottom of the ladder, disabled by a comment.
+
+  Re-emission is correct by construction rather than by re-checking: the span
+  came from between the quotes of a literal THIS parser accepted, and this
+  parser accepts exactly the standard escape set ('"' '\' '/' b f n r t u) and
+  fails on everything else - so anything kept is re-readable by any conforming
+  parser, and decodes to the very Value being returned beside it. }
+function ParseString(var Ps: TParser; out Value: string;
+  out Raw: string): Boolean;
 var
   C: Char;
   CP, Lo: LongWord;
+  Start: Integer;
+  Esc, Ctl: Boolean;
+  Lit: string;
 begin
   Value := '';
+  Raw := '';
   Result := False;
   if (Ps.P > Length(Ps.S)) or (Ps.S[Ps.P] <> '"') then Exit;
   Inc(Ps.P);
+  Start := Ps.P;
+  Esc := False;
+  Ctl := False;
   while Ps.P <= Length(Ps.S) do
   begin
     C := Ps.S[Ps.P];
     if C = '"' then
     begin
+      Lit := Copy(Ps.S, Start, Ps.P - Start);
       Inc(Ps.P);
+      if Ps.Verbatim and Esc and (not Ctl) and
+         ('"' + Lit + '"' <> JsonQuote(Value)) then
+        Raw := Lit;
       Exit(True);
     end;
     if C = '\' then
     begin
+      Esc := True;
       Inc(Ps.P);
       if Ps.P > Length(Ps.S) then Exit;
       C := Ps.S[Ps.P];
@@ -734,6 +872,7 @@ begin
     end
     else
     begin
+      if C < #32 then Ctl := True;
       Value := Value + C;
       Inc(Ps.P);
     end;
@@ -778,7 +917,7 @@ end;
 function ParseValue(var Ps: TParser): TJson;
 var
   Obj, Child: TJson;
-  K: string;
+  K, Raw: string;
 begin
   SkipWs(Ps);
   if Ps.P > Length(Ps.S) then Exit(Fail(Ps, 'unexpected end'));
@@ -795,7 +934,9 @@ begin
         end;
         repeat
           SkipWs(Ps);
-          if not ParseString(Ps, K) then
+          { Raw is deliberately dropped here: keys are normalised even under
+            Verbatim, for the reason set out at JsonParseVerbatim. }
+          if not ParseString(Ps, K, Raw) then
           begin
             Obj.Free;
             Exit(Fail(Ps, 'expected key'));
@@ -866,9 +1007,14 @@ begin
       end;
     '"':
       begin
-        if not ParseString(Ps, K) then
+        if not ParseString(Ps, K, Raw) then
           Exit(Fail(Ps, 'bad string'));
         Result := TJson.NewStr(K);
+        { Value and literal are captured together and never afterwards move
+          apart - the invariant written out at the field's declaration.  A
+          private field of the same unit, so no accessor is needed and none is
+          added: nothing outside uJson can see this exists. }
+        Result.FRawLit := Raw;
       end;
     't':
       if Literal(Ps, 'true') then Result := TJson.NewBool(True)
@@ -891,6 +1037,24 @@ begin
   Ps.S := Text;
   Ps.P := 1;
   Ps.Err := '';
+  { Explicitly False rather than relying on the record being zeroed, because
+    what this line is really saying is that the default behaviour of the unit
+    everything depends on did not change. }
+  Ps.Verbatim := False;
+  Result := ParseValue(Ps);
+  Err := Ps.Err;
+end;
+
+function JsonParseVerbatim(const Text: string; out Err: string): TJson;
+var
+  Ps: TParser;
+begin
+  Ps.S := Text;
+  Ps.P := 1;
+  Ps.Err := '';
+  Ps.Verbatim := True;
+  { The same ParseValue, so there is no second parser to drift out of step
+    with this one - the mode is one field, read in one place. }
   Result := ParseValue(Ps);
   Err := Ps.Err;
 end;

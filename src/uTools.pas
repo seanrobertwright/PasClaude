@@ -285,6 +285,14 @@ const
     directory already says what the file is, and the layout already names it. }
   UserMcpFileName = 'mcp.json';
 
+  { The leaf directory a stderr spool goes in, and the extension it carries.
+    Named once because there are now TWO of these directories - the project's
+    <root>\.pasclaude\mcp\ and the user's %LOCALAPPDATA%\pasclaude\mcp\ - and
+    two literals for one concept is how a rename ends up half-done: /mcp would
+    keep printing the word the builder stopped using. }
+  UserMcpSpoolDirName = 'mcp';
+  McpSpoolExt         = '.err';
+
 { The tool list, as the API expects it under "tools". }
 function ToolsSchema: TJson;
 
@@ -760,8 +768,8 @@ function SetOutputStyle(const Name: string; out Err: string): Boolean;
   fence line plus the capped body.  Exposed so a test can assert the text
   without making a request.
 
-  Not a plain accessor: it first asks the file system whether the style file
-  behind the body has changed, and re-reads it if it has - see StyleRecheck.
+  Not a plain accessor: it reads the file behind the body and compares a
+  fingerprint of its bytes, and re-parses it if that moved - see StyleRecheck.
   A built-in style has no file and never reaches the disk from here. }
 function StyleNote: string;
 { True when the body hit MaxStyleNoteBytes.  Reported by /output-style rather
@@ -787,9 +795,20 @@ procedure ClearStyleStartupNote;
 
   Read-and-clear rather than a plain getter, because the caller is a REPL loop
   that runs before every prompt and a note that stayed set would be printed
-  once per keystroke round.  The stamp is updated even when the re-read fails,
-  so a file that stays broken is reported once and then left alone. }
+  once per keystroke round.  The fingerprint is updated even when the re-read
+  fails, so a file that stays broken is reported once and then left alone. }
 function TakeStyleReloadNote: string;
+{ How many times the change check has gone to ask about the style file, for
+  the life of the process.  A test seam, admitted as one, and it exists
+  because the promise it pins - a built-in style has no file and never reaches
+  the disk - was until now only assertable as an ABSENCE of a complaint, which
+  is what let a Check that could not fail sit in the suite for a round.
+  Counted at the TOP of FingerprintStyleFile, before that routine's own
+  empty-path exit, so the guard in StyleRecheck is what the number measures:
+  delete that guard and the count rises.  Never reset, not even by
+  ClearStyles - every assertion on it is a delta, so no test has to restore it
+  and none can be broken by another test having run first. }
+function StyleFileProbes: Int64;
 
 function PluginsDir: string;
 function InstalledPlugins: TPluginInfoArray;
@@ -841,12 +860,16 @@ var
   MaxSpoolBytes: Int64 = 16 * 1024 * 1024;
 
 { Re-checks the spool cap, cheaply and on a clock rather than on the model's
-  behaviour.  Wired to three places the program reaches under its own steam:
+  behaviour.  Wired to four places the program reaches under its own steam:
   the top of every executed tool call, every network chunk of a streaming
-  reply, and the top of the REPL loop before each prompt is drawn.  Between
-  them they cover the two gaps the cap used to fall through - a turn of pure
-  thinking with no tool call in it, and a turn where the model calls nothing
-  further after starting the job.
+  reply, the top of the REPL loop before each prompt is drawn, and - since the
+  prompt-idle window was closed - each wakeup of the bounded wait in front of
+  uTerm's console read, which is to say every quarter second the user spends
+  sitting at a prompt or reading a permission question.  Between them they
+  cover the three gaps the cap used to fall through: a turn of pure thinking
+  with no tool call in it, a turn where the model calls nothing further after
+  starting the job, and the long silence while a human thinks.  The prompt is
+  no longer the one place where this clock stops.
 
   This is the bound; it is not a guarantee, and the comment on SweepTickMs
   spells out the difference.  It sweeps only: a caller that needs a job's
@@ -1033,6 +1056,37 @@ function UserMcpConfigPath: string;
   means no cache at all: those servers connect at every launch, which is slow
   and never unsafe. }
 function UserMcpCachePath: string;
+
+{ Where a USER-scope server's stderr spool goes:
+  <LOCALAPPDATA|USERPROFILE>\pasclaude\mcp\<name>-<SessionKey>.err.  Read this
+  beside UserMcpCachePath, because it is the same jump for a related reason: a
+  server that follows the user between projects should not leave its
+  diagnostics scattered one-per-repository, and it certainly should not write
+  them INTO whatever repository the user happened to open today.
+
+  %LOCALAPPDATA% and not the %USERPROFILE% its mcp.json lives in, which will
+  read as a mistake until you have the rule: %USERPROFILE% is hand-authored
+  configuration a person has to be able to find and edit, %LOCALAPPDATA% is
+  state THIS PROGRAM writes, keyed by session.  The rule is written out at
+  pasclaude.lpr's KeysPath and again in README's layout section.  mcp.json is
+  the first kind, a spool is the second, and the discovery cache six lines up
+  made exactly this jump for exactly this reason.
+
+  '' when neither variable is set - there is no home, so there is no spool.
+  Never a fallback into the project: that is ApprovalsPath's argument, and it
+  applies here for a plainer reason too, since a path inside the project is the
+  thing this function exists to stop writing.  Trailing PathDelim. }
+function UserMcpSpoolDir: string;
+
+{ UserMcpSpoolDir plus this server's file name, or '' when there is no home.
+  Asking creates nothing: only a spawn creates the directory it writes into. }
+function UserMcpSpoolPath(const Name: string): string;
+
+{ The spool this session actually handed that server, whichever scope it came
+  from; '' for a name nobody configured.  Exposed for McpServerApproved's
+  reason - so a suite can assert the WIRING took and not merely that a path
+  builder exists, which is the half of this that has been wrong before. }
+function McpServerErrLog(const Name: string): string;
 
 { Replaces the server table with what Path declares.  This is the PROJECT
   loader and the host does not call it - LoadMcpConfigAll is what startup
@@ -3228,26 +3282,53 @@ begin
   SetLength(Jobs, N);
 end;
 
-{ The cap on a clock rather than on the model's goodwill.  Three callers reach
+{ The cap on a clock rather than on the model's goodwill.  Four callers reach
   this and each covers something the others do not: RunToolInner catches the
   ordinary case of a session that keeps working, uAgent.StreamChunk catches a
-  long reply that calls no tool at all, and the top of the REPL loop catches
-  the moment before the program blocks on the keyboard.  What none of them
-  covers is the block itself: while the user sits at the prompt nothing ticks
-  at all, and a job left running while nobody types is bounded by nothing
-  here.  That window is documented rather than closed - closing it means
-  giving uTerm's single input loop a periodic wakeup, which is a change to the
-  most delicate loop in the program in order to bound some disk inside
-  .pasclaude\jobs that ClearJobs and this unit's finalization already delete.
+  long reply that calls no tool at all, the top of the REPL loop catches the
+  moment before the program blocks on the keyboard, and uTerm's idle wait
+  catches the block itself.
+
+  That fourth caller reverses an argument that stood here, and it is rewritten
+  rather than deleted because a comment that quietly stops contradicting a
+  decision is how the decision gets made twice.  What this paragraph used to
+  say was that the prompt-idle window was documented rather than closed, on
+  the grounds that closing it meant giving uTerm's single input loop a
+  periodic wakeup - a change to the most delicate loop in the program - in
+  order to bound some disk inside .pasclaude\jobs that ClearJobs and this
+  unit's finalization already delete.  The cost estimate turned out to be
+  wrong in the direction that matters: it is a WaitForSingleObject in front of
+  the read that was already there, plus a procedure variable defaulting nil,
+  and the key-handling half of that loop is untouched.  uTerm still calls
+  nothing upward - the tick is PUSHED DOWN as uTerm.IdleTick from
+  pasclaude.lpr, exactly as CompleteProvider and EscEscCommand are - and a
+  host that wires nothing gets the loop this program has always had.  What
+  remains true from the old wording is the modesty: this bounds the window, it
+  does not make the cap a guarantee, and SweepTickMs' own comment still spells
+  out the difference.
 
   The early exit is the whole reason this is safe to call from a hot loop: the
   overwhelmingly common case is no background jobs at all, and that case costs
-  one integer compare.
+  one integer compare.  It is what makes four wakeups a second at an idle
+  prompt free.
 
   Never SweepJobs(True).  A purge from a tick could forget a finished job in
   the gap between the model being told about it and the model reading it,
   which is the exact hazard SweepJobs' own comment argues against;
-  StartBackgroundJob stays the only caller entitled to ask for a purge. }
+  StartBackgroundJob stays the only caller entitled to ask for a purge.
+
+  The idle wait adds a SECOND reason, and it is a new constraint on a function
+  nobody previously thought was constrained, so it is written where an edit to
+  SweepJobs will hit it.  A tick can now fire from a PERMISSION PROMPT, and a
+  permission prompt is itself nested inside a uTools call: RunToolInner is on
+  the stack, above it Ask, and the prompt reads through uTerm.ReadLineEdit.
+  That makes the tick re-entrant with respect to this unit.  It is safe today
+  for a reason worth naming rather than rediscovering - SweepJobs(False) never
+  calls FreeJob and never SetLengths the Jobs array, so an index a nested
+  caller is holding across the prompt survives it untouched.  A purge does
+  both, and would invalidate that index while the user was reading a diff.
+  Whoever teaches SweepJobs(False) to resize the array breaks this, silently,
+  and this sentence is the only thing that will tell them. }
 procedure TickBackgroundJobs;
 var
   Now_: QWord;
@@ -4896,27 +4977,44 @@ const
     'it back. Do not then write it yourself in the same reply.');
 
 var
-  { The selected style.  The body is cached here rather than read per request,
-    and it is kept honest by StyleRecheck, which stats the file on the way
-    through StyleNote and re-reads only when the stamp moved.
+  { The selected style.  The body is cached here rather than parsed per
+    request, and it is kept honest by StyleRecheck, which fingerprints the
+    file on the way through StyleNote and re-parses only when that moved.
 
-    STAT AND RE-READ ON CHANGE, not re-read every time, and the choice is
-    worth its paragraph.  StyleNote is called from SessionNote, which is
-    called while a request body is being built, which happens on every single
-    turn: re-reading unconditionally would put a file read, a UTF-8 repair and
-    a frontmatter parse on the request path, and - worse than the cost - it
+    FINGERPRINT AND RE-PARSE ON CHANGE, not re-parse every time, and the
+    choice is worth its paragraph.  StyleNote is called from SessionNote,
+    which is called while a request body is being built, which happens on
+    every single turn: parsing unconditionally would put a UTF-8 repair and a
+    frontmatter parse on the request path, and - worse than the cost - it
     would put the PARSE FAILURE there too, so a half-saved file caught
     mid-write by an editor would decide the style for a request already in
-    flight.  A stat is one directory lookup, it cannot fail halfway, and in
-    the ordinary case where nothing changed the cached note is returned
-    byte-identical, which is what the prompt cache upstream depends on.
+    flight.  Gating on the fingerprint keeps that whole class of failure off
+    the turn, and in the ordinary case where nothing changed the cached note
+    is returned byte-identical, which is what the prompt cache upstream
+    depends on.
 
-    The stamp is FindFirst's, which on Windows is a DOS timestamp with
-    two-second granularity, so the size is compared beside it.  An edit that
-    lands inside the same two-second tick AND leaves the file exactly the same
-    length is therefore not seen; re-running /output-style <name> still forces
-    the read, and that is the residual, stated here rather than left to be
-    discovered. }
+    THE FINGERPRINT IS THE FILE'S BYTES, and it used not to be.  What stood
+    here was FindFirst's stamp compared beside the size, which on Windows is a
+    DOS timestamp with two-second granularity: an edit landing inside one tick
+    that left the file exactly the same length was invisible, and the escape
+    hatch was re-running /output-style <name>.  A real last-write time -
+    GetFileAttributesExW into WIN32_FILE_ATTRIBUTE_DATA, a 100-nanosecond
+    FILETIME - was the obvious replacement and is not enough.  NTFS stores
+    100ns ticks but nothing writes 100ns values into them: the file system
+    stamps a write from the cached system time, whose tick is about 15
+    milliseconds, so two saves inside one tick get byte-identical last-write
+    times.  That turns a documented miss into a flaky one, which is worse, and
+    it means a Windows API import into a unit that has none.  The bytes are
+    the only thing that cannot be identical while the content differs, so the
+    check hashes them: FNV-1a 64 over the whole file, beside the size the
+    directory already reports.
+
+    What that costs, honestly, because it revises an argument this project
+    made in prose: one bounded open of a file capped at MaxStyleBytes - 64 KB
+    - once per turn, on the path that is about to make an HTTPS request.  The
+    read is back on the request path; the PARSE is not, and the parse was
+    always the half that mattered, because a read either works or returns
+    False while a parse can decide a style from a file caught mid-save. }
   StyleName: string = DefaultStyleName;
   StylePath: string = '';
   StyleSource: string = 'builtin';
@@ -4924,13 +5022,19 @@ var
   StyleNote_: string = '';
   StyleNoteWasCut: Boolean = False;
   StyleStartupNote_: string = '';
-  { The stamp of the file StyleBody was read from.  Size -1 means "there was
-    no file there", which is both the state before any file style is set and
-    the state after one is deleted - the two are distinguished by StylePath,
-    which is '' only for a built-in. }
-  StyleStamp: LongInt = 0;
+  { The size the directory reports for the file StyleBody was read from, and
+    FNV-1a 64 over its bytes.  Size -1 means "there was no file there", which
+    is both the state before any file style is set and the state after one is
+    deleted - the two are distinguished by StylePath, which is '' only for a
+    built-in.  Hash 0 means "a file is there and its bytes could not be got";
+    an EMPTY file hashes to the offset basis and never to 0, so the marker is
+    unambiguous, and a locked file therefore reports itself once and then
+    compares equal until the lock lifts. }
   StyleSize: Int64 = -1;
+  StyleHash: QWord = 0;
   StyleReloadNote_: string = '';
+  { Deliberately outside every reset below - see StyleFileProbes. }
+  StyleProbes_: Int64 = 0;
 
   StyleCache: TStyleInfoArray;
   StyleCacheValid: Boolean = False;
@@ -5125,9 +5229,13 @@ begin
   StyleNote_ := '';
   StyleNoteWasCut := False;
   StyleStartupNote_ := '';
-  StyleStamp := 0;
   StyleSize := -1;
+  StyleHash := 0;
   StyleReloadNote_ := '';
+  { StyleProbes_ is NOT cleared here.  It is monotonic for the life of the
+    process precisely so that every assertion on it is a delta between two
+    reads a test made itself, which means no test has to restore it in a
+    finally and no test can be poisoned by another having run first. }
 end;
 
 function OutputStyleName: string;
@@ -5244,23 +5352,70 @@ begin
   Result := True;
 end;
 
-{ The stamp the change check compares.  Size -1 for "nothing is there", which
-  covers both a built-in (Path = '') and a file that has been deleted since it
-  was read - the caller tells those two apart by StylePath and needs to,
-  because only one of them is worth complaining about. }
-procedure StampStyleFile(const Path: string; out Stamp: LongInt; out Size: Int64);
+const
+  { FNV-1a 64's published offset basis - the same value SessionKey and
+    McpCommandHash seed with.  Named here rather than repeated as a literal a
+    third time because this one is compared against a value stored from a
+    PREVIOUS call, so a typo would not fail, it would silently stop detecting
+    changes. }
+  StyleHashSeed = QWord($CBF29CE484222325);
+
+{ The fingerprint the change check compares: the size the directory reports,
+  and FNV-1a 64 over the bytes of the file.
+
+  Over the first MaxStyleBytes of them, exactly - 64 KB - because that is what
+  LoadFileLimited hands back, and this comment said "every byte" until an audit
+  caught it.  The distinction is invisible today and is written down anyway,
+  because of what makes it invisible: ReadStyleFile truncates at the SAME cap,
+  so a body cannot depend on a byte this hash never saw, and a change out past
+  65536 that also moved the length is caught by Size sitting beside the hash.
+  That is a coupling between two functions and not a property of either.  Raise
+  the cap in ReadStyleFile alone and a style file whose only edit is past 64 KB,
+  at unchanged length, stops being noticed - silently, with three documents
+  claiming it cannot happen.  Whoever raises one raises both.
+
+  Size -1 for "nothing is there",
+  which covers both a built-in (Path = '') and a file that has been deleted
+  since it was read - the caller tells those two apart by StylePath and needs
+  to, because only one of them is worth complaining about.
+
+  FindFirst is still here and still first, for the one thing a hash cannot
+  say: whether there is a file at all.  A deleted style file is worth a line
+  saying so; a file that is present but will not open is worth a different
+  one.  R.Time is not read any more - it was the two-second DOS stamp the old
+  check turned on, and the hash below is what it turns on now.
+
+  Hash 0 for a file that would not open, deliberately: it is a value the
+  content path cannot produce, since Fnv1a of the empty string is the offset
+  basis.  So a file held open by an editor moves the fingerprint once, gets
+  its complaint once, and compares equal every turn after until it becomes
+  readable again - at which point the hash moves back and the body is
+  re-read, silently, even though not one byte of it changed. }
+procedure FingerprintStyleFile(const Path: string; out Size: Int64;
+  out Hash: QWord);
 var
   R: TSearchRec;
+  Text, Note: string;
 begin
-  Stamp := 0;
+  { Counted before the empty-path exit below - see StyleFileProbes.  This is
+    the only line in the unit whose placement is chosen for a test, and it is
+    the placement that makes the caller's guard a testable line rather than an
+    unreachable one: if StyleRecheck stopped short-circuiting on a built-in,
+    the number would move and a Check in the smoke suite would fail. }
+  Inc(StyleProbes_);
   Size := -1;
+  Hash := 0;
   if Path = '' then Exit;
-  if FindFirst(Path, faAnyFile, R) = 0 then
-  begin
-    Stamp := R.Time;
-    Size := R.Size;
-    SysUtils.FindClose(R);
-  end;
+  if FindFirst(Path, faAnyFile, R) <> 0 then Exit;
+  Size := R.Size;
+  SysUtils.FindClose(R);
+  if LoadFileLimited(Path, MaxStyleBytes, Text, Note) then
+    Hash := Fnv1a(Text, StyleHashSeed);
+end;
+
+function StyleFileProbes: Int64;
+begin
+  Result := StyleProbes_;
 end;
 
 { Has the file behind the cached body changed, and if so can the new one be
@@ -5278,22 +5433,33 @@ end;
   because somebody saved a broken frontmatter would change the voice of every
   reply from that moment on, in a way nothing on screen would explain - and
   the old body is still exactly what the user asked for the last time the file
-  was readable.  The stamp is updated even on failure so the complaint is made
-  once rather than once per turn. }
+  was readable.  The fingerprint is updated even on failure so the complaint
+  is made once rather than once per turn.
+
+  On a turn where something DID change the file is read twice - once here for
+  the hash, once inside ReadStyleFile to parse it - and that is deliberate.
+  ReadStyleFile stays the single definition of what a valid style file is, and
+  threading the already-read text into it would fork that definition in two to
+  save an open of a 64 KB file on the rare turn.  The window between the two
+  reads is self-correcting: a file rewritten inside it stores the hash of a
+  version that was not parsed, so the next turn sees a mismatch and converges. }
 procedure StyleRecheck;
 var
-  NewStamp: LongInt;
   NewSize: Int64;
+  NewHash: QWord;
   NewBody, Err: string;
 begin
   { A built-in has no file, and this is the line that keeps it off the disk
-    entirely: default, explanatory and learning must not start statting
-    anything merely because file-backed styles learned to reload. }
+    entirely: default, explanatory and learning must not start reading
+    anything merely because file-backed styles learned to reload.  It is now
+    an assertable line rather than defence in depth - StyleFileProbes counts
+    entries to FingerprintStyleFile above that routine's own empty-path exit,
+    so deleting this Exit makes a Check in the smoke suite fail. }
   if StylePath = '' then Exit;
-  StampStyleFile(StylePath, NewStamp, NewSize);
-  if (NewStamp = StyleStamp) and (NewSize = StyleSize) then Exit;
-  StyleStamp := NewStamp;
+  FingerprintStyleFile(StylePath, NewSize, NewHash);
+  if (NewSize = StyleSize) and (NewHash = StyleHash) then Exit;
   StyleSize := NewSize;
+  StyleHash := NewHash;
   if NewSize < 0 then
   begin
     StyleReloadNote_ := 'output style ' + StyleName + ': ' + StylePath +
@@ -5327,16 +5493,16 @@ function SetStyleChecked(const Name, Want: string; out Err: string): Boolean;
 var
   N, Path, Src, StBody: string;
   B, I: Integer;
-  NewStamp: LongInt;
   NewSize: Int64;
+  NewHash: QWord;
 begin
   Err := '';
   Result := False;
   N := Trim(Name);
   if N = '' then N := DefaultStyleName;
 
-  NewStamp := 0;
   NewSize := -1;
+  NewHash := 0;
   B := BuiltinStyleIndex(N);
   if B >= 0 then
   begin
@@ -5358,11 +5524,16 @@ begin
       Err := 'no style called ' + N;
       Exit;
     end;
-    { Stamped BEFORE the read, never after: a file rewritten in the window
-      between the two would otherwise be recorded under the newer stamp with
-      the older body cached, and the change check would then never fire for
-      it.  Stamping first can only cost one redundant re-read. }
-    StampStyleFile(Path, NewStamp, NewSize);
+    { Fingerprinted BEFORE the read, never after: a file rewritten in the
+      window between the two would otherwise be recorded under the NEWER
+      fingerprint with the older body cached.  Under the old timestamp that
+      wedged the check permanently - a stamp cannot go backwards, so the
+      newer-stamp-older-body pairing never resolved.  Under a hash it merely
+      could not resolve on this turn, since the stored hash would be of a
+      version we did not parse and the next turn's read would differ from it
+      and converge; fingerprinting first makes even that impossible, at a cost
+      of at most one redundant re-read. }
+    FingerprintStyleFile(Path, NewSize, NewHash);
     if not ReadStyleFile(Path, N, StBody, Err) then Exit;
     { Which source actually answered.  Compared by path rather than re-walked,
       so the label can never disagree with the file that was read. }
@@ -5391,13 +5562,13 @@ begin
   StylePath := Path;
   StyleSource := Src;
   StyleBody := StBody;
-  { Both, and both from the branch above: a built-in leaves them at 0/-1,
+  { Both, and both from the branch above: a built-in leaves them at -1/0,
     which StyleRecheck never looks at because StylePath is ''.  A pending
     complaint about the PREVIOUS style file goes too - the user has just
     chosen a different style and a yellow line about the old one would be
     answering a question they stopped asking. }
-  StyleStamp := NewStamp;
   StyleSize := NewSize;
+  StyleHash := NewHash;
   StyleReloadNote_ := '';
   BuildStyleNote;
   Result := True;
@@ -6969,7 +7140,7 @@ end;
 function McpDir: string;
 begin
   Result := IncludeTrailingPathDelimiter(NormalizeRoot) + StateDirName +
-    PathDelim + 'mcp' + PathDelim;
+    PathDelim + UserMcpSpoolDirName + PathDelim;
 end;
 
 function McpCachePath: string;
@@ -7006,6 +7177,34 @@ begin
   if Home = '' then Exit;
   Result := IncludeTrailingPathDelimiter(Home) + 'pasclaude' + PathDelim +
     'mcp-cache.json';
+end;
+
+{ Deliberately line-for-line UserMcpCachePath above, down to the LOCALAPPDATA
+  first and the bare 'pasclaude' literal - the same spelling GlobalDenyPath and
+  ApprovalsPath use, rather than a fourth word for one directory.  The long
+  argument for the home it picks is in the interface. }
+function UserMcpSpoolDir: string;
+var
+  Home: string;
+begin
+  Result := '';
+  Home := Trim(SysUtils.GetEnvironmentVariable('LOCALAPPDATA'));
+  if Home = '' then
+    Home := Trim(SysUtils.GetEnvironmentVariable('USERPROFILE'));
+  if Home = '' then Exit;
+  Result := IncludeTrailingPathDelimiter(Home) + 'pasclaude' + PathDelim +
+    UserMcpSpoolDirName + PathDelim;
+end;
+
+function UserMcpSpoolPath(const Name: string): string;
+begin
+  Result := UserMcpSpoolDir;
+  if Result = '' then Exit;
+  { Name leads and the session key trails, which is the whole reason for the
+    ordering: one listing of this directory groups every project's copy of your
+    server together, and grouping by server is the question the user was asking
+    when they went looking for the file at all. }
+  Result := Result + Name + '-' + SessionKey + McpSpoolExt;
 end;
 
 function McpFind(const Name: string): Integer;
@@ -7063,6 +7262,15 @@ begin
   Result := McpServers[I].Approved;
 end;
 
+function McpServerErrLog(const Name: string): string;
+var
+  I: Integer;
+begin
+  I := McpFind(Name);
+  if I < 0 then Exit('');
+  Result := McpServers[I].ErrLog;
+end;
+
 function McpStatusWord(S: TMcpStatus): string;
 begin
   case S of
@@ -7075,6 +7283,22 @@ begin
   else
     Result := 'failed to start';
   end;
+end;
+
+{ Every sentence in this unit that says "stderr: " follows it with this, never
+  with ErrLog itself.  A spool path is now allowed to be '', and three format
+  strings that would each have rendered "stderr: )" - a sentence that stops
+  dead exactly where the answer was meant to be - are three places a reader
+  would conclude the program had lost track of its own file.  Sited beside
+  McpStatusWord rather than beside McpServerList, its notional home, only
+  because two of the three callers are McpRun and Pascal wants it declared
+  first. }
+function McpErrLogWord(const P: string): string;
+begin
+  if P = '' then
+    Result := 'discarded, no LOCALAPPDATA or USERPROFILE to keep it in'
+  else
+    Result := P;
 end;
 
 procedure ClearMcpServers;
@@ -7481,7 +7705,54 @@ begin
       Rec.LastErr := '';
       Rec.Hash := '';
       Rec.WorkDir := NormalizeRoot;
-      Rec.ErrLog := McpDir + Name + '.err';
+      { Scope decides where the stderr goes, and the three levels that make the
+        path unambiguous are all here.
+
+        SCOPE picks the root.  A user server is the user's and follows them
+        between projects, so its spool follows too, out to
+        %LOCALAPPDATA%\pasclaude\mcp\ - which also stops it writing diagnostics
+        into whatever repository the user happened to open today.  A project
+        server was chosen by the repository and its spool stays in the
+        repository's own .pasclaude\mcp\, deliberately unmoved: that is where
+        that project's state already lives, and moving it would key one more
+        thing on the session for no argument at all.  The two roots also mean a
+        project 'github' and a user 'github' can never name one file, even
+        though only one of them can be live at a time - MergeMcpConfig above
+        refuses the collision.
+
+        THE NAME is the leaf, and it is a bare name by then: ValidServerName
+        has already refused anything path-bearing.  It has NOT refused every
+        character Windows dislikes in a filename, so a server called a*b builds
+        a path CreateFile will fail on - the same hole project scope has always
+        had, now reachable from a file in the user's own home.  The name filter
+        is the guard and it is narrower than the filesystem's.
+
+        THE SESSION KEY distinguishes two PROJECTS running the same user
+        server, and it is not tidiness.  uMcp opens this file CREATE_ALWAYS, so
+        one shared file would mean whichever project started second truncating
+        the first mid-write, with the two children then scribbling over each
+        other at independent file offsets - a corruption bug traded for a
+        placement one.
+
+        Projects and not sessions, and the name is the trap: SessionKey is a
+        pure function of the primary root (the leaf plus a hash of the
+        normalised path) with no pid, clock or per-process part in it, so two
+        pasclaude windows open on the SAME directory compute the same leaf and
+        DO still share one spool, second truncating first.  This comment used
+        to claim that case was designed out.  It is not, it never was, and it
+        is not a regression either - the in-project path it replaced collided
+        in exactly the same way - but a key that fixes one collision must not
+        be described as fixing both.  Adding the pid would fix it and is
+        refused for a reason: the file's whole value is that it is still there
+        after the server died and you went looking for what it said, and a
+        name nobody can predict is a file nobody finds.
+
+        '' when there is no home at all.  McpSpawn routes an empty path to NUL:
+        the stderr is discarded and the server starts normally.  Never a
+        fallback into the project, which would restore precisely the thing this
+        branch exists to stop. }
+      if Scope = msUser then Rec.ErrLog := UserMcpSpoolPath(Name)
+      else Rec.ErrLog := McpDir + Name + McpSpoolExt;
       Rec.Status := mcPending;
       Rec.Approved := False;
       Rec.Conn := -1;
@@ -7828,7 +8099,16 @@ begin
     Exit;
   end;
 
-  ForceDirectories(McpDir);
+  { The directory we create is exactly the one we are about to write, and only
+    that one.  It used to be "create the project's mcp dir, always", which was
+    fine while every spool lived there and is wrong now in both directions: a
+    user server's spool would be created in the wrong place, and a session
+    whose only servers are the user's own would still leave an empty
+    .pasclaude\mcp\ inside somebody else's repository - a program creating a
+    directory it will never write in.  No path, no directory: '' means the
+    stderr is going to NUL and there is nothing to make. }
+  if McpServers[I].ErrLog <> '' then
+    ForceDirectories(ExtractFilePath(McpServers[I].ErrLog));
   C := uMcp.McpSpawn(McpServers[I].Name, McpServers[I].Command,
     McpServers[I].WorkDir, McpServers[I].ErrLog, McpServers[I].EnvPairs, Err);
   if C < 0 then
@@ -8003,7 +8283,8 @@ begin
 
   if not McpEnsureConnected(Si) then
     Exit(Format('mcp server "%s" is not running: %s (stderr: %s)',
-      [McpServers[Si].Name, McpServers[Si].LastErr, McpServers[Si].ErrLog]));
+      [McpServers[Si].Name, McpServers[Si].LastErr,
+       McpErrLogWord(McpServers[Si].ErrLog)]));
 
   if not uMcp.McpCallTool(McpServers[Si].Conn, McpServers[Si].Tools[Ti].Orig,
        Input, McpServers[Si].TimeoutMs, Text, IsErr, Err) then
@@ -8012,7 +8293,7 @@ begin
     McpServers[Si].LastErr := Err;
     Exit(Format('mcp server "%s" did not answer: %s (exit %d, stderr: %s)',
       [McpServers[Si].Name, Err, uMcp.McpExitCode(McpServers[Si].Conn),
-       McpServers[Si].ErrLog]));
+       McpErrLogWord(McpServers[Si].ErrLog)]));
   end;
 
   { Everything here is bytes a third-party program chose.  uMcp caps them but
@@ -8050,7 +8331,7 @@ begin
     Note := McpServers[I].Note;
     if McpServers[I].LastErr <> '' then NoteReason(Note, McpServers[I].LastErr);
     if (McpServers[I].Status = mcDead) or (McpServers[I].Status = mcFailed) then
-      NoteReason(Note, 'stderr: ' + McpServers[I].ErrLog);
+      NoteReason(Note, 'stderr: ' + McpErrLogWord(McpServers[I].ErrLog));
     if uMcp.McpToolsChanged(McpServers[I].Conn) then
       NoteReason(Note, 'tools changed - /mcp refresh to pick up');
     { A command line is under the user's nose in a prompt, not in a table:

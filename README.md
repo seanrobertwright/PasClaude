@@ -609,9 +609,30 @@ bytes it went in as and no line the user did not touch moves. This README
 used to claim the opposite, that escaping was a deliberate deviation; it was
 not a deviation and it was not deliberate, it was untested, and the fixture
 that now checks it was written by nbformat itself. A file that arrived with
-`\uXXXX` escapes in it, which some other writer produced, is normalised to
-the raw form on the first edit - a real change, and a change towards what
-Jupyter would have written. The line array is cut where Python's
+`\uXXXX` escapes in it, which some other writer produced, keeps them: the
+parser remembers the literal a string arrived as whenever writing it back our
+way would change it, and the writer hands that literal back, so the user's
+diff is still the one line they asked about. Those two sentences are not in
+tension - the first is about what this program writes when it is composing a
+string, the second about what it reproduces when it is rewriting somebody
+else's file - and the second reverses an earlier preference on purpose:
+normalising towards Jupyter's spelling is still a change to a line nobody
+touched. Three limits. Object keys are not covered, because the keys of an
+object live in a parallel array that four operations shift and a raw-key
+array shifted out of step would emit one field's name onto another, which is
+a corrupted notebook rather than a spurious diff. It is the literal that
+is reproduced, not the layout: indent, key order and the trailing newline are
+still canonicalised, which is the reformatting the permission prompt
+announces. And a string that arrived carrying a **raw** byte below `0x20` -
+an unescaped tab or newline inside the quotes, which this parser accepts and
+strict JSON does not - is written back escaped rather than as it arrived, so
+that one string's other escapes are normalised with it. That is the one place
+"keeps them" is knowingly not kept, and it is deliberate in the other
+direction: handing the raw byte back would produce a file `nbformat` refuses
+to read, which is worse than any diff. The fidelity is switched on by the notebook path alone - one
+parser entry point, `uJson.JsonParseVerbatim`, whose only caller is
+`uNotebook` - so a request body is still composed and emitted exactly the way
+it always was. The line array is cut where Python's
 `str.splitlines(True)` cuts it, which is on eleven things and not on `\n`
 alone: a form feed page break in a Python source used to make one array
 element here where Jupyter makes two. A source replace
@@ -687,12 +708,21 @@ so.
 
 Two limits are worth stating rather than hiding. The 16 MB cap is checked on
 a throttled tick that runs at the top of every executed tool call, on every
-chunk of a streaming reply, and before every prompt is drawn, so enforcement
-no longer depends on the model choosing to start, poll or list a job. It is a
-bound and not a guarantee: nothing here is in the child's write path, so a
-child can still write between two ticks, and while the user is sitting at the
-prompt the program is blocked in a console read with no timeout and nothing
-ticks at all. And a job still running at exit
+chunk of a streaming reply, before every prompt is drawn, and now every
+quarter second while the user sits at a prompt - the console read waits with
+a timeout rather than blocking forever, and the permission question ticks on
+the same clock, because that is where a user sits longest. Enforcement no
+longer depends on the model choosing to start, poll or list a job, nor on
+anybody touching the keyboard. Every quarter second *nobody types*, exactly:
+a wake caused by a key goes straight to the read and runs nothing, because a
+sweep that has to kill a job waits two seconds for each one to die, and that
+belongs at an idle prompt and never between two characters of a line being
+typed. A paste or a held key therefore suspends the sweep until the typing
+pauses, which is a window bounded by the burst. It is still a bound and not a
+guarantee:
+nothing here is in the child's write path, so a child can write between two
+ticks and the real promise is the cap plus a quarter-second of writing -
+everywhere, with no exception for the prompt. And a job still running at exit
 is stopped by design, so a user who wanted a truly detached server will find
 it gone; that is the deliberate trade against orphaning, which the launch
 message and `/jobs` make visible.
@@ -1301,6 +1331,32 @@ that went wrong. Your servers' discovery cache is written to
 the project cache is a file the project can write and the cache is read back as
 tool declarations for a server that is approved by construction.
 
+Their stderr goes out of the project too, to
+`%LOCALAPPDATA%\pasclaude\mcp\<name>-<session key>.err`. A server of yours
+follows you between projects and so should what it says; before this it wrote
+its diagnostics into whichever repository you happened to have open, one
+disconnected file per project. Three things make the path unambiguous. Scope
+picks the root, so a project `github` and a user `github` cannot name one file.
+The name leads, so one listing of that directory shows every project's copy of
+your server together. The session key trails, because the spool is opened
+`CREATE_ALWAYS`: with one shared file the second *project* would truncate the
+first mid-write and the two children would then write over each other at
+independent offsets, which is worse than the placement bug it fixed. Project
+and not session, despite the name: the key is a pure function of the directory
+you opened, so two pasclaude windows on the *same* directory still share one
+spool and still collide exactly as they did when the file lived in the project.
+Nothing was lost there and nothing was fixed there either; adding a pid would
+fix it and would cost the one thing the file is for, which is being findable by
+somebody who went looking after the server died.
+`%LOCALAPPDATA%` and not the `%USERPROFILE%` the `mcp.json` itself sits in -
+that asymmetry is the layout rule below working exactly as intended, since
+`mcp.json` is configuration you hand-write and a spool is state this program
+writes, keyed by session. A PROJECT server's spool does not move: a program the
+repository chose leaves its diagnostics in the repository, where
+`.pasclaude\mcp\<name>.err` already is. And nothing creates a directory it is
+not about to write, so a session running only your own servers no longer leaves
+an empty `.pasclaude\mcp\` behind in somebody else's tree.
+
 Their tools become ordinary tools, named `mcp__<server>__<tool>`. stdio
 transport only; an entry carrying a `url`, or a `type` other than stdio, is
 listed in `/mcp` as unsupported rather than silently dropped, because a user
@@ -1336,8 +1392,13 @@ worse than one that looks broken. The declarations share a 32 KB budget across
 *all* servers, consumed in configuration order, because that text lands in the
 cached prefix and a per-server cap is unbounded in aggregate.
 
-`/mcp` lists every configured server with its status, tool and skip counts,
-expanded command line and stderr path. `/mcp restart <name>` drops a
+`/mcp` lists every configured server with its scope, status, tool and skip
+counts and expanded command line. It names the exact spool file on a server
+that is dead or failed to start, which is when the path is the thing you want,
+and once at the foot of the panel it names the directory your own servers write
+to - a footer rather than a column because that answers the other question, the
+one nothing was answering: where a *healthy* server's log went now that it is
+not in the project. `/mcp restart <name>` drops a
 connection so the next call reconnects; `/mcp refresh` reconnects everything
 and rewrites the cache for the next run. Servers do not appear in `/jobs`, are
 not killable by `kill_bash`, and survive `/clear`: a running server is a
@@ -1643,18 +1704,34 @@ still cached rather than re-read per request - `SessionNote` runs while a
 request body is being built, and putting a file read, a UTF-8 repair and a
 frontmatter parse there would put the parse FAILURE there too, so a file caught
 half-written by an editor would decide the style for a request already in
-flight. Instead `StyleNote` stats the file it read and re-reads only when the
-stamp or the size moved: one directory lookup on the ordinary turn, where
-nothing changed and the cached paragraph goes out byte-identical. A built-in
+flight. Instead `StyleNote` fingerprints the file it read - the size the
+directory reports and FNV-1a 64 over its bytes - and re-parses only when that
+fingerprint moved: on the ordinary turn nothing changed, the cached paragraph
+goes out byte-identical, and the read that produced the fingerprint is one open
+of a file capped at 64 KB. Over the bytes *inside that cap*, precisely: the
+hash sees the same first 64 KB the parser does, so a body can never depend on a
+byte the fingerprint missed, and a change past the cap that also moves the
+length is caught by the size sitting beside the hash. Raising the read cap
+without raising the hash cap would open a real blind spot, which is why the
+source says so where the two meet. The read is on the request path and the parse is
+not, which is the half of the caching that was ever load-bearing. A built-in
 style has no file and never touches the disk at all.
 
-Two residuals, both deliberate. The stamp `FindFirst` reports is a DOS
-timestamp with two-second granularity, so an edit that lands inside the same
-tick and leaves the file exactly the same length is not seen - re-running
-`/output-style <name>` still forces the read. And a file that has become
-unreadable, unparseable or deleted does NOT empty the style: what was working
-stays in force, and a yellow line before the next prompt says which file and
-why, once, rather than once a turn.
+The check used to compare the DOS timestamp `FindFirst` reports beside the
+size, and two-second granularity made an edit that landed inside one tick and
+left the file exactly the same length invisible. A real `FILETIME` through
+`GetFileAttributesExW` was the obvious replacement and was rejected: NTFS
+stores 100-nanosecond ticks but nothing writes 100-nanosecond values into
+them - Windows stamps a write from the cached system time, whose tick is about
+15 milliseconds, so two saves inside one tick share a last-write time to the
+digit. That shrinks the blind window and makes what is left flaky rather than
+documented. The bytes are the only thing that cannot be identical while the
+content differs.
+
+One residual, deliberate. A file that has become unreadable, unparseable or
+deleted does NOT empty the style: what was working stays in force, and a yellow
+line before the next prompt says which file and why, once, rather than once a
+turn.
 
 ## Adding to the system prompt
 
@@ -2991,8 +3068,10 @@ Six suites, all built with `-gh` so an unfreed block fails the run - JSON
 ownership here is manual, so a leak is a defect rather than noise.
 
 * `tests\smoke.lpr` - the JSON parser (escapes, surrogate pairs, malformed
-  input, locale-proof number formatting) and every tool, including the path
-  guard and the deny-by-default permission path.
+  input, locale-proof number formatting, and the arrival-form memory the
+  notebook path turns on - including the two assertions that the ordinary
+  parser did not change for anyone who did not ask) and every tool, including
+  the path guard and the deny-by-default permission path.
 * `tests\stream.lpr` - recorded server-sent events replayed through the real
   decoder, delivered in 7- and 13-byte chunks so every line boundary and
   several JSON escapes are split across chunks. Covers text/thinking/tool
@@ -3237,7 +3316,22 @@ For notebooks: dropping the space after `:` in `ToJsonPretty` fails 2,
 removing the `PermitChange` call from the `notebook_edit` branch fails 2,
 rendering output data by value instead of by size fails 4, and an off-by-one
 in `InsertAt`'s shift loop fails 1 and leaks besides - 13 blocks in `smoke`,
-52 in `ux` - because the overwritten child is never freed. For background
+52 in `ux` - because the overwritten child is never freed. For the arrival
+form a notebook keeps: leaving `OpenDoc` on the ordinary `JsonParse` fails 4
+in `ux`, and dropping the raw-control-byte clause from the capture test fails
+1 in `smoke` - the assertion that a literal mixing a raw newline with an
+escape is not reproduced, which is the only thing standing between us and
+writing a notebook Python's `json` refuses to read. The gate itself was
+checked the other way round too: making the ordinary `JsonParse` verbatim
+fails 1 in `smoke`, 1 in `loop` and 6 in `fuzz` - request bodies and
+round-trips, none of them notebooks, which is the evidence that the opt-in is
+load-bearing and not decoration. One mutation deliberately survives and is
+recorded so nobody hunts for the test that should have caught it: dropping the
+`JsonQuote` comparison, so that every escaped literal is remembered rather
+than only the ones a rewrite would change, fails nothing. It is a memory
+optimisation and not a correctness one - a literal identical to what we would
+write produces identical output either way - and it is commented as such in
+`ParseString`. For background
 bash: making `bash` ignore `run_in_background` fails 4, moving the
 permission gate below the background fork fails 3, dropping the OEM
 conversion from the spool reader fails 2,
@@ -3534,13 +3628,56 @@ what pins the 12 mask bytes into the pixel offset. The encoded result decoded
 through WIC with red top-left and blue top-right, so the flip and the reorder
 are proved against a real clipboard rather than against a fixture we wrote.
 
-The one place with no regression test says so. The argument loop that parses
-`-p` and the format flags is inline in `pasclaude.lpr`'s main block,
-interleaved with `FailStart`, `Halt` and `SetCurrentDir`, and no suite spawns
-the executable; pinning it honestly means extracting the whole loop into a
-seam, which is a larger refactor than a one-line predicate warrants, and
-extracting only the predicate would test a tautology. It was verified by hand
-against the built binary instead.
+**That decision is now reversed, and the reversal is the point.** This section
+used to say the argument loop had no regression test and would not be getting
+one: it was inline in `pasclaude.lpr`'s main block, interleaved with
+`FailStart`, `Halt` and `SetCurrentDir`, no suite spawns the executable, and
+extracting the whole loop into a seam was judged a larger refactor than a
+one-line predicate warranted. The judgement was wrong, and the evidence that it
+was wrong accumulated in three separate rounds of residuals - `--continue`'s
+four refusals, whether `--no-project-context` was parsed at all, and which
+`TDiagMode` values count as a `--ci` verb were each recorded as "main-block
+code no suite can link" and each left there.
+
+The loop is extracted. `uArgs.ArgsParse` takes an `array of string` and returns
+a `TArgsOpts`; it writes no global, prints nothing, halts nothing and opens
+nothing, and a refusal comes back in the record as a message, a hint and an
+exit code. `smoke` drives it directly over argument arrays. What is pinned:
+every flag and its value form, `--add-dir` repeating in both spellings, the
+refusal messages **verbatim** - the words are the user interface, so the
+strings are the assertion - the order-sensitive cases (`-p` not swallowing
+a following flag, `--resume` refusing before `--continue` does, `plan` and
+bypass contradicting whichever arrives first), and the property the host
+depends on but could never show: that a refusal carries the output format
+parsed *before* it and never one from past where it stopped, so
+`--output-format json --bogus` still emits one JSON error line and
+`--bogus --output-format json` still emits prose.
+
+The count, because this paragraph got it wrong once and this is the section
+whose whole job is to be right about coverage. `ArgsParse` has **43** refusal
+sites. **41** can be produced by an argument list and all 41 are asserted word
+for word. The remaining two - `--status, --doctor and --ci take no prompt` and
+the same trio refusing `--input-format stream-json` - cannot be reached by any
+command line, because `--print` is the only thing that fills the prompt and
+`--input-format` without `-p` is refused higher up, so the `-p` refusals fire
+first in both cases. They are kept as guards for a future flag, marked
+unreachable at their sites, and stood in for by assertions on the *ordering*
+that makes them unreachable. The earlier version of this paragraph said
+"forty-two … verbatim"; fourteen refusals were in fact asserted nowhere, and
+one entire flag, `--output-style`, was parsed by no test at all - its value,
+its default and its refusal are all pinned now. A number nobody recomputes is
+how a coverage claim goes stale, so the count now lives in `tests/smoke.lpr`
+beside the assertions as well as here.
+
+What is **not** pinned, and stays hand-verified against the built binary: the
+help text, which is output rather than a decision and stayed in the host; and
+the apply half - `DirectoryExists`, `SetCurrentDir`, `AddWorkingDir`,
+`ResolveInRoot`, `SetOutputStyle` - which is where the disk starts and where a
+pure function has to stop. The apply half is a column of plain assignments off
+the record, deliberately, so it can be checked by eye. `--help`, `--bogus`,
+`--output-format json --bogus`, `-p` with a json driver, `--status`, `--doctor`
+and a `--ci prepare` over a fixture event were run against the binary after the
+extraction and behave exactly as before.
 
 `uHttp.HttpTransport` is the seam the loop suite uses. It is nil in the shipped
 program, which is asserted by the network suite reaching the real API.
@@ -3674,11 +3811,20 @@ pinned instead is that the success path leaves the error string empty.
 | `uAgent` | request building, SSE decoding, the tool loop |
 | `uDiag` | status and doctor as records, both renderers, the redactors |
 | `uSdk` | system prompt assembly, the NDJSON line protocol, the facade |
+| `uArgs` | argv to a record: every flag, every refusal, no side effect |
 | `pasclaude.lpr` | REPL, slash commands, rendering |
 
 The ladder is strict: `uSandbox` -> `uJson` -> `uHttp`/`uDiff`/`uRegex`/
 `uNotebook`/`uMcp`/`uHooks`/`uSettings`/`uAuth`/`uTelem` -> `uTools` ->
-`uAgent` -> `uDiag` -> `uSdk` -> `pasclaude.lpr`. Nothing at or below `uAgent`
+`uAgent` -> `uDiag` -> `uSdk` -> `uArgs` -> `pasclaude.lpr`. `uArgs` is above
+`uSdk` and `uCi` because one record has to name a `TSdkFormat` and a `TCiFloor`
+at once, and those two units are peers that cannot see each other - so the
+ladder did not merely permit the argument parser's home, it chose it. Being the
+top unit below the program is the whole value: it is the last place a suite can
+still link, which is exactly what the main block is not. Nothing in `src\` may
+ever `uses uArgs` except `pasclaude.lpr`; a unit that tried would cycle and
+fail to compile, which is the good outcome, and the unit's own header says so
+in those words. Nothing at or below `uAgent`
 knows the console exists. `uSettings`, `uAuth` and `uTelem` are leaves for the
 same class of reason `uImage` is: each takes `uJson` and `SysUtils` and nothing
 else of ours, so the scope table, the credential resolver and the payload

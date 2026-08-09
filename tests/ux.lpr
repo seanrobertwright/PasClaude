@@ -3190,9 +3190,48 @@ begin
     '}'#10;
 end;
 
+{ The same cell, the same layout, the same id - with its non-ASCII spelled as
+  \u escapes instead.  That is what Python's json.dumps produces when nobody
+  turns ensure_ascii off, so it is what a notebook written by a tool that is
+  not nbformat looks like; Jupyter itself would never write this file, and that
+  is exactly the point.  It is a spelling we have to reproduce rather than one
+  we would ever choose.  One of the escapes is a surrogate pair, the character
+  that breaks first in either direction.  It lives beside NbUnicodeMarkdownCell
+  for the same reason that one exists: the assertions below compare against
+  these exact bytes rather than against the test's own idea of them. }
+function NbEscapedMarkdownCell: string;
+begin
+  Result :=
+    '  {'#10 +
+    '   "cell_type": "markdown",'#10 +
+    '   "id": "1c2d0f07",'#10 +
+    '   "metadata": {},'#10 +
+    '   "source": ['#10 +
+    '    "# na\u00efve \u2014 \ud83d\ude00 rocket \ud83d\ude80\n"'#10 +
+    '   ]'#10 +
+    '  }'#10;
+end;
+
+{ The nbformat fixture with that one cell swapped for its escaped twin.
+  Building it by substitution rather than by writing it out again guarantees
+  the two fixtures differ in exactly one cell, and it leaves the CODE cell's
+  e-acute and kanji raw - so the document is mixed, which is the whole point.
+  The memory is per string, not per file, and a fixture that was escaped
+  throughout could not tell the difference. }
+function NbEscapedFixture: string;
+begin
+  Result := StringReplace(NbUnicodeFixture, NbUnicodeMarkdownCell,
+    NbEscapedMarkdownCell, []);
+end;
+
+
 procedure TestNotebookUnicode;
 const
   Grin = #$F0#$9F#$98#$80;
+  IDiaeresis = #$C3#$AF;
+  EmDash = #$E2#$80#$94;
+  Rocket = #$F0#$9F#$9A#$80;
+  Kanji = #$E6#$BC#$A2#$E5#$AD#$97;
   Copyright = #$C2#$A9;                      { U+00A9: starts C2, is not NEL }
   EnDash = #$E2#$80#$93;                     { U+2013: starts E2 80, is not LS }
   Nel = #$C2#$85;                            { U+0085 }
@@ -3200,7 +3239,7 @@ const
   ParaSep = #$E2#$80#$A9;                    { U+2029 }
 var
   Doc, Cells, Src: TJson;
-  Nb, Canon, New_, Err: string;
+  Nb, Canon, New_, View, Err: string;
 begin
   WriteLn('-- notebook non-ASCII --');
 
@@ -3248,20 +3287,40 @@ begin
     Doc.Free;
   end;
 
-  { A file somebody else wrote with escapes.  We normalise it to the raw form
-    on the first edit, which is a real change to lines the user did not touch -
-    but it is a change towards what Jupyter would have written, and the
-    permission prompt already announces that saving reformats a file laid out
-    differently.  The assertion is that the characters are the same ones:
-    a surrogate pair has to become one four-byte character, not two stumps. }
+  { A file somebody else wrote with escapes.  The rule here used to be that we
+    normalised it to the raw form on the first edit, on the argument that the
+    change was at least a change towards what Jupyter would have written.  That
+    argument now runs the other way, and the reversal is deliberate rather than
+    a sentence that quietly became more accurate: the promise this program
+    makes about a notebook edit is that the user's diff shows the line they
+    asked about and nothing else, and a line rewritten into a better spelling
+    is still a line the user did not touch.  So a string that ARRIVED escaped
+    goes back out escaped, and only what we compose ourselves is raw.
+
+    The property the old assertion was really guarding - a surrogate pair
+    joining into one four-byte character rather than two stumps - has not gone
+    anywhere.  It is asserted on the parsed value now, because the emitted text
+    no longer shows it, and dropping it along with the line that used to check
+    it would have retired the only test of surrogate joining in the suite. }
   Nb := '{"cells":[{"cell_type":"code","execution_count":null,"id":"a1",' +
         '"metadata":{},"outputs":[],"source":["s = \"\ud83d\ude00\u00e9\""]}],' +
         '"metadata":{},"nbformat":4,"nbformat_minor":5}';
   Check(NotebookCanonical(Nb, Canon, Err),
     'a notebook written with \u escapes still reads: ' + Err);
   Check(IsValidUtf8(Canon), 'and rewrites as valid UTF-8');
-  Check(Pos('s = \"' + Grin + #$C3#$A9 + '\"', Canon) > 0,
-    'the surrogate pair becoming one four-byte character, not two stumps');
+  Check(Pos('s = \"\ud83d\ude00\u00e9\"', Canon) > 0,
+    'the escapes it arrived with are written back as they arrived');
+  Doc := JsonParse(Canon, Err);
+  Check(Doc <> nil, 'the rewritten document parses: ' + Err);
+  if Doc <> nil then
+  try
+    Check(Doc.Find('cells').Item(0).Find('source').Item(0).AsString =
+      's = "' + Grin + #$C3#$A9 + '"',
+      'and the surrogate pair still reads as one four-byte character, not two '
+      + 'stumps');
+  finally
+    Doc.Free;
+  end;
 
   { Where the line array is cut.  nbformat splits a cell's source with Python's
     str.splitlines(True), which breaks on eleven things and not on #10 alone;
@@ -3300,6 +3359,61 @@ begin
     Doc.Free;
   end;
 
+  { The unit itself.  A notebook whose author's tooling escaped what Jupyter
+    would not: left alone it has to be a fixed point like any other file we did
+    not write, and after an edit to one cell the other cell has to come back
+    byte for byte, escapes and all.  Pos of the escaped cell proves it survived;
+    Pos of the raw one being zero proves it was not quietly normalised, which is
+    the failure this unit exists to remove and the one a test that only checked
+    the characters would have walked straight past. }
+  Nb := NbEscapedFixture;
+  Check(NotebookCanonical(Nb, Canon, Err) and (Canon = Nb),
+    'a notebook whose escapes are not the ones Jupyter writes is a fixed '
+    + 'point too: ' + Err);
+  Check(NotebookApply(Nb, 0, 'replace', 'print("' + Grin + '")', '', New_, Err),
+    'a cell of it can be replaced: ' + Err);
+  Check(Pos(NbEscapedMarkdownCell, New_) > 0,
+    'and every other cell comes back byte-identical, escapes included');
+  Check(Pos(NbUnicodeMarkdownCell, New_) = 0,
+    'rather than normalised to the raw form we would have written ourselves');
+  Check(Pos('print(\"' + Grin + '\")', New_) > 0,
+    'while the cell we did write goes out as raw UTF-8, as nbformat writes it');
+  Check(IsValidUtf8(New_), 'the result is valid UTF-8');
+  Doc := JsonParse(New_, Err);
+  Check(Doc <> nil, 'the edited escaped notebook parses: ' + Err);
+  if Doc <> nil then
+  try
+    Src := Doc.Find('cells').Item(1).Find('source');
+    Check((Src <> nil) and (Src.Count = 1) and
+      (Src.Item(0).AsString = '# na' + IDiaeresis + 've ' + EmDash + ' ' +
+       Grin + ' rocket ' + Rocket + #10),
+      'and the preserved cell still means the characters it always meant');
+  finally
+    Doc.Free;
+  end;
+
+  { The other direction, in the same document, and the pair is the whole rule.
+    Replacing the ESCAPED cell writes it the way we write anything we composed
+    ourselves - raw, as nbformat writes it - because a source the model handed
+    us has no arrival form to be faithful to.  The code cell's kanji, which
+    nobody touched, is still the raw bytes it came in as.  So one file holds
+    both spellings at once and neither is imposed on the other: the memory is
+    per string, not per file, which is the part a per-file switch would get
+    wrong. }
+  Check(NotebookApply(Nb, 1, 'replace', '# ' + EmDash + ' done', '', New_, Err),
+    'the escaped cell itself can be replaced: ' + Err);
+  Check(Pos('"# ' + EmDash + ' done"', New_) > 0,
+    'and the source we supplied goes out raw, not re-escaped to match the '
+    + 'neighbours it is replacing');
+  Check(Pos('# ' + Kanji, New_) > 0,
+    'while a raw character in a cell nobody touched stays raw');
+
+  { The model never sees an escape it will not be asked to reproduce: the view
+    is built from decoded values, so remembering the literal changed nothing
+    about what reaches the conversation. }
+  Check(NotebookView(NbEscapedFixture, View, Err) and (Pos(Grin, View) > 0),
+    'the cell view shows the characters, not the spelling of the file');
+
   { v3 stays refused, and says so in terms somebody can act on.  Upgrading was
     measured and rejected: nbformat's own converter joins a heading cell's
     lines into one and draws every new cell id from a random word corpus, so
@@ -3312,6 +3426,7 @@ begin
     'a v3 notebook is refused by version: ' + Err);
   Check(Pos('as_version=4', Err) > 0,
     'and the refusal names the tool that owns the conversion');
+
 end;
 
 { -------------------------------------------------------------- gitignore -- }
@@ -3958,6 +4073,135 @@ begin
     'and clearing empties it again');
 end;
 
+var
+  IdleTicks: Integer = 0;
+
+procedure CountingIdleTick;
+begin
+  Inc(IdleTicks);
+end;
+
+{ The prompt-idle window: while a user sits at a prompt, uTerm's read now wakes
+  on a bounded wait and runs the tick the host pushed down, so a background job
+  left running while nobody types is bounded by the same clock as everywhere
+  else.
+
+  What can be asserted here is the decision and the seam, and that is deliberate
+  rather than a shortfall being glossed over: the wait itself needs a console,
+  which no test runner has, and the wiring line in pasclaude.lpr sits in a main
+  block no suite can link.  So the interval arithmetic is tested with numbers
+  rather than with a sleep - which is the whole reason IdleTickFires takes NowMs
+  as a parameter - and the one property the frame depends on, that the wired
+  tick prints nothing, is tested against the real callee rather than a stand-in
+  that could not print anything anyway. }
+procedure TestIdleTickAtThePrompt;
+var
+  SavedIdle: uTerm.TIdleProc;
+  Last, Seq: QWord;
+  Id, Err: string;
+  Found: Boolean;
+begin
+  WriteLn('-- the prompt-idle tick --');
+  SavedIdle := uTerm.IdleTick;
+  try
+    Check(not Assigned(SavedIdle),
+      'nothing is wired into the idle seam by default: a unit that ticked by ' +
+      'itself would be a unit that reached upward');
+    Check(not uTerm.IdleTickFires(False, 0, 1000000),
+      'with nothing pushed down, no wake ever ticks however long the wait was');
+    Check(uTerm.IdleTickFires(True, 0, 1),
+      'the first wake ticks: zero means never here, as it does for the sweep');
+    Check(not uTerm.IdleTickFires(True, 1000, 1000),
+      'two wakes inside one clock tick are one tick, not two');
+    Check(not uTerm.IdleTickFires(True, 1000, 1000 + uTerm.IdleTickMs - 1),
+      'one millisecond short of the gap is not due');
+    Check(uTerm.IdleTickFires(True, 1000, 1000 + uTerm.IdleTickMs),
+      'the gap exactly is due');
+    Check(uTerm.IdleTickFires(True, 1000, 1000 + uTerm.IdleWaitMs),
+      'a wake that timed out is always due - the gap is set under the wait ' +
+      'so the coarse tick clock cannot skip one');
+
+    Last := 0;
+    Check(not uTerm.IdleTickRun(Last, 5000),
+      'nil does nothing at all, which is what the default has to mean');
+    Check(Last = 0,
+      'and a wake that did not tick leaves the clock where it was');
+
+    uTerm.IdleTick := @CountingIdleTick;
+    IdleTicks := 0;
+    Check(uTerm.IdleTickRun(Last, 5000), 'wired, the first wake runs the tick');
+    Check(IdleTicks = 1, 'exactly once');
+    Check(Last = 5000, 'and the wake that ran it is what the clock now holds');
+    Check(not uTerm.IdleTickRun(Last, 5000 + uTerm.IdleTickMs - 1),
+      'a wake inside the gap does not run it again');
+    Check(IdleTicks = 1, 'so a burst of keystrokes cannot make the tick hot');
+    Check(uTerm.IdleTickRun(Last, 5000 + uTerm.IdleTickMs),
+      'and the first wake past the gap does');
+    Check(IdleTicks = 2, 'twice, and no more than twice');
+
+    { A live job, because TickBackgroundJobs exits on an empty table and a
+      silence proved against a function that returned immediately would prove
+      nothing.  The same command TestJobList uses, for the same reason: it
+      runs long enough to still be there when the sweep walks it. }
+    uTools.ClearJobs;
+    if not StartBackgroundJob('ping -n 30 127.0.0.1', Id, Err) then
+    begin
+      Check(False, 'a job starts for the tick: ' + Err);
+      Exit;
+    end;
+    uTerm.IdleTick := @uTools.TickBackgroundJobs;
+    Last := 0;
+    Seq := uTerm.EmitCount;
+    Check(uTerm.IdleTickRun(Last, 9000),
+      'the real sweep runs from a wake with a job in the table');
+    Check(uTerm.EmitCount = Seq,
+      'and prints not one byte, which is the whole reason the framed prompt ' +
+      'block can stay up across a tick');
+    Check(uTools.BackgroundJobList <> 'no background jobs',
+      'and the job it just walked is under the cap, so the sweep left it ' +
+      'alone rather than killing it');
+
+    { The purge, and this is the second version of this assertion.  The first
+      claimed to prove the tick sweeps WITHOUT purging and could not fail: it
+      re-listed the ping above, which is alive and therefore not Reaped, and
+      SweepJobs' purge arm only frees a job whose Reaped flag is set.  Turning
+      TickBackgroundJobs' SweepJobs(False) into SweepJobs(True) - the exact
+      edit three comments now exist to forbid, because it would resize the
+      Jobs array under a nested RunToolInner holding an index across a
+      permission prompt - left the suite green.  The only defence against the
+      one new constraint of the round was grep.
+
+      So the fixture has to be a job the purge WOULD take: finished, and read
+      to the end, which is the pair of conditions PollBackgroundJob turns into
+      Reaped.  ClearJobs first because it also zeroes LastSweepTick, and the
+      tick above has just set it - without that the sweep would decline on the
+      quarter-second gate and the check would pass for the wrong reason, which
+      is the failure mode being fixed here in the first place. }
+    uTools.ClearJobs;
+    if not StartBackgroundJob('echo swept', Id, Err) then
+    begin
+      Check(False, 'a short job starts for the purge check: ' + Err);
+      Exit;
+    end;
+    uTools.WaitBackgroundJob(Id, 5000);
+    { Twice: the first poll reports the exit and drains the spool, and it is
+      the poll that finds nothing left after it which can say the output has
+      been read to the end. }
+    uTools.PollBackgroundJob(Id, Found);
+    uTools.PollBackgroundJob(Id, Found);
+    Check(Pos(Id, uTools.BackgroundJobList) > 0,
+      'a finished, fully read job is still listed until something purges it');
+    Last := 0;
+    Check(uTerm.IdleTickRun(Last, 30000), 'a wake runs the sweep over it');
+    Check(Pos(Id, uTools.BackgroundJobList) > 0,
+      'and the tick did not purge it: an id the model was just given still ' +
+      'names a job after the prompt has been sat at');
+  finally
+    uTerm.IdleTick := SavedIdle;
+    uTools.ClearJobs;
+  end;
+end;
+
 { ------------------------------------------------------------------- main -- }
 
 { %USERPROFILE% has to be moved somewhere known: the user memory is read from
@@ -4126,12 +4370,117 @@ begin
       'is running in: ' + uTools.UserMcpCachePath);
     Check(uTools.UserMcpConfigPath <> uTools.McpConfigPath,
       'and the two config files are never the same path');
+
+    { The spool, asserted through the loaded server rather than through the
+      builder: the builder being right and the load site still writing the old
+      expression is precisely the failure this pair of scopes can hide. }
+    Check(Pos(IncludeTrailingPathDelimiter(TmpRoot),
+      uTools.McpServerErrLog('mine')) = 0,
+      'a user server''s stderr spool is not inside the project either: ' +
+      uTools.McpServerErrLog('mine'));
+    Check(Pos(IncludeTrailingPathDelimiter(Local),
+      uTools.McpServerErrLog('mine')) = 1,
+      'it is under localappdata, where state this program writes lives');
+    Check(uTools.McpServerErrLog('mine') = uTools.UserMcpSpoolPath('mine'),
+      'and it is the path UserMcpSpoolPath names, not a second one built at ' +
+      'the load site');
+    Check(Pos(uTools.SessionKey, uTools.McpServerErrLog('mine')) > 0,
+      'the session key is in the file name, so two projects running the same ' +
+      'user server do not truncate one file');
+    Check(Pos(IncludeTrailingPathDelimiter(TmpRoot),
+      uTools.McpServerErrLog('theirs')) = 1,
+      'while a project server''s spool has not moved: ' +
+      uTools.McpServerErrLog('theirs'));
+    Check(uTools.McpServerErrLog('nobody') = '',
+      'and a name nobody configured has no spool at all');
   finally
     uTools.ClearMcpServers;
     uTools.ClearTrust;
     SysUtils.DeleteFile(IncludeTrailingPathDelimiter(TmpRoot) + '.mcp.json');
     SetEnvironmentVariable('USERPROFILE', PChar(SavedHome));
     SetEnvironmentVariable('LOCALAPPDATA', PChar(SavedLocal));
+  end;
+end;
+
+{ The spool path on its own, including the two shapes the test above cannot
+  reach because loading a user server needs a %USERPROFILE% to have found the
+  mcp.json in: no LOCALAPPDATA, and no home at all.  Both env vars are saved at
+  the top and handed back in ONE finally at the very end - never mid-test, and
+  never partially, because a fixture that redirects %USERPROFILE% and leaves
+  %LOCALAPPDATA% pointing at the developer's real profile is how a suite starts
+  computing paths in somebody's actual home directory. }
+procedure TestUserMcpSpoolIsOutOfTree;
+var
+  Local, Prof, Want, SavedHome, SavedLocal, P: string;
+begin
+  { TWO directories, and they used to be one.  With %USERPROFILE% and
+    %LOCALAPPDATA% pointing at the same place, "the spool sits under
+    localappdata and not under the profile" was a sentence no assertion could
+    tell from its opposite, and the fallback below could not be distinguished
+    from the ordinary path at all. }
+  Local := ExcludeTrailingPathDelimiter(TmpRoot) + '-spoollocal';
+  Prof := ExcludeTrailingPathDelimiter(TmpRoot) + '-spoolprofile';
+  SavedHome := SysUtils.GetEnvironmentVariable('USERPROFILE');
+  SavedLocal := SysUtils.GetEnvironmentVariable('LOCALAPPDATA');
+  { Cleanup first, not after: one assertion below is that asking for the path
+    creates nothing, and a directory left behind by an earlier run would make
+    that assertion pass or fail on history rather than on this code. }
+  Cleanup(Local);
+  Cleanup(Prof);
+  SetEnvironmentVariable('USERPROFILE', PChar(Prof));
+  SetEnvironmentVariable('LOCALAPPDATA', PChar(Local));
+  try
+    { The location spelled out rather than asked for.  Pos(UserMcpSpoolDir, P)
+      was what stood here and it is a tautology - UserMcpSpoolPath's first
+      statement IS Result := UserMcpSpoolDir, so both sides move together and
+      no edit to either function could ever fail it.  A literal is the only
+      thing that can say the panel and the spawn agree on somewhere REAL. }
+    Want := IncludeTrailingPathDelimiter(Local) + 'pasclaude' + PathDelim +
+      'mcp' + PathDelim;
+    P := uTools.UserMcpSpoolPath('mine');
+    Check(Pos(Want, P) = 1,
+      'the user spool sits under localappdata, not the profile its mcp.json ' +
+      'lives in: ' + P);
+    Check(Pos(IncludeTrailingPathDelimiter(Prof), P) = 0,
+      'and no part of it is the profile directory');
+    Check(ExtractFileExt(P) = '.err',
+      'and is still a .err file, so nothing that looked for one has to learn ' +
+      'a new extension');
+    Check(uTools.UserMcpSpoolDir = Want,
+      'the directory /mcp names is that same one, spelled out here so the ' +
+      'panel and the spawn cannot drift apart: ' + uTools.UserMcpSpoolDir);
+    Check(not DirectoryExists(uTools.UserMcpSpoolDir),
+      'asking for the path creates nothing - only a spawn creates the ' +
+      'directory it writes');
+    Check(uTools.UserMcpSpoolPath('a') <> uTools.UserMcpSpoolPath('b'),
+      'two of your servers never share one spool');
+
+    { No LOCALAPPDATA.  The fallback is the profile, which is one directory
+      this program may not have written before - but it is still not the
+      project.  Asserted as "it is under the profile" and not merely as "it is
+      not under the project", because '' satisfies the second: deleting the
+      two fallback lines from UserMcpSpoolDir left the old check passing while
+      every user server on such a machine silently threw its stderr at NUL. }
+    SetEnvironmentVariable('LOCALAPPDATA', nil);
+    P := uTools.UserMcpSpoolPath('mine');
+    Check(Pos(IncludeTrailingPathDelimiter(Prof) + 'pasclaude' + PathDelim +
+      'mcp' + PathDelim, P) = 1,
+      'with no localappdata it falls back to the profile: ' + P);
+    Check(Pos(IncludeTrailingPathDelimiter(TmpRoot), P) = 0,
+      'and never into the project');
+
+    { No home at all.  '' travels to McpSpawn, which opens NUL. }
+    SetEnvironmentVariable('USERPROFILE', nil);
+    Check(uTools.UserMcpSpoolPath('mine') = '',
+      'with no home at all there is no spool path, and the server''s stderr ' +
+      'goes to NUL');
+    Check(uTools.UserMcpSpoolDir = '',
+      'so the panel has no directory to offer either');
+  finally
+    SetEnvironmentVariable('USERPROFILE', PChar(SavedHome));
+    SetEnvironmentVariable('LOCALAPPDATA', PChar(SavedLocal));
+    Cleanup(Local);
+    Cleanup(Prof);
   end;
 end;
 
@@ -7081,8 +7430,10 @@ begin
     TestVt;
     TestRewind;
     TestJobList;
+    TestIdleTickAtThePrompt;
     TestMcpPanel;
     TestUserMcpIsNotPrompted;
+    TestUserMcpSpoolIsOutOfTree;
     TestHooksPanel;
     TestPluginState;
     TestSystemPromptLift;
@@ -7166,6 +7517,10 @@ begin
     { The spawn seam back to nil: a suite that left one installed would
       hand it to whatever ran next. }
     uIde.IdeSpawnOverride := nil;
+    { And the idle seam, for exactly the same reason: a suite that left a tick
+      wired would hand it to whatever ran next, and this one wires the real
+      sweep. }
+    uTerm.IdleTick := nil;
     uGitHub.GitHubClear;
     uHttp.HttpGetTransport := nil;
     uTools.RootDir := '';

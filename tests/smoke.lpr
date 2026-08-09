@@ -10,7 +10,7 @@ program smoke;
   come after it. }
 uses Windows, SysUtils, Classes, uJson, uSettings, uAuth, uHttp, uTelem, uMcp,
   uHooks, uSandbox, uIde, uTools, uAgent, uDiag, uRegex, uSdk, uTerm,
-  uGitHub, uCi;
+  uGitHub, uCi, uArgs;
 
 var
   Fails: Integer = 0;
@@ -63,6 +63,94 @@ begin
   J := JsonParse('"\ud83d\ude00"', Err);
   Check((J <> nil) and (Length(J.AsString) = 4), 'joins a surrogate pair into UTF-8');
   J.Free;
+
+  { Arrival forms.  The first two assertions are the invisibility contract
+    written as a test: the bottom of the ladder did not move for anybody who
+    did not ask for it, and what the verbatim parser hands a reader is still
+    the decoded string, not the literal.  The raw bytes are spelled #$C3#$A9
+    rather than typed so this file's encoding cannot decide the result, the
+    same way ux.lpr spells its fixtures. }
+  J := JsonParse('"caf\u00e9"', Err);
+  try
+    Check(J.ToJson = '"caf'#$C3#$A9'"',
+      'the ordinary parser still normalises an arriving escape to raw UTF-8');
+  finally
+    J.Free;
+  end;
+
+  J := JsonParseVerbatim('"caf\u00e9"', Err);
+  try
+    Check(J.ToJson = '"caf\u00e9"',
+      'the verbatim parser writes the literal back exactly as it arrived');
+    Check(J.AsString = 'caf'#$C3#$A9,
+      'while the value every caller reads is still the decoded UTF-8');
+  finally
+    J.Free;
+  end;
+
+  J := JsonParseVerbatim('"a\/b"', Err);
+  try
+    Check(J.ToJson = '"a\/b"', 'an escaped solidus comes back escaped');
+  finally
+    J.Free;
+  end;
+
+  { The guard that keeps us from writing a file other parsers refuse.  This
+    parser accepts a byte below $20 raw inside a string; strict JSON does not,
+    so reproducing one would hand out a notebook Python's json will not read.
+    The second case is the one that actually exercises the clause - the first
+    would pass with no Ctl test at all, because it carries no escape either. }
+  J := JsonParseVerbatim('"a'#10'b"', Err);
+  try
+    Check(J.ToJson = '"a\nb"',
+      'a raw control byte is still escaped on the way out, however it arrived');
+  finally
+    J.Free;
+  end;
+
+  J := JsonParseVerbatim('"a'#10'b\/c"', Err);
+  try
+    Check(J.ToJson = '"a\nb/c"',
+      'and a literal mixing a raw control byte with an escape is not preserved '
+      + 'at all, rather than reproduced with the illegal byte in it');
+  finally
+    J.Free;
+  end;
+
+  J := JsonParseVerbatim('"\ud800x"', Err);
+  try
+    Check(J.ToJson = '"\ud800x"',
+      'a lone surrogate goes back out as the escape it came in as');
+    Check(IsValidUtf8(J.ToJson),
+      'so what we write stays valid UTF-8 instead of three stray bytes');
+  finally
+    J.Free;
+  end;
+
+  { The residual, pinned so it is a documented limit and not a surprise:
+    object keys are normalised even here, because a parallel raw-key array
+    would have to be shifted in lockstep by Add, Push, Drop and InsertAt and a
+    bug in any of the four writes one field's name onto another. }
+  J := JsonParseVerbatim('{"\u0061b":1}', Err);
+  try
+    Check(J.ToJson = '{"ab":1}',
+      'an escaped object key is still normalised, which is the documented limit');
+  finally
+    J.Free;
+  end;
+
+  J := JsonParseVerbatim('{"s":"caf\u00e9 \ud83d\ude00"}', Err);
+  try
+    K := JsonParse(J.ToJson, Err);
+    try
+      Check((K <> nil) and (K.Str('s') = J.Str('s')),
+        'a preserved literal parses back to the same string');
+    finally
+      K.Free;
+    end;
+  finally
+    J.Free;
+  end;
 
   { SetAt replaces a value where it stands.  Implementing it as Drop-then-Add
     would move the key to the end, which is why the position is asserted as
@@ -3977,15 +4065,18 @@ end;
 { An edited style file applies by itself, and the three ways that could go
   wrong are each asserted.
 
-  The bodies below deliberately differ in LENGTH at every step.  The change
-  check compares FindFirst's stamp and the file size, and that stamp has
-  two-second granularity - three writes inside one test share it, so a test
-  that changed only the words would be testing the timestamp's luck rather
-  than the rule.  The size is the half of the check that a suite can drive
-  honestly, and the residual is written down in uTools beside the code. }
+  The bodies below still differ in LENGTH at every step, and that is now
+  incidental rather than load-bearing.  It used to be the whole design of this
+  test: the change check compared FindFirst's two-second stamp beside the
+  size, three writes inside one test shared that stamp, and only the size was
+  a half a suite could drive honestly.  The check hashes the bytes now, so the
+  case that could not be driven has a test of its own immediately below.  What
+  this procedure is for has not moved - an edit applies, a file that stops
+  parsing keeps the working body and says so, a deleted file likewise. }
 procedure TestStyleFileReload;
 var
   Err, StylePath, Note: string;
+  Probes: Int64;
 begin
   StartSkillRoot;
   uTools.ClearStyles;
@@ -4029,26 +4120,82 @@ begin
   Note := TakeStyleReloadNote;
   Check(Pos('gone', Note) > 0, 'and that is said too: ' + Note);
 
-  { A built-in has no file, so nothing here may make it start looking for
-    one.  OutputStylePath is the gate the code tests, so it is the gate the
-    suite tests.
+  { A built-in has no file, so nothing here may make it start looking for one.
 
-    What the third line does NOT do, said out loud so nobody counts it twice:
-    it is not a test of `if StylePath = '' then Exit` in StyleRecheck.  Deleting
-    that line changes no observable behaviour at all - StampStyleFile has its
-    own Path = '' early exit returning 0/-1, which is exactly what
-    SetStyleChecked stored for the built-in branch, so the comparison below it
-    matches and the reload exits silently either way.  The guard is
-    defence-in-depth against a future StampStyleFile that stats before it
-    checks, and it is not reachable by any assertion this suite can write.
-    What the line really pins is the visible promise: a built-in never emits a
-    reload complaint, however many times its note is read. }
+    Last round this block could only assert an ABSENCE - that no complaint was
+    produced - and the note that stood here said so out loud: deleting
+    `if StylePath = '' then Exit` from StyleRecheck changed no observable
+    behaviour, because the stamping routine had its own empty-path exit
+    returning exactly what the built-in branch had stored, so the comparison
+    matched and the reload exited silently either way.  Two guards, one
+    promise, and not one line of it reachable by an assertion.
+
+    StyleFileProbes closes that.  It counts entries to FingerprintStyleFile at
+    the top, before that routine's own empty-path exit, so the third Check
+    below fails the moment anything asks the file system about a built-in -
+    which is what deleting the guard in StyleRecheck would do. }
   Check(SetOutputStyle('explanatory', Err), 'a built-in is set: ' + Err);
   Check(OutputStylePath = '', 'a built-in style has no file behind it');
+  Probes := StyleFileProbes;
   Check(Pos('why it is built that way', StyleNote) > 0,
     'its body is the compiled-in one');
+  Check(Pos('why it is built that way', StyleNote) > 0,
+    'and the same on a second read');
+  Check(StyleFileProbes = Probes,
+    'and neither read asked the file system anything');
   Check(TakeStyleReloadNote = '',
-    'and reading it again never produces a reload complaint');
+    'nor produced a reload complaint');
+
+  uTools.ClearStyles;
+  uTools.ClearSkills;
+  uTools.ClearPluginState;
+  WipeTree(SkillRoot);
+  uTools.RootDir := IncludeTrailingPathDelimiter(GetTempDir) + 'pasclaude-test';
+end;
+
+{ The case the two-second DOS stamp could not see, which is the whole reason
+  the change check now hashes the bytes.  The two files are the same number of
+  bytes and the second is written microseconds after the first was read, so
+  FindFirst's stamp and the size are identical for both: anything but the
+  content being compared and the edit is invisible.  Before this round it was.
+
+  The lengths are asserted rather than assumed.  A later edit that changed one
+  body by a byte would quietly turn this back into the test the suite already
+  has one procedure up, and it would still pass, and nobody would know. }
+procedure TestStyleSameLengthEditInOneTick;
+var
+  Err, First, Second: string;
+  Probes: Int64;
+begin
+  StartSkillRoot;
+  uTools.ClearStyles;
+  First  := '---'#10'description: terse.'#10'---'#10'ALPHA BODY'#10;
+  Second := '---'#10'description: terse.'#10'---'#10'OMEGA BODY'#10;
+  Check(Length(First) = Length(Second),
+    'the two style files are byte-for-byte the same length');
+
+  PutStyle(StylesDirProject, 'terse', First);
+  RefreshStyles;
+  Check(SetOutputStyle('terse', Err), 'a file style is set: ' + Err);
+  Check(Pos('ALPHA BODY', StyleNote) > 0, 'and its body reaches the prompt');
+
+  PutStyle(StylesDirProject, 'terse', Second);
+  Probes := StyleFileProbes;
+  Check(Pos('OMEGA BODY', StyleNote) > 0,
+    'a same-length edit inside one clock tick is seen');
+  Check(Pos('ALPHA BODY', StyleNote) = 0, 'and the body it replaced is gone');
+  Check(StyleFileProbes > Probes,
+    'the check did go to the file, so a count that does not move means something');
+  Check(TakeStyleReloadNote = '', 'and a reload that worked says nothing');
+
+  { The same bytes written again are not a change.  Under a timestamp this was
+    a pointless re-read and a pointless parse of a file nobody had altered;
+    under a hash it is nothing at all, and a parse that does not happen is a
+    parse that cannot fail on the request path. }
+  PutStyle(StylesDirProject, 'terse', Second);
+  Check(Pos('OMEGA BODY', StyleNote) > 0,
+    'rewriting a style file with the same bytes changes nothing');
+  Check(TakeStyleReloadNote = '', 'and complains about nothing');
 
   uTools.ClearStyles;
   uTools.ClearSkills;
@@ -6932,6 +7079,389 @@ begin
     'and it carries the footer, so it cannot answer itself');
 end;
 
+{ ------------------------------------------------------ the command line -- }
+
+{ Five procedures over uArgs.ArgsParse, and the reason they are here at all is
+  that until this round they could not have existed.  The whole argument loop
+  lived in pasclaude.lpr's main block, which no suite can link, so every one
+  of ArgsParse's forty-three refusals was checked by running the executable and
+  reading the console with a person's eyes - and three separate rounds recorded
+  that in a comment as a residual instead of fixing it.
+
+  Forty-three, counted rather than remembered: one Fail call per site, forty-one
+  of which an argument list can reach and all forty-one of which are asserted
+  below word for word.  The other two cannot be produced by any command line,
+  are marked as unreachable at their sites in uArgs, and are represented here by
+  the orderings that make them unreachable.  The first version of this comment
+  said forty-two, of which fourteen were in fact asserted nowhere; the count is
+  in this file because a number nobody can recompute is how that happened.
+
+  Smoke rather than ux, by the rule README states and this suite follows: a
+  pure parser goes in smoke.  Nothing here opens a file, reads an environment
+  variable or touches module state, so these are indifferent to HomeAside and
+  HomeBack and need no finally of their own.  The one global they so much as
+  look at is uSdk.SdkAppendSystem, and it is captured before and compared
+  after rather than cleared, because the assertion IS that the parser never
+  wrote it. }
+procedure TestArgvFlagsAndValues;
+var
+  A: uArgs.TArgsOpts;
+  Before: string;
+begin
+  A := uArgs.ArgsParse(['-p', 'what is 2+2']);
+  Check(A.Ok and A.PrintMode and (A.PrintPrompt = 'what is 2+2'),
+    '-p takes the next argument as the prompt');
+  Check(A.ScriptedRun, 'and -p marks the run scripted');
+  A := uArgs.ArgsParse(['-p', '--web']);
+  Check(A.Ok and A.PrintMode and (A.PrintPrompt = '') and A.WebFlag,
+    '-p does not swallow a following flag as its prompt');
+  A := uArgs.ArgsParse(['--output-format', 'json', '-p', 'hi']);
+  Check(A.Ok and (A.OutFormat = uSdk.sfJson) and (A.PrintPrompt = 'hi'),
+    'the format flag parses on either side of -p');
+  Check(A.ScriptedRun, 'and a json driver marks the run scripted too');
+
+  A := uArgs.ArgsParse(['--add-dir', 'one', '--add-dir=two',
+    '--add-dir', 'three']);
+  Check(A.Ok and (Length(A.AddDirs) = 3) and (A.AddDirs[0] = 'one') and
+    (A.AddDirs[1] = 'two') and (A.AddDirs[2] = 'three'),
+    '--add-dir repeats and keeps its order, in both spellings');
+
+  A := uArgs.ArgsParse(['--no-project-context']);
+  Check(A.Ok and A.NoProjectContext,
+    '--no-project-context is seen by the parser');
+  Check(not uArgs.ArgsParse(['-p', 'hi']).NoProjectContext,
+    'and is off unless it is typed');
+
+  A := uArgs.ArgsParse(['--ci', 'prepare', '--ci-in', 'e.json',
+    '--ci-out', 'p.txt']);
+  Check(A.Ok and (A.DiagMode = uArgs.dmCiPrepare) and
+    (A.CiInPath = 'e.json') and (A.CiOutPath = 'p.txt'),
+    '--ci prepare parses with its paths');
+  Check(A.CiTrigger = uCi.CiDefaultTrigger,
+    'and the trigger defaults to @claude');
+  Check(A.CiFloor = uCi.cfCollaborator, 'and the floor to collaborator');
+  A := uArgs.ArgsParse(['--ci', 'report', '--ci-in', 'r.json',
+    '--ci-out', 'c.md']);
+  Check(A.Ok and (A.DiagMode = uArgs.dmCiReport), '--ci report parses');
+
+  A := uArgs.ArgsParse(['--dangerously-skip-permissions']);
+  Check(A.Ok and A.ModeGiven and (A.ModeWanted = uTools.pmodeBypass) and
+    A.BypassFlag, 'the dangerous flag is the only spelling of bypass');
+  A := uArgs.ArgsParse(['--permission-mode', 'plan']);
+  Check(A.Ok and A.ModeGiven and A.PlanFlag and
+    (A.ModeWanted = uTools.pmodePlan),
+    '--permission-mode plan records the mode and the contradiction flag');
+  A := uArgs.ArgsParse(['--sandbox', 'off']);
+  Check(A.Ok and A.SandboxGiven and (A.SandboxWanted = uSandbox.slOff),
+    '--sandbox off is held, not applied');
+  { --output-style was the one flag no test parsed at all - neither its value
+    nor its refusal - which is the sort of hole an audit finds and a reader
+    never does.  It is held as typed and not resolved here on purpose: the
+    name is looked up against the style directories by SetOutputStyle in the
+    host, where the disk starts. }
+  A := uArgs.ArgsParse(['--output-style', 'explanatory']);
+  Check(A.Ok and (A.StyleWanted = 'explanatory'),
+    '--output-style holds the name as typed, unresolved');
+  Check(uArgs.ArgsParse(['-p', 'hi']).StyleWanted = '',
+    'and is empty unless it is asked for, which is what leaves the saved ' +
+    'style alone');
+
+  A := uArgs.ArgsParse(['first', '--web', 'last']);
+  Check(A.Ok and (A.Dir = 'last'), 'the last bare argument is the directory');
+  A := uArgs.ArgsParse(['--help']);
+  Check(A.Ok and A.Help, '--help asks for the help text and nothing else');
+  A := uArgs.ArgsParse(['--help', '--bogus']);
+  Check(A.Ok and A.Help, 'and stops the parse where it stands');
+
+  { The one flag whose rule lives in uSdk, because uSdk owns the storage the
+    cap is a statement about.  The parser reaches it through SdkAppendJoin,
+    which has no global in it - and the second Check is the proof. }
+  Before := uSdk.SdkAppendSystem;
+  A := uArgs.ArgsParse(['--append-system-prompt', 'one',
+    '--append-system-prompt', 'two']);
+  Check(A.Ok and (A.AppendSystem = 'one'#10#10'two'),
+    '--append-system-prompt accumulates in order');
+  Check(uSdk.SdkAppendSystem = Before,
+    'and the parser wrote no global doing it');
+end;
+
+{ Every message asserted verbatim, because a refusal is a user interface: the
+  words are the contract, and a transcription that kept the condition and lost
+  the sentence would be a silent regression in the only thing the user ever
+  sees. }
+procedure TestArgvRefusals;
+var
+  A: uArgs.TArgsOpts;
+begin
+  A := uArgs.ArgsParse(['--bogus']);
+  Check((not A.Ok) and (A.ErrMsg = 'unknown option: --bogus') and
+    (A.ErrCode = 2), 'an unknown flag is refused by name');
+  A := uArgs.ArgsParse(['-p', 'hi', '--output-format']);
+  Check((not A.Ok) and (A.ErrMsg =
+    '--output-format needs a value: text, json or stream-json'),
+    'a flag missing its value is refused, not read past the end');
+  A := uArgs.ArgsParse(['-p', 'hi', '--output-format', 'yaml']);
+  Check((not A.Ok) and (A.ErrMsg = 'unknown output format: yaml'),
+    'and an unknown format is named back');
+  A := uArgs.ArgsParse(['--permission-mode', 'bypass']);
+  Check((not A.Ok) and
+    (A.ErrMsg = 'bypass is spelled --dangerously-skip-permissions'),
+    'bypass by that name is refused with the spelling that means it');
+  A := uArgs.ArgsParse(['--permission-mode', 'yolo']);
+  Check((not A.Ok) and (A.ErrMsg = 'unknown permission mode: yolo'),
+    'and any other mode name is refused');
+  A := uArgs.ArgsParse(['--ci', 'publish']);
+  Check((not A.Ok) and (A.ErrMsg = 'unknown --ci verb: publish') and
+    (A.ErrHint = 'prepare or report'), 'an unknown --ci verb is refused');
+  A := uArgs.ArgsParse(['--ci']);
+  Check((not A.Ok) and (A.ErrMsg = '--ci needs a value: prepare or report'),
+    '--ci at the end of the line is refused');
+  A := uArgs.ArgsParse(['--ci-trigger', '@']);
+  Check((not A.Ok) and
+    (A.ErrMsg = '--ci-trigger: a trigger phrase is 2 to 32 characters'),
+    'the trigger validator reaches the refusal verbatim');
+  A := uArgs.ArgsParse(['--ci-allow', 'anyone']);
+  Check((not A.Ok) and (A.ErrMsg = 'unknown --ci-allow value: anyone'),
+    'the association floor narrows only');
+  A := uArgs.ArgsParse(['--add-dir']);
+  Check((not A.Ok) and (A.ErrMsg = '--add-dir needs a directory'),
+    '--add-dir with nothing after it is refused');
+  A := uArgs.ArgsParse(['--append-system-prompt']);
+  Check((not A.Ok) and (A.ErrMsg = '--append-system-prompt needs text'),
+    'and --append-system-prompt with nothing after it');
+  A := uArgs.ArgsParse(['--sandbox', 'none', '--help']);
+  Check((not A.Ok) and (A.ErrMsg = 'unknown sandbox level: none'),
+    'a refusal stops the parse where it happened');
+  { The two orderings that pin the partial state the host depends on.
+    FailStart picks red prose or one SdkErrorLine by reading the format, so a
+    refusal AFTER the format flag has to carry it and one BEFORE has to not.
+    Both are what the program did when this was a loop, and neither is
+    something any suite could reach until it stopped being one. }
+  A := uArgs.ArgsParse(['--output-format', 'json', '--bogus']);
+  Check((not A.Ok) and (A.OutFormat = uSdk.sfJson),
+    'a refusal carries the format already parsed, so the host reports it as JSON');
+  A := uArgs.ArgsParse(['--bogus', '--output-format', 'json']);
+  Check((not A.Ok) and (A.OutFormat = uSdk.sfText),
+    'and never a format from past the point it stopped');
+end;
+
+{ The rest of them, and the reason this procedure exists is an accounting
+  failure rather than a code one.  README claimed all of these refusals were
+  pinned verbatim; fourteen of the forty-three were not asserted anywhere at
+  all, and one whole flag - --output-style - was never parsed by any test.
+  Every one of them was a string a maintainer could have rewritten with the
+  suite still green, in the section of the README whose stated purpose is
+  honest coverage accounting.
+
+  These are the twelve of the fourteen that an argument list can actually
+  reach.  The other two cannot be produced by any command line - uArgs says so
+  at both sites, at length - and what stands in for them here is the ORDER
+  that makes them unreachable, asserted at the bottom of this procedure,
+  because that order is the thing an edit could break. }
+procedure TestArgvValueRefusals;
+var
+  A: uArgs.TArgsOpts;
+begin
+  A := uArgs.ArgsParse(['--permission-mode']);
+  Check((not A.Ok) and (A.ErrMsg =
+    '--permission-mode needs a value: ask, plan or accept-edits'),
+    '--permission-mode at the end of the line names its three values');
+  A := uArgs.ArgsParse(['--output-style']);
+  Check((not A.Ok) and (A.ErrMsg = '--output-style needs a name: default, ' +
+    'explanatory, learning or one of your own'),
+    'and --output-style names the two built-ins and your own');
+  A := uArgs.ArgsParse(['--sandbox']);
+  Check((not A.Ok) and
+    (A.ErrMsg = '--sandbox needs a value: off, limits or low'),
+    'and --sandbox its three levels');
+  A := uArgs.ArgsParse(['--session-file']);
+  Check((not A.Ok) and (A.ErrMsg = '--session-file needs a path'),
+    'and --session-file asks for a path');
+  A := uArgs.ArgsParse(['--input-format']);
+  Check((not A.Ok) and
+    (A.ErrMsg = '--input-format needs a value: text or stream-json'),
+    'and --input-format its two forms');
+  A := uArgs.ArgsParse(['--input-format', 'yaml']);
+  Check((not A.Ok) and (A.ErrMsg = 'unknown input format: yaml'),
+    'and an input format nobody speaks is named back rather than ignored');
+
+  { The five --ci-* values.  They are the flags a YAML step writes, where a
+    typo is read by nobody until the job fails, so the message has to say what
+    was wanted and not merely that something was. }
+  A := uArgs.ArgsParse(['--ci-in']);
+  Check((not A.Ok) and (A.ErrMsg = '--ci-in needs a path'),
+    '--ci-in with nothing after it is refused');
+  A := uArgs.ArgsParse(['--ci-pr']);
+  Check((not A.Ok) and (A.ErrMsg = '--ci-pr needs a path'), 'and --ci-pr');
+  A := uArgs.ArgsParse(['--ci-out']);
+  Check((not A.Ok) and (A.ErrMsg = '--ci-out needs a path'), 'and --ci-out');
+  A := uArgs.ArgsParse(['--ci-trigger']);
+  Check((not A.Ok) and (A.ErrMsg = '--ci-trigger needs a phrase'),
+    'and --ci-trigger asks for a phrase, not a path');
+  A := uArgs.ArgsParse(['--ci-allow']);
+  Check((not A.Ok) and (A.ErrMsg =
+    '--ci-allow needs a value: collaborator, member or owner'),
+    'and --ci-allow lists the three floors it will narrow to');
+
+  { --append-system-prompt's two refusals come back through uSdk, and the
+    prefix is added here - so the words a user sees are half this unit's and
+    half another's, which is exactly the seam a transcription loses.  The cap
+    is spelled out as bytes rather than computed from the constant: the number
+    IS the message, and a test that recomputed it would agree with any cap. }
+  A := uArgs.ArgsParse(['--append-system-prompt', '   ']);
+  Check((not A.Ok) and
+    (A.ErrMsg = '--append-system-prompt: nothing to append'),
+    'whitespace is nothing to append, and says so rather than appending it');
+  A := uArgs.ArgsParse(['--append-system-prompt', StringOfChar('x', 4097)]);
+  Check((not A.Ok) and (A.ErrMsg = '--append-system-prompt: ' +
+    '--append-system-prompt is capped at 4096 bytes; this would make 4097'),
+    'and one byte over the cap is refused at the flag, with both numbers');
+  Check(Pos('CLAUDE.md', A.ErrHint) > 0,
+    'and the hint still points at the file a standing instruction belongs in');
+
+  { The two refusals no command line reaches, standing in as the orderings
+    that keep them unreachable.  If the diagnostic block were ever hoisted
+    above the not-PrintMode block, or the -p refusal moved below the prompt
+    one, these two messages would change and these two Checks would fail -
+    which is the whole of what can be asserted about a line that cannot run. }
+  A := uArgs.ArgsParse(['--status', '--input-format', 'stream-json']);
+  Check((not A.Ok) and (A.ErrMsg = '--input-format needs -p'),
+    'a driver input format under --status is refused for wanting -p, which ' +
+    'is what makes the diagnostic version of that refusal unreachable');
+  A := uArgs.ArgsParse(['--status', '-p', 'hi']);
+  Check((not A.Ok) and
+    (A.ErrMsg = '--status, --doctor and --ci cannot be combined with -p'),
+    'and a prompt under --status is refused for being -p, never for being a ' +
+    'prompt - the other line that cannot run');
+end;
+
+{ The refusals that need two flags to be seen together, which is the half that
+  could not live in the loop at all - it runs after it.  --continue's four
+  come first because they are the ones three rounds of notes named. }
+procedure TestArgvCrossFlagRefusals;
+var
+  A: uArgs.TArgsOpts;
+begin
+  A := uArgs.ArgsParse(['-p', 'hi', '--continue']);
+  Check((not A.Ok) and
+    (A.ErrMsg = '--continue is interactive; under -p name the transcript'),
+    '--continue is refused under -p');
+  A := uArgs.ArgsParse(['-p', 'hi', '--continue', '--session-file', 's.json']);
+  Check((not A.Ok) and
+    (A.ErrMsg = '--continue is interactive; under -p name the transcript'),
+    'and --session-file is not an escape from that refusal');
+  A := uArgs.ArgsParse(['--resume', '--continue']);
+  Check((not A.Ok) and
+    (A.ErrMsg = '--resume and --continue name different conversations'),
+    '--resume and --continue contradict rather than order');
+  A := uArgs.ArgsParse(['--status', '-c']);
+  Check((not A.Ok) and (A.ErrMsg = '--status, --doctor and --ci cannot be ' +
+    'combined with --resume or --continue'),
+    'and a diagnostic mode refuses either of them');
+  A := uArgs.ArgsParse(['-p', 'hi', '--resume', '--continue']);
+  Check((not A.Ok) and
+    (A.ErrMsg = '--resume under -p needs --session-file <path>'),
+    'and the refusals keep their order: the resume one comes first');
+
+  A := uArgs.ArgsParse(['-p', 'hi', '--resume']);
+  Check((not A.Ok) and
+    (A.ErrMsg = '--resume under -p needs --session-file <path>'),
+    'a scripted resume must name the transcript');
+  A := uArgs.ArgsParse(['--output-format', 'json']);
+  Check((not A.Ok) and
+    (A.ErrMsg = '--output-format needs -p, --status or --doctor'),
+    'a driver format without a one-shot run is refused');
+  A := uArgs.ArgsParse(['--status', '--output-format', 'json']);
+  Check(A.Ok, 'but --status is the exception, and takes one');
+  A := uArgs.ArgsParse(['--session-file', 's.json']);
+  Check((not A.Ok) and (A.ErrMsg = '--session-file needs -p'),
+    '--session-file without -p is refused');
+  A := uArgs.ArgsParse(['--input-format', 'stream-json']);
+  Check((not A.Ok) and (A.ErrMsg = '--input-format needs -p'),
+    'and --input-format without one');
+  A := uArgs.ArgsParse(['-p', 'hi', '--output-format', 'json',
+    '--input-format', 'stream-json']);
+  Check((not A.Ok) and (A.ErrMsg =
+    '--input-format stream-json needs --output-format stream-json'),
+    'a driver that sends must be able to read');
+
+  A := uArgs.ArgsParse(['-p', 'hi', '--permission-mode', 'accept-edits']);
+  Check((not A.Ok) and (A.ErrMsg = '--permission-mode accept-edits needs ' +
+    'somebody to accept: -p has nobody'),
+    'accept-edits under -p with no driver is a startup error');
+  A := uArgs.ArgsParse(['-p', 'hi', '--permission-mode', 'accept-edits',
+    '--output-format', 'stream-json', '--input-format', 'stream-json']);
+  Check(A.Ok, 'and is allowed once a driver is attached');
+
+  A := uArgs.ArgsParse(['--permission-mode', 'plan',
+    '--dangerously-skip-permissions']);
+  Check((not A.Ok) and (A.ErrMsg = '--permission-mode plan and ' +
+    '--dangerously-skip-permissions contradict each other'),
+    'plan and bypass contradict in either order');
+  A := uArgs.ArgsParse(['--dangerously-skip-permissions',
+    '--permission-mode', 'plan']);
+  Check((not A.Ok) and (A.ErrMsg = '--permission-mode plan and ' +
+    '--dangerously-skip-permissions contradict each other'),
+    'including the order that would have let bypass win');
+
+  A := uArgs.ArgsParse(['--doctor', '-p', 'hi']);
+  Check((not A.Ok) and
+    (A.ErrMsg = '--status, --doctor and --ci cannot be combined with -p'),
+    'a diagnostic mode runs alone');
+  A := uArgs.ArgsParse(['--online', '--status']);
+  Check((not A.Ok) and (A.ErrMsg = '--online needs --doctor'),
+    '--online is the opt-in for the one check that makes a request');
+
+  A := uArgs.ArgsParse(['--ci', 'prepare', '--ci-out', 'p.txt']);
+  Check((not A.Ok) and (A.ErrMsg = '--ci needs --ci-in <path>'),
+    '--ci prepare needs its input');
+  A := uArgs.ArgsParse(['--ci', 'prepare', '--ci-in', 'e.json']);
+  Check((not A.Ok) and (A.ErrMsg = '--ci needs --ci-out <path>'),
+    'and its output');
+  A := uArgs.ArgsParse(['--ci', 'report', '--ci-in', 'r.json',
+    '--ci-out', 'c.md', '--ci-pr', 'pr.json']);
+  Check((not A.Ok) and (A.ErrMsg = '--ci-pr belongs to --ci prepare'),
+    '--ci-pr is prepare''s alone');
+  A := uArgs.ArgsParse(['--ci-in', 'e.json']);
+  Check((not A.Ok) and
+    (A.ErrMsg = 'the --ci-* flags need --ci prepare or --ci report'),
+    'and the --ci-* flags mean nothing without a verb');
+  A := uArgs.ArgsParse(['--ci', 'prepare', '--ci-in', 'e.json',
+    '--ci-out', 'p.txt', '--output-format', 'json']);
+  Check((not A.Ok) and
+    (A.ErrMsg = '--ci cannot be combined with --output-format'),
+    'a --ci verb writes files and leaves stdout to the build log');
+end;
+
+{ The residual uSdk.SdkProjectContextDecide's own comment used to record: the
+  predicate was pinned, both of its INPUTS were main-block code no suite
+  linked.  Both have followed it out, so the chain from argv to the gate is
+  now one a suite drives end to end. }
+procedure TestArgvCiVerbAndProjectContext;
+var
+  A: uArgs.TArgsOpts;
+begin
+  Check(uArgs.ArgsIsCiVerb(uArgs.dmCiPrepare) and
+    uArgs.ArgsIsCiVerb(uArgs.dmCiReport), 'both --ci verbs count as one');
+  Check((not uArgs.ArgsIsCiVerb(uArgs.dmNone)) and
+    (not uArgs.ArgsIsCiVerb(uArgs.dmStatus)) and
+    (not uArgs.ArgsIsCiVerb(uArgs.dmDoctor)),
+    'and no other mode does - the project loader gate reads this');
+
+  A := uArgs.ArgsParse(['--ci', 'prepare', '--ci-in', 'e.json',
+    '--ci-out', 'p.txt']);
+  Check(not uSdk.SdkProjectContextDecide(A.NoProjectContext,
+    uArgs.ArgsIsCiVerb(A.DiagMode)),
+    'argv to the project-context gate is now one chain a suite drives');
+  A := uArgs.ArgsParse(['-p', 'hi', '--no-project-context']);
+  Check(not uSdk.SdkProjectContextDecide(A.NoProjectContext,
+    uArgs.ArgsIsCiVerb(A.DiagMode)), 'the flag closes it too');
+  A := uArgs.ArgsParse(['-p', 'hi']);
+  Check(uSdk.SdkProjectContextDecide(A.NoProjectContext,
+    uArgs.ArgsIsCiVerb(A.DiagMode)),
+    'and a plain -p leaves it open, which is the promise to every script');
+end;
+
 var
   Schema: TJson;
 begin
@@ -6961,6 +7491,7 @@ begin
   TestPluginPrecedence;
   TestOutputStyleResolution;
   TestStyleFileReload;
+  TestStyleSameLengthEditInOneTick;
   TestStyleNoteIsUncachedAndOptional;
   TestStyleNoteOrdering;
   TestStyleCapsAndEncoding;
@@ -7031,6 +7562,11 @@ begin
   TestCiDenyFloor;
   TestCiOutputLine;
   TestCiRefusalCarriesNoCommentText;
+  TestArgvFlagsAndValues;
+  TestArgvRefusals;
+  TestArgvValueRefusals;
+  TestArgvCrossFlagRefusals;
+  TestArgvCiVerbAndProjectContext;
   TestResolveProgramWalk;
   WipeTree(ExcludeTrailingPathDelimiter(IdeRoot));
   TestIdeDetect;

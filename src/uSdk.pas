@@ -133,14 +133,19 @@ var
   half a mis-wiring most often lands in - had no test at all where the two
   DIRECTIONS of the variable already had several.
 
-  What the lift did NOT make testable, said plainly because a reader deciding
-  how much this comment covers deserves the boundary: both INPUTS are still
-  main-block code no suite links.  Whether --no-project-context was seen by the
-  argument parser, and which TDiagMode values count as a --ci verb, are read
-  off argv and off a case statement up there; break either and the whole suite
-  still passes.  Widening `DiagMode in [dmCiPrepare, dmCiReport]` to one verb,
-  or deleting the parser clause, are both green today.  The truth table below
-  pins the rule and nothing about its arguments.
+  Both INPUTS have since followed it out of the main block, and the paragraph
+  that used to stand here saying they had not is deleted rather than softened,
+  because it was the whole reason to read this comment carefully.  Whether
+  --no-project-context was seen is now decided by uArgs.ArgsParse over an
+  array of string, and smoke drives it both ways; which TDiagMode values count
+  as a --ci verb is now uArgs.ArgsIsCiVerb, one spelling with a truth table of
+  its own, where it used to be `DiagMode in [dmCiPrepare, dmCiReport]` written
+  out at five separate sites, five chances to widen the set by a verb with
+  nothing anywhere that would notice.  smoke chains all three: argv in, this
+  predicate's answer out.
+
+  What is left in the main block is the single assignment of the byte above,
+  which is what "one writer, go and read it" always meant and is not a gap.
 
   It is an `and` of two negatives on purpose.  Neither term can widen the
   other - --no-project-context under a --ci verb is redundant rather than an
@@ -211,6 +216,26 @@ function SdkAppendSystem: string;
   silently discard text the user typed and can be had anyway by passing the
   flag once. }
 function SdkAppendSystemPush(const Text: string; out Err: string): Boolean;
+{ The same rule with no global in it: Current is what has accumulated so far,
+  Text is the next value, Joined is the two of them together once the trim,
+  the blank-line separator and the cap-on-the-TOTAL have all been applied.
+
+  It exists because the argument parser is uArgs.ArgsParse, a pure function
+  that may not write anything, and this flag was the one place in the whole
+  argument loop that reached out and mutated module state as it parsed.  The
+  alternative - collect the raw values and push them in the host afterwards -
+  is a smaller diff and it changes behaviour: today an over-cap append is
+  refused AT THE FLAG, so "--append-system-prompt <5KB> --bogus" reports the
+  cap, and deferring the join would have made it report the unknown option
+  instead.  A different refusal for the same command line is exactly what the
+  extraction was not allowed to do.
+
+  SdkAppendSystemPush is now a wrapper over this, and is still the only thing
+  in the program that STORES: the one-writer property claimed above
+  SdkAppendSystem is unchanged, and a reviewer grepping for AppendSystem_ in
+  src\ still finds one assignment. }
+function SdkAppendJoin(const Current, Text: string;
+  out Joined, Err: string): Boolean;
 procedure SdkAppendSystemClear;            { test seam }
 
 { ---- custom commands ---- }
@@ -616,11 +641,18 @@ begin
   Result := AppendSystem_;
 end;
 
-function SdkAppendSystemPush(const Text: string; out Err: string): Boolean;
+function SdkAppendJoin(const Current, Text: string;
+  out Joined, Err: string): Boolean;
 var
-  T, Joined: string;
+  T, Both: string;
+  Total: Integer;
 begin
   Err := '';
+  { Joined is the caller's new accumulator, so on every refusal it is what
+    they already had.  A caller that ignored the Boolean would then merely
+    fail to append rather than append something the cap refused - the failure
+    mode you want when the value ends up in a system prompt. }
+  Joined := Current;
   Result := False;
   T := Trim(Text);
   if T = '' then
@@ -628,20 +660,32 @@ begin
     Err := 'nothing to append';
     Exit;
   end;
-  if AppendSystem_ = '' then Joined := T else Joined := AppendSystem_ + #10#10 + T;
+  if Current = '' then Both := T else Both := Current + #10#10 + T;
   { Measured on the JOIN, not on this occurrence, so three flags of fifteen
     hundred bytes are refused where one of four thousand is allowed - the
     model is handed the total either way and the cap is a statement about the
     total.  The blank line between them counts too, which is pedantic and
     right: it is bytes in the request. }
-  if Length(Joined) > MaxAppendSystemBytes then
+  Total := Length(Both);
+  if Total > MaxAppendSystemBytes then
   begin
     Err := Format('--append-system-prompt is capped at %d bytes; this would ' +
-      'make %d', [MaxAppendSystemBytes, Length(Joined)]);
+      'make %d', [MaxAppendSystemBytes, Total]);
     Exit;
   end;
-  AppendSystem_ := Joined;
+  Joined := Both;
   Result := True;
+end;
+
+{ The store, and the only one.  Three lines over SdkAppendJoin, because the
+  cap and the join are a rule about bytes and this is a rule about who is
+  allowed to remember them. }
+function SdkAppendSystemPush(const Text: string; out Err: string): Boolean;
+var
+  Joined: string;
+begin
+  Result := SdkAppendJoin(AppendSystem_, Text, Joined, Err);
+  if Result then AppendSystem_ := Joined;
 end;
 
 procedure SdkAppendSystemClear;

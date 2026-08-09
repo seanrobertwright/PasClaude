@@ -9,6 +9,14 @@
   left as raw UTF-8 - and every subtree an edit does not name is carried
   across by reference, so ids, execution counts and outputs cannot drift.
 
+  Raw UTF-8 is what WE write, when we are the ones spelling a string.  A string
+  that ARRIVED escaped is written back escaped, which sounds like the opposite
+  rule and is not: the promise this unit makes is a git diff with one changed
+  line in it, and normalising an escape somebody else's tool produced is a
+  change to a line nobody asked about even when it is a change towards
+  Jupyter's own form.  uJson's JsonParseVerbatim is what makes that possible,
+  and this unit is its only caller.
+
   Format knowledge lives here and not in uTools because none of it depends on
   paths, permissions or the console; that is what makes the rules testable
   without a session root or a file on disk. }
@@ -259,7 +267,15 @@ var
 begin
   Doc := nil;
   Cells := nil;
-  Doc := JsonParse(Text, Err);
+  { Verbatim, and this is the entire opt-in for the whole program.  Every
+    string reaching this parse is going back into a file somebody else wrote,
+    so the literal it arrived as is the literal to write; the tool only ever
+    replaces a cell's source slot, and a replaced source is a fresh node built
+    by SourceLines with no memory of anything, so the cell we edit goes out the
+    way we would write any cell and the cells we did not touch are not rewritten
+    at all.  NotebookView, NotebookCanonical and NotebookApply all come through
+    here, so all three are faithful together or none of them is. }
+  Doc := JsonParseVerbatim(Text, Err);
   if Doc = nil then
   begin
     if Err = '' then Err := 'not JSON';
@@ -460,7 +476,18 @@ end;
   nothing more: quote, backslash, and everything below U+0020 as lower-case
   \u00XX except the five with short forms.  That is JsonQuote's set exactly,
   down to leaving DEL and U+2028 raw - legal JSON, if awkward JavaScript - so
-  the two writers agree on every byte and not merely on the common ones. }
+  the two writers agree on every byte and not merely on the common ones.
+
+  All of that is about what we WRITE, and none of it moved.  What changed later
+  is what we REPRODUCE, which is a different question and it is worth saying so
+  here rather than leaving a later reader to think the two decisions are in
+  tension.  Writing: a string this program composed has no history, so it goes
+  out raw, matching nbformat.  Reproducing: a string that arrived in somebody
+  else's file has a history, and OpenDoc parses verbatim so it goes back out as
+  the bytes it came in as.  A tool that wrote the file with ensure_ascii left at
+  Python's default escaped every non-ASCII character in it; converting all of
+  those to Jupyter's spelling on the way past would be exactly the whole-file
+  diff the paragraph above rejected, only pointed the other way. }
 function Emit(Doc: TJson): string;
 begin
   Result := Doc.ToJsonPretty(True) + #10;
