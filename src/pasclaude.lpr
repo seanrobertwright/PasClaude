@@ -12,7 +12,7 @@ program pasclaude;
 uses
   Windows, SysUtils, Classes, DateUtils, uTerm, uJson, uSettings, uAuth,
   uHttp, uTelem, uMcp, uHooks, uSandbox, uIde, uTools, uImage, uAgent, uDiag,
-  uSdk, uGitHub;
+  uSdk, uGitHub, uCi;
 
 const
   Version = '0.1';
@@ -4199,11 +4199,29 @@ type
     which the missing-credential and missing-winhttp refusals below become
     recorded notes instead of a startup halt, and the branch it selects ends
     in Halt with no path past it to the REPL.  Nothing in a file, an
-    environment variable or a settings key can reach it. }
-  TDiagMode = (dmNone, dmStatus, dmDoctor);
+    environment variable or a settings key can reach it.
+
+    The two --ci verbs join the enum rather than becoming a mode of their
+    own, and that inheritance is the whole reason the host diff for CI is
+    sixty lines: they get the refusals ("cannot be combined with -p, a
+    prompt, --resume or a driver"), the one relaxation that lets a run
+    continue past a missing credential - safe only because the branch ends in
+    Halt - and the skipped MCP connect, approvals load and session backup,
+    all of which a run with nobody at the console must not do. }
+  TDiagMode = (dmNone, dmStatus, dmDoctor, dmCiPrepare, dmCiReport);
 var
   DiagMode: TDiagMode = dmNone;
   DiagOnline: Boolean = False;
+  { The --ci-* flag values.  Every one of them is a PATH or a fixed word:
+    no byte of comment text ever arrives on this program's command line,
+    which is the classic GitHub Actions injection and is avoided by pasclaude
+    reading GITHUB_EVENT_PATH itself rather than having YAML interpolate the
+    body into a run: line. }
+  CiInPath: string = '';
+  CiPrPath: string = '';
+  CiOutPath: string = '';
+  CiTrigger: string = uCi.CiDefaultTrigger;
+  CiFloor: uCi.TCiFloor = uCi.cfCollaborator;
 
 { The yellow startup block: deny rules that are not in force, settings
   problems, the project economy line, an --add-dir that came with a caveat.
@@ -4252,6 +4270,194 @@ begin
   uSandbox.SandboxShutdown;
   TermDone;
   Halt(Code);
+end;
+
+{ ------------------------------------------------------- GitHub Actions -- }
+
+{ Writes Text to Path, creating or appending.  Deliberately small and
+  deliberately here rather than in uCi: uCi is pure functions over bytes so
+  that every decision it makes is a suite assertion, and the moment it opens
+  a file half of it stops being testable without a temp tree. }
+function CiPutFile(const Path, Text: string; Append: Boolean;
+  out Err: string): Boolean;
+var
+  F: TFileStream;
+begin
+  Result := False;
+  Err := '';
+  try
+    if Append and FileExists(Path) then
+    begin
+      F := TFileStream.Create(Path, fmOpenWrite or fmShareDenyWrite);
+      F.Seek(0, soEnd);
+    end
+    else
+      F := TFileStream.Create(Path, fmCreate);
+    try
+      if Text <> '' then F.WriteBuffer(Text[1], Length(Text));
+    finally
+      F.Free;
+    end;
+    Result := True;
+  except
+    on E: Exception do Err := E.Message;
+  end;
+end;
+
+{ One name=value line into %GITHUB_OUTPUT%, and silence when the variable is
+  not set (running the verb by hand outside a runner is a legitimate thing to
+  do).  CiOutputLine returns '' for anything it will not vouch for and that
+  line is then simply not written: a value carrying a newline would write a
+  SECOND variable of the writer's choosing, and one of the variables here
+  chooses the commit actions/checkout puts in the workspace. }
+procedure CiEmitOutput(const Name, Value: string);
+var
+  Line, Path, Err: string;
+begin
+  Line := uCi.CiOutputLine(Name, Value);
+  if Line = '' then Exit;
+  Path := SysUtils.GetEnvironmentVariable('GITHUB_OUTPUT');
+  if Path = '' then Exit;
+  CiPutFile(Path, Line + #10, True, Err);
+end;
+
+procedure CiEmitSummary(const Text: string);
+var
+  Path, Err: string;
+begin
+  if Text = '' then Exit;
+  Path := SysUtils.GetEnvironmentVariable('GITHUB_STEP_SUMMARY');
+  if Path = '' then Exit;
+  CiPutFile(Path, Text + #10, True, Err);
+end;
+
+{ The whole of the unattended path's host side.  It runs at the same point in
+  startup as --status and --doctor, so the deny rules it asserts on are the
+  ones actually in force for this process, and like them it ends in Halt on
+  every path: there is no way from here to a REPL, a turn or a tool.
+
+  Exit codes are the existing three and no more: 0 for any decision it
+  reached (including "no, and here is why"), 2 for a usage error, an input it
+  could not read or that was too large, an output it could not write, or a
+  deny floor that is not in force. }
+procedure RunCi;
+var
+  Bytes, Err, Text, Line: string;
+  E: uCi.TCiEvent;
+  P: uCi.TCiPr;
+  D: uCi.TCiDecision;
+  Missing, InForce: TStringArray;
+  Rules: uTools.TDenyRuleArray;
+  Answer, ErrText, Model: string;
+  IsError: Boolean;
+  DurationMs, I: Integer;
+begin
+  if not ReadFileText(CiInPath, Bytes) then
+    FailStart('--ci-in: cannot read ' + CiInPath, '', 2);
+
+  if DiagMode = dmCiReport then
+  begin
+    if not uCi.CiResultFromJson(Bytes, Answer, ErrText, Model, IsError,
+      DurationMs, Err) then
+      FailStart('--ci report: ' + Err,
+        'the input is one line of --output-format json', 2);
+    if not CiPutFile(CiOutPath, uCi.CiCommentBody(Answer, ErrText, Model,
+      IsError, DurationMs), False, Err) then
+      FailStart('--ci-out: cannot write ' + CiOutPath + ': ' + Err, '', 2);
+    D := Default(uCi.TCiDecision);
+    D.Proceed := True;
+    D.Code := 'ok';
+    CiEmitSummary(uCi.CiStepSummary(D, Answer, ErrText, IsError));
+    EmitCLn(clGrey, '  ci: comment written to ' + CiOutPath);
+    uTelem.TelemShutdown;
+    uSandbox.SandboxShutdown;
+    TermDone;
+    Halt(0);
+  end;
+
+  { prepare. }
+  if not uCi.CiParseEvent(Bytes, E, Err) then
+    FailStart('--ci prepare: ' + Err,
+      'the input is the file named by GITHUB_EVENT_PATH', 2);
+  P := Default(uCi.TCiPr);
+  if CiPrPath <> '' then
+  begin
+    if not ReadFileText(CiPrPath, Bytes) then
+      FailStart('--ci-pr: cannot read ' + CiPrPath, '', 2);
+    if not uCi.CiParsePr(Bytes, P, Err) then
+      FailStart('--ci prepare: ' + Err,
+        'the input is gh pr view --json isCrossRepository,headRefOid,state',
+        2);
+  end;
+
+  { The assertion that keeps the strongest guarantee honest.  A workflow
+    edited to drop the step that writes deny.json gets a run that stops here
+    naming every missing rule, rather than one that quietly hands a shell to
+    an agent answering a comment.  It is checked against the rules IN FORCE -
+    a rule that failed to parse is not one - and it is checked here, after
+    LoadDenyRules and before anything decides to proceed. }
+  Rules := uTools.DenyRules;
+  InForce := nil;
+  for I := 0 to High(Rules) do
+    if Rules[I].Err = '' then
+    begin
+      SetLength(InForce, Length(InForce) + 1);
+      InForce[High(InForce)] := Rules[I].Text;
+    end;
+  Missing := uCi.CiDenyFloorMissing(InForce);
+  if Length(Missing) > 0 then
+  begin
+    Text := '';
+    for I := 0 to High(Missing) do
+      Text := Text + '  ' + Missing[I] + #10;
+    FailStart('--ci prepare: the CI deny floor is not in force',
+      'these rules are missing and an unattended run will not start ' +
+      'without them:'#10 + Text +
+      'write them to the "deny" array of ' + uTools.GlobalDenyPath, 2);
+  end;
+
+  D := uCi.CiDecide(E, P, CiTrigger, CiFloor);
+
+  if D.Proceed then
+  begin
+    if not CiPutFile(CiOutPath, D.Prompt, False, Err) then
+      FailStart('--ci-out: cannot write ' + CiOutPath + ': ' + Err, '', 2);
+  end
+  else
+  begin
+    { The refusal comment goes to a sibling file rather than to --ci-out, so
+      a workflow can never mistake "here is why not" for a prompt and feed it
+      to the model.  An empty one means "say nothing at all", which is the
+      right answer for a comment that never mentioned us. }
+    Line := uCi.CiRefusalComment(D);
+    if Line <> '' then CiPutFile(CiOutPath + '.md', Line, False, Err);
+    CiEmitSummary(uCi.CiStepSummary(D, '', '', False));
+  end;
+
+  { Five values, every one from a fixed vocabulary or validated.  No byte of
+    comment text reaches GITHUB_OUTPUT, GITHUB_ENV or a run: line, on any
+    path. }
+  if D.Proceed then
+    CiEmitOutput('proceed', 'true')
+  else
+    CiEmitOutput('proceed', 'false');
+  CiEmitOutput('code', D.Code);
+  CiEmitOutput('reason', D.Reason);
+  CiEmitOutput('number', IntToStr(D.Number));
+  if D.HeadSha <> '' then CiEmitOutput('head_sha', D.HeadSha);
+  if uCi.CiRefusalComment(D) <> '' then
+    CiEmitOutput('refusal_file', 'yes');
+
+  { One line for the log, built from the code and the fixed reason: the
+    commenter's own words are not printed into a page anyone can read. }
+  if D.Proceed then
+    EmitCLn(clGrey, '  ci: proceeding (#' + IntToStr(D.Number) + ')')
+  else
+    EmitCLn(clGrey, '  ci: not proceeding (' + D.Code + ') - ' + D.Reason);
+  uTelem.TelemShutdown;
+  uSandbox.SandboxShutdown;
+  TermDone;
+  Halt(0);
 end;
 
 var
@@ -4466,6 +4672,64 @@ begin
         DiagMode := dmDoctor
       else if Arg = '--online' then
         DiagOnline := True
+      { The six GitHub Actions flags.  Every value is a path or a fixed word;
+        none of them can carry comment text, because the workflow never
+        interpolates a github.event expression into a command line at all -
+        the
+        event reaches this program as a FILE it opens itself. }
+      else if Arg = '--ci' then
+      begin
+        if ArgI >= ParamCount then
+          FailStart('--ci needs a value: prepare or report', '', 2);
+        if ParamStr(ArgI + 1) = 'prepare' then
+          DiagMode := dmCiPrepare
+        else if ParamStr(ArgI + 1) = 'report' then
+          DiagMode := dmCiReport
+        else
+          FailStart('unknown --ci verb: ' + ParamStr(ArgI + 1),
+            'prepare or report', 2);
+        SkipNext := True;
+      end
+      else if Arg = '--ci-in' then
+      begin
+        if ArgI >= ParamCount then FailStart('--ci-in needs a path', '', 2);
+        CiInPath := ParamStr(ArgI + 1);
+        SkipNext := True;
+      end
+      else if Arg = '--ci-pr' then
+      begin
+        if ArgI >= ParamCount then FailStart('--ci-pr needs a path', '', 2);
+        CiPrPath := ParamStr(ArgI + 1);
+        SkipNext := True;
+      end
+      else if Arg = '--ci-out' then
+      begin
+        if ArgI >= ParamCount then FailStart('--ci-out needs a path', '', 2);
+        CiOutPath := ParamStr(ArgI + 1);
+        SkipNext := True;
+      end
+      else if Arg = '--ci-trigger' then
+      begin
+        if ArgI >= ParamCount then
+          FailStart('--ci-trigger needs a phrase', '', 2);
+        CiTrigger := ParamStr(ArgI + 1);
+        if not uCi.CiTriggerValid(CiTrigger, AddArg) then
+          FailStart('--ci-trigger: ' + AddArg, '', 2);
+        SkipNext := True;
+      end
+      else if Arg = '--ci-allow' then
+      begin
+        if ArgI >= ParamCount then
+          FailStart('--ci-allow needs a value: collaborator, member or owner',
+            '', 2);
+        { It narrows and only narrows.  There is deliberately no flag that
+          widens the association gate: a workflow that could be told to answer
+          anybody is the failure this whole feature is designed against. }
+        if not uCi.CiFloorParse(ParamStr(ArgI + 1), CiFloor) then
+          FailStart('unknown --ci-allow value: ' + ParamStr(ArgI + 1),
+            'collaborator (the default), member or owner', 2);
+        SkipNext := True;
+      end
       else if Arg = '--dangerously-skip-permissions' then
       begin
         ModeWanted := uTools.pmodeBypass;
@@ -4582,6 +4846,22 @@ begin
         EmitCLn(clGrey, '            which is why they continue past a missing credential');
         EmitCLn(clGrey, '            and report it instead of refusing to start.  Both');
         EmitCLn(clGrey, '            take --output-format json|stream-json.');
+        EmitCLn(clBright, '  GitHub Actions (see examples\github\)');
+        EmitCLn(clGrey, '  --ci prepare|report');
+        EmitCLn(clGrey, '            the unattended path, run from a workflow step and never');
+        EmitCLn(clGrey, '            with -p, a prompt, --resume or a driver.  prepare reads');
+        EmitCLn(clGrey, '            the event payload, decides whether to answer at all, and');
+        EmitCLn(clGrey, '            writes the prompt; report turns one line of');
+        EmitCLn(clGrey, '            --output-format json into the comment markdown.  prepare');
+        EmitCLn(clGrey, '            refuses to run unless the CI deny floor is in force, so a');
+        EmitCLn(clGrey, '            workflow edited to drop it fails closed.');
+        EmitCLn(clGrey, '  --ci-in <path>     the event payload, or the result line');
+        EmitCLn(clGrey, '  --ci-out <path>    the prompt file, or the comment markdown');
+        EmitCLn(clGrey, '  --ci-pr <path>     gh pr view --json isCrossRepository,headRefOid,state');
+        EmitCLn(clGrey, '  --ci-trigger <phrase>   default @claude');
+        EmitCLn(clGrey, '  --ci-allow collaborator|member|owner');
+        EmitCLn(clGrey, '            the lowest author association that may start a run.  It');
+        EmitCLn(clGrey, '            narrows only: there is no flag that widens it.');
         EmitCLn(clGrey, '  --output-format text|json|stream-json   (needs -p)');
         EmitCLn(clGrey, '  --input-format  text|stream-json        (needs -p and stream-json out)');
         EmitCLn(clGrey, '            json/stream-json put one JSON object per line on stdout,');
@@ -4657,18 +4937,40 @@ begin
     if DiagMode <> dmNone then
     begin
       if PrintMode then
-        FailStart('--status and --doctor cannot be combined with -p',
+        FailStart('--status, --doctor and --ci cannot be combined with -p',
           'they are modes of their own: run them alone', 2);
       if Trim(PrintPrompt) <> '' then
-        FailStart('--status and --doctor take no prompt', '', 2);
+        FailStart('--status, --doctor and --ci take no prompt', '', 2);
       if Resume then
-        FailStart('--status and --doctor cannot be combined with --resume',
+        FailStart('--status, --doctor and --ci cannot be combined with ' +
+          '--resume',
           'they report on a fresh session, and loading a transcript would ' +
           'change what they report', 2);
       if StreamInput then
-        FailStart('--status and --doctor cannot be combined with ' +
+        FailStart('--status, --doctor and --ci cannot be combined with ' +
           '--input-format stream-json', '', 2);
     end;
+    { The two CI verbs take their own flags and refuse the driver formats:
+      what they write is a prompt file and a comment file, and their stdout
+      is a build log a person reads.  A JSON protocol there would be a second
+      contract to keep, for a caller that is a YAML step. }
+    if DiagMode in [dmCiPrepare, dmCiReport] then
+    begin
+      if OutFormat <> uSdk.sfText then
+        FailStart('--ci cannot be combined with --output-format',
+          'it writes files named by --ci-out; stdout is the build log', 2);
+      if CiInPath = '' then
+        FailStart('--ci needs --ci-in <path>',
+          'prepare reads the event payload (%GITHUB_EVENT_PATH%); report ' +
+          'reads one line of --output-format json', 2);
+      if CiOutPath = '' then
+        FailStart('--ci needs --ci-out <path>',
+          'prepare writes the prompt there; report writes the comment', 2);
+      if (DiagMode = dmCiReport) and (CiPrPath <> '') then
+        FailStart('--ci-pr belongs to --ci prepare', '', 2);
+    end
+    else if (CiInPath <> '') or (CiOutPath <> '') or (CiPrPath <> '') then
+      FailStart('the --ci-* flags need --ci prepare or --ci report', '', 2);
     if DiagOnline and (DiagMode <> dmDoctor) then
       FailStart('--online needs --doctor',
         'it is the opt-in for the one check that makes a request', 2);
@@ -5142,7 +5444,8 @@ begin
         that line is ABOVE the branch that nils Ask, and the whole
         unattended argument would collapse.  GitHubExecOverride stays nil:
         the unit calls uTools.RunShellQuiet itself. }
-      uGitHub.GitHubAllowed := True;
+      if not (DiagMode in [dmCiPrepare, dmCiReport]) then
+        uGitHub.GitHubAllowed := True;
       { Second application: LoadPermissions widens, so without this a flag
         saying "ask me" would be quietly overruled by a grant the user made
         weeks ago and has since forgotten. }
@@ -5248,7 +5551,11 @@ begin
         line of prose is indistinguishable from a protocol line that went
         wrong.  Only reachable from --status/--doctor, which are the only
         modes that get this far with a non-text format. }
-      if OutFormat = uSdk.sfText then ShowBanner;
+      { And the same argument in a different key for --ci: its stdout is a
+        build log, nobody is reading it for reassurance, and an amber logo
+        between two YAML steps is noise.  It says one grey line instead. }
+      if (OutFormat = uSdk.sfText) and
+         not (DiagMode in [dmCiPrepare, dmCiReport]) then ShowBanner;
 
       { Keybindings, from %USERPROFILE% and nowhere else - below the banner
         because any note it prints is about a file the user wrote and belongs
@@ -5333,6 +5640,11 @@ begin
         because a status that cannot see the approvals file or the configured
         servers is a lie.  That is affordable only because the mode cannot
         run a turn: Halt is the last statement on every path out of here. }
+      { The two CI verbs halt from here too, and from the same position for
+        the same reason: --ci prepare's whole job is to assert that the deny
+        floor loaded above is really in force, and a check that ran before
+        LoadDenyRules would be asserting nothing. }
+      if DiagMode in [dmCiPrepare, dmCiReport] then RunCi;
       if DiagMode <> dmNone then
       begin
         FillDiagFacts;

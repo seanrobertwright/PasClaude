@@ -570,7 +570,86 @@ text preserves what was missing at the time. Unchecked items remain open.
   side is written under `%LOCALAPPDATA%\pasclaude\ide` and swept only on
   the next launch, so a session that opens one diff and exits leaves one
   file holding project text for up to a day.*
-- [ ] **GitHub Actions / `@claude` mentions** — no CI integration.
+- [x] ~~**GitHub Actions / `@claude` mentions** — no CI integration.~~
+  *Built: a template workflow in `examples\github\` and two new modes,
+  `--ci prepare` and `--ci report`, that carry every decision the YAML would
+  otherwise have to make. A CI run **may read the repository and write one
+  comment**. It may never push, never patch, never approve, never merge, and
+  that is enforced in four independent places rather than asserted once. The
+  trigger is `issue_comment` (created) and nothing else — its workflow file
+  is always taken from the default branch, so a pull request cannot edit the
+  workflow that reviews it. The `_target` variant of the pull-request
+  trigger, the classic hole that hands a fork's code your secrets, is used
+  nowhere and the ux suite fails if its name ever appears in the template at
+  all. **Authorization runs twice**: a cheap `if:` in YAML so a stranger's
+  comment never starts a runner, then again in Pascal, in `--ci prepare`,
+  against `author_association` — a value GitHub computes from the
+  commenter's relationship to the repository, not one the commenter types.
+  Anything below `COLLABORATOR` is refused, an unrecognised or future
+  association maps to the **lowest** enum member rather than the last one,
+  and `--ci-allow member|owner` narrows further: there is deliberately no
+  flag that widens. **Fork pull requests are refused by name**, not left
+  unhandled — `gh pr view --json isCrossRepository,headRefOid,state` is
+  parsed as if hostile, anything that is not the boolean `false` reads as a
+  fork, and a pull-request comment with no `--ci-pr` file is refused too, so
+  removing that step fails closed rather than open. The `permissions:` block
+  is `contents: read` for the checkout, `issues: write` to post (the
+  narrower of the two keys that endpoint accepts), `pull-requests: read` for
+  `gh pr view`, and nothing else, which sets every unnamed key to `none`: an
+  injected instruction acting with exactly that token **could not push to a
+  branch**, create a branch or tag, approve or submit a review, merge, edit
+  a workflow, publish a release, or reach another repository. It holds no
+  token at all in any case — `GH_TOKEN` is set on exactly the two fixed `gh`
+  steps and the step that runs the model has `ANTHROPIC_API_KEY` and no
+  GitHub credential, with `persist-credentials: false` so none is left in
+  `.git\config` for `read_file` to find. **`--dangerously-skip-permissions`
+  appears nowhere**, and the ux grep fails if it ever does: under `-p` there
+  is nobody to ask, so `Ask` is nil and a gated tool already returns an
+  ordinary error result while the turn continues. The run is
+  `-p --output-format json --permission-mode plan` over a deny floor written
+  out of tree to `%LOCALAPPDATA%\pasclaude\deny.json` — bash, bash_output,
+  kill_bash, fetch, web_search, write_file, edit_file, notebook_edit, task,
+  `**/.git/**`, `**/.env*`, `**/*.pem` — because nothing overrides a deny
+  rule: not a mode, not a persisted "always", not a hook's allow, not a file
+  in the checkout. What is left is read, list, search and todo, which is the
+  whole job. **No shell is what makes `ANTHROPIC_API_KEY` in that step
+  unreadable, and it is the single assumption doing the most work**, so
+  `--ci prepare` runs after the deny rules load and exits 2 naming every
+  missing rule: a workflow edited to drop the deny step stops working
+  instead of quietly widening. Comment text never passes through YAML
+  expansion or a command line — pasclaude opens `GITHUB_EVENT_PATH` itself,
+  which is exactly how the classic Actions injection is avoided — and lands
+  in an ordinary user message inside a marked block, control characters
+  stripped, cut to 4 KB, with any line forging a marker dropped **after**
+  the cut, never before it and never on the assembled string. Nothing
+  untrusted reaches `GITHUB_OUTPUT`, `GITHUB_ENV` or a `run:` line: every
+  value is from a fixed vocabulary or validated, and `head_sha` must be
+  exactly 40 hex characters or it is not emitted, because it chooses the
+  commit `actions/checkout` writes into the workspace. The one artifact
+  `build.cmd` cannot compile is checked the only way an RTL-only program
+  can — the ux suite reads the template (**absent is a failure, not a
+  skip**), asserts every deny rule verbatim, the three permission keys and
+  no fourth `: write`, `persist-credentials: false`, under 120 lines, and
+  the absence of four specific mutations. It is a grep, not a parse; there
+  is no YAML parser here and nothing semantically load-bearing lives in the
+  YAML. Honest cost: `windows-latest`, Chocolatey's `freepascal`, and
+  **there is no release pipeline**, so the workflow clones and runs
+  `build.cmd` — about four minutes wall, eight billed on a private
+  repository, free on a public one. Still missing: no write-capable job (it
+  would need `accept-edits` with a driver nobody is there to run, or the
+  bypass flag, plus `contents: write`, which is precisely the
+  RCE-by-sentence this exists to avoid); no auto-review on pull-request open,
+  because that is a run triggered by something other than a vouching human;
+  `pull_request_review_comment` is classified `unsupported-event` and
+  refused rather than half-parsed; no compiler caching, because a cached
+  compiler directory without the matching PATH state is a support burden;
+  and no GitHub App, because there is none to install — see the
+  `/install-github-app` entry above. Two residuals are recorded rather than
+  fixed: a same-repo branch's `CLAUDE.md`, `AGENTS.md` or skill descriptions
+  enter the system prompt with no gate and the deny floor's `path:` rules do
+  not cover that loader, bounded only by its author having push access; and
+  the posted answer is not rewritten, so it can `@`-mention people, since
+  rewriting `@` would corrupt code in the answer.*
 - [x] ~~**/review, /pr-comments, /install-github-app** — no built-in PR
   workflow commands (git itself works through bash, and `/diff` summarizes
   changes).~~

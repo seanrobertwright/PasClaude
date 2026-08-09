@@ -9,7 +9,7 @@ program fuzz;
 {$mode objfpc}{$H+}
 
 uses SysUtils, Classes, Windows, uJson, uSettings, uAuth, uTelem, uMcp, uHooks,
-  uSandbox, uIde, uTools, uImage, uAgent, uDiag, uHttp, uSdk, uGitHub;
+  uSandbox, uIde, uTools, uImage, uAgent, uDiag, uHttp, uSdk, uGitHub, uCi;
 
 var
   Fails: Integer = 0;
@@ -4318,6 +4318,146 @@ begin
   No('https://github.com:443@evil.net/o/r', 'and one with a port too');
 end;
 
+{ The event payload is written by GitHub but shaped by whoever commented, and
+  it arrives on the one path in this program that has nobody at a console to
+  notice a crash.  Nothing here may raise, and nothing here may proceed. }
+procedure TestCiHostileEvent;
+var
+  E: uCi.TCiEvent;
+  P: uCi.TCiPr;
+  D: uCi.TCiDecision;
+  Err: string;
+
+  procedure Refuses(const Bytes, What: string);
+  var
+    Ok: Boolean;
+  begin
+    Ok := uCi.CiParseEvent(Bytes, E, Err);
+    if not Ok then
+    begin
+      Check(Err <> '', What + ': refused with a reason');
+      Exit;
+    end;
+    D := uCi.CiDecide(E, P, uCi.CiDefaultTrigger, uCi.cfCollaborator);
+    Check(not D.Proceed,
+      What + ': parsed but does not proceed (' + D.Code + ')');
+  end;
+
+begin
+  P := Default(uCi.TCiPr);
+  Refuses('', 'an empty payload');
+  Refuses('{', 'truncated JSON');
+  Refuses('[1,2,3]', 'a JSON array where an object belongs');
+  Refuses('null', 'a JSON null');
+  Refuses(StringOfChar('a', 2 * 1024 * 1024), 'a 2 MB payload');
+  Refuses('{"action":"created","issue":{"number":7,"title":"t"},' +
+    '"comment":{"body":12345,"author_association":"OWNER"}}',
+    'a body that is a number');
+  Refuses('{"action":"created","issue":{"number":7,"title":"t"},' +
+    '"comment":{"body":{"x":"@claude hi"},"author_association":"OWNER"}}',
+    'a body that is an object');
+  Refuses('{"action":"created","issue":{"number":7,"title":"t"},' +
+    '"comment":{"body":null,"author_association":"OWNER"}}',
+    'a body that is null');
+  { The one that matters most: a wrong-typed association must not read as
+    empty and fall through to allowed. }
+  Refuses('{"action":"created","issue":{"number":7,"title":"t"},' +
+    '"comment":{"body":"@claude hi","author_association":{"a":1}}}',
+    'an association that is an object');
+  Refuses('{"action":"created","issue":{"number":7,"title":"t"},' +
+    '"comment":{"body":"@claude hi","author_association":["OWNER"]}}',
+    'an association that is an array');
+  Refuses('{"action":"deleted","repository":{"full_name":"a/b"},' +
+    '"issue":{"number":7,"title":"t"},"comment":{"body":"@claude hi",' +
+    '"author_association":"OWNER"}}', 'an action other than created');
+  Refuses('{"action":"created","repository":{"full_name":"a/b"},' +
+    '"issue":{"title":"t"},"comment":{"body":"@claude hi",' +
+    '"author_association":"OWNER"}}', 'an issue with no number');
+  Refuses(StringOfChar('[', 400) + StringOfChar(']', 400),
+    'deeply nested JSON');
+
+  { A huge body and title inside a payload under the cap: it must parse, be
+    cut, and the prompt must still be valid UTF-8 and bounded - a 300-comment
+    argument cannot be allowed to push the instructions out of the window. }
+  Check(uCi.CiParseEvent('{"action":"created",' +
+    '"repository":{"full_name":"a/b"},"issue":{"number":7,"title":"' +
+    StringOfChar('T', 100000) + '"},"comment":{"body":"@claude ' +
+    StringOfChar('x', 500000) + '","author_association":"OWNER",' +
+    '"user":{"login":"alice"}}}', E, Err),
+    'a payload with a huge body and title parses');
+  D := uCi.CiDecide(E, P, uCi.CiDefaultTrigger, uCi.cfCollaborator);
+  Check(D.Proceed, 'and proceeds');
+  Check(Length(D.Prompt) < 10000, 'with a bounded prompt: ' +
+    IntToStr(Length(D.Prompt)));
+  Check(uJson.IsValidUtf8(D.Prompt), 'and a valid UTF-8 one');
+
+  { Invalid UTF-8 in the body.  It reaches a transcript, so it cannot stay. }
+  Check(uCi.CiParseEvent('{"action":"created",' +
+    '"repository":{"full_name":"a/b"},"issue":{"number":7,"title":"t"},' +
+    '"comment":{"body":"@claude ' + #$C3#$28#$FF#$FE +
+    ' look","author_association":"OWNER","user":{"login":"alice"}}}',
+    E, Err), 'a payload with invalid UTF-8 in the body parses');
+  D := uCi.CiDecide(E, P, uCi.CiDefaultTrigger, uCi.cfCollaborator);
+  Check(D.Proceed and uJson.IsValidUtf8(D.Prompt),
+    'and the prompt built from it is valid UTF-8');
+
+  { The pull request side, same treatment, and the same polarity: a shape we
+    did not expect reads as a fork. }
+  Check(not uCi.CiParsePr('not json', P, Err),
+    'a pr payload that is not JSON is refused');
+  Check(not uCi.CiParsePr('[]', P, Err), 'and one that is an array');
+  Check(uCi.CiParsePr('{"headRefOid":123,"state":true}', P, Err),
+    'a pr payload with wrong types parses');
+  Check(P.CrossRepository and (P.HeadSha = ''),
+    'and reads as a fork with no sha - fail closed');
+end;
+
+{ The model's own answer is untrusted in the outbound direction: it is posted
+  to a public page and may carry whatever the model was talked into writing. }
+procedure TestCiHostileResult;
+var
+  Answer, ErrText, Model, Err, Body: string;
+  IsError: Boolean;
+  Ms: Integer;
+begin
+  Check(not uCi.CiResultFromJson('not json at all', Answer, ErrText, Model,
+    IsError, Ms, Err), 'a result line that is not JSON is refused');
+  Check(Err <> '', 'with a reason');
+
+  Check(uCi.CiResultFromJson('{"type":"result","is_error":false}',
+    Answer, ErrText, Model, IsError, Ms, Err),
+    'a result line with no result field parses');
+  Body := uCi.CiCommentBody(Answer, ErrText, Model, IsError, Ms);
+  Check(Pos('could not answer', Body) > 0,
+    'and says so rather than posting nothing');
+  Check(Copy(Body, Length(Body) - Length(uCi.CiFooterMark) + 1, MaxInt) =
+    uCi.CiFooterMark, 'and still ends with the footer');
+
+  { Five megabytes of answer, with a multi-byte character straddling the cut.
+    Copy() here instead of Utf8Cut would post half a character. }
+  Answer := StringOfChar('x', uCi.CiMaxAnswerBytes - 1) + #$C3#$A9 +
+    StringOfChar('y', 5 * 1024 * 1024);
+  Body := uCi.CiCommentBody(Answer, '', 'claude-x', False, 12);
+  Check(uJson.IsValidUtf8(Body), 'a 5 MB answer is cut on a UTF-8 boundary');
+  Check(Length(Body) < uCi.CiMaxAnswerBytes + 400,
+    'and the body stays near the cap: ' + IntToStr(Length(Body)));
+  Check(Copy(Body, Length(Body) - Length(uCi.CiFooterMark) + 1, MaxInt) =
+    uCi.CiFooterMark, 'and ends with the footer');
+
+  Answer := 'here is the key sk-ant-' + StringOfChar('k', 40) +
+    ' and a header Authorization: Bearer abc.def.ghi';
+  Body := uCi.CiCommentBody(Answer, '', '', False, 0);
+  Check(Pos('sk-ant-***', Body) > 0, 'an api key in the answer is redacted');
+  Check(Pos(StringOfChar('k', 40), Body) = 0, 'and its bytes are gone');
+  Check(Pos('Bearer ***', Body) > 0, 'and a bearer token too');
+  Check(Pos('abc.def.ghi', Body) = 0, 'and its bytes are gone');
+
+  { A model name is a label on a public page: anything that is not the shape
+    of one is dropped rather than printed. }
+  Body := uCi.CiCommentBody('fine', '', 'claude</b><script>', False, 0);
+  Check(Pos('script', Body) = 0, 'a model name that is not one is dropped');
+end;
+
 begin
   TestImageDecodersHostile;
   TestBinaryFileDoesNotCorruptBody;
@@ -4378,6 +4518,8 @@ begin
   TestIdeHostileEnv;
   TestGhHostileJson;
   TestGhHostileRemote;
+  TestCiHostileEvent;
+  TestCiHostileResult;
   uTools.ClearWorkingDirs;
   uIde.IdeSpawnOverride := nil;
   uGitHub.GitHubClear;

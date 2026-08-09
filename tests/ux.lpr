@@ -16,7 +16,7 @@ program ux;
   the raw API of the same names. }
 uses Windows, SysUtils, Classes, DateUtils, uJson, uSettings, uAuth, uDiff,
   uHttp, uTelem, uHooks, uSandbox, uIde, uTools, uImage, uAgent, uDiag,
-  uTerm, uNotebook, uSdk, uGitHub;
+  uTerm, uNotebook, uSdk, uGitHub, uCi;
 
 var
   Fails: Integer = 0;
@@ -6079,6 +6079,162 @@ begin
   end;
 end;
 
+{ The one artifact in this repository that build.cmd and test.cmd cannot
+  compile, run or notice rotting.  It is verified the only way an RTL-only
+  program can verify YAML - by reading it as text - and that is stated out
+  loud rather than dressed up as a parse.  Everything semantically
+  load-bearing lives in uCi, where the assertions above can drive it.
+
+  ABSENT IS A FAILURE, NOT A SKIP: a template that quietly vanished would
+  take every one of these guarantees with it. }
+procedure TestCiWorkflowTemplate;
+var
+  Path, Text: string;
+  L: TStringList;
+  Floor: TStringArray;
+  I, Writes: Integer;
+
+  procedure Has(const S, What: string);
+  begin
+    Check(Pos(S, Text) > 0, What);
+  end;
+
+  procedure Hasnt(const S, What: string);
+  begin
+    Check(Pos(S, Text) = 0, What);
+  end;
+
+begin
+  { Relative to the suite binary, which test.cmd puts in bin\. }
+  Path := ExtractFilePath(ParamStr(0)) + '..' + PathDelim + 'examples' +
+    PathDelim + 'github' + PathDelim + 'pasclaude-mention.yml';
+  Check(FileExists(Path), 'the workflow template is there: ' + Path);
+  if not FileExists(Path) then Exit;
+  L := TStringList.Create;
+  try
+    L.LoadFromFile(Path);
+    Text := L.Text;
+    Check(L.Count < 120, 'and is short enough to read: ' +
+      IntToStr(L.Count) + ' lines');
+
+    { Every rule of the floor, verbatim.  A dropped rule here is a shell in
+      an unattended run, and --ci prepare's own check would never see it
+      because that check reads what the file actually loaded. }
+    Floor := uCi.CiDenyFloor;
+    for I := 0 to High(Floor) do
+      Has('"' + Floor[I] + '"', 'the deny floor carries ' + Floor[I]);
+
+    Has('persist-credentials: false',
+      'checkout leaves no token in .git/config');
+    Has('contents: read', 'contents is read');
+    Has('issues: write', 'issues is write');
+    Has('pull-requests: read', 'pull-requests is read');
+    Writes := 0;
+    for I := 0 to L.Count - 1 do
+      if Pos(': write', L[I]) > 0 then Inc(Writes);
+    Check(Writes = 1, 'and exactly one permission is write: ' +
+      IntToStr(Writes));
+
+    { The four mutations that would matter, each one a real vulnerability. }
+    Hasnt('pull_request_target',
+      'the classic fork-secrets trigger appears nowhere');
+    Hasnt('${{ github.event.comment.body',
+      'the comment body is never interpolated into the file');
+    Hasnt('${{ github.event.issue.title',
+      'and neither is the title');
+    Hasnt('--dangerously-skip-permissions',
+      'and the bypass flag appears nowhere');
+    Has('ANTHROPIC_API_KEY', 'the model credential is named');
+    Check(L.Count > 0, 'and the file is not empty');
+  finally
+    L.Free;
+  end;
+end;
+
+procedure TestCiRefusalComment;
+var
+  E: uCi.TCiEvent;
+  P: uCi.TCiPr;
+  D: uCi.TCiDecision;
+  Err, Text: string;
+  Payload: string;
+
+  procedure ForCode(const Assoc, Login: string; IsBot: Boolean;
+    const Want: string);
+  var
+    SenderType: string;
+  begin
+    if IsBot then SenderType := 'Bot' else SenderType := 'User';
+    Payload := '{"action":"created","repository":{"full_name":"ZZINJECTZZ/ZZINJECTZZ"},' +
+      '"issue":{"number":7,"title":"ZZINJECTZZ"' +
+      '},"comment":{"body":"@claude ZZINJECTZZ","author_association":"' +
+      Assoc + '","user":{"login":"' + Login + '","type":"User"}},' +
+      '"sender":{"login":"' + Login + '","type":"' + SenderType + '"}}';
+    Check(uCi.CiParseEvent(Payload, E, Err), 'the sentinel payload parses');
+    D := uCi.CiDecide(E, P, uCi.CiDefaultTrigger, uCi.cfCollaborator);
+    Check(D.Code = Want, 'the code is ' + Want + ': ' + D.Code);
+    Text := uCi.CiRefusalComment(D);
+    Check(Text <> '', 'a refusal comment exists for ' + Want);
+    { The mutation this exists to catch: a refusal built by concatenating the
+      reason with attacker text would post an unauthorized stranger's prose
+      as a comment from the repository's own bot. }
+    Check(Pos('ZZINJECTZZ', Text) = 0,
+      'and it carries no byte of the body, the title, the repo or the login');
+    Check(Pos(uCi.CiFooterMark, Text) > 0, 'and it carries the footer');
+  end;
+
+begin
+  P := Default(uCi.TCiPr);
+  ForCode('CONTRIBUTOR', 'ZZINJECTZZ', False, 'not-authorized');
+  ForCode('OWNER', 'ZZINJECTZZ', True, 'bot');
+  { Silence, not a comment: a body that never mentioned us is not an event,
+    and a workflow that answered every comment to say it would not answer
+    would be worse than the feature is worth. }
+  Payload := '{"action":"created","repository":{"full_name":"a/b"},' +
+    '"issue":{"number":7,"title":"t"},"comment":{"body":"just talking",' +
+    '"author_association":"OWNER","user":{"login":"alice"}},' +
+    '"sender":{"login":"alice","type":"User"}}';
+  Check(uCi.CiParseEvent(Payload, E, Err), 'an ordinary comment parses');
+  D := uCi.CiDecide(E, P, uCi.CiDefaultTrigger, uCi.cfCollaborator);
+  Check(D.Code = 'no-trigger', 'and does not trigger: ' + D.Code);
+  Check(uCi.CiRefusalComment(D) = '',
+    'a comment that never mentioned us is answered with silence');
+end;
+
+procedure TestCiStepSummary;
+var
+  E: uCi.TCiEvent;
+  P: uCi.TCiPr;
+  D: uCi.TCiDecision;
+  Err, S: string;
+begin
+  P := Default(uCi.TCiPr);
+  Check(uCi.CiParseEvent('{"action":"created",' +
+    '"repository":{"full_name":"a/b"},"issue":{"number":7,"title":"t"},' +
+    '"comment":{"body":"@claude ZZINJECTZZ","author_association":' +
+    '"CONTRIBUTOR","user":{"login":"eve"}}}', E, Err),
+    'a refused payload parses');
+  D := uCi.CiDecide(E, P, uCi.CiDefaultTrigger, uCi.cfCollaborator);
+  S := uCi.CiStepSummary(D, '', '', False);
+  Check(Pos('not-authorized', S) > 0, 'the summary names the code');
+  Check(Pos(D.Reason, S) > 0, 'and the fixed reason');
+  { A step summary is rendered by GitHub and reviewed by nobody in
+    particular, which is exactly why the request must not land in it. }
+  Check(Pos('ZZINJECTZZ', S) = 0, 'and no request text');
+
+  D := Default(uCi.TCiDecision);
+  D.Proceed := True;
+  D.Code := 'ok';
+  D.Number := 7;
+  S := uCi.CiStepSummary(D, StringOfChar('a', uCi.CiMaxSummaryBytes * 2),
+    '', False);
+  Check(Length(S) < uCi.CiMaxSummaryBytes + 200,
+    'a long answer is clipped for the summary: ' + IntToStr(Length(S)));
+  Check(Pos('#7', S) > 0, 'and the number is named');
+  S := uCi.CiStepSummary(D, '', 'the turn exploded', True);
+  Check(Pos('the turn exploded', S) > 0, 'a failed turn says why');
+end;
+
 begin
   TmpRoot := IncludeTrailingPathDelimiter(GetTempDir) + 'pasclaude-ux';
   Cleanup(TmpRoot);
@@ -6168,6 +6324,9 @@ begin
     TestBoxPiecesLineUp;
     TestPromptWrapsAndPlacesTheCaret;
     TestStatusLinesSayOnlyWhatIsKnown;
+    TestCiWorkflowTemplate;
+    TestCiRefusalComment;
+    TestCiStepSummary;
   finally
     { Before the cleanup, not after: a live child holding a spool handle under
       TmpRoot would make the recursive delete fail. }
