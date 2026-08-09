@@ -366,6 +366,50 @@ type
 var
   CompleteProvider: TCompleteProc = nil;
 
+  { The line a second Escape submits at the REPL prompt, '' for "do nothing",
+    which is both the default and what every build of this program did before
+    the feature existed.  Pushed down from pasclaude.lpr - uTerm is below
+    uTools and cannot reach a slash command, and inventing a callback that
+    ran a command from inside the editor's own read loop would be worse
+    still: /rewind prompts, and prompting re-enters ReadLineCore while its
+    console mode and its frame are still live.  Reporting the intent as a
+    submitted line means the REPL dispatches it exactly as if it had been
+    typed, through the one path that already handles commands.
+
+    Same one-byte shape and same fail-closed default as uHooks.HooksAllowed,
+    and re-read at the point of use rather than captured, for the same
+    reason. }
+  EscEscCommand: string = '';
+
+const
+  { How long the second Escape has.  Long enough that Escape-Escape is one
+    gesture rather than two, short enough that an Escape now and an Escape
+    after a moment's thought are not read as one - and the whole trigger is
+    already fenced by "the line was ALREADY empty", so the window is the
+    second lock rather than the only one. }
+  EscEscWindowMs = 600;
+
+{ Should this Escape submit EscEscCommand instead of doing what Escape does?
+  Every condition is here rather than inline in the key handler so the rule
+  can be asserted by a test with no console attached, which is the only way
+  anything about ReadLineCore gets tested at all.
+
+  AtPrompt is the REPL's own read and nothing else: the permission question,
+  the model picker, the session picker and the rewind picker all read through
+  ReadLineEdit, and turning Escape into "/rewind" while somebody is being
+  asked which turn to rewind to is a loop and a nonsense.
+
+  LineEmpty means empty when the FIRST Escape was pressed, not after it - so
+  Escape (which clears the line) followed by Escape does nothing new, and the
+  clear keeps the meaning it has always had.
+
+  Vim disqualifies it outright.  A vim user's fingers press Escape twice to be
+  sure they are in normal mode; that is muscle memory older than this program
+  and stealing it would be exactly the breakage this must not cause.  /rewind
+  is still one word away. }
+function EscEscFires(AtPrompt, Armed, LineEmpty, Vim: Boolean;
+  SinceMs: QWord): Boolean;
+
 { Starts an edit with an empty line, vim off and an empty undo stack. }
 procedure EditInit(out E: TEditState);
 { The same, then takes the profile's vim setting.  Every line starts in
@@ -2748,6 +2792,16 @@ begin
   St.CaretRow := 0;
 end;
 
+function EscEscFires(AtPrompt, Armed, LineEmpty, Vim: Boolean;
+  SinceMs: QWord): Boolean;
+begin
+  { EscEscCommand read HERE, at the point of use, so a host that wires it late
+    or clears it mid-run gets what it asked for rather than what was true when
+    the line started. }
+  Result := AtPrompt and Armed and LineEmpty and (not Vim) and
+            (EscEscCommand <> '') and (SinceMs <= EscEscWindowMs);
+end;
+
 { The one console key loop, taking its profile as a REQUIRED PARAMETER and
   reading no module state.  That is the structural half of the wall: the two
   wrappers below are the only things that supply a profile, and the one that
@@ -2773,6 +2827,14 @@ var
   Bound: TEditKey;
   Blk: TBlockState;
   Framed: Boolean;
+  { The double-Escape latch.  Armed only by an Escape that arrived on an
+    already-empty line at the REPL prompt with vim off; EscTick is when.
+    Both are locals, so the state dies with the line and an Escape left
+    hanging from a previous prompt can never arm anything. }
+  EscArmed: Boolean;
+  EscPrev: Boolean;
+  EscTick: QWord;
+  EscEmpty: Boolean;
 
   { Applies a key and repaints.  Every editing key goes through here, so the
     console and the state cannot drift apart. }
@@ -2806,6 +2868,9 @@ var
 begin
   Line := '';
   PrevLen := 0;
+  EscArmed := False;
+  EscPrev := False;
+  EscTick := 0;
   EditInitProfile(E, P);
   { The frame needs VT for the cursor moves and a real console to read from;
     without either, the caller silently gets the line editor this program has
@@ -2856,6 +2921,32 @@ begin
       Alt := (Rec.Event.KeyEvent.dwControlKeyState and
               (LEFT_ALT_PRESSED or RIGHT_ALT_PRESSED)) <> 0;
       Shift := (Rec.Event.KeyEvent.dwControlKeyState and SHIFT_PRESSED) <> 0;
+
+      { A modifier pressed on its own is not a key event this loop has any
+        other use for - Ch is #0, the case below has no arm for these codes,
+        and Ctrl/Alt/Shift reach the handlers that care through
+        dwControlKeyState rather than as records of their own.  It is skipped
+        HERE, above the latch, for the one reason the latch cares about:
+        ReadConsoleInputW delivers a Shift press as a KEY_EVENT with
+        bKeyDown set, so it does reach this point, and disarming on it broke
+        the double-Escape pair for anyone who reached for a modifier inside the
+        600 ms window.  The comment below used to promise that holding Shift
+        was safe while nothing in the code made it so; this is the line that
+        makes the promise true rather than the line that deleted it. }
+      case Rec.Event.KeyEvent.wVirtualKeyCode of
+        VK_SHIFT, VK_CONTROL, VK_MENU, VK_LWIN, VK_RWIN,
+        VK_CAPITAL, VK_NUMLOCK, VK_SCROLL: Continue;
+      end;
+
+      { The double-Escape latch survives exactly one key event: this one.  Any
+        key at all breaks the pair, so a character typed and rubbed out inside
+        the window cannot leave an Escape from before it still armed - and the
+        Escape branch below re-arms from EscPrev, which is why disarming here
+        unconditionally is safe.  Key-up records, non-key records and the bare
+        modifiers just above all Continue before reaching this line, so holding
+        Shift does not break the pair. }
+      EscPrev := EscArmed;
+      EscArmed := False;
 
       case Rec.Event.KeyEvent.wVirtualKeyCode of
         VK_RETURN:
@@ -2930,6 +3021,37 @@ begin
         VK_DOWN:   begin Apply(ekHistNext, #0);  Continue; end;
         VK_ESCAPE:
           begin
+            { Measured BEFORE anything is applied: "already empty" is a fact
+              about the line as the user pressed the key, and reading it after
+              ekClear had run would make every Escape look like it arrived on
+              an empty line. }
+            EscEmpty := Length(E.Text) = 0;
+            if EscEscFires(Block, EscPrev, EscEmpty, E.Vim,
+                           GetTickCount64 - EscTick) then
+            begin
+              { Submitted exactly as though it had been typed and entered, so
+                the REPL's one command path handles it and nothing here knows
+                what the word means.  Put in the line first and repainted, so
+                the scrollback shows WHY the next thing on screen happened -
+                a rewind list appearing under a blank prompt would read as the
+                program doing something of its own accord.
+
+                Deliberately not HistoryAdd: the user pressed Escape twice,
+                they did not type this, and up-arrow should still reach the
+                last thing they did type. }
+              E.Text := UTF8Decode(EscEscCommand);
+              E.Caret := Length(E.Text);
+              Repaint;
+              if Framed then CloseBlock else EmitLn;
+              Line := EscEscCommand;
+              Exit(True);
+            end;
+            { Armed for the next Escape only under the conditions that could
+              ever fire - the test is repeated rather than trusted to
+              EscEscFires, because arming on a line that had text in it is how
+              "Escape clears, Escape again rewinds" would sneak back in. }
+            EscArmed := Block and EscEmpty and (not E.Vim);
+            EscTick := GetTickCount64;
             { With vim on, Escape leaves insert mode - which costs the
               clear-the-line meaning it has always had.  Ctrl+U still clears,
               and /vim says so when it turns the mode on. }

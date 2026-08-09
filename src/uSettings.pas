@@ -135,7 +135,7 @@ const
     is the natural way to add a setting, which is exactly why the Scope column
     has to be filled in at the same moment: the load position (above the
     print-mode halt) is legal ONLY because nothing here can grant. }
-  SettingCount = 45;
+  SettingCount = 46;
   SettingDefs: array[0..SettingCount - 1] of TSettingDef = (
     { ---- scAny: display and economy.  A project may set these. ---- }
     (Name: 'output_style'; Kind: skStr; Scope: scAny;
@@ -261,6 +261,18 @@ const
      Lo: 0; Hi: 0; ProjMax: 0; Dflt: 0; Cheap: chNone; Shape: shNone;
      Note: 'the sandbox level comes from --sandbox or /sandbox, never a file ' +
        'in a repository'),
+    { Refused at EVERY tier, the user's own file included, which is stricter
+      than output_style two screens up and deliberately so.  A style adds a
+      paragraph about PROSE and its body has exactly one reader; this would
+      add arbitrary standing instructions to the most trusted position in
+      every request.  Refused by name rather than merely absent, because a
+      key nothing knows about is a key that fails silently, and somebody
+      pasting a wrapper's config deserves to be told where the thing lives. }
+    (Name: 'append_system_prompt'; Kind: skStr; Scope: scRefused;
+     Lo: 0; Hi: 0; ProjMax: 0; Dflt: 0; Cheap: chNone; Shape: shNone;
+     Note: 'text is added to the system prompt by --append-system-prompt on ' +
+       'the command line only; a file that could do it could rewrite the ' +
+       'agent''s instructions'),
     (Name: 'permission_mode'; Kind: skStr; Scope: scRefused;
      Lo: 0; Hi: 0; ProjMax: 0; Dflt: 0; Cheap: chNone; Shape: shNone;
      Note: 'the permission mode comes from --permission-mode or /mode, never ' +

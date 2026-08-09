@@ -109,12 +109,47 @@ var
     executes a command; an instruction file is prose that still has to talk a
     gated tool past its own prompt.  And a project's CLAUDE.md binding under
     -p is a promise README makes to every scripted user, so the host narrows
-    this to the two --ci verbs only.  The honest cost of that: the mention
-    template's answering step IS an ordinary -p in the checked-out head, so
-    the branch's CLAUDE.md still reaches THAT run's prompt.  This narrows the
-    surface rather than closing it, and the remainder is written down in
-    FEATURES-NOT-YET.md rather than papered over here. }
+    this to the two --ci verbs only.  The honest cost of that USED to be the
+    mention template's answering step, an ordinary -p in the checked-out head
+    where the branch's CLAUDE.md reached the prompt of the run that actually
+    asks a model something.  That step now passes --no-project-context, an
+    explicit flag on the command line, and the flag clears this same one byte
+    through SdkProjectContextDecide below - so it is one gate with two
+    reasons to close rather than a second mechanism to audit.
+
+    -p WITHOUT the flag still loads a project's files, exactly as the REPL
+    does, because that is the promise README's Scripted sessions section
+    makes and a script that quietly stopped following the conventions it was
+    written for would fail invisibly.  What is left reaching a CI request
+    from the branch is the skill catalogue, which rides in the skill tool's
+    own description rather than the system prompt and is deliberately not
+    gated here; ux pins that in both configurations so the claim stays true
+    the day somebody moves the catalogue. }
   SdkProjectContextAllowed: Boolean = False;
+
+{ The rule that decides the byte above, as a function rather than as an
+  expression in the host.  It lives here because pasclaude.lpr's main block
+  cannot be linked by any suite, so the COMBINING of the two conditions - the
+  half a mis-wiring most often lands in - had no test at all where the two
+  DIRECTIONS of the variable already had several.
+
+  What the lift did NOT make testable, said plainly because a reader deciding
+  how much this comment covers deserves the boundary: both INPUTS are still
+  main-block code no suite links.  Whether --no-project-context was seen by the
+  argument parser, and which TDiagMode values count as a --ci verb, are read
+  off argv and off a case statement up there; break either and the whole suite
+  still passes.  Widening `DiagMode in [dmCiPrepare, dmCiReport]` to one verb,
+  or deleting the parser clause, are both green today.  The truth table below
+  pins the rule and nothing about its arguments.
+
+  It is an `and` of two negatives on purpose.  Neither term can widen the
+  other - --no-project-context under a --ci verb is redundant rather than an
+  override - and there is deliberately no argument that turns the loader back
+  ON, the same shape as --ci-allow, which narrows only.  A new reason to
+  suppress belongs INSIDE here, where the truth-table test demands a line for
+  it; the host still performs the single assignment, so a reviewer grepping
+  for `SdkProjectContextAllowed :=` in src\ still finds exactly one writer. }
+function SdkProjectContextDecide(NoContextFlag, CiVerb: Boolean): Boolean;
 
 { ---- system prompt assembly, lifted verbatim from pasclaude.lpr ---- }
 function SdkGitContext: string;
@@ -134,6 +169,49 @@ function SdkSystemPrompt: string;
   context rather than a standing rule and the "treat them as binding" line
   must stay attached to the files it introduces. }
 function SdkFullSystem: string;
+
+{ ---- --append-system-prompt ---- }
+
+const
+  { Four kilobytes of prose, which is about two screens and rather more than
+    the guidelines block this text sits after.  A cap at all because the
+    string goes into the most trusted position in every request of the run and
+    an unbounded one would let a wrapper script push the real instructions out
+    of the model's attention; this cap and not a larger one because a standing
+    rule that does not fit in two screens is a CLAUDE.md, which is read from
+    disk, shown by /memory and reviewable, where a command line is none of
+    those.  Windows caps a command line near 32 KB anyway, so a much larger
+    number here would only be honest about a limit somebody else enforces. }
+  MaxAppendSystemBytes = 4 * 1024;
+
+{ What the user typed on THIS run's command line to be added to the system
+  prompt, already joined and capped, '' when the flag was never given.  Read
+  by SdkFullSystem and reported by the banner, and written by exactly one
+  thing - SdkAppendSystemPush - so the cap cannot be walked around by
+  assigning to it.
+
+  There is deliberately NO settings.json key and no approvals-file key for
+  this, and that absence is the feature.  A project file that could append to
+  the system prompt is a project file that can rewrite the agent's standing
+  instructions from inside a clone, which is the same risk .mcp.json and
+  hooks.json are already refused for; the difference is that those two at
+  least announce themselves and can be trusted per-tree, where a system-prompt
+  line would be invisible in every reply it shaped.  Command line only means
+  the person who typed it was at the keyboard. }
+function SdkAppendSystem: string;
+{ Appends one --append-system-prompt value.  False with Err set when the text
+  is empty after trimming, or when adding it would take the TOTAL past
+  MaxAppendSystemBytes - the caller turns that into a startup error rather
+  than a silent truncation, because a standing instruction the model received
+  half of is worse than one it never received at all.
+
+  Given more than once the values ACCUMULATE, joined by a blank line, in the
+  order they appear on the command line.  That is the literal reading of a
+  flag with "append" in its name; the alternative - last one wins - would
+  silently discard text the user typed and can be had anyway by passing the
+  flag once. }
+function SdkAppendSystemPush(const Text: string; out Err: string): Boolean;
+procedure SdkAppendSystemClear;            { test seam }
 
 { ---- custom commands ---- }
 function SdkCommandNames: TStringArray;
@@ -161,6 +239,11 @@ function SdkNoticeLine(const Text: string): string;
   Deliberately a string parameter and not a uDiag type, so uSdk gains no
   dependency on the unit that produces it. }
 function SdkDiagnosticLine(const Kind, PayloadJson: string): string;
+{ One finished hook fire: {"type":"hook","event":...,"tool_name":...,
+  "detail":...,"blocked":true|false}.  Blocked is the whole point of the line -
+  a hook that ran and let a call through and a hook that refused it both land
+  in the same tool_result today, one as content and one as an error, and a
+  driver that wanted to log refusals had to infer which from a string. }
 function SdkHookLine(const Event, ToolName, Detail: string; Blocked: Boolean): string;
 function SdkErrorLine(const Text: string): string;
 function SdkPermissionRequestLine(const Id, ToolName, Title, Detail: string): string;
@@ -172,6 +255,26 @@ function SdkResultLine(const Subtype, ErrText, FinalText: string;
   const Models: TModelUsageList): string;
 
 { ---- plumbing ---- }
+{ Points uHooks' report seam at this unit's emitter, or clears it.  Called by
+  SdkRun with the run's own format, and public because SdkRun is not the only
+  way in: an embedder that drives TAgent itself, the way examples\embed.lpr
+  does, has the same one decision to make and no reason to reimplement it.
+
+  stream-json and nothing else, and the exclusions are each deliberate.  A
+  text-mode REPL must not gain a line of output for a feature it already
+  renders its own way - the hook's words are in the tool result and a
+  misbehaving hook already gets a yellow notice - and `json` emits exactly one
+  object for the whole run, so an event that happens mid-turn has nowhere in
+  that shape to go.  Clearing on every other format rather than leaving the
+  seam alone is what makes a second SdkRun in one process safe: a reporter
+  left over from a stream-json run would keep writing lines into a format
+  whose frame has no room for them.
+
+  Note what this does NOT do: it does not decide whether hooks run.  That is
+  uHooks.HooksAllowed, which pasclaude sets only on the interactive path, so
+  in the shipped program a stream-json run has this seam armed and no hook to
+  report through it - see FEATURES-NOT-YET.md, which says so out loud. }
+procedure SdkInstallHookReporter(Fmt: TSdkFormat);
 procedure SdkEmit(const Line: string);
 function SdkReadLine(out S: string): Boolean;
 function SdkNewSessionId: string;
@@ -232,7 +335,12 @@ type
 
 implementation
 
-uses Classes;
+{ uHooks is below uTools, which is below this unit, so naming it here is a step
+  DOWN the ladder and not a new tie between two peers.  It is in the
+  implementation and not the interface on purpose: nothing in this unit's
+  published shape is a hook type, and a host that includes uSdk should not
+  thereby find itself compiling against the hook table. }
+uses Classes, uHooks;
 
 { ---------------------------------------------------------- system prompt -- }
 
@@ -426,6 +534,11 @@ const
   SdkContextNames: array[0..2] of string =
     ('AGENTS.md', 'CLAUDE.md', '.pasclaude.md');
 
+function SdkProjectContextDecide(NoContextFlag, CiVerb: Boolean): Boolean;
+begin
+  Result := (not NoContextFlag) and (not CiVerb);
+end;
+
 { Project instructions, if the repository ships any.  This is how a project
   tells the agent about its own conventions.  The user-level memory loads
   first so the project's own files can override it - nearer wins. }
@@ -491,11 +604,78 @@ begin
     end;
 end;
 
+{ ------------------------------------------------ append-system-prompt -- }
+
+var
+  { Written by SdkAppendSystemPush and by nothing else - see the interface for
+    why there is no file that can reach it. }
+  AppendSystem_: string = '';
+
+function SdkAppendSystem: string;
+begin
+  Result := AppendSystem_;
+end;
+
+function SdkAppendSystemPush(const Text: string; out Err: string): Boolean;
+var
+  T, Joined: string;
+begin
+  Err := '';
+  Result := False;
+  T := Trim(Text);
+  if T = '' then
+  begin
+    Err := 'nothing to append';
+    Exit;
+  end;
+  if AppendSystem_ = '' then Joined := T else Joined := AppendSystem_ + #10#10 + T;
+  { Measured on the JOIN, not on this occurrence, so three flags of fifteen
+    hundred bytes are refused where one of four thousand is allowed - the
+    model is handed the total either way and the cap is a statement about the
+    total.  The blank line between them counts too, which is pedantic and
+    right: it is bytes in the request. }
+  if Length(Joined) > MaxAppendSystemBytes then
+  begin
+    Err := Format('--append-system-prompt is capped at %d bytes; this would ' +
+      'make %d', [MaxAppendSystemBytes, Length(Joined)]);
+    Exit;
+  end;
+  AppendSystem_ := Joined;
+  Result := True;
+end;
+
+procedure SdkAppendSystemClear;
+begin
+  AppendSystem_ := '';
+end;
+
 function SdkFullSystem: string;
 begin
   Result := SdkSystemPrompt;
   if Assigned(SdkSystemExtra) then Result := Result + SdkSystemExtra();
   Result := Result + SdkProjectContext;
+  { LAST, after the project's own instruction files, and that order is the
+    whole argument for the flag.  Everything above was written by whoever last
+    committed to this tree; this line was typed by the person sitting in front
+    of the terminal on this run, and a standing instruction from the keyboard
+    that lost the recency position to a file out of a clone would have the
+    trust relationship backwards.
+
+    It ADDS and can never replace: SdkSystemPrompt and SdkProjectContext are
+    both assembled above, unconditionally, exactly as they were before this
+    existed - the same rule /output-style follows, for the same reason.  A
+    flag that could blank the guidelines would be a flag that turns off the
+    paragraph telling the model its writes need approval, and no command line
+    gets to do that.
+
+    The fence line names where the text came from, because the model is
+    otherwise being handed an anonymous paragraph in the system prompt and
+    "the user typed this at launch" is exactly the provenance it should weigh
+    it by. }
+  if AppendSystem_ <> '' then
+    Result := Result + #10#10 +
+      'Additional instructions, given on this run''s command line:'#10 +
+      AppendSystem_;
 end;
 
 { --------------------------------------------------------- slash commands -- }
@@ -1029,6 +1209,39 @@ begin
   SdkEmit(SdkNoticeLine(S));
 end;
 
+{ A fired hook's own words, held to the budget one hook's output is already
+  held to.  uHooks caps each CHILD at MaxHookOutBytes, but the outcome text a
+  fire hands back is the concatenation of up to MaxHooksPerEvent of them, so
+  the detail arriving here can be eight times a cap that was chosen to be
+  prompt-sized - and this line is written per tool call, twice.
+
+  Safe first and Utf8Cut second, in that order and not the other: Utf8Cut
+  passes bytes that were never UTF-8 through untouched, by design, so cutting
+  first would hand the encoder a repair job on a string that had already lost
+  the length it was cut to.  Cutting after the repair is safe because a cut of
+  valid UTF-8 on a character boundary is still valid UTF-8.  Control bytes are
+  not touched here at all - JsonQuote escapes everything below #32, which is
+  what keeps one hook's stray newline from becoming two protocol lines, and
+  duplicating that judgement here would be a second place to get it wrong. }
+function HookDetail(const S: string): string;
+begin
+  Result := Safe(S);
+  if Length(Result) > uHooks.MaxHookOutBytes then
+    Result := uJson.Utf8Cut(Result, uHooks.MaxHookOutBytes) +
+      #10'[hook detail truncated]';
+end;
+
+procedure HookFired(const Event, ToolName, Detail: string; Blocked: Boolean);
+begin
+  SdkEmit(SdkHookLine(Event, ToolName, HookDetail(Detail), Blocked));
+end;
+
+procedure SdkInstallHookReporter(Fmt: TSdkFormat);
+begin
+  if Fmt = sfStreamJson then uHooks.OnHookFired := @HookFired
+  else uHooks.OnHookFired := nil;
+end;
+
 procedure HookToolInput(const Id, Name, InputJson: string);
 begin
   SdkEmit(SdkToolUseLine(Id, Name, InputJson));
@@ -1208,6 +1421,13 @@ begin
     A.OnToolInput := @HookToolInput;
     A.OnToolDone := @HookToolDone;
   end;
+  { And the same wholesale replacement one step down the ladder, for the same
+    reason.  It is a separate call rather than another line inside the `if`
+    because the seam it sets is uHooks' and not the agent's: RunTool fires the
+    two tool events without the agent being told, so a run that left a stale
+    reporter installed would keep emitting hook lines from inside a format
+    that has no place for them. }
+  SdkInstallHookReporter(Opts.Format);
 
   { Delegation is only offered when there is a driver on stdin to delegate
     to.  Everything else runs the print-mode rule unchanged: nobody to ask

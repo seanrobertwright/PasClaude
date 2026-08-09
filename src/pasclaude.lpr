@@ -633,9 +633,11 @@ begin
   EmitCLn(clGrey,   '                 <n>, or the PR for this branch. Printed');
   EmitCLn(clGrey,   '                 first, then sent to the model as data;');
   EmitCLn(clGrey,   '                 --show prints and sends nothing. Read only');
-  EmitCLn(clGrey,   '  /hooks         hooks this project defines; /hooks off disables them');
+  EmitCLn(clGrey,   '  /hooks         hooks, yours and this project''s; /hooks off');
+  EmitCLn(clGrey,   '                 disables both for the session');
   EmitCLn(clGrey,   '  /jobs          background commands still running');
-  EmitCLn(clGrey,   '  /mcp           MCP servers: status, restart, refresh');
+  EmitCLn(clGrey,   '  /mcp           MCP servers, yours and this project''s:');
+  EmitCLn(clGrey,   '                 status, restart, refresh');
   EmitCLn(clGrey,   '  /memory        show the project memory (CLAUDE.md)');
   EmitCLn(clGrey,   '  /init          have the model write a CLAUDE.md for this project');
   EmitCLn(clGrey,   '  /rewind        undo turns: conversation and edited files');
@@ -684,14 +686,16 @@ begin
   EmitCLn(clGrey,   '                 keeps real paths, --json writes JSON');
   EmitCLn(clGrey,   '  /exit          quit (Ctrl+C also works)');
   EmitLn;
-  EmitCLn(clGrey,   '  Esc during a reply stops it.');
+  EmitCLn(clGrey,   '  Esc during a reply stops it. Esc twice on a prompt line that was');
+  EmitCLn(clGrey,   '  ALREADY empty opens /rewind (not with /vim on, where Esc is');
+  EmitCLn(clGrey,   '  normal mode).');
   EmitCLn(clGrey,   '  A file in .pasclaude\commands\ is a slash command; one in');
   EmitCLn(clGrey,   '  .pasclaude\agents\ is a subagent type the task tool can ask for;');
   EmitCLn(clGrey,   '  .pasclaude\skills\<name>\SKILL.md is a skill the model can read;');
   EmitCLn(clGrey,   '  .pasclaude\styles\<name>.md is an output style.');
   EmitCLn(clGrey,   '  A directory in .pasclaude\plugins\ can carry all four, once you');
-  EmitCLn(clGrey,   '  enable it by name. A skill added mid-session appears after /skills,');
-  EmitCLn(clGrey,   '  and an edited style applies after you re-run /output-style <name>.');
+  EmitCLn(clGrey,   '  enable it by name. A skill added mid-session appears after /skills;');
+  EmitCLn(clGrey,   '  an edited style file applies by itself, from the next turn.');
   EmitCLn(clGrey,   '  To drive pasclaude from another program: -p with');
   EmitCLn(clGrey,   '  --output-format json|stream-json (see pasclaude --help).');
 end;
@@ -862,7 +866,15 @@ end;
   The fingerprint is over the bytes, so editing the file re-asks - an "always"
   that survived the text changing under it would be an approval of something
   never read.  Same y/a/n vocabulary, same file, same narrow-always rule as the
-  bash prefixes.  /yolo deliberately does not answer this question. }
+  bash prefixes.  /yolo deliberately does not answer this question.
+
+  It is asked about the PROJECT file and only ever that.  The user's own
+  %USERPROFILE%\.pasclaude\hooks.json is loaded whatever this returns, is never
+  fingerprinted and is never prompted for - prompting somebody about a file
+  only they can write is noise that teaches them to answer yes, and every yes
+  it trains is spent later on this prompt.  uHooks.HooksConfigured is False
+  when the session root IS the home directory, so a file that is both is the
+  user's and no question is asked about it here. }
 function TrustHooks: Boolean;
 var
   FP: string;
@@ -887,7 +899,12 @@ begin
         Result := True;
       end;
   else
-    EmitCLn(clGrey, '  hooks are off for this session (/hooks shows them)');
+    { Named as this project's, because with a user file loaded the flat old
+      sentence is no longer true: refusing the project's hooks leaves the
+      user's own running, and a line that said otherwise would be a lie about
+      what is about to execute. }
+    EmitCLn(clGrey,
+      '  this project''s hooks are off for this session (/hooks shows them)');
   end;
 end;
 
@@ -944,6 +961,13 @@ begin
       L.SaveToFile(Path);
       EmitCLn(clGrey, '  remembered in ' + ExtractFileName(Path));
       EmitCLn(clGrey, '  (takes effect next session; project instructions load at startup)');
+      { And not even then, if this session was told to ignore the tree's own
+        files.  Writing a note into a file nothing reads is the small waste
+        this line exists to stop; it says nothing about the note being saved,
+        which it was. }
+      if not uSdk.SdkProjectContextAllowed then
+        EmitCLn(clGrey, '  (this session was started with --no-project-context, ' +
+          'so it is not loaded)');
     except
       on E: Exception do
         EmitCLn(clRed, '  could not write ' + ExtractFileName(Path) + ': ' + E.Message);
@@ -969,6 +993,13 @@ begin
     Exit;
   end;
   EmitCLn(clBright, '  ' + ExtractFileName(Path) + ':');
+  { The file is printed either way - /memory answers "what does this project
+    tell the agent?" and the honest answer under the flag is "this, and it was
+    not told" - but a reader editing prose nothing will read deserves to know
+    before they spend the effort. }
+  if not uSdk.SdkProjectContextAllowed then
+    EmitCLn(clGrey, '  (this session was started with --no-project-context, ' +
+      'so it is not loaded)');
   L := TStringList.Create;
   try
     try
@@ -1848,20 +1879,53 @@ var
 begin
   if LowerCase(Trim(Arg)) = 'off' then
   begin
+    { BOTH scopes, and said so.  ClearHooks empties the one table, so this was
+      already true; naming it is what stops the switch being a lie by omission
+      now that some of the entries came from a file the user never approved
+      and might not remember writing. }
     uHooks.ClearHooks;
-    EmitCLn(clGrey, '  hooks are off for this session');
+    EmitCLn(clGrey, '  hooks are off for this session - both your own and ' +
+      'this project''s');
     Exit;
   end;
-  if not uHooks.HooksConfigured then
+  if not uHooks.AnyHooksConfigured then
   begin
     EmitCLn(clGrey, '  no hooks (put them in ' + SessionDir + PathDelim +
       uHooks.HooksFileName + ')');
+    if uHooks.UserHooksFilePath <> '' then
+      EmitCLn(clGrey, '  or in ' + uHooks.UserHooksFilePath +
+        ', which every project you open reads');
     Exit;
   end;
-  EmitCLn(clGrey, '  ' + uHooks.HooksFilePath);
+
+  { Both files, both states, because a panel that showed one of them would
+    leave the user unable to find the hook that just fired. }
+  if uHooks.UserHooksConfigured then
+    EmitCLn(clGrey, '  ' + uHooks.UserHooksFilePath +
+      ' (yours; loaded without asking, fires first)')
+  else if uHooks.UserHooksFilePath <> '' then
+    EmitCLn(clGrey, '  ' + uHooks.UserHooksFilePath + ' (none)');
+  if uHooks.HooksConfigured then
+    EmitCLn(clGrey, '  ' + uHooks.HooksFilePath + ' (this project''s)')
+  else if not uHooks.ProjectHooksAreTheUsers then
+    EmitCLn(clGrey, '  ' + uHooks.HooksFilePath + ' (none)');
+  { The suppression is the same one HooksConfigured and LoadHooks apply, and it
+    has to be here too.  Running IN the home directory makes the two paths one
+    file: the line above has just named it as the user's own, loaded and firing
+    first, and HooksConfigured is False there BY CONSTRUCTION, so an unguarded
+    else printed that identical path a second time as "(none)".  A panel that
+    says a file is firing and then says there is no such file is the one thing
+    a diagnostic must never do, and it is worse here than elsewhere because the
+    reader is looking at this panel precisely to find out where the hook that
+    just ran came from. }
+
   if uHooks.HooksEnabled then
   begin
-    EmitCLn(clGreen, '  enabled, fingerprint ' + uHooks.HookFingerprint);
+    if uHooks.HooksConfigured then
+      EmitCLn(clGreen, '  enabled, project fingerprint ' +
+        uHooks.HookFingerprint)
+    else
+      EmitCLn(clGreen, '  enabled');
     Sum := uHooks.HookSummary;
     if Sum <> '' then EmitC(clGrey, Sum);
   end
@@ -2244,7 +2308,10 @@ begin
   Rows := uTools.McpServerList;
   if Length(Rows) = 0 then
   begin
-    EmitCLn(clGrey, '  no MCP servers configured (.mcp.json in the session root)');
+    EmitCLn(clGrey, '  no MCP servers configured (.mcp.json in the session ' +
+      'root, or mcp.json in your own .pasclaude)');
+    if uTools.UserMcpConfigPath <> '' then
+      EmitCLn(clGrey, '  ' + uTools.UserMcpConfigPath);
     Exit;
   end;
   for I := 0 to High(Rows) do
@@ -2255,6 +2322,10 @@ begin
             (Status = 'failed to start') then Col := clRed
     else Col := clGrey;
     EmitC(clBright, '  ' + Field(Rows[I], 0) + '  ');
+    { Which file named this program, beside the name and before the status: a
+      user reading /mcp to decide whether to be alarmed is asking exactly that
+      question, and a server they configured themselves needs no alarm. }
+    EmitC(clGrey, Field(Rows[I], 6) + '  ');
     EmitC(Col, Status);
     EmitCLn(clGrey, Format('  %s tools, %s skipped',
       [Field(Rows[I], 2), Field(Rows[I], 3)]));
@@ -2433,9 +2504,10 @@ begin
   if FindFirst(Dir + '*.json', faAnyFile, R) = 0 then
   begin
     repeat
-      { Sessions only: the permissions file also lives here. }
-      if (R.Name = 'session.json') or (R.Name = 'session.prev.json') or
-         (Pos('.session.json', R.Name) > 0) then
+      { Sessions only: the permissions file also lives here.  uAgent owns the
+        rule now, because --continue asks the same question and the two must
+        never disagree about what a transcript is. }
+      if uAgent.IsSessionFile(R.Name) then
         Add(R.Name, R.Size, FileDateToDateTime(R.Time));
     until FindNext(R) <> 0;
     SysUtils.FindClose(R);
@@ -2993,7 +3065,16 @@ end;
 
 { How many memory files were actually loaded.  The same names SdkProjectContext
   reads, asked the same way, so the count cannot claim a file the model did
-  not get. }
+  not get.  Which is why the project loop is behind the same gate the loader
+  is: under --no-project-context the three files are still on disk and still
+  found by FileExists, and a status line saying "2 memories" about text no
+  request ever carried is precisely the claim the sentence above forbids.
+  The byte is re-read here rather than passed in, for the reason uSdk gives at
+  SdkProjectContext's own open: clearing it has to turn the feature off in
+  every reader at once, including whichever one is added next.
+  The %USERPROFILE% line stays OUTSIDE the gate, matching SdkUserContext
+  sitting above it in the loader - the gate asks which tree wrote the prompt,
+  and the user's own memory is not in the tree. }
 function MemoryFileCount: Integer;
 const
   Names: array[0..2] of string = ('AGENTS.md', 'CLAUDE.md', '.pasclaude.md');
@@ -3003,9 +3084,26 @@ begin
   Result := 0;
   if FileExists(IncludeTrailingPathDelimiter(GetEnvironmentVariable('USERPROFILE')) +
      '.pasclaude' + PathDelim + 'CLAUDE.md') then Inc(Result);
-  for I := 0 to High(Names) do
-    if FileExists(IncludeTrailingPathDelimiter(uTools.RootDir) + Names[I]) then
-      Inc(Result);
+  if uSdk.SdkProjectContextAllowed then
+    for I := 0 to High(Names) do
+      if FileExists(IncludeTrailingPathDelimiter(uTools.RootDir) + Names[I]) then
+        Inc(Result);
+end;
+
+{ The tail of the --no-project-context notice, present only when there is a
+  user memory for it to be true about.  A separate function and not an inline
+  conditional because the notice is built inside the main block, where a local
+  string would be a fourteenth reused variable, and because the rule it carries
+  is the same one MemoryFileCount above states at length: a line that names a
+  file the model did not get is worse than no line.  It asks the LOADER rather
+  than the disk - SdkUserContext returns '' both for a missing file and for one
+  it could not read, and in neither case did any request carry the text. }
+function UserMemoryClause: string;
+begin
+  if uSdk.SdkUserContext <> '' then
+    Result := '; your %USERPROFILE% memory still was'
+  else
+    Result := '';
 end;
 
 procedure RefreshStatus;
@@ -3155,6 +3253,9 @@ begin
   EmitCLn(clGrey, '  /rewind pickers.  Every chord must carry ctrl or alt, or');
   EmitCLn(clGrey, '  be a named key, so a plain letter cannot be rebound at');
   EmitCLn(clGrey, '  all; enter, tab, escape and ctrl+c are reserved.');
+  EmitCLn(clGrey, '  Escape clears the line; pressed twice on a line that was');
+  EmitCLn(clGrey, '  already empty it opens /rewind.  With vim on it leaves');
+  EmitCLn(clGrey, '  insert mode and does nothing else, both times.');
   EmitCLn(clGrey, '  {"vim":true,"bindings":{"ctrl+w":"delete-word-left"}}');
 end;
 
@@ -4586,6 +4687,13 @@ var
   Dropped: Integer;
   Resume: Boolean = False;
   Resumed: Boolean = False;
+  { --continue: resume the most recent saved conversation without being asked
+    which.  Held beside Resume rather than folded into it because the two name
+    DIFFERENT files - Resume is always this directory's session.json, this one
+    is whichever of the saved conversations was written last - and a run has to
+    be able to say which of them it did. }
+  ContinueFlag: Boolean = False;
+  ResumeFile: string = '';
   AuthList: uAuth.TAuthInfoArray;
   ExpiryMs: Int64;
   SaveWarned: Boolean = False;
@@ -4593,9 +4701,23 @@ var
   PrintPrompt: string = '';
   PrintMode: Boolean = False;
   WebFlag: Boolean = False;
+  { --no-project-context, held rather than applied for the same reason
+    ModeWanted is: the decision it feeds is made once, further down, after the
+    session root is known and beside the hooks gate, and a flag that acted the
+    moment it was parsed would be a second place the loader could be turned
+    off.  False shipped, for the same reason uSdk.SdkProjectContextAllowed
+    defaults false in the other direction - a flag nobody typed must leave -p
+    behaving exactly as it always has. }
+  NoProjectContext: Boolean = False;
   Piped: string;
   McpErr: string = '';
   HookNotes: string = '';
+  { How many of the loaded entries came from the user's own file, counted at
+    startup so the one line about them can be printed.  Nothing else reads it. }
+  UserHooks: Integer = 0;
+  { Not initialized, deliberately: an initialized global is a typed constant to
+    the compiler and cannot be a for-loop counter. }
+  HookIdx: Integer;
   HookOut: THookOutcome;
   HookCallRec: THookCall;
   SdkOpts: uSdk.TSdkOptions;
@@ -4704,6 +4826,31 @@ begin
       end;
       if (Arg = '--resume') or (Arg = '-r') then
         Resume := True
+      { Claude Code's pair, and the same division of labour: --continue takes
+        the most recent conversation and asks nothing, --resume is the one you
+        reach for when you want to choose.  The shapes are not identical and
+        pretending otherwise would be the lie: --resume here has always meant
+        exactly this directory's session.json and still does, because changing
+        what an existing flag loads is not a thing a new flag gets to do.  The
+        choosing is /sessions, which was already the picker and is what --help
+        points at. }
+      else if (Arg = '--continue') or (Arg = '-c') then
+        ContinueFlag := True
+      else if Arg = '--append-system-prompt' then
+      begin
+        if ArgI >= ParamCount then
+          FailStart('--append-system-prompt needs text', '', 2);
+        { Refused at the door rather than truncated or ignored.  Every other
+          way of getting this wrong - too long, empty - ends the run here with
+          the reason, because the flag's whole job is to put words in the
+          system prompt and a run that half-did that is a run whose replies
+          cannot be explained. }
+        if not uSdk.SdkAppendSystemPush(ParamStr(ArgI + 1), Err) then
+          FailStart('--append-system-prompt: ' + Err,
+            'it adds to the system prompt and can never replace it; put a ' +
+            'long standing instruction in CLAUDE.md instead', 2);
+        SkipNext := True;
+      end
       else if Arg = '--web' then
         { Print mode leaves Ask nil, so nothing there can be approved
           interactively; without a flag a -p run could never search. }
@@ -4780,6 +4927,16 @@ begin
         SetLength(AddDirs, Length(AddDirs) + 1);
         AddDirs[High(AddDirs)] := AddArg;
       end
+      { Beside --add-dir because they answer the same question from opposite
+        ends: one says what this tree may REACH, this one says what this tree
+        may SAY.  A plain boolean with no value and no = form - --add-dir has
+        one because a path is what people paste, and there is nothing here to
+        paste or to validate.  It is refused against no other flag either: it
+        is meaningful in the REPL, under -p, and redundantly under a --ci
+        verb, and this program refuses combinations that are dangerous or
+        meaningless rather than ones that are merely unusual. }
+      else if Arg = '--no-project-context' then
+        NoProjectContext := True
       else if Arg = '--status' then
         DiagMode := dmStatus
       else if Arg = '--doctor' then
@@ -4888,7 +5045,13 @@ begin
       begin
         EmitCLn(clBright, 'pasclaude [directory] [--resume] [--web] [--add-dir <dir>] [-p "prompt"]');
         EmitCLn(clGrey, '  --resume  continue the conversation saved in that directory');
-        EmitCLn(clGrey, '            (under -p it needs --session-file, below)');
+        EmitCLn(clGrey, '            (-r; under -p it needs --session-file, below)');
+        EmitCLn(clGrey, '  --continue');
+        EmitCLn(clGrey, '            continue the most recently saved conversation in that');
+        EmitCLn(clGrey, '            directory, whichever it is - the live one, the safety');
+        EmitCLn(clGrey, '            copy, or a /save - and do not ask (-c). To CHOOSE one,');
+        EmitCLn(clGrey, '            start without it and type /sessions. Interactive only:');
+        EmitCLn(clGrey, '            under -p name the transcript with --session-file.');
         EmitCLn(clGrey, '  --web     let the model search the web (off by default)');
         EmitCLn(clGrey, '  -p        answer one prompt and exit (reads stdin when piped)');
         EmitCLn(clGrey, '            (-p never loads hooks: nobody is there to approve them)');
@@ -4924,6 +5087,17 @@ begin
         EmitCLn(clGrey, '            session root. An added directory grants file access only:');
         EmitCLn(clGrey, '            its hooks, skills, commands, agents and .mcp.json are not');
         EmitCLn(clGrey, '            read. Nothing is persisted, so say it again next session.');
+        EmitCLn(clGrey, '  --no-project-context');
+        EmitCLn(clGrey, '            do not read this tree''s AGENTS.md, CLAUDE.md or');
+        EmitCLn(clGrey, '            .pasclaude.md into the system prompt, and follow no @import');
+        EmitCLn(clGrey, '            inside one.  For a checkout somebody else wrote: the Answer');
+        EmitCLn(clGrey, '            step in examples\github\ passes it, because that step runs in');
+        EmitCLn(clGrey, '            the pull request''s own head.  Without it, -p loads them');
+        EmitCLn(clGrey, '            exactly as the REPL does and scripts rely on that.  Your own');
+        EmitCLn(clGrey, '            %USERPROFILE%\.pasclaude\CLAUDE.md still loads - the question');
+        EmitCLn(clGrey, '            the flag asks is which TREE wrote the prompt.  Skills are not');
+        EmitCLn(clGrey, '            affected: their descriptions ride in the skill tool''s own');
+        EmitCLn(clGrey, '            description and were never in the system prompt.');
         EmitCLn(clGrey, '  --output-style <name>');
         EmitCLn(clGrey, '            how replies are written: default, explanatory, learning,');
         EmitCLn(clGrey, '            or a .pasclaude\styles\<name>.md of your own (the user');
@@ -4932,6 +5106,19 @@ begin
         EmitCLn(clGrey, '            grants nothing and cannot change what you are asked to');
         EmitCLn(clGrey, '            approve.  Interactively the name is remembered; under -p');
         EmitCLn(clGrey, '            nothing is remembered and this flag is the only way in.');
+        EmitCLn(clGrey, '            Edit the file and it applies from the next turn; if the');
+        EmitCLn(clGrey, '            edit cannot be read the old text stays and you are told.');
+        EmitCLn(clGrey, '  --append-system-prompt <text>');
+        EmitCLn(clGrey, '            add your own paragraph to the end of the system prompt for');
+        EmitCLn(clGrey, '            this run.  It ADDS and never replaces: the guidelines and');
+        EmitCLn(clGrey, '            this project''s CLAUDE.md are still there, above it.  Give');
+        EmitCLn(clGrey, '            it more than once and the pieces accumulate in order,');
+        EmitCLn(clGrey, '            separated by a blank line; 4096 bytes in total, and past');
+        EmitCLn(clGrey, '            that the run stops rather than sending half of it.  There');
+        EmitCLn(clGrey, '            is no settings.json key for this on purpose - a file in a');
+        EmitCLn(clGrey, '            cloned project that could rewrite the system prompt is the');
+        EmitCLn(clGrey, '            thing that must not exist.  Something long belongs in');
+        EmitCLn(clGrey, '            CLAUDE.md, where /memory can show it to you.');
         EmitCLn(clGrey, '  --session-file <path>   (needs -p)');
         EmitCLn(clGrey, '            names the transcript a -p run saves to after every turn,');
         EmitCLn(clGrey, '            and with --resume the one it continues.  Without it -p');
@@ -5022,6 +5209,27 @@ begin
       FailStart('--resume under -p needs --session-file <path>',
         'a scripted run must name the conversation it continues; the ' +
         'directory''s saved session is left alone', 2);
+    { And --continue is refused under -p outright, with no --session-file
+      escape, because it is a STRONGER version of the thing the refusal above
+      exists for: --resume at least names one fixed file, where this one takes
+      whichever transcript happens to have been written last.  A script that
+      continued "the most recent conversation" would continue a different one
+      depending on what the user did in the REPL an hour ago, which is not
+      something a scripted run can be said to have chosen.  --session-file is
+      the answer under -p, and it is what the message says. }
+    if ContinueFlag and PrintMode then
+      FailStart('--continue is interactive; under -p name the transcript',
+        'use --session-file <path>, optionally with --resume: a scripted run ' +
+        'must not depend on which conversation was saved last', 2);
+    { Contradictory rather than ordered, exactly as --permission-mode plan and
+      --dangerously-skip-permissions are.  They load DIFFERENT files - one the
+      directory's session.json, the other whichever save is newest - so either
+      precedence would be a guess about which conversation the user meant, and
+      the wrong guess silently continues the wrong one. }
+    if Resume and ContinueFlag then
+      FailStart('--resume and --continue name different conversations',
+        '--resume loads this directory''s saved session, --continue loads ' +
+        'whichever was written last; pick one', 2);
     if StreamInput and (OutFormat <> uSdk.sfStreamJson) then
       FailStart('--input-format stream-json needs --output-format stream-json',
         'a driver that sends messages has to be able to read the answers', 2);
@@ -5055,9 +5263,12 @@ begin
           'they are modes of their own: run them alone', 2);
       if Trim(PrintPrompt) <> '' then
         FailStart('--status, --doctor and --ci take no prompt', '', 2);
-      if Resume then
+      { Both flags, and for the one reason: whichever transcript is loaded,
+        it changes the message count, the token counters and the model the
+        report would print. }
+      if Resume or ContinueFlag then
         FailStart('--status, --doctor and --ci cannot be combined with ' +
-          '--resume',
+          '--resume or --continue',
           'they report on a fresh session, and loading a transcript would ' +
           'change what they report', 2);
       if StreamInput then
@@ -5363,61 +5574,107 @@ begin
       WHAT THIS DOES NOT DO, said here rather than left to be discovered.
       Neither --ci verb sends anything to a model: RunCi ends in Halt on every
       path, and the prompt built a few lines below is thrown away under both.
-      So this gate stops a branch's instructions being READ and assembled - it
-      is not what kept them out of the answer, because the answer was not
-      produced here.  In the mention template it comes from the step before,
-      an ordinary -p in the same checked-out head, where the gate is
-      deliberately open: a project's CLAUDE.md binding under -p is a promise
-      README makes to every scripted user.  That residual is real, it is
-      recorded in FEATURES-NOT-YET.md, and the notice below is worded so that
-      nobody reading a build log can mistake this line for a statement about
-      the answer above it.
+      So the --ci half of this gate stops a branch's instructions being READ
+      and assembled - it is not what keeps them out of the answer, because the
+      answer is not produced here.  In the mention template it comes from the
+      step before, an ordinary -p in the same checked-out head, and THAT is
+      what the second term is for: --no-project-context, an explicit flag the
+      workflow file passes on that step.  A flag and never a mode inferred
+      from the prompt text, because the prompt is the one string in the run an
+      attacker wrote, and any behaviour keyed on its contents is a behaviour
+      the attacker chooses.
 
-      The notice is unconditional rather than suppressed for machine output
-      because --ci refuses --output-format at the argument parser, so this
-      stdout is a build log by construction and cannot land in front of a
-      driver's parser.
+      The two terms are combined in uSdk.SdkProjectContextDecide rather than
+      spelled out here, and the reason is that this is a program's main block:
+      no suite can link it, so the condition that decides whether a checkout
+      writes part of the system prompt was the one part of this feature with
+      no test at all.  A third reason to suppress belongs inside that function
+      too - not as another assignment somewhere below, because "one writer,
+      go and read it" is the property that makes this auditable.
 
-      MemoryFileCount is deliberately left alone: it feeds the REPL status
-      line and --doctor, and neither is reachable under these two verbs -
-      RunCi halts before FillDiagFacts - so what it counts is still what that
-      caller wants to know. }
-    uSdk.SdkProjectContextAllowed :=
-      not (DiagMode in [dmCiPrepare, dmCiReport]);
+      The notice below used to be unconditional on stdout, and the argument
+      for that was that --ci refuses --output-format at the argument parser,
+      so its stdout is a build log by construction.  That argument does not
+      survive the flag: the template's Answer step is
+      -p --output-format json > result.json, where one grey line would land in
+      front of --ci report's parser and break the posted comment.  So the flag
+      branch goes to StdErr, exactly as the --dangerously-skip-permissions
+      warning above does and for word-for-word the same reason.  It is named
+      first when both hold, because the flag is the thing the operator typed.
+
+      MemoryFileCount is NOT left alone any more, and the flag is why: under
+      the two --ci verbs it was unreachable - RunCi halts before
+      FillDiagFacts - but --no-project-context reaches the REPL status line,
+      where a count of two memories the model never received would be exactly
+      the claim that function's own comment promises it cannot make. }
+    uSdk.SdkProjectContextAllowed := uSdk.SdkProjectContextDecide(
+      NoProjectContext, DiagMode in [dmCiPrepare, dmCiReport]);
     if (not uSdk.SdkProjectContextAllowed) and
        (uSdk.SdkProjectContextFiles <> '') then
     begin
-      EmitCLn(clGrey, '  ci: ' + uSdk.SdkProjectContextFiles +
-        ' in this directory were not read by this --ci step');
-      EmitCLn(clGrey, '    it asks no model anything; a -p step in the same ' +
-        'checkout loads them as usual');
+      if NoProjectContext then
+        { The second clause is CONDITIONAL, and the flag's own shipping
+          environment is why.  It exists for CI, where a runner's home
+          directory has no .pasclaude\CLAUDE.md in it at all - so the sentence
+          "your %USERPROFILE% memory still was" read would be printed into
+          every workflow log while SdkUserContext had in fact returned nothing.
+          That is exactly the claim MemoryFileCount's own comment forbids: a
+          line naming a file the model did not get.  Asked through
+          SdkUserContext rather than through a FileExists of the same path
+          spelled a second time here, so the notice cannot come to disagree
+          with the loader about what counts as present - an unreadable file
+          loads as nothing and is reported as nothing. }
+        WriteLn(StdErr, 'pasclaude: --no-project-context: ' +
+          uSdk.SdkProjectContextFiles + ' in this directory were not read ' +
+          'into the system prompt' + UserMemoryClause)
+      else
+      begin
+        EmitCLn(clGrey, '  ci: ' + uSdk.SdkProjectContextFiles +
+          ' in this directory were not read by this --ci step');
+        EmitCLn(clGrey, '    it asks no model anything; a -p step in the same ' +
+          'checkout loads them unless it too passes --no-project-context');
+      end;
     end;
     if uHooks.HooksAllowed then
     begin
       uHooks.OnHookNotice := @HookNotice;
-      if TrustHooks then
+      { LoadHooks is now called unconditionally, and that is the wiring change
+        this round turns on.  The user's own hooks must load whether or not the
+        project's were trusted, and TrustHooks already returns False without
+        prompting when there is no project file - so the answer it gives is
+        still exactly the answer about the project, passed straight through.
+        HooksAllowed still wraps the whole block, so no unattended mode reaches
+        either file. }
+      uHooks.LoadHooks(TrustHooks, HookNotes);
+      if Trim(HookNotes) <> '' then
+        EmitC(clYellow, '  ' + StringReplace(Trim(HookNotes), #10, #10'  ',
+          [rfReplaceAll]) + #10);
+      { Said once, out loud, because it is the file nobody was asked about: a
+        hook firing invisibly is the complaint this program's own
+        FEATURES-NOT-YET already records, and the scope that skips the prompt
+        is the one that most needs a line saying it is there. }
+      UserHooks := 0;
+      for HookIdx := 0 to uHooks.HookEntryCount - 1 do
+        if uHooks.HookScopeAt(HookIdx) = 'user' then Inc(UserHooks);
+      if UserHooks > 0 then
+        EmitCLn(clGrey, Format('  %d hook(s) from %s (/hooks)',
+          [UserHooks, uHooks.UserHooksFilePath]));
+      if uHooks.HooksEnabled then
       begin
-        uHooks.LoadHooks(True, HookNotes);
-        if Trim(HookNotes) <> '' then
-          EmitC(clYellow, '  ' + StringReplace(Trim(HookNotes), #10, #10'  ',
-            [rfReplaceAll]) + #10);
-        if uHooks.HooksEnabled then
+        HookOut := uHooks.FireHooks(uHooks.HookCall(heSessionStart));
+        if HookOut.Blocked then
         begin
-          HookOut := uHooks.FireHooks(uHooks.HookCall(heSessionStart));
-          if HookOut.Blocked then
-          begin
-            { A SessionStart hook is the one place a block means "do not
-              start": there is no turn to refuse and no transcript to keep
-              legal, so the honest answer is to say why and stop. }
-            NeedNewLine;
-            EmitCLn(clRed, '  ' + Trim(HookOut.Text));
-            TermDone;
-            Halt(2);
-          end;
-          if Trim(HookOut.Text) <> '' then
-            HookSystemExtra := #10#10'Session context follows.'#10 +
-              HookOut.Text;
+          { A SessionStart hook is the one place a block means "do not
+            start": there is no turn to refuse and no transcript to keep
+            legal, so the honest answer is to say why and stop. }
+          NeedNewLine;
+          EmitCLn(clRed, '  ' + Trim(HookOut.Text));
+          TermDone;
+          Halt(2);
         end;
+        if Trim(HookOut.Text) <> '' then
+          HookSystemExtra := #10#10'Session context follows.'#10 +
+            HookOut.Text;
       end;
     end;
 
@@ -5455,6 +5712,29 @@ begin
       Agent.ShouldCancel := @UserWantsStop;
       if WebFlag then Agent.WebSearch := True;
       uTerm.CompleteProvider := @Complete;
+      { Escape twice on an already-empty prompt line opens /rewind.  The word
+        is pushed DOWN into the editor exactly like the completion provider
+        above it: uTerm is below uTools and has no idea what a slash command
+        is, so it submits this string as though the user had typed it and the
+        REPL's one dispatcher does the rest.
+
+        Set beside the other seam that only makes sense with a console, and
+        NOT structurally confined to one: this assignment is ABOVE the
+        `if PrintMode` below, so -p, --status, --doctor and both --ci verbs all
+        execute it too.  What makes that inert is only that ReadPromptLine has
+        exactly one call site and none of those modes reaches it - a property
+        of the call graph, not of this line.  Anyone adding a second reader
+        that blocks for input, or a scripted path that calls ReadPromptLine,
+        inherits an armed shortcut and has to turn it off deliberately.  The
+        earlier wording here claimed the -p branch "never reaches this line",
+        which is the reverse of the truth and is the sentence a reviewer
+        auditing the fail-closed story would have trusted.
+
+        A NAME AND NOT A COMMAND OBJECT, which is the point: this string goes
+        through HandleCommand like any other line, so /rewind's own "nothing
+        to rewind to yet" and its picker are what a stray double-Escape gets,
+        not a second undo path that had to be kept in step with the first. }
+      uTerm.EscEscCommand := '/rewind';
 
       { Print mode: one prompt in, one answer out, exit code says how it
         went.  This is what makes  pasclaude -p "..."  usable from scripts
@@ -5602,10 +5882,21 @@ begin
       { Resuming happens before the banner, because a saved session can carry
         its own model and the banner should report the one actually in use. }
       ResumeErr := '';
-      if Resume then
+      if Resume or ContinueFlag then
       begin
-        Resumed := Agent.LoadSession(SessionPath(uTools.RootDir), ResumeErr);
-        if Resumed then TelemRebaseline;
+        { The one place the two flags differ, and they differ only in which
+          path they hand to the same loader.  Nothing below here knows which
+          flag was given except the notice, which names the file for
+          --continue because the user did not choose it. }
+        if ContinueFlag then ResumeFile := uAgent.NewestSession(uTools.RootDir)
+        else ResumeFile := SessionPath(uTools.RootDir);
+        if ResumeFile = '' then
+          ResumeErr := 'no saved conversation in ' + SessionDir
+        else
+        begin
+          Resumed := Agent.LoadSession(ResumeFile, ResumeErr);
+          if Resumed then TelemRebaseline;
+        end;
       end;
 
       { Up-arrow reaching last week's build command is the whole point of
@@ -5697,12 +5988,34 @@ begin
         EmitCLn(clYellow, '  output style ' + uTools.OutputStyleName +
           ' comes from ' + uTools.OutputStylePath);
 
+      { --append-system-prompt announces itself, in the same yellow the style
+        notices use and for the same reason: text is being added to the most
+        trusted position in every request of this run, and a session where the
+        model is following an instruction nobody on screen can see is the
+        failure this line exists to prevent.  The byte count and not the text:
+        the text is on the command line the user just typed, they can scroll
+        up, and four kilobytes of somebody's prose replayed into the banner
+        would push the rest of it off the screen. }
+      if uSdk.SdkAppendSystem <> '' then
+        { StartupNote and not EmitCLn: --status and --doctor run the whole of
+          startup and reach this line, and one sentence of prose on a stdout
+          somebody is parsing as JSON is a broken protocol. }
+        StartupNote(clYellow, Format('  --append-system-prompt: %d bytes ' +
+          'added to the system prompt', [Length(uSdk.SdkAppendSystem)]));
+
       { After LoadPermissions, so an approval already given suppresses the
         prompt, and after the print-mode Halt above, which is what makes a
         scripted run structurally unable to be the thing that first executes a
         repository's code - print mode never reaches here at all, and would
-        arrive with a nil Ask and deny everything if it did. }
-      if uTools.LoadMcpConfig(uTools.McpConfigPath, McpErr) then
+        arrive with a nil Ask and deny everything if it did.  That is still
+        true of BOTH files: LoadMcpConfigAll reads the user's mcp.json as well
+        as the project's .mcp.json, and print mode reaches neither.
+
+        LoadMcpConfigAll and not LoadMcpConfig, which is the project-only
+        loader the suites drive.  The user's servers are loaded first and are
+        approved without the spawn prompt, because they name programs the user
+        themselves chose; the per-call permission gate is unchanged for them. }
+      if uTools.LoadMcpConfigAll(McpErr) then
       begin
         { Parsed, but NOT approved and NOT connected under --status or
           --doctor.  Approving a spawn is a permission answer, and a health
@@ -5780,13 +6093,51 @@ begin
            uTools.PluginsDirName]));
       end;
 
-      if Resume then
+      if Resume or ContinueFlag then
       begin
-        if Resumed then
+        if Resumed and ContinueFlag then
+          { Named, because --continue chose the file and the user did not.  A
+            "resumed 41 messages" with no file behind it is the notice a user
+            has to take on faith, and the whole risk of the flag is that it
+            picked the wrong conversation. }
+          EmitCLn(clGreen, Format('  resumed %s: %d messages (%d turns)',
+            [ExtractFileName(ResumeFile), Agent.MessageCount, Agent.TurnCount]))
+        else if Resumed then
           EmitCLn(clGreen, Format('  resumed %d messages (%d turns)',
             [Agent.MessageCount, Agent.TurnCount]))
         else
           EmitCLn(clYellow, '  starting fresh: ' + ResumeErr);
+        { --continue is NOT the exemption --resume is, and treating the two
+          flags as one here destroyed conversations.  --resume loads
+          session.json itself, so the file the first save overwrites is the
+          file already in memory and a copy of it would be a copy of what is
+          about to be written back - that skip is right.  --continue loads
+          WHICHEVER SAVE IS NEWEST, which may be a /save copy, and loads
+          nothing at all when the newest one will not parse.  In both of those
+          the first turn writes over the session.json nobody read, and the
+          branch below - the one that takes the copy - was never reached
+          because it sits in the else of `Resume or ContinueFlag`.
+
+          Reproduced before this was written: a directory holding a valid
+          session.json and a newer unparseable save, run with --continue,
+          printed "starting fresh" and left no session.prev.json anywhere; the
+          same directory with no flag printed the notice and did create one.
+
+          So the test is not which flag was typed but whether the file about to
+          be overwritten is the file that was loaded.  Compared as text because
+          both paths are built by the same two lines of uAgent from the same
+          root, so they are the same string or they are different files. }
+        if (DiagMode = dmNone) and
+           (CompareText(ResumeFile, SessionPath(uTools.RootDir)) <> 0) and
+           FileExists(SessionPath(uTools.RootDir)) then
+        begin
+          if BackupSession(SessionPath(uTools.RootDir), SaveErr) then
+            EmitCLn(clGrey, '  the conversation already saved here was not the ' +
+              'one loaded; a copy is kept as session.prev.json')
+          else
+            EmitCLn(clYellow, '  a different saved conversation is here and ' +
+              'could not be copied aside: ' + SaveErr);
+        end;
         EmitLn;
       end
       else if (DiagMode = dmNone) and
@@ -5884,6 +6235,23 @@ begin
 
           The status block is refreshed here, immediately before the read, so
           what it says is what was true when the user looked at it. }
+        { The last moment before the program blocks in ReadConsoleInputW for
+          an unbounded time, and therefore the last chance to enforce the
+          background spool cap on this side of it.  Before RefreshStatus, so
+          the job count the status block prints is the count after any kill
+          rather than one that was true a moment ago.  What this does not do
+          is cover the read below: once it begins nothing ticks until the user
+          types, so a job left running through lunch is bounded by nothing
+          here. }
+        uTools.TickBackgroundJobs;
+        { The style file behind the session changed and the new contents could
+          not be used.  Drained HERE, before the status block is drawn and
+          before the read blocks, because that is the last moment the user is
+          looking at the screen rather than at their editor - and read-and-
+          cleared, so a file left broken says this once instead of once a
+          turn.  What was working is still in force; the line says so. }
+        StyleErr := uTools.TakeStyleReloadNote;
+        if StyleErr <> '' then EmitCLn(clYellow, '  ' + StyleErr);
         RefreshStatus;
         if not ReadPromptLine(ModePrompt, Line) then Break;
         Line := Trim(Line);

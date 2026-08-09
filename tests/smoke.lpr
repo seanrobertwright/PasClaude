@@ -1948,6 +1948,33 @@ begin
   end;
 end;
 
+{ The user's own hooks.json, written through uHooks.UserHooksFilePath rather
+  than a path this file builds, so the fixture and the loader can never
+  disagree about where the file goes.
+
+  THAT MAKES IT SAFE ONLY BECAUSE %USERPROFILE% IS REDIRECTED FOR THE WHOLE OF
+  THIS SUITE, which is a property of the main block and not of this procedure.
+  An earlier version of this comment asserted the redirection as a standing
+  fact; it was not one - a HomeBack in the middle of the file had already put
+  the real home back by the time any hook test ran, so this wrote into the
+  developer's actual %USERPROFILE%\.pasclaude and the finally below deleted it.
+  The note above SetEnvironmentVariable records the measurement and the fix.
+  Anything that reaches for a user-scope path from here must check that note
+  first rather than trusting this one. }
+procedure WriteUserHooksFile(const Body: string);
+var
+  L: TStringList;
+begin
+  ForceDirectories(ExtractFileDir(uHooks.UserHooksFilePath));
+  L := TStringList.Create;
+  try
+    L.Text := Body;
+    L.SaveToFile(uHooks.UserHooksFilePath);
+  finally
+    L.Free;
+  end;
+end;
+
 { Hooks are an INTERACTIVE-only feature, and this is the assertion that says
   so.  It runs first in this suite because it is the only place the shipped
   DEFAULT of HooksAllowed is observable: every other hook test needs the flag
@@ -2178,6 +2205,121 @@ begin
   Check(uHooks.HookCount(hePreTool) = 0, 'and empties the table');
 end;
 
+{ The other half of the trust asymmetry: a user-level hooks.json is trusted
+  without a prompt, loads first, and cannot be crowded out or shadowed by the
+  project's.  The four things worth pinning are the four that would each be a
+  security bug if they went the other way - the user file loading when the
+  project's was refused, the ORDER (first block wins, so whoever fires first
+  decides), the ceiling never eating a user entry, and HooksAllowed still
+  covering both scopes so no unattended run reaches either file. }
+procedure TestUserHooksAreTrustedAndFireFirst;
+var
+  Notes, F, SavedRoot, Sum: string;
+  O: uHooks.THookOutcome;
+  I: Integer;
+begin
+  SavedRoot := uTools.RootDir;
+  uTools.RootDir := HookRoot;
+  try
+    WriteUserHooksFile('{"hooks":{"PreToolUse":[{"command":"echo user ran"}]}}');
+    WriteHooksFile('{"hooks":{"PreToolUse":[{"command":"echo project said no ' +
+      '& exit /b 2"}]}}');
+
+    { Trusted False is the answer about the PROJECT file and nothing else. }
+    uHooks.LoadHooks(False, Notes);
+    Check(uHooks.HooksEnabled, 'a user hook loads with the project file refused');
+    Check(uHooks.HookCount(hePreTool) = 1,
+      'and it is the only entry the refusal left');
+    Check(uHooks.HookScopeAt(0) = 'user', 'the surviving entry is the user''s own');
+
+    uHooks.LoadHooks(True, Notes);
+    Check(uHooks.HookCount(hePreTool) = 2, 'with the project trusted there are two');
+    Check(uHooks.HookScopeAt(0) = 'user', 'the user''s hook is first in the table');
+    Check(uHooks.HookScopeAt(1) = 'project', 'and the project''s comes after it');
+    { On the rendered COLUMN and not on the bare word.  Pos('user', Sum) was
+      what stood here and it could not fail: the fixture's user command is
+      'echo user ran', so the substring is in the summary whether or not
+      SummaryLine ever grew a scope column, and deleting the column outright
+      left this green.  The two-space padding is what makes it the column
+      rather than the command text. }
+    Sum := uHooks.HookSummary;
+    Check(Pos('  user ', Sum) > 0,
+      '/hooks renders a scope column, and the user''s line carries it: ' + Sum);
+    Check(Pos('  project ', Sum) > 0, 'and the project''s line carries the other');
+
+    { The assertion that would catch a future edit appending the two tables the
+      other way round.  It is not cosmetic: FireHooks stops at the first block,
+      so a project file that fired first could pre-empt the user's own hook. }
+    O := uHooks.FireHooks(uHooks.HookCall(hePreTool));
+    Check(O.Blocked, 'a project hook still blocks a tool call');
+    Check(Pos('user ran', O.Text) > 0,
+      'but the user''s hook ran first and its words survive the block: ' + O.Text);
+    Check(O.Ran = 2,
+      'both ran, and in that order - first block wins, so order is the rule');
+
+    { HooksConfigured is the PROJECT question because it is what gates the
+      trust prompt; nothing about the user's file may ever make it true. }
+    SysUtils.DeleteFile(uHooks.HooksFilePath);
+    Check(uHooks.UserHooksConfigured, 'the user file is configured');
+    Check(not uHooks.HooksConfigured,
+      'HooksConfigured stays the project question, so no user file is ever ' +
+      'prompted for');
+    Check(uHooks.AnyHooksConfigured,
+      'while the question the display asks sees both');
+
+    { Eight project entries plus one of the user's: the per-event ceiling is a
+      ceiling on the EVENT, and the entries it refuses are the project's own
+      overflow rather than the user's. }
+    F := '{"hooks":{"PreToolUse":[';
+    for I := 1 to 8 do
+    begin
+      if I > 1 then F := F + ',';
+      F := F + '{"command":"echo p' + IntToStr(I) + '"}';
+    end;
+    WriteHooksFile(F + ']}}');
+    uHooks.LoadHooks(True, Notes);
+    Check(uHooks.HookCount(hePreTool) = uHooks.MaxHooksPerEvent,
+      Format('eight project hooks and one of the user''s stop at the event ' +
+        'ceiling (%d)', [uHooks.HookCount(hePreTool)]));
+    Check(uHooks.HookScopeAt(0) = 'user',
+      'and the entry the ceiling did not reach is never the user''s');
+
+    { Running in the home directory makes the two paths one file.  Loaded once,
+      as the user's, with nothing asked about it. }
+    { The home directory taken from the path itself rather than from SkillRoot,
+      which is declared further down this file - and it is the more honest
+      question anyway: home is wherever %USERPROFILE% points right now. }
+    uTools.RootDir := ExtractFileDir(ExtractFileDir(uHooks.UserHooksFilePath));
+    Check(uHooks.ProjectHooksAreTheUsers,
+      'in the home directory the two paths name one file');
+    Check(not uHooks.HooksConfigured,
+      'so the host is never asked a question about it');
+    uHooks.LoadHooks(True, Notes);
+    Check(uHooks.HookCount(hePreTool) = 1,
+      'and the one file is loaded once, not twice');
+    Check(uHooks.HookScopeAt(0) = 'user', 'as the user''s own');
+    uTools.RootDir := HookRoot;
+
+    { And commit 43daa12, still closed.  A user-scope file is not an exemption
+      from the one byte that says whether this run may execute hooks at all. }
+    uHooks.HooksAllowed := False;
+    uHooks.LoadHooks(True, Notes);
+    Check(uHooks.HookCount(hePreTool) = 0,
+      'an unattended run loads no user hook either');
+    Check(not uHooks.HooksEnabled,
+      'the user file does not make HooksEnabled true on its own');
+    O := uHooks.FireHooks(uHooks.HookCall(hePreTool));
+    Check(O.Ran = 0, 'and fires none of them');
+  finally
+    { Restored, or every hook test after this one inherits a user hook and
+      heaptrc is the least of it. }
+    uHooks.HooksAllowed := True;
+    uHooks.ClearHooks;
+    SysUtils.DeleteFile(uHooks.UserHooksFilePath);
+    uTools.RootDir := SavedRoot;
+  end;
+end;
+
 { End to end through RunTool, which is the only path that proves the wrapper
   fires around the ladder rather than beside it. }
 procedure TestHookDispatch;
@@ -2312,6 +2454,205 @@ begin
     uHooks.ClearHooks;
     uTools.AllowAllEdits := SavedEdits;
     DeleteFile(Target);
+  end;
+end;
+
+{ The whole path a hook takes to a driver: uHooks fires a real child, the
+  report seam hands the outcome to uSdk, and one protocol line comes out of
+  the sink.  Driven with a sink rather than a pipe, the way the SDK is
+  designed to be tested, so there is no process and no console anywhere in
+  it. }
+var
+  HookProtoLines: array of string;
+
+procedure CollectHookProtoLine(const S: string);
+begin
+  SetLength(HookProtoLines, Length(HookProtoLines) + 1);
+  HookProtoLines[High(HookProtoLines)] := S;
+end;
+
+{ The one field of a captured line, or '' when there is not exactly one line.
+  A helper rather than six copies of parse-check-free, and it deliberately
+  refuses to answer when the count is wrong: "the detail was right" said about
+  the second of two lines nobody expected would be a passing test of a broken
+  stream. }
+function OneHookLineStr(const Key: string): string;
+var
+  D: TJson;
+begin
+  Result := '';
+  if Length(HookProtoLines) <> 1 then Exit;
+  D := JsonParse(HookProtoLines[0]);
+  if D = nil then Exit;
+  try
+    if D.Kind = jkObj then Result := D.Str(Key);
+  finally
+    D.Free;
+  end;
+end;
+
+function OneHookLineBlocked: Boolean;
+var
+  D: TJson;
+begin
+  Result := False;
+  if Length(HookProtoLines) <> 1 then Exit;
+  D := JsonParse(HookProtoLines[0]);
+  if D = nil then Exit;
+  try
+    if D.Kind = jkObj then Result := D.Bool('blocked');
+  finally
+    D.Free;
+  end;
+end;
+
+procedure TestHookLinesReachADriver;
+var
+  A: TAgent;
+  Notes, Err, SavedRoot, Detail: string;
+  Opts: TSdkOptions;
+  Call: uHooks.THookCall;
+  O: uHooks.THookOutcome;
+  Code: Integer;
+begin
+  SavedRoot := uTools.RootDir;
+  uTools.RootDir := HookRoot;
+  A := TAgent.Create('k', 'm', 'sys');
+  uSdk.SdkSink := @CollectHookProtoLine;
+  Call := uHooks.HookCall(hePreTool);
+  Call.ToolName := 'write_file';
+  try
+    { Every count below - O.Ran, and the one line the reporter emits - is a
+      count over BOTH scopes, because LoadHooks reads both.  So the user scope
+      is stated rather than assumed: this test used to pass only because the
+      test registered two lines above it happened to delete the user file in
+      its own finally, which made a U4 assertion depend on the cleanup order
+      of a U2 fixture.  %USERPROFILE% is the suite's own temporary home (see
+      SetEnvironmentVariable's note), so this deletes a fixture and never
+      anybody's real file. }
+    SysUtils.DeleteFile(uHooks.UserHooksFilePath);
+    Check(not uHooks.UserHooksConfigured,
+      'no user-scope hook file is in play, so every count below is the ' +
+      'fixture''s alone');
+    WriteHooksFile('{"hooks":{"PreToolUse":[{"command":"echo watching"}]}}');
+    uHooks.LoadHooks(True, Notes);
+    Check(uHooks.HooksEnabled, 'the reporting fixture loaded: ' + Trim(Notes));
+
+    { The default, which is what the REPL runs under: nobody installed a
+      reporter, so a hook fires and nothing is written anywhere. }
+    HookProtoLines := nil;
+    Check(not Assigned(uHooks.OnHookFired),
+      'no hook reporter is installed by default');
+    O := uHooks.FireHooks(Call);
+    Check(O.Ran = 1, 'a hook ran with nobody watching');
+    Check(Length(HookProtoLines) = 0, 'and put nothing on any stream');
+
+    { A text run CLEARS the seam rather than leaving it alone, which is what
+      makes a second run in one process safe. }
+    Opts := uSdk.SdkDefaultOptions;
+    Opts.Format := sfText;
+    Code := uSdk.SdkRun(A, Opts, '', Err);
+    Check(Code = 0, 'a run with no prompt and no driver is a clean run');
+    Check(not Assigned(uHooks.OnHookFired),
+      'a text-mode run installs no hook reporter');
+    HookProtoLines := nil;
+    uHooks.FireHooks(Call);
+    Check(Length(HookProtoLines) = 0,
+      'so a text-mode REPL gains not one line of output from this feature');
+
+    { json is one object for the whole run, so a mid-turn event has nowhere in
+      that shape to go and is refused the seam as well. }
+    Opts.Format := sfJson;
+    uSdk.SdkRun(A, Opts, '', Err);
+    Check(not Assigned(uHooks.OnHookFired),
+      'nor does --output-format json, which emits one object per run');
+
+    { stream-json, where there IS a place for it. }
+    Opts.Format := sfStreamJson;
+    Code := uSdk.SdkRun(A, Opts, '', Err);
+    Check(Code = 0, 'a stream-json run with no prompt is still a clean run');
+    Check(Assigned(uHooks.OnHookFired),
+      'and stream-json is the format that installs the reporter');
+
+    HookProtoLines := nil;
+    O := uHooks.FireHooks(Call);
+    Check(Length(HookProtoLines) = 1, Format(
+      'one fire that ran a child is one line (%d)', [Length(HookProtoLines)]));
+    Check(OneHookLineStr('type') = 'hook', 'typed hook, its own event');
+    Check(OneHookLineStr('event') = 'PreToolUse',
+      'carrying the event name a hooks.json uses: ' + OneHookLineStr('event'));
+    Check(OneHookLineStr('tool_name') = 'write_file',
+      'and the tool it fired around');
+    Check(Pos('watching', OneHookLineStr('detail')) > 0,
+      'with the hook''s own words: ' + OneHookLineStr('detail'));
+    Check((not OneHookLineBlocked) and not O.Blocked,
+      'a hook that ran and allowed the call is not blocked');
+
+    { The distinction the line exists for.  Same event, same tool, and the
+      only difference a driver can see is the flag. }
+    WriteHooksFile('{"hooks":{"PreToolUse":[{"command":"echo not on my ' +
+      'watch & exit /b 2"}]}}');
+    uHooks.LoadHooks(True, Notes);
+    HookProtoLines := nil;
+    O := uHooks.FireHooks(Call);
+    Check(O.Blocked and OneHookLineBlocked,
+      'a hook that refused the call says so in the line, not only in the ' +
+      'tool result');
+    Check(Pos('not on my watch', OneHookLineStr('detail')) > 0,
+      'and its reason rides along: ' + OneHookLineStr('detail'));
+
+    { Two echoes, so the detail contains a newline the way any real hook's
+      output does.  The line has to survive it: a raw #10 in the middle would
+      split one event into two and desynchronise the driver's parser for the
+      rest of the run. }
+    WriteHooksFile('{"hooks":{"PreToolUse":[{"command":"echo first & echo ' +
+      'second"}]}}');
+    uHooks.LoadHooks(True, Notes);
+    HookProtoLines := nil;
+    uHooks.FireHooks(Call);
+    Check(Length(HookProtoLines) = 1, 'a two-line hook still emits one line');
+    if Length(HookProtoLines) = 1 then
+      Check(Pos(#10, HookProtoLines[0]) = 0,
+        'with no raw newline anywhere in it');
+    Detail := OneHookLineStr('detail');
+    Check((Pos('first', Detail) > 0) and (Pos('second', Detail) > 0) and
+      (Pos(#10, Detail) > 0),
+      'because the newline is escaped rather than dropped: ' + Detail);
+
+    { And the cap.  One child is already held to MaxHookOutBytes, but the
+      outcome text is a concatenation of up to MaxHooksPerEvent of them, so
+      the detail is cut again on the way onto the wire. }
+    WriteHooksFile('{"hooks":{"PreToolUse":[{"command":"for /l %i in ' +
+      '(1,1,400) do @echo 0123456789012345678901234567890123456789"}]}}');
+    uHooks.LoadHooks(True, Notes);
+    HookProtoLines := nil;
+    uHooks.FireHooks(Call);
+    Detail := OneHookLineStr('detail');
+    Check(Length(Detail) <= uHooks.MaxHookOutBytes + 64, Format(
+      'a hook that prints 16 KB is cut to the budget (%d bytes)',
+      [Length(Detail)]));
+    Check(Pos('[hook detail truncated]', Detail) > 0,
+      'and says so rather than ending mid-sentence');
+
+    { Nothing to run is not an event.  RunTool fires both tool events around
+      every call whether or not a matcher matched, so an empty fire that
+      reported itself would put two lines per tool call on the stream and a
+      driver counting hooks would be counting tools. }
+    uHooks.ClearHooks;
+    HookProtoLines := nil;
+    O := uHooks.FireHooks(Call);
+    Check((O.Ran = 0) and (Length(HookProtoLines) = 0),
+      'a fire that ran nothing reports nothing');
+  finally
+    { Every one of these is module state some later test would inherit: a sink
+      left installed swallows the output of every test after it, and a
+      reporter left installed keeps writing into it. }
+    uSdk.SdkSink := nil;
+    uHooks.OnHookFired := nil;
+    uHooks.ClearHooks;
+    HookProtoLines := nil;
+    A.Free;
+    uTools.RootDir := SavedRoot;
   end;
 end;
 
@@ -2645,7 +2986,26 @@ end;
 { %USERPROFILE% is read from inside uTools for the first time by this feature,
   so a suite that does not neutralise it catalogues whatever the developer
   happens to have in their own home directory and stops being deterministic on
-  somebody else's machine. }
+  somebody else's machine.
+
+  IT IS NOW MORE THAN A DETERMINISM QUESTION AND THE RULE CHANGED BECAUSE OF
+  IT.  Since hooks and MCP grew a user scope, tests in this file WRITE to
+  %USERPROFILE%\.pasclaude and delete what they wrote.  While each skill and
+  style test called HomeBack at its own tail, the redirection was off for
+  every test registered after the last of them - and the hook tests are - so
+  the fixture wrote to, and the finally deleted, the developer's REAL
+  %USERPROFILE%\.pasclaude\hooks.json.  Measured, not deduced: a sentinel hook
+  file placed in the real home was READ by TestHookConfig (three assertions
+  failed against it) and was GONE after the run.
+
+  So the redirection is now the SUITE's, taken once before the first test and
+  put back once after the last, and no test restores it in the middle.  The
+  inner HomeBack calls were what made the window; they are gone.  WipeTree
+  still runs where it ran, and deleting the directory %USERPROFILE% names is
+  harmless - the variable is a string, and whichever test needs the directory
+  next makes it again.  Anything added here that writes under the user's home
+  must stay behind this, and there is no longer a HomeBack in the middle of
+  the file for it to fall out of. }
 function SetEnvironmentVariable(Name, Value: PChar): LongBool; stdcall;
   external 'kernel32' name 'SetEnvironmentVariableA';
 
@@ -2658,6 +3018,9 @@ begin
   Result := IncludeTrailingPathDelimiter(GetTempDir) + 'pasclaude-skills';
 end;
 
+{ Idempotent, and it has to be: StartSkillRoot calls it once per skill and
+  style test on top of the suite-wide call, and SavedHome must keep the real
+  home rather than the fake one the previous call installed. }
 procedure HomeAside;
 begin
   if not HomeMoved then SavedHome := SysUtils.GetEnvironmentVariable('USERPROFILE');
@@ -2666,6 +3029,12 @@ begin
   SetEnvironmentVariable('USERPROFILE', PChar(SkillRoot + PathDelim + 'home'));
 end;
 
+{ ONE caller, at the very end of the main block, and it must stay that way -
+  see the long note above SetEnvironmentVariable for what the second caller
+  cost.  Left callable rather than inlined there because the pairing is the
+  thing being stated: the suite takes the home directory aside and gives it
+  back, and a reader looking for where it is given back finds a procedure with
+  this name. }
 procedure HomeBack;
 begin
   if not HomeMoved then Exit;
@@ -3482,7 +3851,6 @@ begin
     tool in every schema assertion after this one. }
   uTools.ClearSkills;
   uTools.ClearPluginState;
-  HomeBack;
   WipeTree(SkillRoot);
   uTools.RootDir := IncludeTrailingPathDelimiter(GetTempDir) + 'pasclaude-test';
 end;
@@ -3602,7 +3970,89 @@ begin
   uTools.ClearStyles;
   uTools.ClearSkills;
   uTools.ClearPluginState;
-  HomeBack;
+  WipeTree(SkillRoot);
+  uTools.RootDir := IncludeTrailingPathDelimiter(GetTempDir) + 'pasclaude-test';
+end;
+
+{ An edited style file applies by itself, and the three ways that could go
+  wrong are each asserted.
+
+  The bodies below deliberately differ in LENGTH at every step.  The change
+  check compares FindFirst's stamp and the file size, and that stamp has
+  two-second granularity - three writes inside one test share it, so a test
+  that changed only the words would be testing the timestamp's luck rather
+  than the rule.  The size is the half of the check that a suite can drive
+  honestly, and the residual is written down in uTools beside the code. }
+procedure TestStyleFileReload;
+var
+  Err, StylePath, Note: string;
+begin
+  StartSkillRoot;
+  uTools.ClearStyles;
+  StylePath := StylesDirProject + 'terse.md';
+
+  PutStyle(StylesDirProject, 'terse',
+    '---'#10'description: terse.'#10'---'#10'FIRST BODY'#10);
+  RefreshStyles;
+  Check(SetOutputStyle('terse', Err), 'a file style is set: ' + Err);
+  Check(Pos('FIRST BODY', StyleNote) > 0, 'and its body is what reaches the prompt');
+  Check(TakeStyleReloadNote = '', 'with nothing to complain about');
+
+  { The whole feature in one assertion: the file changed and nobody re-ran
+    /output-style. }
+  PutStyle(StylesDirProject, 'terse',
+    '---'#10'description: terse.'#10'---'#10'SECOND BODY, WHICH IS LONGER'#10);
+  Check(Pos('SECOND BODY, WHICH IS LONGER', StyleNote) > 0,
+    'an edited style file applies without being set again');
+  Check(Pos('FIRST BODY', StyleNote) = 0, 'and the old body is gone');
+  Check(TakeStyleReloadNote = '',
+    'a reload that worked says nothing: the reply is the evidence');
+
+  { A file saved half-written, or with its fence removed, must not empty the
+    style.  What was working is still what the model is told, and the user is
+    told why their edit did not take. }
+  PutStyle(StylesDirProject, 'terse', 'no fence'#10);
+  Check(Pos('SECOND BODY, WHICH IS LONGER', StyleNote) > 0,
+    'a style file that stops parsing keeps the text that was working');
+  Note := TakeStyleReloadNote;
+  Check(Pos('terse', Note) > 0, 'and it is said out loud: ' + Note);
+  Check(TakeStyleReloadNote = '',
+    'read and cleared, so a broken file is reported once and not every turn');
+  Check(Pos('SECOND BODY, WHICH IS LONGER', StyleNote) > 0,
+    'and the working body is still in force after the complaint');
+  Check(TakeStyleReloadNote = '',
+    'with no second complaint for a file that has not changed again');
+
+  DeleteFile(StylePath);
+  Check(Pos('SECOND BODY, WHICH IS LONGER', StyleNote) > 0,
+    'a deleted style file does not empty the style either');
+  Note := TakeStyleReloadNote;
+  Check(Pos('gone', Note) > 0, 'and that is said too: ' + Note);
+
+  { A built-in has no file, so nothing here may make it start looking for
+    one.  OutputStylePath is the gate the code tests, so it is the gate the
+    suite tests.
+
+    What the third line does NOT do, said out loud so nobody counts it twice:
+    it is not a test of `if StylePath = '' then Exit` in StyleRecheck.  Deleting
+    that line changes no observable behaviour at all - StampStyleFile has its
+    own Path = '' early exit returning 0/-1, which is exactly what
+    SetStyleChecked stored for the built-in branch, so the comparison below it
+    matches and the reload exits silently either way.  The guard is
+    defence-in-depth against a future StampStyleFile that stats before it
+    checks, and it is not reachable by any assertion this suite can write.
+    What the line really pins is the visible promise: a built-in never emits a
+    reload complaint, however many times its note is read. }
+  Check(SetOutputStyle('explanatory', Err), 'a built-in is set: ' + Err);
+  Check(OutputStylePath = '', 'a built-in style has no file behind it');
+  Check(Pos('why it is built that way', StyleNote) > 0,
+    'its body is the compiled-in one');
+  Check(TakeStyleReloadNote = '',
+    'and reading it again never produces a reload complaint');
+
+  uTools.ClearStyles;
+  uTools.ClearSkills;
+  uTools.ClearPluginState;
   WipeTree(SkillRoot);
   uTools.RootDir := IncludeTrailingPathDelimiter(GetTempDir) + 'pasclaude-test';
 end;
@@ -3712,7 +4162,6 @@ begin
   uTools.ClearStyles;
   uTools.ClearSkills;
   uTools.ClearPluginState;
-  HomeBack;
   WipeTree(SkillRoot);
   uTools.RootDir := IncludeTrailingPathDelimiter(GetTempDir) + 'pasclaude-test';
 end;
@@ -3762,7 +4211,6 @@ begin
   uTools.ClearStyles;
   uTools.ClearSkills;
   uTools.ClearPluginState;
-  HomeBack;
   WipeTree(SkillRoot);
   uTools.RootDir := IncludeTrailingPathDelimiter(GetTempDir) + 'pasclaude-test';
 end;
@@ -3807,7 +4255,6 @@ begin
   uTools.ClearStyles;
   uTools.ClearSkills;
   uTools.ClearPluginState;
-  HomeBack;
   WipeTree(SkillRoot);
   uTools.RootDir := IncludeTrailingPathDelimiter(GetTempDir) + 'pasclaude-test';
 end;
@@ -6513,6 +6960,7 @@ begin
   TestSkillTool;
   TestPluginPrecedence;
   TestOutputStyleResolution;
+  TestStyleFileReload;
   TestStyleNoteIsUncachedAndOptional;
   TestStyleNoteOrdering;
   TestStyleCapsAndEncoding;
@@ -6533,8 +6981,10 @@ begin
   TestMcpServerProcess;
   TestRunChild;
   TestHookConfig;
+  TestUserHooksAreTrustedAndFireFirst;
   TestHookDispatch;
   TestHookPermission;
+  TestHookLinesReachADriver;
   TestModelAliases;
   TestModelRouting;
   TestModelSourceNote;

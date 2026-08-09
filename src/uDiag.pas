@@ -676,6 +676,22 @@ begin
   end;
 end;
 
+{ The hook files a fix line may honestly send somebody to open.  Both when
+  there are two, the project's alone when %USERPROFILE% is unset - which
+  uHooks documents as "not an error: it means there are none", and which the
+  fuzz suite constructs on purpose.  The unguarded concatenation that stood
+  here ended the sentence "...otherwise fix it in C:\proj\.pasclaude\hooks.json
+  or " - a dangling conjunction naming nothing, in the one line of the whole
+  report whose job is to say where to go.  Every other new site that prints
+  this path already guards it; this is that guard, in one place, so the next
+  caller inherits it instead of forgetting it. }
+function HookFilesPhrase: string;
+begin
+  Result := uHooks.HooksFilePath;
+  if uHooks.UserHooksFilePath <> '' then
+    Result := Result + ' or ' + uHooks.UserHooksFilePath;
+end;
+
 { Resolves the first word of a command line on PATH.  A heuristic, and
   deliberately reported as one: a shell builtin, a PATHEXT this does not
   enumerate, or quoting parsed differently would all produce a false alarm,
@@ -908,7 +924,11 @@ begin
     Item('github', 'github', DiagFacts.GithubRemoteWhy)
   else
     Item('github', 'github', 'not probed');
-  if not uHooks.HooksConfigured then
+  { AnyHooksConfigured and not HooksConfigured: the latter is the PROJECT
+    question, which is what gates the trust prompt, and a session running only
+    the user's own hooks would otherwise be reported as having none.  Denying
+    what is running is the one thing a diagnostic must never do. }
+  if not uHooks.AnyHooksConfigured then
     Item('hooks', 'hooks', 'none configured')
   else if not uHooks.HooksEnabled then
     Item('hooks', 'hooks', 'configured but not enabled')
@@ -925,8 +945,8 @@ begin
   Rows := uTools.McpServerList;
   Result[N - 1].Value := IntToStr(Length(Rows));
   for I := 0 to High(Rows) do
-    Sub(Field(Rows[I], 0) + ' - ' + Field(Rows[I], 1) + ', ' +
-      Field(Rows[I], 2) + ' tools');
+    Sub(Field(Rows[I], 0) + ' - ' + Field(Rows[I], 6) + ', ' +
+      Field(Rows[I], 1) + ', ' + Field(Rows[I], 2) + ' tools');
   Skills := uTools.SkillCatalogue;
   Item('skills', 'skills', IntToStr(Length(Skills)));
   Plugins := uTools.InstalledPlugins;
@@ -1255,7 +1275,11 @@ var
     for I := 0 to High(Rows) do
     begin
       if Detail <> '' then Detail := Detail + '; ';
-      Detail := Detail + Field(Rows[I], 0) + ': ' + Field(Rows[I], 1);
+      { The scope is part of the identification, not decoration: "this server
+        is dead" is a different problem depending on whether the user or the
+        repository named the program. }
+      Detail := Detail + Field(Rows[I], 0) + ' (' + Field(Rows[I], 6) + '): ' +
+        Field(Rows[I], 1);
       if (Field(Rows[I], 1) = 'dead') or
          (Field(Rows[I], 1) = 'failed to start') then Inc(Bad);
       { PATH resolution only.  Nothing is spawned: approving a spawn is a
@@ -1285,9 +1309,13 @@ var
     I, Bad: Integer;
     Detail, Cmd: string;
   begin
-    if not uHooks.HooksConfigured then
+    { The display question, for the same reason the panel above uses it: a user
+      hook that fires on every tool call must not be reported as "no
+      hooks.json". }
+    if not uHooks.AnyHooksConfigured then
     begin
-      Emit('hook_commands', 'hook commands', 'no hooks.json in this project',
+      Emit('hook_commands', 'hook commands',
+        'no hooks.json in this project and none in your home directory',
         '', dlOk, dcNone);
       Exit;
     end;
@@ -1307,7 +1335,9 @@ var
       if ProgramResolves(Cmd) then Continue;
       Inc(Bad);
       if Detail <> '' then Detail := Detail + '; ';
-      Detail := Detail + Cmd;
+      { Which file the unresolved command came from, because the fix advice
+        below names two files and the user needs to know which one to open. }
+      Detail := Detail + uHooks.HookScopeAt(I) + ' ' + Cmd;
     end;
     if Bad = 0 then
       Emit('hook_commands', 'hook commands',
@@ -1322,7 +1352,8 @@ var
           [Bad, uHooks.HookEntryCount, Detail]),
         'this check reads PATH only and does not run anything; if the ' +
         'command is a shell builtin it is fine, otherwise fix it in ' +
-        uHooks.HooksFilePath, dlWarn, dcDisk);
+        HookFilesPhrase,
+        dlWarn, dcDisk);
   end;
 
   procedure CheckConsole;

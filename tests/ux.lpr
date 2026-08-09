@@ -1070,6 +1070,67 @@ begin
   end;
 end;
 
+{ What --continue resolves to, which is the only part of that flag a suite can
+  reach: the argument parsing lives in pasclaude.lpr, which nothing links.
+
+  The stamps are SET rather than taken from the order the files were written.
+  FindFirst reports a DOS timestamp with two-second granularity, so three
+  files written in the same instant carry the same date and "newest" would be
+  whatever the directory happened to return first - a test that passed or
+  failed on disk-order luck asserts nothing.  Setting them says exactly what
+  the rule is meant to do.
+
+  The decoy is the assertion that matters most.  The approvals file lives in
+  the same directory as the transcripts and is deliberately given the newest
+  date of all: a "most recent .json in .pasclaude" rule would load a
+  permissions file as a conversation. }
+procedure TestNewestSessionIsWhatContinueTakes;
+var
+  Root, Dir: string;
+
+  procedure PutStamped(const Name: string; Y, M, D: Word);
+  begin
+    WriteFileText(Dir + Name, '{"version":1,"messages":[]}');
+    FileSetDate(Dir + Name,
+      DateTimeToFileDate(EncodeDate(Y, M, D) + EncodeTime(10, 0, 0, 0)));
+  end;
+
+begin
+  WriteLn('-- newest session --');
+  Root := IncludeTrailingPathDelimiter(TmpRoot) + 'newest';
+  Dir := IncludeTrailingPathDelimiter(Root) + SessionDir + PathDelim;
+  ForceDirectories(Dir);
+
+  Check(NewestSession(Root) = '',
+    'an empty state directory offers nothing to continue');
+
+  PutStamped('session.prev.json', 2024, 1, 1);
+  PutStamped('session.json', 2024, 1, 2);
+  PutStamped('work.session.json', 2024, 1, 3);
+  PutStamped('permissions.json', 2030, 1, 1);
+
+  Check(IsSessionFile('session.json'), 'the live file is a session');
+  Check(IsSessionFile('session.prev.json'), 'so is the safety copy');
+  Check(IsSessionFile('work.session.json'), 'and so is a /save');
+  Check(not IsSessionFile('permissions.json'),
+    'the approvals file beside them is not, whatever its date');
+
+  Check(NewestSession(Root) = Dir + 'work.session.json',
+    'the newest of them is what --continue would take');
+
+  DeleteFile(Dir + 'work.session.json');
+  Check(NewestSession(Root) = Dir + 'session.json',
+    'and with it gone, the next newest - not the live file by default');
+
+  DeleteFile(Dir + 'session.json');
+  Check(NewestSession(Root) = Dir + 'session.prev.json',
+    'down to the safety copy, which is a conversation somebody may want');
+
+  DeleteFile(Dir + 'session.prev.json');
+  Check(NewestSession(Root) = '',
+    'and with only the approvals file left, nothing at all');
+end;
+
 { ------------------------------------------------------------- self-state -- }
 
 { The session file sits inside the directory the model is working in, and it
@@ -3061,6 +3122,198 @@ begin
   uTools.AllowAllEdits := False;
 end;
 
+{ ------------------------------------------------- notebook, non-ASCII -- }
+
+{ The markdown cell of the non-ASCII fixture, on its own so the round-trip
+  assertion and the fixture cannot drift apart: the test below asserts these
+  exact bytes are still present after an edit to a different cell, and if it
+  built its own copy of them the assertion would only prove the test agrees
+  with itself.  Every non-ASCII byte is spelled out rather than typed, because
+  a fixture whose whole point is byte identity must not be at the mercy of
+  whatever encoding an editor decides this file is in. }
+function NbUnicodeMarkdownCell: string;
+const
+  IDiaeresis = #$C3#$AF;                     { U+00EF, two bytes }
+  EmDash = #$E2#$80#$94;                     { U+2014, three }
+  Grin = #$F0#$9F#$98#$80;                   { U+1F600, four - outside the BMP,
+                                               so escaping it would need a
+                                               surrogate pair }
+  Rocket = #$F0#$9F#$9A#$80;                 { U+1F680, four }
+begin
+  Result :=
+    '  {'#10 +
+    '   "cell_type": "markdown",'#10 +
+    '   "id": "1c2d0f07",'#10 +
+    '   "metadata": {},'#10 +
+    '   "source": ['#10 +
+    '    "# na' + IDiaeresis + 've ' + EmDash + ' ' + Grin + ' rocket ' +
+      Rocket + '\n"'#10 +
+    '   ]'#10 +
+    '  }'#10;
+end;
+
+{ A notebook nbformat itself wrote - generated with nbformat 5.11 through
+  nbformat.write and copied out byte for byte, ids included - carrying an
+  accented letter, a CJK pair, an em dash and two emoji outside the BMP.
+  Every one of those is raw UTF-8 in the file, which is the fact the tests
+  below exist to pin down. }
+function NbUnicodeFixture: string;
+const
+  EAcute = #$C3#$A9;                         { U+00E9 }
+  Kanji = #$E6#$BC#$A2#$E5#$AD#$97;          { U+6F22 U+5B57 }
+begin
+  Result :=
+    '{'#10 +
+    ' "cells": ['#10 +
+    '  {'#10 +
+    '   "cell_type": "code",'#10 +
+    '   "execution_count": null,'#10 +
+    '   "id": "ead6385d",'#10 +
+    '   "metadata": {},'#10 +
+    '   "outputs": [],'#10 +
+    '   "source": ['#10 +
+    '    "print(''caf' + EAcute + ''')\n",'#10 +
+    '    "# ' + Kanji + '\n"'#10 +
+    '   ]'#10 +
+    '  },'#10 +
+    NbUnicodeMarkdownCell +
+    ' ],'#10 +
+    ' "metadata": {'#10 +
+    '  "kernelspec": {'#10 +
+    '   "display_name": "Python 3",'#10 +
+    '   "language": "python",'#10 +
+    '   "name": "python3"'#10 +
+    '  }'#10 +
+    ' },'#10 +
+    ' "nbformat": 4,'#10 +
+    ' "nbformat_minor": 5'#10 +
+    '}'#10;
+end;
+
+procedure TestNotebookUnicode;
+const
+  Grin = #$F0#$9F#$98#$80;
+  Copyright = #$C2#$A9;                      { U+00A9: starts C2, is not NEL }
+  EnDash = #$E2#$80#$93;                     { U+2013: starts E2 80, is not LS }
+  Nel = #$C2#$85;                            { U+0085 }
+  LineSep = #$E2#$80#$A8;                    { U+2028 }
+  ParaSep = #$E2#$80#$A9;                    { U+2029 }
+var
+  Doc, Cells, Src: TJson;
+  Nb, Canon, New_, Err: string;
+begin
+  WriteLn('-- notebook non-ASCII --');
+
+  Nb := NbUnicodeFixture;
+  Check(IsValidUtf8(Nb), 'the non-ASCII fixture is itself valid UTF-8');
+
+  { The whole claim in one assertion.  nbformat writes non-ASCII raw - its
+    writer passes ensure_ascii=False, against json.dumps' default - so a writer
+    that escaped it would differ from the file it was handed on every line
+    with an accent in it, which is the diff the layout rules exist to prevent.
+    A fixed point here is the only thing that proves we agree. }
+  Check(NotebookCanonical(Nb, Canon, Err) and (Canon = Nb),
+    'the writer is a fixed point on a notebook nbformat wrote with non-ASCII '
+    + 'in it: ' + Err);
+  Check(Pos('\u', Canon) = 0,
+    'and escapes none of it, not the emoji as a surrogate pair either');
+
+  { An edit to cell 0 must leave cell 1 alone to the byte.  The emoji is the
+    part that would break first: four bytes, outside the BMP, and the one
+    character that a writer reaching for \uXXXX has to split into a surrogate
+    pair to emit at all. }
+  Check(NotebookApply(Nb, 0, 'replace', 'x = 1', '', New_, Err),
+    'a cell of a non-ASCII notebook can be replaced: ' + Err);
+  Check(Pos(NbUnicodeMarkdownCell, New_) > 0,
+    'and the untouched cell comes back byte-identical, emoji included');
+  Check(IsValidUtf8(New_), 'the rewritten notebook is valid UTF-8');
+  Check(Pos('\u', New_) = 0, 'with nothing escaped on the way out');
+
+  { Non-ASCII the model supplies has to survive the trip out and back in.  It
+    arrives as UTF-8 in the tool arguments and is written the same way, so the
+    only thing that could go wrong is a writer that mangles what it did not
+    parse itself. }
+  Check(NotebookApply(Nb, 0, 'replace', 'print("' + Grin + '")', '',
+    New_, Err), 'a replacement source can carry an emoji: ' + Err);
+  Check(Pos('print(\"' + Grin + '\")', New_) > 0,
+    'and reaches the file as its four raw bytes');
+  Doc := JsonParse(New_, Err);
+  Check(Doc <> nil, 'the result parses: ' + Err);
+  if Doc <> nil then
+  try
+    Src := Doc.Find('cells').Item(0).Find('source');
+    Check((Src.Count = 1) and (Src.Item(0).AsString = 'print("' + Grin + '")'),
+      'and reads back as the source that went in');
+  finally
+    Doc.Free;
+  end;
+
+  { A file somebody else wrote with escapes.  We normalise it to the raw form
+    on the first edit, which is a real change to lines the user did not touch -
+    but it is a change towards what Jupyter would have written, and the
+    permission prompt already announces that saving reformats a file laid out
+    differently.  The assertion is that the characters are the same ones:
+    a surrogate pair has to become one four-byte character, not two stumps. }
+  Nb := '{"cells":[{"cell_type":"code","execution_count":null,"id":"a1",' +
+        '"metadata":{},"outputs":[],"source":["s = \"\ud83d\ude00\u00e9\""]}],' +
+        '"metadata":{},"nbformat":4,"nbformat_minor":5}';
+  Check(NotebookCanonical(Nb, Canon, Err),
+    'a notebook written with \u escapes still reads: ' + Err);
+  Check(IsValidUtf8(Canon), 'and rewrites as valid UTF-8');
+  Check(Pos('s = \"' + Grin + #$C3#$A9 + '\"', Canon) > 0,
+    'the surrogate pair becoming one four-byte character, not two stumps');
+
+  { Where the line array is cut.  nbformat splits a cell's source with Python's
+    str.splitlines(True), which breaks on eleven things and not on #10 alone;
+    the expected seven elements below are what nbformat 5.11 produced for this
+    exact string.  The two near misses are the point of the fixture: U+00A9
+    starts with the same byte as NEL and U+2013 with the same two bytes as the
+    line separator, and a scanner that split on the lead byte would cut both of
+    them in half and hand the model invalid UTF-8. }
+  Nb := NbUnicodeFixture;
+  Check(NotebookApply(Nb, 0, 'replace',
+    'a'#12'b'#13'c'#13#10'd' + LineSep + 'e' + Copyright + 'f' + Nel +
+    'g' + EnDash + 'h' + ParaSep + 'i', '', New_, Err),
+    'a source with every kind of line break can be written: ' + Err);
+  Doc := JsonParse(New_, Err);
+  Check(Doc <> nil, 'and the result parses: ' + Err);
+  if Doc <> nil then
+  try
+    Cells := Doc.Find('cells');
+    Src := Cells.Item(0).Find('source');
+    Check(Src.Count = 7, 'the source is cut into seven lines, as Python cuts it');
+    if Src.Count = 7 then
+    begin
+      Check(Src.Item(0).AsString = 'a'#12, 'a form feed ends a line');
+      Check(Src.Item(1).AsString = 'b'#13, 'a lone carriage return ends one');
+      Check(Src.Item(2).AsString = 'c'#13#10,
+        'and CRLF ends one line rather than two');
+      Check(Src.Item(3).AsString = 'd' + LineSep, 'U+2028 ends a line');
+      Check(Src.Item(4).AsString = 'e' + Copyright + 'f' + Nel,
+        'U+0085 ends a line and U+00A9, which starts with the same byte, does not');
+      Check(Src.Item(5).AsString = 'g' + EnDash + 'h' + ParaSep,
+        'U+2029 ends a line and U+2013, which shares its first two bytes, does not');
+      Check(Src.Item(6).AsString = 'i', 'and the tail with no break survives');
+    end;
+    Check(IsValidUtf8(New_), 'no character was cut in half doing it');
+  finally
+    Doc.Free;
+  end;
+
+  { v3 stays refused, and says so in terms somebody can act on.  Upgrading was
+    measured and rejected: nbformat's own converter joins a heading cell's
+    lines into one and draws every new cell id from a random word corpus, so
+    the same v3 file converted twice gives two different v4 files - it cannot
+    be the no-op an edit has to be. }
+  Nb := '{"worksheets":[{"cells":[{"cell_type":"code","input":["x = 1"],' +
+        '"prompt_number":1,"outputs":[]}]}],"metadata":{},"nbformat":3,' +
+        '"nbformat_minor":0}';
+  Check((not NotebookCanonical(Nb, Canon, Err)) and (Pos('nbformat 3', Err) > 0),
+    'a v3 notebook is refused by version: ' + Err);
+  Check(Pos('as_version=4', Err) > 0,
+    'and the refusal names the tool that owns the conversion');
+end;
+
 { -------------------------------------------------------------- gitignore -- }
 
 procedure TestGitignore;
@@ -3230,6 +3483,48 @@ begin
   MdFeed('`'#10'code line'#10'```'#10);
   Check(not MdMidLine, 'the fenced block flowed through');
   MdFinish;
+end;
+
+{ Escape twice opens /rewind, and every clause of that sentence is a fence
+  around behaviour that already existed.  The decision is a pure function
+  precisely so it can be asserted here: ReadLineCore itself needs a console
+  and cannot be driven by a suite, so a rule left inline in its key handler
+  would be a rule nothing ever checked.
+
+  The fifth and sixth assertions are the ones that matter.  Escape has always
+  cleared the line and, with vim on, has always left insert mode; if either of
+  those regresses, the feature has cost more than it is worth and this is
+  where that shows up. }
+procedure TestEscEscOpensRewind;
+var
+  Saved: string;
+begin
+  WriteLn('-- escape twice --');
+  Saved := uTerm.EscEscCommand;
+  try
+    uTerm.EscEscCommand := '';
+    Check(not EscEscFires(True, True, True, False, 10),
+      'with no command pushed down, escape twice does nothing at all');
+    uTerm.EscEscCommand := '/rewind';
+    Check(EscEscFires(True, True, True, False, 10),
+      'at the prompt, armed, on an empty line, a second escape fires');
+    Check(not EscEscFires(False, True, True, False, 10),
+      'never in a picker or a permission question: only the REPL prompt');
+    Check(not EscEscFires(True, False, True, False, 10),
+      'never on a first escape, whatever the line');
+    Check(not EscEscFires(True, True, False, False, 10),
+      'never on a line that had text in it: escape still just clears');
+    Check(not EscEscFires(True, True, True, True, 10),
+      'and never with vim on, where escape means normal mode both times');
+    Check(EscEscFires(True, True, True, False, EscEscWindowMs),
+      'the last millisecond of the window still counts');
+    Check(not EscEscFires(True, True, True, False, EscEscWindowMs + 1),
+      'and one past it is two gestures, not one');
+  finally
+    { Back to whatever it was, or every ReadLineCore after this suite would
+      believe a command had been wired into it. }
+    uTerm.EscEscCommand := Saved;
+  end;
 end;
 
 { The console control handler, driven directly: a Ctrl+C event must be
@@ -3665,6 +3960,16 @@ end;
 
 { ------------------------------------------------------------------- main -- }
 
+{ %USERPROFILE% has to be moved somewhere known: the user memory is read from
+  it, and so now are %USERPROFILE%\.pasclaude\hooks.json and
+  %USERPROFILE%\.pasclaude\mcp.json - a developer's real home directory would
+  otherwise decide these tests, and on somebody else's machine decide them
+  differently.  Declared here rather than beside the system-prompt tests
+  further down, which is where it used to live: the two panel tests below need
+  it, and a declaration after its callers is not one. }
+function SetEnvironmentVariable(Name, Value: PChar): LongBool; stdcall;
+  external 'kernel32' name 'SetEnvironmentVariableA';
+
 { /mcp is the only place a user can see what became of a program a project
   asked to run, so the panel has to account for every configured server -
   including the ones that contribute nothing.  A server that vanished from
@@ -3711,8 +4016,11 @@ begin
   { Skip counts are part of the line, so a server contributing three of forty
     tools cannot look correct. }
   All := Row('local');
-  Check(Length(All) - Length(StringReplace(All, #9, '', [rfReplaceAll])) = 5,
-    'each line carries name, status, tools, skipped, command and note');
+  Check(Length(All) - Length(StringReplace(All, #9, '', [rfReplaceAll])) = 6,
+    'each line carries name, status, tools, skipped, command, note and scope');
+  Check(Copy(All, Length(All) - Length(#9'project') + 1, MaxInt) = #9'project',
+    'and the scope is the last field, so every existing reader still indexes ' +
+    'the same columns: ' + All);
 
   { Nobody to ask is no, and the panel says which. }
   uTools.McpApproveAll(nil, nil);
@@ -3745,15 +4053,103 @@ begin
   DeleteFile(Path);
 end;
 
+{ The user's own mcp.json: loaded first, approved without the spawn prompt
+  because it names a program the user chose, and holding its names against a
+  project file that wants them.  Both %USERPROFILE% and %LOCALAPPDATA% are
+  redirected - the second because UserMcpCachePath resolves through it, and a
+  test that writes the developer's real discovery cache is a test that changes
+  their next session. }
+procedure TestUserMcpIsNotPrompted;
+var
+  Rows: TStringArray;
+  Home, Local, SavedHome, SavedLocal, Err: string;
+
+  function Row(const Name: string): string;
+  var
+    K: Integer;
+  begin
+    Result := '';
+    for K := 0 to High(Rows) do
+      if Copy(Rows[K], 1, Length(Name) + 1) = Name + #9 then Result := Rows[K];
+  end;
+
+begin
+  Home := ExcludeTrailingPathDelimiter(TmpRoot) + '-userhome';
+  Local := ExcludeTrailingPathDelimiter(TmpRoot) + '-userlocal';
+  SavedHome := SysUtils.GetEnvironmentVariable('USERPROFILE');
+  SavedLocal := SysUtils.GetEnvironmentVariable('LOCALAPPDATA');
+  ForceDirectories(Home + PathDelim + StateDirName);
+  ForceDirectories(Local);
+  SetEnvironmentVariable('USERPROFILE', PChar(Home));
+  SetEnvironmentVariable('LOCALAPPDATA', PChar(Local));
+  try
+    uTools.ClearMcpServers;
+    uTools.ClearTrust;
+    WriteFileText(uTools.UserMcpConfigPath,
+      '{"mcpServers":{"mine":{"command":"my-own-server.exe"}}}');
+    { The project deliberately names "mine" as well, which is the collision the
+      user has to win: under project-wins a repository could take over a name
+      the model has been calling all session. }
+    WriteFileText(IncludeTrailingPathDelimiter(TmpRoot) + '.mcp.json',
+      '{"mcpServers":{"mine":{"command":"their-server.exe"},' +
+      '"theirs":{"command":"other-server.exe"}}}');
+
+    Check(uTools.LoadMcpConfigAll(Err), 'both scopes load through one call');
+    Check(uTools.McpServerCount = 2, 'a name in both files is one server, not two');
+    Check(uTools.McpServerScope('mine') = 'user',
+      'and the name the user holds still runs the user''s program');
+    Check(Pos('mine', Err) > 0,
+      'the project''s attempt to take that name is reported, not silent: ' + Err);
+    Check(uTools.McpServerScope('theirs') = 'project',
+      'a project server the user never named is still the project''s');
+
+    { The half this feature is allowed to skip, and the half it is not.  A nil
+      Ask is print mode and a subagent both. }
+    uTools.McpApproveAll(nil, nil);
+    Check(uTools.McpServerApproved('mine'),
+      'a user-scope server needs nobody to ask');
+    Check(uTools.McpServerStatus('mine') <> mcDenied,
+      'so a nil Ask does not deny it');
+    Check(not uTools.McpServerApproved('theirs'),
+      'while the project''s server is not approved by anybody');
+    Check(uTools.McpServerStatus('theirs') = mcDenied,
+      'and nobody to ask is still no, exactly as before');
+
+    Rows := uTools.McpServerList;
+    Check(Pos(#9'user', Row('mine')) > 0,
+      'the /mcp line says which file a server came from: ' + Row('mine'));
+    Check(Pos(#9'project', Row('theirs')) > 0,
+      'and says it for the project''s too: ' + Row('theirs'));
+
+    Check(Pos(IncludeTrailingPathDelimiter(TmpRoot), uTools.UserMcpCachePath) = 0,
+      'a user server''s discovery cache is not inside the project the session ' +
+      'is running in: ' + uTools.UserMcpCachePath);
+    Check(uTools.UserMcpConfigPath <> uTools.McpConfigPath,
+      'and the two config files are never the same path');
+  finally
+    uTools.ClearMcpServers;
+    uTools.ClearTrust;
+    SysUtils.DeleteFile(IncludeTrailingPathDelimiter(TmpRoot) + '.mcp.json');
+    SetEnvironmentVariable('USERPROFILE', PChar(SavedHome));
+    SetEnvironmentVariable('LOCALAPPDATA', PChar(SavedLocal));
+  end;
+end;
+
 { What the user reads before approving a hook file, and what survives in
   permissions.json afterwards.  Both are the parts of this feature a person
   actually meets: the summary is the entire basis for the yes, and the
   fingerprint is what stops the yes outliving the text it was given for. }
 procedure TestHooksPanel;
 var
-  Notes, Sum, P, FP: string;
+  Notes, Sum, P, FP, SavedHome: string;
   SavedEdits, SavedBash, SavedFetch: Boolean;
 begin
+  { LoadHooks reads the user's home directory now, so without this the two
+    "one line per hook" counts below would be counting whatever hooks the
+    developer running the suite happens to have of their own. }
+  SavedHome := SysUtils.GetEnvironmentVariable('USERPROFILE');
+  SetEnvironmentVariable('USERPROFILE',
+    PChar(IncludeTrailingPathDelimiter(TmpRoot) + 'nohome'));
   ForceDirectories(IncludeTrailingPathDelimiter(TmpRoot) + StateDirName);
   WriteFileText(uHooks.HooksFilePath, '{"hooks":{' +
     '"PreToolUse":[{"matcher":"^(write_file|edit_file)$",' +
@@ -3833,6 +4229,7 @@ begin
     uTools.AllowAllEdits := SavedEdits;
     uTools.AllowAllBash := SavedBash;
     uTools.AllowAllFetch := SavedFetch;
+    SetEnvironmentVariable('USERPROFILE', PChar(SavedHome));
   end;
 end;
 
@@ -3955,11 +4352,6 @@ begin
   RemoveDir(Dir);
 end;
 
-{ %USERPROFILE% has to be moved somewhere known: the user memory is read from
-  it, and a developer's real home directory would decide this test. }
-function SetEnvironmentVariable(Name, Value: PChar): LongBool; stdcall;
-  external 'kernel32' name 'SetEnvironmentVariableA';
-
 function LiftSentinel: string;
 begin
   Result := #10#10'SENTINEL-FROM-EXTRA';
@@ -4030,6 +4422,76 @@ begin
     Check(Pos('SENTINEL-FROM-EXTRA', Full) = 0,
       'and with the seam unhooked it contributes nothing at all');
   finally
+    SetEnvironmentVariable('USERPROFILE', PChar(SavedHome));
+    uTools.RootDir := TmpRoot;
+    uSdk.SdkProjectContextAllowed := SavedAllowed;
+  end;
+end;
+
+{ --append-system-prompt.  Three properties, and the second is the one that
+  would be quietly lost by a refactor: the text ADDS, it goes LAST, and the
+  cap is on the total rather than on each occurrence.  The project's own
+  CLAUDE.md is put on disk here for the same reason the lift test does it -
+  "last" is only a claim worth making when there is something for it to come
+  after. }
+procedure TestAppendSystemPrompt;
+var
+  Root, Home, Full, Err, Before, SavedHome: string;
+  SavedAllowed: Boolean;
+begin
+  WriteLn('-- append system prompt --');
+  Root := IncludeTrailingPathDelimiter(TmpRoot) + 'append';
+  Home := IncludeTrailingPathDelimiter(Root) + 'home';
+  ForceDirectories(Home + PathDelim + '.pasclaude');
+  SavedHome := SysUtils.GetEnvironmentVariable('USERPROFILE');
+  SetEnvironmentVariable('USERPROFILE', PChar(Home));
+  uTools.RootDir := Root;
+  SavedAllowed := uSdk.SdkProjectContextAllowed;
+  uSdk.SdkProjectContextAllowed := True;
+  uSdk.SdkAppendSystemClear;
+  try
+    WriteFileText(IncludeTrailingPathDelimiter(Root) + 'CLAUDE.md',
+      'PROJECT-RULE-LINE'#10);
+
+    Check(uSdk.SdkAppendSystem = '',
+      'nothing is appended until the flag is given');
+    Full := uSdk.SdkFullSystem;
+    Check(Pos('Additional instructions', Full) = 0,
+      'and the system prompt carries no fence for it');
+
+    Check(not uSdk.SdkAppendSystemPush('   ', Err),
+      'text that is only whitespace is refused: ' + Err);
+    Check(uSdk.SdkAppendSystem = '', 'and adds nothing');
+
+    Check(uSdk.SdkAppendSystemPush('APPENDED-ONE', Err),
+      'one value is taken: ' + Err);
+    Full := uSdk.SdkFullSystem;
+    Check(Pos('APPENDED-ONE', Full) > 0, 'and reaches the system prompt');
+    Check(Pos('You are pasclaude', Full) > 0,
+      'which still opens with the identity line');
+    Check(Pos('Guidelines:', Full) > 0,
+      'and still carries the guidelines: it adds, it never replaces');
+    Check(Pos('PROJECT-RULE-LINE', Full) > 0,
+      'and the project''s own instructions are still there');
+    Check(Pos('APPENDED-ONE', Full) > Pos('PROJECT-RULE-LINE', Full),
+      'with the command line LAST, after everything the tree supplied');
+
+    Check(uSdk.SdkAppendSystemPush('APPENDED-TWO', Err),
+      'a second occurrence is taken too: ' + Err);
+    Check(Pos('APPENDED-ONE', uSdk.SdkAppendSystem) = 1,
+      'the first value keeps its place');
+    Check(Pos(#10#10'APPENDED-TWO', uSdk.SdkAppendSystem) > 0,
+      'and the second accumulates after it, a blank line apart');
+
+    Before := uSdk.SdkAppendSystem;
+    Check(not uSdk.SdkAppendSystemPush(
+      StringOfChar('x', uSdk.MaxAppendSystemBytes), Err),
+      'a value that takes the TOTAL past the cap is refused: ' + Err);
+    Check(Pos('capped', Err) > 0, 'saying which cap: ' + Err);
+    Check(uSdk.SdkAppendSystem = Before,
+      'and nothing at all is added, so the refusal is not a truncation');
+  finally
+    uSdk.SdkAppendSystemClear;
     SetEnvironmentVariable('USERPROFILE', PChar(SavedHome));
     uTools.RootDir := TmpRoot;
     uSdk.SdkProjectContextAllowed := SavedAllowed;
@@ -4139,6 +4601,92 @@ begin
       made the order of the two load-bearing and the failure of the second one
       unreadable if either ever moved; that test now sets the flag it needs
       itself. }
+    uSdk.SdkProjectContextAllowed := SavedAllowed;
+  end;
+end;
+
+{ --no-project-context, in both directions, because both are requirements and
+  only one of them is the new behaviour.
+
+  The truth table comes first and it is the part that has never been testable
+  before: the condition deciding whether a checkout writes part of the system
+  prompt lived as an expression in pasclaude.lpr's main block, which no suite
+  can link, so the flag's two DIRECTIONS were coverable and the COMBINING of
+  them was not.  SdkProjectContextDecide exists to close that, and a new reason
+  to suppress has to be added inside it - which will fail a line here until it
+  is written down.
+
+  The boundary, because a suite that lets itself be read as covering more than
+  it does is worse than one that covers less: the two ARGUMENTS are still
+  untested and unreachable from here.  Nothing below notices if the parser
+  stops setting the flag, or if the set of DiagModes counted as a --ci verb
+  shrinks to one - both mutations build clean and leave every suite green.
+  What is pinned is the rule, given its inputs.
+
+  Then the same decision driven through the real loader over real files,
+  because a predicate that returns the right Boolean while the loader ignores
+  it is the failure the truth table cannot see.  The off direction - an
+  ordinary -p still binding the tree's CLAUDE.md, imports and all - is the one
+  a future refactor breaks silently: -p quietly losing a project's
+  instructions is a regression scripted users would find in production rather
+  than in a diff. }
+procedure TestNoProjectContextFlag;
+var
+  Root, Home, SavedHome, Full: string;
+  SavedAllowed: Boolean;
+begin
+  SavedAllowed := uSdk.SdkProjectContextAllowed;
+  Root := IncludeTrailingPathDelimiter(TmpRoot) + 'noctx';
+  Home := IncludeTrailingPathDelimiter(Root) + 'home';
+  ForceDirectories(Home + PathDelim + '.pasclaude');
+  SavedHome := SysUtils.GetEnvironmentVariable('USERPROFILE');
+  SetEnvironmentVariable('USERPROFILE', PChar(Home));
+  uTools.RootDir := Root;
+  try
+    Check(uSdk.SdkProjectContextDecide(False, False),
+      'an ordinary -p run still loads the project''s instruction files');
+    Check(not uSdk.SdkProjectContextDecide(True, False),
+      'and --no-project-context takes them away from that same run');
+    Check(not uSdk.SdkProjectContextDecide(False, True),
+      'a --ci verb loads none of them with no flag typed');
+    Check(not uSdk.SdkProjectContextDecide(True, True),
+      'and the flag cannot widen a --ci verb back open');
+
+    WriteFileText(Home + PathDelim + '.pasclaude' + PathDelim + 'CLAUDE.md',
+      'always speak plainly'#10);
+    WriteFileText(IncludeTrailingPathDelimiter(Root) + 'shared.md',
+      'the imported branch text'#10);
+    WriteFileText(IncludeTrailingPathDelimiter(Root) + 'CLAUDE.md',
+      'branch rules'#10'@import shared.md'#10);
+    WriteFileText(IncludeTrailingPathDelimiter(Root) + 'AGENTS.md',
+      'branch agent rules'#10);
+
+    uSdk.SdkProjectContextAllowed := uSdk.SdkProjectContextDecide(False, False);
+    Full := uSdk.SdkFullSystem;
+    Check(Pos('branch rules', Full) > 0,
+      'with no flag a -p run binds the tree''s claude.md');
+    Check(Pos('the imported branch text', Full) > 0, 'imports and all');
+    Check(Pos('branch agent rules', Full) > 0, 'and agents.md with it');
+
+    uSdk.SdkProjectContextAllowed := uSdk.SdkProjectContextDecide(True, False);
+    Full := uSdk.SdkFullSystem;
+    Check(Pos('branch rules', Full) = 0,
+      'and with --no-project-context the same run gets none of it');
+    Check(Pos('the imported branch text', Full) = 0,
+      'and no @import inside one is followed either');
+    Check(Pos('branch agent rules', Full) = 0, 'nor agents.md');
+    Check(Pos('always speak plainly', Full) > 0,
+      'while the user memory survives: the flag asks which tree wrote the prompt');
+    Check(Pos('Session root: ', Full) > 0,
+      'and the guidelines the program wrote are untouched');
+    Check(uSdk.SdkProjectContextFiles = 'AGENTS.md, CLAUDE.md',
+      'and the run can still name what it refused');
+  finally
+    SetEnvironmentVariable('USERPROFILE', PChar(SavedHome));
+    uTools.RootDir := TmpRoot;
+    { Back to what it was found at, in a finally: heaptrc aside, a byte left
+      set here is inherited by every test below and the next failure would be
+      read as belonging to whatever ran last. }
     uSdk.SdkProjectContextAllowed := SavedAllowed;
   end;
 end;
@@ -4675,9 +5223,13 @@ end;
   and afterwards nothing that decides authority has moved. }
 procedure TestSettingsRefusedKeys;
 const
-  Names: array[0..14] of string = ('permissions', 'allow_edits', 'allow_bash',
+  Names: array[0..15] of string = ('permissions', 'allow_edits', 'allow_bash',
     'allow_fetch', 'deny', 'sandbox', 'permission_mode', 'add_dir', 'env',
-    'apiKey', 'mcpServers', 'plugins', 'vim', 'bindings', 'hooks');
+    'apiKey', 'mcpServers', 'plugins', 'vim', 'bindings', 'hooks',
+    { The newest of them, and the one whose absence would be hardest to
+      notice: a project file that could append to the system prompt could
+      rewrite every standing instruction the agent has. }
+    'append_system_prompt');
 var
   Problems: TStringArray;
   Doc: string;
@@ -6308,7 +6860,7 @@ var
   Path, Text: string;
   L: TStringList;
   Floor: TStringArray;
-  I, Writes: Integer;
+  I, Writes, AnswerAt: Integer;
 
   procedure Has(const S, What: string);
   begin
@@ -6360,6 +6912,24 @@ begin
       'and neither is the title');
     Hasnt('--dangerously-skip-permissions',
       'and the bypass flag appears nowhere');
+
+    { Found on ONE LINE and asserted there, not anywhere in the file, and this
+      is the whole point of the check rather than fussiness about how a grep
+      is written: the flag has to be ON the command that runs the model.  A
+      file-wide Pos would be satisfied by the word appearing in a YAML comment
+      - which is exactly where it also appears - and a comment changes nothing
+      about what that step loads.  If somebody reorders the flags so the line
+      reads --output-format json -p, this search misses and the first Check
+      below fails loudly, pointing at the line that changed.  That is the
+      correct failure; do not widen it back to the whole file to quiet it. }
+    AnswerAt := -1;
+    for I := 0 to L.Count - 1 do
+      if Pos('-p --output-format json', L[I]) > 0 then AnswerAt := I;
+    Check(AnswerAt >= 0, 'the answering step is still a -p run');
+    if AnswerAt >= 0 then
+      Check(Pos('--no-project-context', L[AnswerAt]) > 0,
+        'and it refuses the branch''s instruction files on that same line');
+
     Has('ANTHROPIC_API_KEY', 'the model credential is named');
     Check(L.Count > 0, 'and the file is not empty');
   finally
@@ -6469,10 +7039,16 @@ begin
       itself - so this is an ordering the suite reads better in, not one it
       depends on. }
     TestProjectContextIsNotForCi;
+    { And immediately after it, never before: the test above holds the suite's
+      only observation of SdkProjectContextAllowed's shipped default, and
+      anything that sets the byte higher up would delete that assertion
+      without failing anything. }
+    TestNoProjectContextFlag;
     TestDiff;
     TestPreview;
     TestCompact;
     TestSession;
+    TestNewestSessionIsWhatContinueTakes;
     TestSdkResumePolicy;
     TestDeniedPathIsInvisible;
     TestDenyRoundTrip;
@@ -6495,18 +7071,22 @@ begin
     TestMentions;
     TestMultiEdit;
     TestNotebook;
+    TestNotebookUnicode;
     TestGitignore;
     TestWalkDepth;
     TestMarkdown;
+    TestEscEscOpensRewind;
     TestCtrlC;
     TestHistoryPersistence;
     TestVt;
     TestRewind;
     TestJobList;
     TestMcpPanel;
+    TestUserMcpIsNotPrompted;
     TestHooksPanel;
     TestPluginState;
     TestSystemPromptLift;
+    TestAppendSystemPrompt;
     TestModeIsVisible;
     TestLoadedGrantIsAnnounced;
     TestExtraRootDisplay;

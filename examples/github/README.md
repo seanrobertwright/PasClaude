@@ -59,7 +59,13 @@ it is enforced in four independent places, any three of which could fail:
    **`--dangerously-skip-permissions` appears nowhere.** It is not needed:
    under `-p` there is nobody to ask, so `Ask` is nil and a gated tool returns
    an ordinary error result while the turn continues. The run is
-   `-p --output-format json --permission-mode plan`.
+   `-p --output-format json --permission-mode plan --no-project-context`.
+   That last flag is there because this step runs in the checkout, and the
+   checkout is the pull request's *own head*: its `AGENTS.md`, `CLAUDE.md` and
+   `.pasclaude.md` are the author's text, and the system prompt is the most
+   trusted position in the request. It is a flag on the command line and never
+   a mode inferred from the prompt, because the prompt is the part an attacker
+   wrote.
 
    `--ci prepare` runs *after* the deny rules load and refuses to proceed, with
    exit 2 naming every missing rule, if the floor is not in force. A workflow
@@ -110,11 +116,18 @@ emitted, because it chooses the commit `actions/checkout` writes into the
 workspace.
 
 **Residual, stated rather than glossed:** a same-repo branch's `CLAUDE.md`,
-`AGENTS.md` or skill descriptions enter the system prompt with no gate. The
-bound is that whoever wrote them has push access, and that the worst outcome is
-a wrong comment rather than an action. The posted answer is also not rewritten,
-so it can `@`-mention people and generate notifications; rewriting `@` would
-corrupt code in the answer.
+`AGENTS.md` and `.pasclaude.md` — and every `@import` inside them — no longer
+enter the system prompt at all, because the answering step passes
+`--no-project-context`. What still reaches the request from the branch is its
+**skill descriptions**, which were never in the system prompt to begin with:
+the catalogue rides in the `skill` tool's own description, rebuilt with the
+schema on every request. They are not gated by that flag on purpose —
+suppressing them is a different feature, changing the tool schema and with it
+the cache breakpoint — and the bound on them is the same as it always was:
+whoever wrote them has push access, the deny floor above still holds, and the
+worst outcome is a wrong comment rather than an action. The posted answer is
+also not rewritten, so it can `@`-mention people and generate notifications;
+rewriting `@` would corrupt code in the answer.
 
 ## How this file is checked
 
@@ -122,7 +135,10 @@ corrupt code in the answer.
 from disk (**absent is a failure, not a skip**) and asserts that every rule of
 `uCi.CiDenyFloor` appears verbatim, that `persist-credentials: false` appears,
 that the three `permissions:` keys appear and no fourth `: write` line does,
-that the file is under 120 lines, and that none of `pull_request_target`,
+that the file is under 120 lines, that the line running the model carries
+`--no-project-context` — checked on *that line*, not anywhere in the file, so
+naming the flag in a comment would not satisfy it — and that none of
+`pull_request_target`,
 `${{ github.event.comment.body`, `${{ github.event.issue.title` or
 `--dangerously-skip-permissions` appears anywhere. It is a grep, not a parse —
 there is no YAML parser here and RTL-only forbids adding one. Everything

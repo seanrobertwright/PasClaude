@@ -88,7 +88,17 @@ type
     the next request - its Text holds the block's own JSON, captured whole
     from content_block_start.  Making bkResult the fallback for any
     unrecognised type is what keeps a future server-side block from being
-    silently flattened into empty prose. }
+    silently flattened into empty prose.
+
+    Exactly one type is now interpreted far enough to be shortened, and the
+    exception is worth stating precisely because the sentence above is the
+    rule the rest of this unit rests on.  web_search_tool_result - whose
+    content array this decoder already had to reach into to count results for
+    the host - is clipped at capture by ClipSearchResult when it is larger
+    than MaxSearchResultBytes.  The interpretation is deliberately shallow:
+    whole elements are dropped off the end and one title string is annotated
+    to say so.  No element is ever rebuilt, nothing inside a surviving
+    element is touched, and no other block type is looked at at all. }
   TBlockKind = (bkText, bkThinking, bkToolUse, bkServerToolUse, bkResult);
 
   TPartialBlock = record
@@ -402,6 +412,22 @@ const
   OauthBeta      = 'oauth-2025-04-20';
   OauthIdentity  = 'You are Claude Code, Anthropic''s official CLI for Claude.';
   MaxToolRounds = 24;
+  { The budget one web_search_tool_result block may occupy in the transcript.
+    A single result is a title, a url, a page age - a few hundred bytes of
+    that - and then an opaque blob of page content the server encoded for
+    itself, which is several kilobytes on its own and is essentially the
+    whole cost.  Five of those is commonly fifty to a hundred and fifty
+    kilobytes, and unlike a tool result it is not paid once: the block is
+    echoed back on every later request for the rest of the session, so a
+    single verbose search quietly taxes every turn that follows it.
+    Thirty-two kilobytes is the same order as uTools.MaxOutBytes (30 KB), the
+    ceiling every local tool's output already lives under - a search must not
+    be allowed to cost more in the transcript than reading a file does - and
+    it still holds two to four real results, which is what a follow-up
+    question actually reaches for.  Declared here rather than in the
+    implementation so the suite can assert against the same number the code
+    uses instead of writing its own copy of it. }
+  MaxSearchResultBytes = 32 * 1024;
   { Transient failures are retried this many times before giving up. }
   MaxRetries    = 3;
   { Bumped when the saved-session shape changes incompatibly. }
@@ -475,6 +501,28 @@ function ModelListMatches(const Target: string; const List: TModelList): Boolean
 { The default save location under Root. }
 function SessionPath(const Root: string): string;
 
+{ What counts as a saved conversation, and the only statement of it: the live
+  file, the safety copy that a fresh run leaves behind, and any /save <name>,
+  which writes <name>.session.json.  It lives here beside SessionPath rather
+  than in the host because there are now two askers - the /sessions picker and
+  --continue - and two spellings of "is this a session" is how a file the
+  picker lists becomes one --continue cannot see, or, far worse, how the
+  approvals file that shares that directory gets loaded as a transcript. }
+function IsSessionFile(const FileName: string): Boolean;
+
+{ The most recently written saved conversation under Root, full path, '' when
+  there is none.  This is --continue's whole definition of "most recent", and
+  it deliberately walks the same set of files and reads the same date that the
+  /sessions listing prints beside each name: a flag that reached a file the
+  picker does not show, or that disagreed with the newest date on that
+  listing, would be a second notion of recency for the user to carry.
+
+  Ties go to whichever FindFirst returns first, which is arbitrary and
+  admitted - the stamp has two-second granularity, so two saves inside one
+  tick are a coin toss however it is broken, and /sessions is there for
+  anybody who needs to be certain. }
+function NewestSession(const Root: string): string;
+
 { Expands @path mentions in a prompt.  Each mention of a readable text file
   under the session root becomes an attachment appended after the prose, so
   the model gets the file without spending a tool round reading it.  Returns
@@ -528,6 +576,40 @@ function SessionPath(const Root: string): string;
 begin
   Result := IncludeTrailingPathDelimiter(Root) + SessionDir +
     PathDelim + SessionFile;
+end;
+
+function IsSessionFile(const FileName: string): Boolean;
+begin
+  Result := (FileName = SessionFile) or (FileName = 'session.prev.json') or
+            (Pos('.' + SessionFile, FileName) > 0);
+end;
+
+function NewestSession(const Root: string): string;
+var
+  R: TSearchRec;
+  Dir: string;
+  Best, Stamp: TDateTime;
+begin
+  Result := '';
+  Best := 0;
+  Dir := IncludeTrailingPathDelimiter(Root) + SessionDir + PathDelim;
+  { '*.json' and then the name test, which is the same two-step the picker
+    does: the glob is a cheap first cut and IsSessionFile is the rule. }
+  if FindFirst(Dir + '*.json', faAnyFile, R) = 0 then
+  begin
+    repeat
+      if IsSessionFile(R.Name) then
+      begin
+        Stamp := FileDateToDateTime(R.Time);
+        if (Result = '') or (Stamp > Best) then
+        begin
+          Result := Dir + R.Name;
+          Best := Stamp;
+        end;
+      end;
+    until FindNext(R) <> 0;
+    SysUtils.FindClose(R);
+  end;
 end;
 
 { ------------------------------------------------------------- aliases -- }
@@ -989,11 +1071,91 @@ begin
   end;
 end;
 
+{ Clips a web_search_tool_result block in place and returns the one-line
+  summary the host prints for it.  The two jobs are one function because only
+  this walk knows both the count that arrived and the count that survived;
+  splitting it would mean walking the array twice and computing the same
+  running total in two places, and the second copy is the one that would
+  drift.
+
+  The cut is at result boundaries and nowhere else.  Truncating the block's
+  JSON at a byte offset the way Clip does everywhere else would land inside an
+  object and produce not a fused pair of results but text that no longer
+  parses, and the block would then fail to reparse on the next request and
+  lose its pairing to the server_tool_use that produced it.  Utf8Cut protects
+  a byte from being cut through a character; nothing protects an object from
+  being cut through a brace.  So whole elements are kept from the front while
+  a running byte total stays under the budget, and whole elements are dropped
+  after that.  Every element that survives is byte-identical to what the
+  server sent.
+
+  The first result is kept however large it is.  An empty content array reads
+  as "the search found nothing", which is a different claim from "the search
+  found things and this client did not carry them all", and it is a claim the
+  model would act on.  One oversize result is the honest failure here.
+
+  The marker goes into the last kept result's title because that is where the
+  cut happened, and because title is the one field in this shape that is
+  display text rather than something the server has to read back.  An extra
+  array element would be a search result this client forged, and an extra key
+  on the block itself is exactly the unknown field a strict request validator
+  rejects. }
+function ClipSearchResult(CB: TJson): string;
+var
+  Content, Item: TJson;
+  I, Kept, Ti, Arrived: Integer;
+  Total, Dropped: Int64;
+  Title: string;
+begin
+  Content := CB.Find('content');
+  if Content = nil then Exit('no results');
+  { The error shape is an object, not an array, and there is nothing in it to
+    clip - it is a code and no page content at all. }
+  if Content.Kind <> jkArr then
+    Exit('error: ' + Content.Str('error_code'));
+
+  Arrived := Content.Count;
+  Total := 0;
+  Kept := 0;
+  for I := 0 to Arrived - 1 do
+  begin
+    Total := Total + Length(Content.Item(I).ToJson);
+    if (I > 0) and (Total > MaxSearchResultBytes) then Break;
+    Kept := I + 1;
+  end;
+  if Kept >= Arrived then Exit(Format('%d results', [Arrived]));
+
+  { Dropped bytes are counted before the drop, because after it the only
+    thing that could say how much was saved is a number nobody kept. }
+  Dropped := 0;
+  for I := Kept to Arrived - 1 do
+    Dropped := Dropped + Length(Content.Item(I).ToJson);
+  while Content.Count > Kept do
+    Content.Drop(Content.Count - 1);
+
+  Item := Content.Item(Kept - 1);
+  if Item <> nil then
+  begin
+    Title := Item.Str('title');
+    Title := Title + Format(' [+%d more results from this search were ' +
+      'dropped from this transcript by pasclaude; search again to see them]',
+      [Arrived - Kept]);
+    Ti := Item.IndexOf('title');
+    if Ti >= 0 then
+      Item.SetAt(Ti, TJson.NewStr(Title))
+    else
+      Item.AddStr('title', Title);
+  end;
+
+  Result := Format('%d results, %d kept (%d dropped, %d KB)',
+    [Arrived, Kept, Arrived - Kept, (Dropped + 1023) div 1024]);
+end;
+
 procedure ApplyEvent(St: PStream; Ev: TJson);
 var
   T, K: string;
   Idx: Integer;
-  CB, Delta, Msg, Usage, ErrObj, Content: TJson;
+  CB, Delta, Msg, Usage, ErrObj: TJson;
   Frag: string;
 begin
   T := Ev.Str('type');
@@ -1062,23 +1224,26 @@ begin
         to text, as this branch used to, dropped it from the transcript
         entirely and broke the echo the API requires. }
       St^.Blocks[Idx].Kind := bkResult;
-      St^.Blocks[Idx].Text := CB.ToJson;
       if K = 'web_search_tool_result' then
       begin
         { A network fetch that leaves no trace in the transcript would be the
           one tool where silence is least acceptable, so the result is
-          summarised for the host the same way a local tool's would be. }
-        Frag := '';
-        Content := CB.Find('content');
-        if (Content <> nil) and (Content.Kind = jkArr) then
-          Frag := Format('%d results', [Content.Count])
-        else if Content <> nil then
-          Frag := 'error: ' + Content.Str('error_code')
-        else
-          Frag := 'no results';
+          summarised for the host the same way a local tool's would be.  The
+          summary now also names the clip when one happened, because a set of
+          results that shrank on its way into the transcript is exactly the
+          thing the user should learn about while it is on screen rather than
+          three turns later from a title. }
+        Frag := ClipSearchResult(CB);
         if Assigned(St^.Agent.OnToolResult) then
           St^.Agent.OnToolResult('web_search', Frag);
       end;
+      { Captured after the clip, not before: this string is what every later
+        request echoes and what the session file writes to disk, so clipping
+        it afterwards would save nothing and a resumed session would carry the
+        whole unclipped set straight back into the context the clip exists to
+        protect.  CB is a child of Ev and is freed with it in ConsumeLines, so
+        editing it here costs no allocation and outlives nothing. }
+      St^.Blocks[Idx].Text := CB.ToJson;
     end;
   end
 
@@ -1181,6 +1346,13 @@ begin
     still reacts within a few hundred bytes of the user pressing Esc. }
   if St^.Agent.WantsCancel then
     St^.Cancel := True;
+  { And swept per chunk for the same reason, one level down: a turn where the
+    model thinks for two minutes and calls no tool at all is exactly the gap
+    the background spool cap used to fall through, and chunks arrive all the
+    way through it.  The call is throttled inside uTools and returns on an
+    integer compare when no job is running, which is nearly always, so a fast
+    stream pays nothing for it. }
+  uTools.TickBackgroundJobs;
   Result := not St^.Cancel;
 end;
 
@@ -2005,8 +2177,13 @@ begin
         end;
       bkResult:
         begin
-          { Echoed byte-for-byte: this client never understood the block, so
-            reconstructing it is the one thing guaranteed to be wrong. }
+          { The capture is echoed byte-for-byte: this client never understood
+            the block, so reconstructing it is the one thing guaranteed to be
+            wrong.  The only editing a capture ever gets happened at capture
+            time, in ClipSearchResult, while the whole block was still in
+            hand and the decoder could still tell one result from the next.
+            This arm stays a pure replay of whatever was stored, and stays the
+            place that must never learn to rebuild anything. }
           B := JsonParse(Blocks[I].Text);
           if B = nil then Continue;
         end;

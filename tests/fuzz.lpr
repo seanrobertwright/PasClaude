@@ -823,6 +823,72 @@ begin
   uTools.AllowAllBash := False;
 end;
 
+{ The spool cap used to be checked only inside a sweep, and a sweep only ever
+  happened because the model started, polled or listed a job - so a job nobody
+  polled wrote without bound until the model happened to call something.  The
+  tick is what took that dependency out, and this drives the job with nothing
+  but the tick: no poll, no listing, no RunTool, so if the tick is not itself
+  the enforcement the job simply runs on and the wait below fails.  Aliveness
+  is read through WaitBackgroundJob, which is the one seam that answers the
+  question without sweeping and therefore without doing the tick's job for it.
+
+  StartBackgroundJob is called directly rather than through the bash tool: this
+  test has nothing to say about permissions and should not have to leave any
+  approval state behind to make its point.  The cap is lowered to a megabyte
+  and put back in a finally - a leaked cap would kill jobs in every suite that
+  ran after this one, and heaptrc fails on a job table left populated. }
+procedure TestSpoolCapTicks;
+var
+  Id, Err, Out_: string;
+  Saved: Int64;
+  Found, Dead: Boolean;
+  I: Integer;
+begin
+  uTools.RootDir := SessionDir;
+  uTools.ClearJobs;
+  Saved := uTools.MaxSpoolBytes;
+  try
+    uTools.MaxSpoolBytes := 1024 * 1024;
+
+    uTools.TickBackgroundJobs;
+    Check(uTools.BackgroundJobCount = 0,
+      'a tick with no jobs does nothing and starts nothing');
+
+    { Two million lines is roughly a hundred megabytes and several minutes of
+      writing, which is the point: if the tick never fires, the loop below
+      times out with the job still going rather than watching it finish and
+      calling that a pass. }
+    if StartBackgroundJob('for /L %i in (1,1,2000000) do @echo ' +
+         StringOfChar('y', 60), Id, Err) then
+    begin
+      Dead := False;
+      for I := 1 to 100 do
+      begin
+        Sleep(100);
+        uTools.TickBackgroundJobs;
+        if WaitBackgroundJob(Id, 0) then
+        begin
+          Dead := True;
+          Break;
+        end;
+      end;
+      Check(Dead, 'a job nobody polled is stopped by the tick alone');
+      Out_ := PollBackgroundJob(Id, Found);
+      Check(Pos('killed', Out_) > 0, 'and the poll afterwards says killed');
+      Check(Pos('more than', Out_) > 0, 'and the note names the cap it passed');
+      Check(uTools.BackgroundJobCount >= 1,
+        'the killed job stays in the table so its output can still be read');
+    end
+    else
+      Check(False, 'a runaway job starts: ' + Err);
+  finally
+    uTools.MaxSpoolBytes := Saved;
+    uTools.ClearJobs;
+  end;
+  Check(uTools.MaxSpoolBytes = 16 * 1024 * 1024,
+    'the cap is back where the suite found it');
+end;
+
 { Search results are third-party text this client echoes back verbatim on
   every later turn, which is a surface nothing else in the transcript has.
   It is captured whole and replayed, so the question is whether hostile
@@ -4463,6 +4529,17 @@ begin
     uHooks and TestHooksAreInteractiveOnly in the smoke suite.  This suite
     stands in for the REPL, which is the one caller that sets it. }
   uHooks.HooksAllowed := True;
+  { And the same neutralisation loop.lpr already does at the top of its main
+    block: LoadHooks now reads %USERPROFILE%\.pasclaude\hooks.json as well as
+    the project's, and four tests here drive it - TestHooksHostileConfig,
+    TestHooksHostileBehaviour, TestDenyBeatsHookAllow and
+    TestPlanModeBeatsHookAllow.  Without this they would inherit whatever hooks
+    the developer running the suite keeps in their own home directory, and the
+    symptom is a suite that passes on this machine and fails on another.  The
+    two tests that save and restore USERPROFILE themselves capture the
+    neutralised value and are unaffected. }
+  SetEnvironmentVariable('USERPROFILE',
+    PChar(IncludeTrailingPathDelimiter(SessionDir) + 'nohome'));
   TestImageDecodersHostile;
   TestBinaryFileDoesNotCorruptBody;
   TestNulByteIsEscaped;
@@ -4474,6 +4551,7 @@ begin
   TestHostileRegex;
   TestNotebookHostileInput;
   TestBackgroundJobsHostile;
+  TestSpoolCapTicks;
   TestHostileSearchResult;
   TestAgentDefinitions;
   TestSkillsHostile;

@@ -25,14 +25,19 @@ gained the one thing a multi-turn driver needed: `--session-file <path>`,
 opt-in by name, so repeated subprocess calls continue one conversation while
 a bare `-p` still touches nothing on disk.
 
-It now also covers the extensibility surface: MCP servers over stdio behind a
-per-command-line spawn prompt, lifecycle hooks at five points in a turn behind
-a fingerprint prompt, skills and plugins discovered from disk, a dynamic tool
-registry any future source can plug into, and an SDK — `-p` with
+It now also covers the extensibility surface: MCP servers over stdio, lifecycle
+hooks at five points in a turn, skills and plugins discovered from disk, a
+dynamic tool registry any future source can plug into, and an SDK — `-p` with
 `--output-format json|stream-json` and `--input-format stream-json` — plus a
-console-free embedding facade in `src/uSdk.pas`. Standing approvals moved out
-of the project to `%LOCALAPPDATA%\pasclaude\approvals\`, so a repository can no
-longer ship the file that answers its own permission questions.
+console-free embedding facade in `src/uSdk.pas`. Both of the first two read a
+user-scope file as well as the project's, and the asymmetry between them is
+the whole design: `%USERPROFILE%\.pasclaude\hooks.json` and `mcp.json` name
+things the user chose and are trusted without a question, while the project's
+`.pasclaude\hooks.json` is gated on a fingerprint of its bytes and each
+`.mcp.json` server on a prompt showing its expanded command line. Standing
+approvals moved out of the project to `%LOCALAPPDATA%\pasclaude\approvals\`,
+so a repository can no longer ship the file that answers its own permission
+questions.
 
 The permission system is now most of one too. Deny rules — `tool:`, `bash:`
 and `path:` globs, out of tree only — are checked above every allow-all, the
@@ -68,19 +73,31 @@ opt-in OTLP metrics send five counters and no text at all; and `/status`,
 needs, built once as a record and rendered twice so the two views cannot
 disagree.
 
-That leaves **Integrations** as the only section here with anything unchecked
-in it: GitHub Actions. IDE integration is done as far as it honestly goes
-from a console program — the editor around the terminal is detected and
-`/ide` opens files and session diffs in it, while an extension and reading
-the editor's selection are refused with their reasons. The PR workflow
-commands are done too: `/review` reviews a local diff and needs no token at
-all, `/pr-comments` reads one pull request's comments over a client that
-issues GET and nothing else, and `/install-github-app` is recorded as not
-applicable because there is no pasclaude GitHub App to install. Every other
-section is complete.
+**Every section is now complete.** Integrations was the last one open and
+GitHub Actions closed it: a template workflow in `examples\github\` and two
+modes, `--ci prepare` and `--ci report`, which hold the judgement calls so the
+YAML does not have to. The ceiling on such a run is reading the repository and
+posting one comment, and the entry below sets out the four separate mechanisms
+that hold it there. IDE integration is done as
+far as it honestly goes from a console program — the editor around the
+terminal is detected and `/ide` opens files and session diffs in it, while an
+extension and reading the editor's selection are refused with their reasons.
+The PR workflow commands are done too: `/review` reviews a local diff and
+needs no token at all, `/pr-comments` reads one pull request's comments over a
+client that issues GET and nothing else, and `/install-github-app` is recorded
+as not applicable because there is no pasclaude GitHub App to install.
 
 Checked items have been built since this list was compiled; the strikethrough
-text preserves what was missing at the time. Unchecked items remain open.
+text preserves what was missing at the time.
+
+With nothing left unchecked, **the open work is no longer in the boxes**. It
+is in the `Still missing:` clause that closes most entries, where a feature
+built to a boundary records what fell outside it and why. Those clauses are
+what to read now, and they are not all the same kind of thing: some are
+deliberate refusals with the argument attached (no VS Code extension, no
+write-capable CI job, no GitHub Enterprise host), and some are genuine
+residuals somebody could still close. A reader looking for work should start
+there rather than with the checkboxes, all of which are ticked.
 
 ## Agents and tools
 
@@ -97,9 +114,16 @@ text preserves what was missing at the time. Unchecked items remain open.
   round-trips `server_tool_use` and `web_search_tool_result` blocks and
   resumes on `pause_turn`, and a declaration the server rejects disables
   itself after one wasted request. Off by default and never persisted.
-  Still missing: no per-query prompt is possible (there is no local call to
-  gate), and results are not clipped, so a verbose result set stays in the
-  transcript and is echoed on every later turn.*
+  A result set is clipped as it is captured, against a 32 KB budget and at
+  result boundaries only, so no result is ever half-echoed and every result
+  that survives is the object the server sent, byte for byte; the last kept
+  result's title says how many were dropped and the status line names the
+  clip as it happens. Still missing: no per-query prompt is possible (there
+  is no local call to gate); the first result is kept whole however large it
+  is, because an empty array would read as a search that found nothing; the
+  clip changes only what later turns re-send, not the answer the search was
+  run for; and a citation in the model's own prose can now point at a result
+  the transcript no longer carries.*
 - [x] ~~**Todo tracking** — no TodoWrite/task-list tool for plan visibility
   on multi-step work.~~
   *Built: the `todo_write` tool maintains a task list rendered live in the
@@ -110,21 +134,47 @@ text preserves what was missing at the time. Unchecked items remain open.
   `kill_bash` to stop; output spooled to a file under `.pasclaude\jobs`
   rather than a pipe; a Win32 job object per job so the tree dies with
   pasclaude; the same per-program approval as foreground bash; `/jobs` to
-  see what is running. At most eight at once, 16 MB of output each. Still
-  missing: a job left running at exit is stopped by design, so there is no
-  truly detached server; the 16 MB cap is only enforced when something
-  sweeps the table, so an unpolled job can overrun it until the next tool
-  call; and a grandchild spawned in the moment between `CreateProcess` and
-  the job assignment escapes `kill_bash`.*
+  see what is running. At most eight at once, 16 MB of output each, and the
+  16 MB is re-checked on a throttled tick that every tool call, every network
+  chunk of a streaming reply and every prompt reaches, so enforcement no
+  longer waits on the model calling another tool. Still missing: a job left
+  running at exit is stopped by design, so there is no truly detached server;
+  nothing can stop a child writing between two ticks, so the guarantee is the
+  cap plus a quarter-second of writing rather than the cap itself; while the
+  user sits at the prompt the program is blocked in a console read with no
+  timeout, so nothing ticks at all and a job left running while nobody types
+  is still unbounded; and a grandchild spawned in the moment between
+  `CreateProcess` and the job assignment escapes `kill_bash`.*
 - [x] ~~**Notebook editing** — no Jupyter (`.ipynb`) aware read/edit.~~
   *Built: `read_file` renders a `.ipynb` as numbered cells with outputs
   summarised by mime type and size rather than dumped; `notebook_edit`
   replaces, inserts or deletes a cell through `edit_file`'s permission gate
   and diff preview. Writes back in nbformat's exact layout, so ids,
-  execution counts and outputs survive a round trip untouched. Still
-  missing: nbformat 4 only — a v3 notebook is refused rather than upgraded —
-  and non-ASCII text is written as raw UTF-8 where nbformat escapes it, so
-  such lines show as changed once on the first edit.*
+  execution counts and outputs survive a round trip untouched. The escaping
+  half of the clause that used to stand here was simply false and is
+  withdrawn: nbformat's writer passes `ensure_ascii=False` to `json.dumps`,
+  against that function's own default, so it writes non-ASCII raw and so do
+  we — checked against a file nbformat 5.11 wrote and now pinned by a fixture
+  with an accent, a CJK pair, an em dash and two emoji outside the BMP, which
+  has to come back byte-identical after an edit to a different cell. Escaping
+  to "match Jupyter" would have created exactly the spurious diff the clause
+  complained about. One real layout difference was found in the same reading
+  and fixed: the line array is now cut where Python's `str.splitlines(True)`
+  cuts it — eleven break characters, CRLF counted once — rather than on `\n`
+  alone, so a form feed page break in a Python source makes two array
+  elements here as it does in Jupyter. Still missing: nbformat 4 only, and a
+  v3 notebook is still refused rather than upgraded — deliberately, after
+  measuring the upgrade rather than assuming it. nbformat's own converter
+  joins a heading cell's lines into one line and draws every new cell id from
+  a random word corpus, so the same v3 file converted twice gives two
+  different v4 files; a conversion that is not reproducible cannot be the
+  no-op an edit has to be, and it rewrites every line of a document whose one
+  guarantee is that an edit touches the cell it names. What changed is the
+  refusal itself, which now names the conversion
+  (`nbformat.read(path, as_version=4)`) instead of only saying no. Also still
+  true: a notebook that arrives with `\uXXXX` escapes in it, written by some
+  other tool, is normalised to raw UTF-8 on the first edit — a change to
+  lines nobody touched, though a change towards what Jupyter would write.*
 - [x] ~~**Regex search** — `search` does case-insensitive substrings and `*`
   globs, not the full regex Grep of Claude Code; `list_dir` is capped at
   depth 4.~~
@@ -167,10 +217,30 @@ text preserves what was missing at the time. Unchecked items remain open.
   sequential, so N servers each taking their 10 s deadline is a 10N-second
   first start; with no threads there is no way to overlap them. "Always" is per
   server, not per tool. The discovery cache can advertise a tool that no longer
-  exists — a clean tool error, fixed by `/mcp refresh`. A user-scope
-  `%USERPROFILE%\.pasclaude\mcp.json` is in the layout but is not read yet. And
+  exists — a clean tool error, fixed by `/mcp refresh`. And
   a server can still put prompt-injection text in a tool description that we
-  faithfully forward; the gate is the user having approved the program.*
+  faithfully forward; the gate is the user having approved the program.
+  A user-scope `%USERPROFILE%\.pasclaude\mcp.json` is now read, and read
+  BEFORE the project's file: its servers are approved without the
+  per-command-line spawn prompt, because that prompt exists for a program the
+  *project* chose and this file names programs the user chose. A project entry
+  may not take a name a user server holds — the refusal is reported by name
+  rather than resolved by nearer-wins, because those four resolutions
+  (`skills`, styles, commands, agents) resolve inert text and this one resolves
+  a program to spawn, and a fresh spawn prompt does not ask the question that
+  went wrong. Their discovery cache goes to
+  `%LOCALAPPDATA%\pasclaude\mcp-cache.json` and never into the project, so a
+  repository cannot ship a cache entry that declares its own tool names under
+  the user's trusted server name. `/mcp` and `/doctor` name each server's
+  scope.
+  Still missing on that half: the per-CALL permission still applies to every
+  user-scope tool, which is deliberate and not a gap — deciding to run a
+  program of your own is not approving every call the model makes to it. With
+  neither `%LOCALAPPDATA%` nor `%USERPROFILE%` set there is no user cache at
+  all, so those servers connect at every launch. A user server's stderr spool
+  still lives in the project's `.pasclaude\mcp\<name>.err`, so a session in one
+  project cannot see what one of your servers said in another. And `-p` reads
+  NEITHER file, so a scripted run still has no MCP tools at all.*
 - [x] ~~**Hooks** — no PreToolUse/PostToolUse or other lifecycle hooks.~~
   *Built: `.pasclaude\hooks.json` runs commands at PreToolUse, PostToolUse,
   UserPromptSubmit, Stop and SessionStart, with an optional regex matcher on
@@ -202,10 +272,35 @@ text preserves what was missing at the time. Unchecked items remain open.
   60-second ceiling is eight minutes on one tool call with nothing on screen,
   and the notice callback fires only on failure. A `tool_input` over 64 KB is
   replaced wholesale with `{"_omitted":"N bytes"}`, so a PreToolUse hook that
-  formats large `write_file` payloads cannot do its job on them. There is no
-  user-scope `%USERPROFILE%\.pasclaude\hooks.json` yet — the trust asymmetry
-  (user-level trusted, project-level prompted) is designed but only the
-  prompted half is built.*
+  formats large `write_file` payloads cannot do its job on them.
+  The trust asymmetry is now built on both sides.
+  `%USERPROFILE%\.pasclaude\hooks.json` loads, is never fingerprinted and is
+  never prompted for — prompting somebody about a file only they can write is
+  noise that teaches them to answer yes, and every yes it trains is spent later
+  on the project prompt that matters. It loads first, so for every event the
+  user's hooks fire before the project's, and since the first block wins that
+  order is the rule rather than a detail. A project file cannot remove, disable
+  or shadow a user hook: there is no key that removes one, and the eight-per-
+  event ceiling is seeded with what is already loaded, so a project file with
+  nine `PreToolUse` entries crowds out its own overflow and never the user's.
+  Running pasclaude in `%USERPROFILE%` makes the two paths one file; it is
+  loaded once, as the user's, with nothing asked, and `/hooks` prints it once
+  rather than naming it as loaded and then again as absent. "One file" is
+  decided against the spelling Windows resolves the two directories to, not
+  against the text: comparing the typed paths meant a junction, a `SUBST`
+  drive or an 8.3 short name reaching home by a second name loaded that single
+  file twice, fired every hook in it twice, and prompted the user to trust
+  their own file — reproduced with a junction before it was fixed. Both scopes
+  are governed by the same `uHooks.HooksAllowed` byte, so a user-scope hook
+  fires under neither `-p` nor any `--ci` verb.
+  Still missing on that half: `/hooks off` is all-or-nothing, with no per-scope
+  switch — a switch that left some hooks running would be worse than none. The
+  32-entry total is shared between the two files, user first. And because the
+  user file carries no fingerprint, an edit to it — by the user, or by a `bash`
+  command they approved — takes effect at the next start with nothing said.
+  That is the accepted price of not prompting about your own file rather than
+  an oversight, but the persistence is broader than the project file's: a hook
+  installed there runs in every project you open.*
 - [x] ~~**Custom slash commands** — no `.claude/commands/*.md` user-defined
   commands.~~
   *Built: `/name args` reads `.pasclaude\commands\name.md` as the prompt
@@ -262,9 +357,24 @@ text preserves what was missing at the time. Unchecked items remain open.
   module-global; a subprocess is the isolation boundary. The raw API
   `stream_event` envelope is not mirrored — the stream is pasclaude's own
   normalised view of the SSE decoder, and re-synthesising raw events would be
-  fiction. `SdkHookLine` exists and is tested but nothing emits it yet: hook
-  activity reaches a driver as `notice` lines and as the resulting
-  `tool_result`.*
+  fiction. `SdkHookLine` is emitted now: `FireHooks` reports every fire that
+  actually ran a child through `uHooks.OnHookFired` - pushed down the ladder
+  the same way `HooksAllowed` is, because the unit that fires hooks sits below
+  the one that knows what a protocol line is - and `SdkRun` points that seam at
+  the encoder for `stream-json` and clears it for `text` and `json`, so the
+  REPL gains no output and the one-object format gains no mid-turn event. A
+  driver gets `{"type":"hook","event":…,"tool_name":…,"detail":…,"blocked":…}`
+  between the `tool_use` and the `tool_result` it explains, with `blocked`
+  telling a refusal from a hook that ran and allowed the call - which the
+  `tool_result` alone never could. Still missing: pasclaude's own `-p` never
+  fires one. Hooks are interactive-only (`HooksAllowed := (not PrintMode) and
+  (DiagMode = dmNone)`) and every SDK format needs `-p`, `--status` or
+  `--doctor`, so in the shipped CLI the seam is armed and there is nothing to
+  report through it; the caller that sees the event today is a program that
+  embeds `uSdk`, drives `SdkRun` in process and turns `uHooks.HooksAllowed` on
+  itself. Widening that gate is a permission decision and not a protocol one -
+  a driver has no way to answer the trust question about a repository's
+  `hooks.json` - and smoke pins it shut.*
 
 ## Permissions
 
@@ -399,13 +509,35 @@ text preserves what was missing at the time. Unchecked items remain open.
   *Built: `/rewind` lists your turns and restores both the transcript and
   the files edited since the picked one, including deleting files created
   that turn. Shell commands are named as not-undoable; files over 400 KB
-  are not snapshotted. (Esc-Esc as a shortcut remains missing.)*
+  are not snapshotted. Escape pressed twice within 600 ms on a prompt line
+  that was ALREADY empty submits `/rewind` as though it had been typed —
+  `uTerm` cannot reach a slash command, so the word is pushed down from
+  `pasclaude.lpr` into `EscEscCommand` and defaults to empty. Every other
+  Escape is untouched: the first one still clears the line, one on a line
+  with text in it still just clears, and with `/vim` on Escape means normal
+  mode both times and never rewinds. It fires only at the REPL prompt, never
+  in the permission question or the model, session and rewind pickers.*
 - [x] ~~**Session picker** — one session per directory (the previous one is
   moved to `session.prev.json`, not offered); no list of past sessions, no
   naming.~~
   *Built: `/save <name>` keeps a named copy, `/sessions` lists everything
   saved (live, safety copy, named) with dates and sizes and resumes the
-  pick. (`--continue` vs `--resume` as CLI flags remains missing.)*
+  pick. `--continue` (`-c`) resumes the most recently written of exactly
+  that set without asking, and names the file it took; `uAgent.NewestSession`
+  and the picker share one rule for what a transcript is, so the approvals
+  file sitting in the same directory can never be loaded as one. Still
+  different from Claude Code in one way, stated rather than papered over:
+  there `--resume` is the picker, where here it keeps the meaning it has
+  always had — this directory's `session.json`, loaded silently — because a
+  new flag does not get to change what an existing one loads. `/sessions` is
+  the picker. `--continue` is refused under `-p`, where `--session-file`
+  names the transcript instead, and refused beside `--resume`, which would
+  be two different files. Because `--continue` may load a file that is *not*
+  this directory's `session.json` — a `/save` copy, or nothing at all when the
+  newest save will not parse — it still takes the `session.prev.json` safety
+  copy in exactly those cases, which `--resume` does not need and does not do:
+  the test is whether the file about to be overwritten is the file that was
+  loaded, not which flag was typed.*
 - [x] ~~**Memory** — no `/memory`, no `#` shortcut to append to CLAUDE.md,
   no user-level `~/.claude/CLAUDE.md`, no `@import` in CLAUDE.md.~~
   *Built: `# note` appends to the project memory file, `/memory` shows it,
@@ -521,10 +653,24 @@ text preserves what was missing at the time. Unchecked items remain open.
   cached prefix, and it is capped at 2 KB — `/output-style` prints the byte
   size it added. The chosen name and the source it resolved from persist
   under `%LOCALAPPDATA%`, never in the project; a name that now resolves
-  somewhere else falls back to `default` with a yellow line. Still missing:
-  no built-in `Explanatory`/`Learning` insert markers in the reply itself,
-  no `--append-system-prompt`, and the body is read once at set time, so an
-  edited style file applies only after re-running `/output-style <name>`.*
+  somewhere else falls back to `default` with a yellow line. An edited style
+  file now applies by itself, from the next turn: `StyleNote` stats the file
+  it read and re-reads it when the stamp or the size moved, which keeps the
+  per-request cost at one directory lookup instead of a read and a
+  frontmatter parse — and keeps a parse failure off the request path. A
+  built-in has no file and never touches the disk; a file that has become
+  unreadable, unparseable or deleted keeps the body that was working and
+  says so in yellow before the next prompt, once, not once a turn.
+  `--append-system-prompt <text>` adds your own paragraph after everything
+  else in the system prompt, accumulates over repeats a blank line apart,
+  and is capped at 4096 bytes in total with the run stopping rather than
+  half-sending; it is command line only, with no `settings.json` key,
+  because a project file that could append to the system prompt is a project
+  file that can rewrite the agent's standing instructions. Still missing: no
+  built-in `Explanatory`/`Learning` insert markers in the reply itself; and
+  the change check compares a two-second DOS stamp beside the size, so an
+  edit landing in the same tick that leaves the file exactly the same length
+  still needs `/output-style <name>` re-run.*
 
 ## Integrations
 
@@ -690,9 +836,10 @@ text preserves what was missing at the time. Unchecked items remain open.
   `/install-github-app` entry above. The instruction-file loader is now gated
   the way hooks are, and by the same one byte read at the point of use:
   `uSdk.SdkProjectContextAllowed` ships false and the host sets it true unless
-  the mode is one of the two `--ci` verbs, so neither verb opens
-  `AGENTS.md`, `CLAUDE.md` or `.pasclaude.md` out of the checkout and neither
-  follows an `@import` inside one. Be exact about the size of that, because
+  the mode is one of the two `--ci` verbs *or* `--no-project-context` was
+  given, so neither verb opens `AGENTS.md`, `CLAUDE.md` or `.pasclaude.md` out
+  of the checkout, neither follows an `@import` inside one, and the flag takes
+  the same files away from an ordinary `-p`. Be exact about the size of that, because
   the flattering reading is wrong and this file is the wrong place for one:
   **neither `--ci` verb runs a turn** — `RunCi` ends in `Halt` on every path —
   so what the flag stops there is the *read and the assembly*, not a delivery
@@ -709,15 +856,28 @@ text preserves what was missing at the time. Unchecked items remain open.
   pins that in both configurations, with the project loader off and again with
   it on, since a pin that only ever ran with the loader switched off would be
   proving the absence of skills from a prompt nothing had been added to.
-  Two residuals are recorded rather than fixed: the answering step is an
-  ordinary `-p` in the checked-out head, so a same-repo branch's `CLAUDE.md`
-  still reaches *that* run's system prompt, bounded by its author having push
-  access — not fixed here because `-p` losing a project's instructions would
-  break the promise every scripted user relies on, and the fix, if it is ever
-  wanted, is an explicit flag on the Answer step rather than a mode inferred
-  from a string in the prompt; and the posted answer is not rewritten, so it
-  can `@`-mention people, since rewriting `@` would corrupt code in the
-  answer.*
+  The answering step is still an ordinary `-p` in the checked-out head, and it
+  now passes `--no-project-context` — an explicit flag on the command line and
+  never a mode inferred from the prompt, which was the recorded requirement
+  and whose reason is that the prompt is the one string in the run an attacker
+  wrote. So the branch's `AGENTS.md`, `CLAUDE.md` and `.pasclaude.md` and
+  everything they `@import` do not reach *that* run's system prompt either,
+  and it is the same one byte the two `--ci` verbs clear that clears it, read
+  at the point the files are opened rather than at a call site — one gate with
+  two reasons to close, not a second mechanism to audit. The two terms meet in
+  `uSdk.SdkProjectContextDecide`, a pure predicate, because the line that
+  decides this used to live in `pasclaude.lpr`'s main block where no suite can
+  link it. `-p` WITHOUT the flag loads a project's files unchanged, exactly as
+  the REPL does, because that is the promise every scripted user relies on,
+  and both directions are asserted over real files. What is NOT closed, and is
+  now the whole of what a same-repo branch contributes to that request: the
+  skill catalogue, which rides in the `skill` tool's own description rather
+  than the prompt and is deliberately not gated by this flag — gating it would
+  be a different feature, changing the tool schema and with it the cache
+  breakpoint — and whatever the model chooses to open with `read_file`, which
+  is the point of the run. So ONE residual is recorded rather than fixed: the
+  posted answer is not rewritten, so it can `@`-mention people, since
+  rewriting `@` would corrupt code in the answer.*
 - [x] ~~**/review, /pr-comments, /install-github-app** — no built-in PR
   workflow commands (git itself works through bash, and `/diff` summarizes
   changes).~~
@@ -1074,19 +1234,23 @@ text preserves what was missing at the time. Unchecked items remain open.
   (Later moved out of the repository; see below.)
 - **Memory** — `# note` appends to the project memory file under a Notes
   heading; `/memory` shows it. (User-level `~/.claude/CLAUDE.md` and
-  `@import` remain missing.)
+  `@import` were missing at the time; both arrived in the next entry.)
 - **User-level memory and @import** — `%USERPROFILE%\.pasclaude\CLAUDE.md`
   loads before the project files (nearer wins), and `@import <path>` lines
   in instruction files inline the referenced file, one level deep.
 - **Checkpointing / rewind** — `/rewind` restores the conversation and the
-  edited files to the moment before a picked turn.
+  edited files to the moment before a picked turn. Escape twice on an
+  already-empty prompt line opens it; with `/vim` on it does not, because
+  Escape there means normal mode.
 - **Session picker** — `/save <name>` makes named copies and `/sessions`
-  lists and resumes them.
+  lists and resumes them. `--continue` takes the most recent of that same
+  set without asking; `--resume` is still this directory's `session.json`.
 - **/init** — the model explores the project and writes a starter
   CLAUDE.md through the ordinary write approval.
 - **Non-interactive mode** — `pasclaude -p "question"` answers once and
   exits with a status code; piped stdin becomes context, or the prompt
-  itself when `-p` is bare. (`--output-format json` remains missing.)
+  itself when `-p` is bare. (`--output-format json` was missing at the time;
+  it arrived with the Agent SDK, below.)
 - **Jcode credentials** — `~\.jcode\auth.json` is a second subscription
   token source when Claude Code's credentials are empty.
 - **Subagents** — `task(prompt, agent_type?)` runs a nested agent with its
@@ -1212,8 +1376,13 @@ text preserves what was missing at the time. Unchecked items remain open.
   permanently last, capped at 2 KB and cut on a character boundary. The name
   and the source it resolved from persist under `%LOCALAPPDATA%`, never in
   the project; a name that now resolves somewhere else falls back to
-  `default` with a yellow line. (The body is read once at set time, so an
-  edited file applies after re-running `/output-style <name>`.)
+  `default` with a yellow line. An edited file applies by itself from the
+  next turn — the file is stat'd on the way through `StyleNote` and re-read
+  when its stamp or size moved — and a file that has become unreadable keeps
+  the text that was working and says so. `--append-system-prompt <text>` is
+  the sibling of all this: it adds your own paragraph LAST, after the
+  project's own instructions, repeats accumulating a blank line apart, 4096
+  bytes in total, command line only and no `settings.json` key.
 - **Image input** — `@shot.png` attaches an image instead of refusing it as a
   binary, and `/paste` takes one off the clipboard (`/paste drop` cancels).
   Both report dimensions, bytes and the real token cost from the documented
@@ -1300,6 +1469,30 @@ text preserves what was missing at the time. Unchecked items remain open.
   uploads nothing. `--status` and `--doctor` are also flags, honour
   `--output-format`, exit 1 on a problem, and are the only modes that
   continue past a missing credential.
+- **The screen** — a two-column welcome frame, a framed prompt block and a
+  status line, in amber. The frame carries identity on the left and commands
+  on the right; the warnings that matter — a permission mode, a deny set, a
+  lowered sandbox — sit deliberately *outside* it, because a box is the shape
+  an eye learns to skip. The prompt block is a rule, word-wrapped text, a
+  rule, and the status line under it, which means painting rows below the
+  caret and walking back up to them: it exists only where VT escapes do, and a
+  console that refuses VT keeps the single-line editor. It is the REPL's
+  alone. The permission question, the model picker, the session picker and the
+  rewind picker all read through `ReadLineEdit`, which never frames, because a
+  question wrapped in a status bar is a question that gets skimmed. The status
+  line says the model and branch, the context and session meters, what was
+  loaded, and the mode last — where a narrow window cannot push it off — and
+  any fact the session does not know takes no columns at all rather than
+  showing a zero. `uTerm` sits below `uAgent` and `uTools` on the ladder and
+  cannot ask either for a token count or a permission mode, so the facts are
+  **pushed down** as a record before each read; that inversion is also what
+  makes the composer a pure function a suite drives at every width from 12 to
+  140 with no console. Rows are one string with zero-width colour marks rather
+  than a run of coloured writes, because a row has to be measurable before it
+  can be padded and `Length()` is not a width when a box character is three
+  bytes. The four amber tones go out as 24-bit escapes and collapse onto
+  intense yellow and a dim pair on a sixteen-colour console — a duller banner,
+  never a broken one.
 
 *Compiled from `README.md` and the `src/` units at
 `E:\Projects\pascal\pasclaude`, compared against the public Claude Code

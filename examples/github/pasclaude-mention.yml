@@ -93,13 +93,14 @@ jobs:
           persist-credentials: false
 
       # The only step that sees the model credential, and the only one with no
-      # GitHub token. Plan mode plus the deny floor: it reads and it answers.
+      # GitHub token. Plan mode, the deny floor, and --no-project-context: this IS
+      # the author's checkout, so its CLAUDE.md is not fit for a system prompt.
       - name: Answer
         if: steps.prepare.outputs.proceed == 'true'
         shell: pwsh
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-        run: Get-Content "$env:RUNNER_TEMP\prompt.txt" -Raw | & "$env:RUNNER_TEMP\agent\bin\pasclaude.exe" -p --output-format json --permission-mode plan > "$env:RUNNER_TEMP\result.json"
+        run: Get-Content "$env:RUNNER_TEMP\prompt.txt" -Raw | & "$env:RUNNER_TEMP\agent\bin\pasclaude.exe" -p --output-format json --permission-mode plan --no-project-context > "$env:RUNNER_TEMP\result.json"
 
       - name: Render the comment
         if: steps.prepare.outputs.proceed == 'true'

@@ -278,6 +278,13 @@ const
     configuration, it is something else wearing the name. }
   McpMaxConfigBytes = 1024 * 1024;
 
+  { The user's own copy, in %USERPROFILE%\.pasclaude\ - and note the missing
+    dot.  The project's file is dot-prefixed because ecosystem convention puts
+    it at a repository root, where a leading dot is how a config file says it
+    is not source.  Inside .pasclaude\ the dot buys nothing at all: the
+    directory already says what the file is, and the layout already names it. }
+  UserMcpFileName = 'mcp.json';
+
 { The tool list, as the API expects it under "tools". }
 function ToolsSchema: TJson;
 
@@ -751,7 +758,11 @@ function OutputStyleSource: string;
 function SetOutputStyle(const Name: string; out Err: string): Boolean;
 { The paragraph SessionNote prepends: '' for the default style, otherwise the
   fence line plus the capped body.  Exposed so a test can assert the text
-  without making a request. }
+  without making a request.
+
+  Not a plain accessor: it first asks the file system whether the style file
+  behind the body has changed, and re-reads it if it has - see StyleRecheck.
+  A built-in style has no file and never reaches the disk from here. }
 function StyleNote: string;
 { True when the body hit MaxStyleNoteBytes.  Reported by /output-style rather
   than silently swallowed: what the model was actually handed is the thing the
@@ -765,6 +776,20 @@ function StyleStartupNote: string;
 { Cleared by a caller that has already overruled the persisted name, so the
   user is not told about a fallback that never happened. }
 procedure ClearStyleStartupNote;
+{ What the last on-the-fly re-read had to say, read-and-cleared: '' when
+  nothing went wrong, otherwise one line for the host to print in yellow.  It
+  fires when the style file has changed on disk and the new contents cannot be
+  used - deleted, unreadable, broken frontmatter, renamed inside its own
+  header.  The style that WAS working is kept in that case, which is why this
+  has to be said out loud: a session whose style file has quietly become
+  rubbish is still writing in the old voice, and the user needs to know their
+  edit did not take before they conclude the feature is broken.
+
+  Read-and-clear rather than a plain getter, because the caller is a REPL loop
+  that runs before every prompt and a note that stayed set would be printed
+  once per keystroke round.  The stamp is updated even when the re-read fails,
+  so a file that stays broken is reported once and then left alone. }
+function TakeStyleReloadNote: string;
 
 function PluginsDir: string;
 function InstalledPlugins: TPluginInfoArray;
@@ -803,6 +828,32 @@ function ValidSkillFileName(const Name: string): Boolean;
 
   Each job also owns a Win32 job object with kill-on-close, so the whole
   process tree dies with pasclaude even when pasclaude dies badly. }
+
+var
+  { A runaway job writing to disk forever is the failure mode a spool file
+    has that a pipe does not.  Sixteen megabytes is generous for anything
+    worth reading and small enough to notice.
+
+    Test seam: a var rather than a const, in the style of MaxOutBytes above,
+    so a suite can lower it and watch a job get stopped without writing
+    sixteen megabytes to the user's disk to do it.  The value and what it
+    means are unchanged; only who can read and set it changed. }
+  MaxSpoolBytes: Int64 = 16 * 1024 * 1024;
+
+{ Re-checks the spool cap, cheaply and on a clock rather than on the model's
+  behaviour.  Wired to three places the program reaches under its own steam:
+  the top of every executed tool call, every network chunk of a streaming
+  reply, and the top of the REPL loop before each prompt is drawn.  Between
+  them they cover the two gaps the cap used to fall through - a turn of pure
+  thinking with no tool call in it, and a turn where the model calls nothing
+  further after starting the job.
+
+  This is the bound; it is not a guarantee, and the comment on SweepTickMs
+  spells out the difference.  It sweeps only: a caller that needs a job's
+  output, or needs finished jobs forgotten, must still call PollBackgroundJob
+  or StartBackgroundJob, which do their own unthrottled sweep because a poll
+  has to report the state as of now. }
+procedure TickBackgroundJobs;
 
 { Starts Cmd detached and returns its job id.  False, with Err set, when the
   table is full, the command is blank, or Windows refused to start it. }
@@ -966,16 +1017,63 @@ function TakeHookAllow: Boolean;
   line has no matching fingerprint and is asked about by name. }
 function McpConfigPath: string;
 
-{ Replaces the server table with what Path declares.  False when there is
-  nothing usable; Err is set only for a real problem, so a missing file is a
-  quiet False.  ${VAR} and ${VAR:-default} are expanded before the command
-  line is hashed, so what the fingerprint covers is what will actually run. }
+{ %USERPROFILE%\.pasclaude\mcp.json - the user's own servers, which apply to
+  every project they open.  '' when %USERPROFILE% is unset, which is not an
+  error: it means there are none. }
+function UserMcpConfigPath: string;
+
+{ Where a USER-scope server's discovery cache goes:
+  <LOCALAPPDATA|USERPROFILE>\pasclaude\mcp-cache.json, the GlobalDenyPath and
+  ApprovalsPath shape.  Deliberately NOT the project's
+  .pasclaude\mcp-cache.json, and not only on tidiness grounds.  McpLoadCache
+  gates on Approved and a user server is approved by construction, so a
+  repository that shipped a cache entry keyed on a guessed name@hash would
+  inject its own tool names and descriptions into every request under the
+  user's own trusted server name.  '' when neither variable is set, which
+  means no cache at all: those servers connect at every launch, which is slow
+  and never unsafe. }
+function UserMcpCachePath: string;
+
+{ Replaces the server table with what Path declares.  This is the PROJECT
+  loader and the host does not call it - LoadMcpConfigAll is what startup
+  wants, and a wiring mistake that calls this one instead simply loses the
+  user's servers, which is the direction a mistake should fail in.
+
+  It keeps this exact shape - one file, ClearMcpServers first - because
+  uDiag.pas documents that behaviour as the reason /doctor does not re-read
+  configuration, and eight test call sites across three suites drive it.
+  False when there is nothing usable; Err is set only for a real problem, so a
+  missing file is a quiet False.  ${VAR} and ${VAR:-default} are expanded
+  before the command line is hashed, so what the fingerprint covers is what
+  will actually run. }
 function LoadMcpConfig(const Path: string; out Err: string): Boolean;
 
-{ The spawn gate.  Asks once per server whose fingerprint is not already
-  recorded; a nil Ask denies everything and spawns nothing, which is what
-  makes print mode structurally unable to be the thing that first runs a
-  repository's code. }
+{ Both scopes, in the order that is the rule: the user's file first, then the
+  project's.  See MergeMcpConfig for why the order decides a name collision. }
+function LoadMcpConfigAll(out Err: string): Boolean;
+
+{ 'user' | 'project' for a configured server; '' when the name is unknown. }
+function McpServerScope(const Name: string): string;
+{ Whether the spawn gate has been answered for this server.  Exposed so a
+  suite can assert that a user-scope server needs nobody to answer it. }
+function McpServerApproved(const Name: string): Boolean;
+
+{ The spawn gate.  Asks once per PROJECT server whose fingerprint is not
+  already recorded; a nil Ask denies every one of those and spawns none of
+  them, which is what makes print mode structurally unable to be the thing that
+  first runs a REPOSITORY's code.
+
+  READ THE SECOND HALF BEFORE RELYING ON THE FIRST.  A user-scope server is
+  approved outright, in both loops, and is never routed past the nil-Ask branch
+  at all - see the long note in the body for why that asymmetry is the whole
+  point of the feature.  So "a nil Ask spawns nothing" is NOT true of this
+  function any more, and this call is not on its own the guard that keeps an
+  unattended entry point from starting the programs in
+  %USERPROFILE%\.pasclaude\mcp.json.  What keeps the shipped host honest there
+  is that print mode halts above the call site.  An embedder that wired a nil
+  Ask on the strength of the first paragraph alone would run every one of the
+  user's servers with nobody watching, which is why the correction is written
+  here rather than left to whoever next reads the body. }
 procedure McpApproveAll(Ask: TAskProc; Notice: TMcpNoticeProc);
 
 { Connects the approved servers that have no cached tool list and returns how
@@ -989,7 +1087,7 @@ function McpRun(const Name: string; Input: TJson; Ask: TAskProc;
   out IsError: Boolean): string;
 
 { One line per configured server for /mcp, tab-separated:
-  name, status, tools, skipped, command, note.  Same shape as
+  name, status, tools, skipped, command, note, scope.  Same shape as
   BackgroundJobList, and for the same reason: a program started on the user's
   behalf has to be visible without asking the model about it. }
 function McpServerList: TStringArray;
@@ -2939,10 +3037,24 @@ const
     offset advances by what was returned, so what is not returned now comes
     back next time rather than vanishing. }
   MaxPollBytes = 24 * 1024;
-  { A runaway job writing to disk forever is the failure mode a spool file
-    has that a pipe does not.  Sixteen megabytes is generous for anything
-    worth reading and small enough to notice. }
-  MaxSpoolBytes = 16 * 1024 * 1024;
+  { MaxSpoolBytes lives in the interface now, beside the functions it bounds,
+    so a suite can lower it rather than having to produce sixteen megabytes to
+    reach it.  Its justification went up there with it.
+
+    How often a tick may actually re-stat the spools.  A quarter of a second
+    is the shortest interval worth re-opening eight files at: below it the
+    check starts to be measurable during a fast stream, where it fires once
+    per network chunk, and above it the overshoot grows for nothing.
+
+    What this buys, stated honestly, because it is not "the cap is now
+    enforced".  Nothing here can stop a child writing between two ticks - the
+    child is a separate process with its own handle and pasclaude is not in
+    its write path at all.  The real guarantee is MaxSpoolBytes plus whatever
+    one tick's worth of writing is, which for a child streaming into a warm
+    page cache is tens of megabytes rather than zero.  What changed is the
+    clock: enforcement used to depend on the model choosing to call another
+    tool, and now it depends on a quarter of a second passing. }
+  SweepTickMs = 250;
   JobKillWaitMs = 2000;
   JobsDirName = 'jobs';
 
@@ -2965,6 +3077,10 @@ type
 var
   Jobs: array of TBackgroundJob;
   JobSeq: Integer = 0;
+  { When the last tick actually swept.  Zero means "never", which GetTickCount64
+    is never equal to in practice, so the first tick after a launch always
+    runs. }
+  LastSweepTick: QWord = 0;
 
 { The spool directory.  This deliberately bypasses SafePath: the state
   directory is exactly where that guard refuses to let the model go, and
@@ -3056,6 +3172,25 @@ begin
   J.Note := '';
 end;
 
+{ The spool cap as a sentence a user can act on.  Integer megabyte division was
+  what stood in the kill note, and it was fine while MaxSpoolBytes was a const:
+  publishing it as a settable var made every value below a megabyte reachable,
+  and 512 KB rendered as "produced more than 0 MB and was stopped" - a line
+  saying a job was killed for producing nothing.  The implementer of the seam
+  worked around it by raising the suite's cap to exactly one megabyte, which
+  hides the sentence without fixing it.  Three ranges and nothing cleverer:
+  this number appears in one string, and a job stopped for writing too much is
+  not the moment to introduce rounding the reader has to think about. }
+function CapText(Bytes: Int64): string;
+begin
+  if Bytes >= 1024 * 1024 then
+    Result := IntToStr(Bytes div (1024 * 1024)) + ' MB'
+  else if Bytes >= 1024 then
+    Result := IntToStr(Bytes div 1024) + ' KB'
+  else
+    Result := IntToStr(Bytes) + ' bytes';
+end;
+
 { Refreshes exit state, and stops anything that has written more than the
   spool cap.  Purge additionally drops jobs whose output has been read to the
   end after exiting - only StartBackgroundJob asks for that, because a poll
@@ -3075,8 +3210,8 @@ begin
         TerminateProcess(Jobs[I].Proc, 1);
       WaitForSingleObject(Jobs[I].Proc, JobKillWaitMs);
       Jobs[I].Killed := True;
-      Jobs[I].Note := Format('[%s produced more than %d MB and was stopped]',
-        [Jobs[I].Id, MaxSpoolBytes div (1024 * 1024)]);
+      Jobs[I].Note := Format('[%s produced more than %s and was stopped]',
+        [Jobs[I].Id, CapText(MaxSpoolBytes)]);
       JobAlive(Jobs[I]);
     end;
   end;
@@ -3091,6 +3226,37 @@ begin
       Inc(N);
     end;
   SetLength(Jobs, N);
+end;
+
+{ The cap on a clock rather than on the model's goodwill.  Three callers reach
+  this and each covers something the others do not: RunToolInner catches the
+  ordinary case of a session that keeps working, uAgent.StreamChunk catches a
+  long reply that calls no tool at all, and the top of the REPL loop catches
+  the moment before the program blocks on the keyboard.  What none of them
+  covers is the block itself: while the user sits at the prompt nothing ticks
+  at all, and a job left running while nobody types is bounded by nothing
+  here.  That window is documented rather than closed - closing it means
+  giving uTerm's single input loop a periodic wakeup, which is a change to the
+  most delicate loop in the program in order to bound some disk inside
+  .pasclaude\jobs that ClearJobs and this unit's finalization already delete.
+
+  The early exit is the whole reason this is safe to call from a hot loop: the
+  overwhelmingly common case is no background jobs at all, and that case costs
+  one integer compare.
+
+  Never SweepJobs(True).  A purge from a tick could forget a finished job in
+  the gap between the model being told about it and the model reading it,
+  which is the exact hazard SweepJobs' own comment argues against;
+  StartBackgroundJob stays the only caller entitled to ask for a purge. }
+procedure TickBackgroundJobs;
+var
+  Now_: QWord;
+begin
+  if Length(Jobs) = 0 then Exit;
+  Now_ := GetTickCount64;
+  if (LastSweepTick <> 0) and (Now_ - LastSweepTick < SweepTickMs) then Exit;
+  LastSweepTick := Now_;
+  SweepJobs(False);
 end;
 
 function StartBackgroundJob(const Cmd: string; out Id: string; out Err: string): Boolean;
@@ -3394,8 +3560,12 @@ begin
     FreeJob(Jobs[I]);
   SetLength(Jobs, 0);
   { Ids restart, because nothing that could still name an old one survives a
-    clear: the transcript holding them has been thrown away too. }
+    clear: the transcript holding them has been thrown away too.  The tick
+    clock restarts for the same reason and for one of its own: a suite that
+    clears the table and immediately starts a job must not find its first tick
+    throttled out by a sweep that happened before any of this existed. }
   JobSeq := 0;
+  LastSweepTick := 0;
 end;
 
 { ---------------------------------------------------------- bash prefixes -- }
@@ -4726,10 +4896,27 @@ const
     'it back. Do not then write it yourself in the same reply.');
 
 var
-  { The selected style, read once at set time.  SessionNote runs on every
-    single request and must not touch the disk, so the body is cached here and
-    the corollary - editing a style file takes effect after re-running
-    /output-style - is what /help says out loud. }
+  { The selected style.  The body is cached here rather than read per request,
+    and it is kept honest by StyleRecheck, which stats the file on the way
+    through StyleNote and re-reads only when the stamp moved.
+
+    STAT AND RE-READ ON CHANGE, not re-read every time, and the choice is
+    worth its paragraph.  StyleNote is called from SessionNote, which is
+    called while a request body is being built, which happens on every single
+    turn: re-reading unconditionally would put a file read, a UTF-8 repair and
+    a frontmatter parse on the request path, and - worse than the cost - it
+    would put the PARSE FAILURE there too, so a half-saved file caught
+    mid-write by an editor would decide the style for a request already in
+    flight.  A stat is one directory lookup, it cannot fail halfway, and in
+    the ordinary case where nothing changed the cached note is returned
+    byte-identical, which is what the prompt cache upstream depends on.
+
+    The stamp is FindFirst's, which on Windows is a DOS timestamp with
+    two-second granularity, so the size is compared beside it.  An edit that
+    lands inside the same two-second tick AND leaves the file exactly the same
+    length is therefore not seen; re-running /output-style <name> still forces
+    the read, and that is the residual, stated here rather than left to be
+    discovered. }
   StyleName: string = DefaultStyleName;
   StylePath: string = '';
   StyleSource: string = 'builtin';
@@ -4737,6 +4924,13 @@ var
   StyleNote_: string = '';
   StyleNoteWasCut: Boolean = False;
   StyleStartupNote_: string = '';
+  { The stamp of the file StyleBody was read from.  Size -1 means "there was
+    no file there", which is both the state before any file style is set and
+    the state after one is deleted - the two are distinguished by StylePath,
+    which is '' only for a built-in. }
+  StyleStamp: LongInt = 0;
+  StyleSize: Int64 = -1;
+  StyleReloadNote_: string = '';
 
   StyleCache: TStyleInfoArray;
   StyleCacheValid: Boolean = False;
@@ -4931,6 +5125,9 @@ begin
   StyleNote_ := '';
   StyleNoteWasCut := False;
   StyleStartupNote_ := '';
+  StyleStamp := 0;
+  StyleSize := -1;
+  StyleReloadNote_ := '';
 end;
 
 function OutputStyleName: string;
@@ -4948,8 +5145,20 @@ begin
   Result := StyleSource;
 end;
 
+{ Defined below, beside the read it shares with SetStyleChecked; declared here
+  because StyleNote is the one caller and StyleNote has to stay where the rest
+  of the accessors are. }
+procedure StyleRecheck; forward;
+
 function StyleNote: string;
 begin
+  { The only place the edited-file check hangs off, and deliberately the
+    narrowest one: this is the function whose result actually reaches a
+    request, so a style file edited between two turns is picked up exactly
+    when it would first matter and at no other time.  /output-style calls it
+    too, on its way to printing the current style, which is what makes the
+    listing agree with what the model is being sent. }
+  StyleRecheck;
   Result := StyleNote_;
 end;
 
@@ -4998,20 +5207,136 @@ begin
     StyleNote_ := StyleNote_ + Body + #10;
 end;
 
+{ Read, repair, parse, and check the header's name against the file's name -
+  everything the file branch of SetStyleChecked used to do inline.  Lifted out
+  whole rather than copied, because there are now two readers of the same file
+  and two ideas of what makes one valid is how a style that /output-style
+  accepted turns into one a later request rejects.  Err is worded for a person
+  who typed a name, since that is still where most of these are seen. }
+function ReadStyleFile(const Path, N: string; out Body, Err: string): Boolean;
+var
+  Text, Note, StName, StDesc, StErr: string;
+begin
+  Body := '';
+  Err := '';
+  Result := False;
+  if not LoadFileLimited(Path, MaxStyleBytes, Text, Note) then
+  begin
+    Err := 'cannot read ' + Path + ': ' + Note;
+    Exit;
+  end;
+  { A style file may have come off a machine with a different codepage.
+    Repaired rather than refused, exactly as a SKILL.md is: one bad byte in
+    the request loses the whole conversation. }
+  if not IsValidUtf8(Text) then Text := OemToUtf8(Text);
+  if not ParseSkillFrontmatter(Text, StName, StDesc, Body, StErr) then
+  begin
+    Err := N + '.md: ' + StErr;
+    Body := '';
+    Exit;
+  end;
+  if (Trim(StName) <> '') and (CompareText(Trim(StName), N) <> 0) then
+  begin
+    Err := Format('%s.md says name: %s; rename one of them', [N, Trim(StName)]);
+    Body := '';
+    Exit;
+  end;
+  Result := True;
+end;
+
+{ The stamp the change check compares.  Size -1 for "nothing is there", which
+  covers both a built-in (Path = '') and a file that has been deleted since it
+  was read - the caller tells those two apart by StylePath and needs to,
+  because only one of them is worth complaining about. }
+procedure StampStyleFile(const Path: string; out Stamp: LongInt; out Size: Int64);
+var
+  R: TSearchRec;
+begin
+  Stamp := 0;
+  Size := -1;
+  if Path = '' then Exit;
+  if FindFirst(Path, faAnyFile, R) = 0 then
+  begin
+    Stamp := R.Time;
+    Size := R.Size;
+    SysUtils.FindClose(R);
+  end;
+end;
+
+{ Has the file behind the cached body changed, and if so can the new one be
+  used?  Called from StyleNote, so once per request at most.
+
+  What it deliberately does NOT do is re-resolve the name.  StylePath was
+  chosen once, by SetStyleChecked, against the project/plugin/user precedence
+  and against the source the user consented to; re-walking that here would let
+  a file dropped into a NEARER directory mid-session take over a style the
+  user picked from their own home directory, which is precisely the
+  substitution OutputStyleSource exists to prevent.  This re-reads the file
+  that was already agreed to and nothing else.
+
+  A failed re-read keeps the body that was working.  Emptying the style
+  because somebody saved a broken frontmatter would change the voice of every
+  reply from that moment on, in a way nothing on screen would explain - and
+  the old body is still exactly what the user asked for the last time the file
+  was readable.  The stamp is updated even on failure so the complaint is made
+  once rather than once per turn. }
+procedure StyleRecheck;
+var
+  NewStamp: LongInt;
+  NewSize: Int64;
+  NewBody, Err: string;
+begin
+  { A built-in has no file, and this is the line that keeps it off the disk
+    entirely: default, explanatory and learning must not start statting
+    anything merely because file-backed styles learned to reload. }
+  if StylePath = '' then Exit;
+  StampStyleFile(StylePath, NewStamp, NewSize);
+  if (NewStamp = StyleStamp) and (NewSize = StyleSize) then Exit;
+  StyleStamp := NewStamp;
+  StyleSize := NewSize;
+  if NewSize < 0 then
+  begin
+    StyleReloadNote_ := 'output style ' + StyleName + ': ' + StylePath +
+      ' is gone; keeping the text it had';
+    Exit;
+  end;
+  if not ReadStyleFile(StylePath, StyleName, NewBody, Err) then
+  begin
+    StyleReloadNote_ := 'output style ' + StyleName + ': ' + Err +
+      '; keeping the text that was working';
+    Exit;
+  end;
+  { Silent on success, and that is the intended shape: the point of the
+    feature is that an edited file simply applies, and a line of chrome after
+    every save would make the ordinary case the noisy one. }
+  StyleBody := NewBody;
+  BuildStyleNote;
+end;
+
+function TakeStyleReloadNote: string;
+begin
+  Result := StyleReloadNote_;
+  StyleReloadNote_ := '';
+end;
+
 { Want = '' means any source is acceptable, which is what a user typing the
   name means.  A non-empty Want is the persisted-source check: the user
   consented to a style from one place, and a file that appeared since in a
   nearer place is not the thing they consented to. }
 function SetStyleChecked(const Name, Want: string; out Err: string): Boolean;
 var
-  N, Path, Src, Text, Note, StName, StDesc, StBody, StErr: string;
+  N, Path, Src, StBody: string;
   B, I: Integer;
+  NewStamp: LongInt;
+  NewSize: Int64;
 begin
   Err := '';
   Result := False;
   N := Trim(Name);
   if N = '' then N := DefaultStyleName;
 
+  NewStamp := 0;
+  NewSize := -1;
   B := BuiltinStyleIndex(N);
   if B >= 0 then
   begin
@@ -5033,26 +5358,12 @@ begin
       Err := 'no style called ' + N;
       Exit;
     end;
-    if not LoadFileLimited(Path, MaxStyleBytes, Text, Note) then
-    begin
-      Err := 'cannot read ' + Path + ': ' + Note;
-      Exit;
-    end;
-    { A style file may have come off a machine with a different codepage.
-      Repaired rather than refused, exactly as a SKILL.md is: one bad byte in
-      the request loses the whole conversation. }
-    if not IsValidUtf8(Text) then Text := OemToUtf8(Text);
-    if not ParseSkillFrontmatter(Text, StName, StDesc, StBody, StErr) then
-    begin
-      Err := N + '.md: ' + StErr;
-      Exit;
-    end;
-    if (Trim(StName) <> '') and (CompareText(Trim(StName), N) <> 0) then
-    begin
-      Err := Format('%s.md says name: %s; rename one of them',
-        [N, Trim(StName)]);
-      Exit;
-    end;
+    { Stamped BEFORE the read, never after: a file rewritten in the window
+      between the two would otherwise be recorded under the newer stamp with
+      the older body cached, and the change check would then never fire for
+      it.  Stamping first can only cost one redundant re-read. }
+    StampStyleFile(Path, NewStamp, NewSize);
+    if not ReadStyleFile(Path, N, StBody, Err) then Exit;
     { Which source actually answered.  Compared by path rather than re-walked,
       so the label can never disagree with the file that was read. }
     Src := 'user';
@@ -5080,6 +5391,14 @@ begin
   StylePath := Path;
   StyleSource := Src;
   StyleBody := StBody;
+  { Both, and both from the branch above: a built-in leaves them at 0/-1,
+    which StyleRecheck never looks at because StylePath is ''.  A pending
+    complaint about the PREVIOUS style file goes too - the user has just
+    chosen a different style and a yellow line about the old one would be
+    answering a question they stopped asking. }
+  StyleStamp := NewStamp;
+  StyleSize := NewSize;
+  StyleReloadNote_ := '';
   BuildStyleNote;
   Result := True;
 end;
@@ -6608,12 +6927,18 @@ type
     Decl: string;   { the validated declaration, as text }
   end;
 
+  { Which file named the program.  It decides three things and nothing else:
+    whether the spawn prompt is asked, which cache file the tool list goes to,
+    and who wins a name collision. }
+  TMcpScope = (msProject, msUser);
+
   TMcpServerRec = record
     Name, Command, Hash, WorkDir, Transport: string;
     Note, LastErr, ErrLog: string;
     EnvPairs: array of string;
     TimeoutMs: Integer;
     Status: TMcpStatus;
+    Scope: TMcpScope;
     Approved: Boolean;
     Conn: Integer;
     Skipped: Integer;
@@ -6653,6 +6978,36 @@ begin
     PathDelim + 'mcp-cache.json';
 end;
 
+function UserMcpConfigPath: string;
+var
+  Home: string;
+begin
+  Result := '';
+  { SysUtils. qualified for the same reason ApprovalsPath and SkillsDirUser do
+    it: the Windows unit has a raw API of this name in scope here. }
+  Home := Trim(SysUtils.GetEnvironmentVariable('USERPROFILE'));
+  if Home = '' then Exit;
+  Result := IncludeTrailingPathDelimiter(Home) + StateDirName + PathDelim +
+    UserMcpFileName;
+end;
+
+{ Out of the project on purpose, and the argument is ApprovalsPath's: user-scope
+  state kept in a project directory is a file the project can write, and this
+  one is read back as tool declarations for a server that is approved by
+  construction. }
+function UserMcpCachePath: string;
+var
+  Home: string;
+begin
+  Result := '';
+  Home := Trim(SysUtils.GetEnvironmentVariable('LOCALAPPDATA'));
+  if Home = '' then
+    Home := Trim(SysUtils.GetEnvironmentVariable('USERPROFILE'));
+  if Home = '' then Exit;
+  Result := IncludeTrailingPathDelimiter(Home) + 'pasclaude' + PathDelim +
+    'mcp-cache.json';
+end;
+
 function McpFind(const Name: string): Integer;
 var
   I: Integer;
@@ -6683,6 +7038,29 @@ begin
   I := McpFind(Name);
   if I < 0 then Exit(0);
   Result := Length(McpServers[I].Tools);
+end;
+
+function McpScopeName(S: TMcpScope): string;
+begin
+  if S = msUser then Result := 'user' else Result := 'project';
+end;
+
+function McpServerScope(const Name: string): string;
+var
+  I: Integer;
+begin
+  I := McpFind(Name);
+  if I < 0 then Exit('');
+  Result := McpScopeName(McpServers[I].Scope);
+end;
+
+function McpServerApproved(const Name: string): Boolean;
+var
+  I: Integer;
+begin
+  I := McpFind(Name);
+  if I < 0 then Exit(False);
+  Result := McpServers[I].Approved;
 end;
 
 function McpStatusWord(S: TMcpStatus): string;
@@ -7007,27 +7385,33 @@ begin
   S := S + Reason;
 end;
 
-function LoadMcpConfig(const Path: string; out Err: string): Boolean;
+{ One file into the shared table, without clearing it.  Label_ is what every
+  sentence in Err names itself by: ExtractFileName for the project's file and
+  the FULL PATH for the user's, so 'mcp.json' and '.mcp.json' are never
+  confusable in a line somebody has to act on.  Once two files write into one
+  Err string, a complaint that does not name its file is a complaint nobody can
+  fix - and NoteReason's own dedupe would otherwise swallow the second file's
+  identical wording and leave the user looking in the wrong place. }
+function MergeMcpConfig(const Path, Label_: string; Scope: TMcpScope;
+  var Err: string): Integer;
 var
   F: TFileStream;
   Text, Name, Cmd, PErr: string;
   Root, Servers, S, A, E: TJson;
-  I, J: Integer;
+  I, J, Held: Integer;
   Args: array of string;
   Rec: TMcpServerRec;
 begin
-  Err := '';
-  Result := False;
-  ClearMcpServers;
-  if not FileExists(Path) then Exit;
+  Result := 0;
+  if (Path = '') or not FileExists(Path) then Exit;
   Text := '';
   try
     F := TFileStream.Create(Path, fmOpenRead or fmShareDenyNone);
     try
       if F.Size > McpMaxConfigBytes then
       begin
-        Err := Format('%s is %d bytes; that is not a configuration',
-          [ExtractFileName(Path), F.Size]);
+        NoteReason(Err, Format('%s is %d bytes; that is not a configuration',
+          [Label_, F.Size]));
         Exit;
       end;
       SetLength(Text, F.Size);
@@ -7038,7 +7422,7 @@ begin
   except
     on Ex: Exception do
     begin
-      Err := 'cannot read ' + ExtractFileName(Path) + ': ' + Ex.Message;
+      NoteReason(Err, 'cannot read ' + Label_ + ': ' + Ex.Message);
       Exit;
     end;
   end;
@@ -7046,14 +7430,14 @@ begin
   Root := JsonParse(Text, PErr);
   if Root = nil then
   begin
-    Err := ExtractFileName(Path) + ' is not valid JSON: ' + PErr;
+    NoteReason(Err, Label_ + ' is not valid JSON: ' + PErr);
     Exit;
   end;
   try
     Servers := Root.Find('mcpServers');
     if (Servers = nil) or (Servers.Kind <> jkObj) then
     begin
-      Err := ExtractFileName(Path) + ' has no mcpServers object';
+      NoteReason(Err, Label_ + ' has no mcpServers object');
       Exit;
     end;
     for I := 0 to Servers.Count - 1 do
@@ -7062,20 +7446,36 @@ begin
       S := Servers.Item(I);
       if not ValidServerName(Name) then
       begin
-        NoteReason(Err, 'refused a server whose name is not a bare name');
+        NoteReason(Err, Label_ + ': refused a server whose name is not a bare name');
         Continue;
       end;
-      if McpFind(Name) >= 0 then
+      Held := McpFind(Name);
+      if Held >= 0 then
       begin
-        NoteReason(Err, 'refused a duplicate server name');
+        { The user wins, and this is the one place in the program where the
+          nearer-wins rule that resolves skills, styles, commands and agents is
+          deliberately inverted.  Those four resolve INERT TEXT; this one
+          resolves A PROGRAM TO SPAWN.  Under project-wins a repository could
+          name its server 'github', displace the user's, and inherit the
+          model's whole session habit of calling mcp__github__* - and the fresh
+          spawn prompt is no defence, because the question it asks ("may this
+          run") is not the question that went wrong ("whose program is this").
+          The refusal is named rather than silent so the collision is something
+          the user can act on. }
+        if (McpServers[Held].Scope = msUser) and (Scope = msProject) then
+          NoteReason(Err, Label_ + ': refused "' + Name + '" - a server in ' +
+            'your own ' + UserMcpFileName + ' already has that name')
+        else
+          NoteReason(Err, Label_ + ': refused a duplicate server name');
         Continue;
       end;
       if (S = nil) or (S.Kind <> jkObj) then
       begin
-        NoteReason(Err, 'refused a server entry that is not an object');
+        NoteReason(Err, Label_ + ': refused a server entry that is not an object');
         Continue;
       end;
 
+      Rec.Scope := Scope;
       Rec.Name := Name;
       Rec.Note := '';
       Rec.LastErr := '';
@@ -7105,6 +7505,7 @@ begin
         Rec.Note := 'this build speaks stdio only';
         SetLength(McpServers, Length(McpServers) + 1);
         McpServers[High(McpServers)] := Rec;
+        Inc(Result);
         Continue;
       end;
 
@@ -7114,7 +7515,7 @@ begin
       Cmd := Trim(McpExpandVars(S.Str('command')));
       if Cmd = '' then
       begin
-        NoteReason(Err, 'refused a server with no command');
+        NoteReason(Err, Label_ + ': refused a server with no command');
         Continue;
       end;
 
@@ -7146,24 +7547,51 @@ begin
 
       SetLength(McpServers, Length(McpServers) + 1);
       McpServers[High(McpServers)] := Rec;
+      Inc(Result);
     end;
   finally
     Root.Free;
   end;
+end;
+
+function LoadMcpConfig(const Path: string; out Err: string): Boolean;
+begin
+  Err := '';
+  ClearMcpServers;
+  MergeMcpConfig(Path, ExtractFileName(Path), msProject, Err);
+  Result := Length(McpServers) > 0;
+end;
+
+{ The host's loader.  User first, project second, and the order IS the rule:
+  MergeMcpConfig refuses an incoming name a user server already holds, so
+  whichever file is read first is the one that keeps its names.  Reading the
+  project first would make that refusal point the other way and hand a
+  repository the ability to take over a name the model has been calling all
+  session. }
+function LoadMcpConfigAll(out Err: string): Boolean;
+begin
+  Err := '';
+  ClearMcpServers;
+  MergeMcpConfig(UserMcpConfigPath, UserMcpConfigPath, msUser, Err);
+  MergeMcpConfig(McpConfigPath, ExtractFileName(McpConfigPath), msProject, Err);
   Result := Length(McpServers) > 0;
 end;
 
 { ---- the discovery cache ---- }
 
-procedure McpLoadCache;
+{ One cache file for one scope.  Split because a user-scope server's tool list
+  is user-scope state and the project directory is exactly where ApprovalsPath
+  already refuses to keep state of that kind - here it is also the difference
+  between a repository being unable to describe the user's servers and being
+  able to name their tools under a name the user trusts. }
+procedure McpLoadCacheFrom(const Path: string; Scope: TMcpScope);
 var
   F: TFileStream;
-  Text, Path: string;
+  Text: string;
   Root, Arr, It: TJson;
   I, J, K: Integer;
 begin
-  Path := McpCachePath;
-  if not FileExists(Path) then Exit;
+  if (Path = '') or not FileExists(Path) then Exit;
   Text := '';
   try
     F := TFileStream.Create(Path, fmOpenRead or fmShareDenyNone);
@@ -7183,6 +7611,7 @@ begin
     if Root.Kind <> jkObj then Exit;
     for I := 0 to High(McpServers) do
     begin
+      if McpServers[I].Scope <> Scope then Continue;
       if McpServers[I].Hash = '' then Continue;
       { Approval first, and not merely as an optimisation.  The cache is a
         file in the project directory, so a repository can ship one whose
@@ -7211,17 +7640,35 @@ begin
   end;
 end;
 
-procedure McpSaveCache;
+procedure McpLoadCache;
+begin
+  McpLoadCacheFrom(McpCachePath, msProject);
+  McpLoadCacheFrom(UserMcpCachePath, msUser);
+end;
+
+procedure McpSaveCacheTo(const Path: string; Scope: TMcpScope);
 var
   Root, Arr, It: TJson;
   Text: string;
   F: TFileStream;
-  I, J: Integer;
+  I, J, Seen: Integer;
 begin
+  if Path = '' then Exit;
+  { A scope's file is touched only by a session that actually read that scope's
+    config.  Without this, a run in a project with no .mcp.json would write an
+    empty document over the user's cache and cost every user server a connect
+    at the next launch - and the same in reverse for a run with no
+    %USERPROFILE%.  A stale entry is dropped only by a session that had the
+    config in front of it. }
+  Seen := 0;
+  for I := 0 to High(McpServers) do
+    if McpServers[I].Scope = Scope then Inc(Seen);
+  if Seen = 0 then Exit;
   Root := TJson.NewObj;
   try
     for I := 0 to High(McpServers) do
     begin
+      if McpServers[I].Scope <> Scope then Continue;
       if (McpServers[I].Hash = '') or (Length(McpServers[I].Tools) = 0) then
         Continue;
       Arr := TJson.NewArr;
@@ -7240,8 +7687,8 @@ begin
     Root.Free;
   end;
   try
-    ForceDirectories(ExtractFileDir(McpCachePath));
-    F := TFileStream.Create(McpCachePath, fmCreate);
+    ForceDirectories(ExtractFileDir(Path));
+    F := TFileStream.Create(Path, fmCreate);
     try
       if Text <> '' then F.WriteBuffer(Text[1], Length(Text));
     finally
@@ -7250,6 +7697,12 @@ begin
   except
     { A cache that cannot be written costs a connect at the next start. }
   end;
+end;
+
+procedure McpSaveCache;
+begin
+  McpSaveCacheTo(McpCachePath, msProject);
+  McpSaveCacheTo(UserMcpCachePath, msUser);
 end;
 
 { ---- approval, connection, discovery ---- }
@@ -7263,6 +7716,23 @@ begin
   for I := 0 to High(McpServers) do
   begin
     if McpServers[I].Status = mcUnsupported then Continue;
+    { This is where the word "approved" is decided, and the loader is
+      deliberately not a second place that grants it.  A user-scope server
+      names a program the USER chose, so the per-command-line spawn prompt has
+      nothing to ask: read uTools' own note above McpConfigPath, which says the
+      genuinely new risk this feature introduced is a program the PROJECT
+      chose, and that is the whole of the asymmetry.  It is skipped in BOTH
+      loops on purpose - counting it into NeedAsk would make the notice below
+      announce that "this project ships .mcp.json and asks to run N programs"
+      and then list a program the project did not ship, which is a security
+      message wrong in the direction of alarming somebody about their own file.
+      The per-CALL gate in McpRun is untouched: deciding to run a program of
+      your own is not approving every call the model makes to it. }
+    if McpServers[I].Scope = msUser then
+    begin
+      McpServers[I].Approved := True;
+      Continue;
+    end;
     if (McpServers[I].Hash <> '') and
        (TrustedFingerprint('mcp:' + McpServers[I].Name) = McpServers[I].Hash) then
     begin
@@ -7298,6 +7768,14 @@ begin
   for I := 0 to High(McpServers) do
   begin
     if McpServers[I].Status = mcUnsupported then Continue;
+    { Second of the two skips - see the long note in the counting loop.  Both
+      or neither: approving here while still counting above produces a notice
+      that names a program the project never asked for. }
+    if McpServers[I].Scope = msUser then
+    begin
+      McpServers[I].Approved := True;
+      Continue;
+    end;
     if McpServers[I].Approved then Continue;
     { Nobody to ask is no.  This is the whole of why print mode can never be
       the thing that first executes a repository's code: it arrives here with
@@ -7580,10 +8058,13 @@ begin
       unreadable, and the full text is in .mcp.json either way. }
     Cmd := McpServers[I].Command;
     if Length(Cmd) > 100 then Cmd := Copy(Cmd, 1, 97) + '...';
+    { Field 6 is the scope, appended rather than inserted: every existing
+      reader indexes by position, and a column added at the end is the one
+      shape of change that cannot silently reinterpret one of them. }
     Result[I] := McpServers[I].Name + #9 + McpStatusWord(McpServers[I].Status) +
       #9 + IntToStr(Length(McpServers[I].Tools)) +
       #9 + IntToStr(McpServers[I].Skipped + McpBudgetDropped) +
-      #9 + Cmd + #9 + Note;
+      #9 + Cmd + #9 + Note + #9 + McpScopeName(McpServers[I].Scope);
   end;
 end;
 
@@ -7650,6 +8131,13 @@ var
   Code: Integer;
   Ok: Boolean;
 begin
+  { Here rather than at the top of RunTool: RunTool's prologue is the ordered
+    R0-R8 decision procedure whose own comment forbids inserting anything
+    above the [DENY] steps, and a spool sweep is not a decision about this
+    call.  RunToolInner sits wholly below that argument and every call that
+    actually executes passes through it. }
+  TickBackgroundJobs;
+
   IsError := False;
 
   if Name = 'read_file' then

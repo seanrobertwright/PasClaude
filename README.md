@@ -39,10 +39,11 @@ Requires Free Pascal 3.2.x for `x86_64-win64`. The script finds `fpc.exe` on
 ```
 set ANTHROPIC_API_KEY=sk-ant-...
 set ANTHROPIC_MODEL=claude-sonnet-4-5          :: optional
-bin\pasclaude.exe [directory] [--resume] [--web] [--add-dir <dir>]
+bin\pasclaude.exe [directory] [--resume | --continue] [--web] [--add-dir <dir>]
                   [--permission-mode ask|plan|accept-edits]
                   [--dangerously-skip-permissions] [--sandbox off|limits|low]
-                  [--output-style <name>]
+                  [--output-style <name>] [--append-system-prompt <text>]
+                  [--no-project-context]
                   [-p "prompt"] [--session-file <path>]
                   [--output-format text|json|stream-json] [--input-format text|stream-json]
                   [--status] [--doctor [--online]]
@@ -105,7 +106,14 @@ If the project contains `AGENTS.md`, `CLAUDE.md` or `.pasclaude.md`, the
 contents are appended to the system prompt as binding instructions. Not under
 `--ci prepare` or `--ci report`, where the working directory is a checkout of
 the pull request under review: those two runs load none of them and name the
-files they skipped - see **Running unattended**.
+files they skipped - see **Running unattended**. `--no-project-context` says
+the same thing for *any* run, which is what you want when the directory is a
+checkout somebody else wrote; it stops the three files and every `@import`
+inside them, and nothing else. Your own
+`%USERPROFILE%\.pasclaude\CLAUDE.md` loads either way, because the question
+the flag asks is which *tree* wrote the prompt, and skills are untouched -
+their descriptions ride in the `skill` tool's own description and were never
+in the system prompt at all.
 
 ## Commands
 
@@ -119,9 +127,9 @@ files they skipped - see **Running unattended**.
 | `/ide` | the editor around this terminal; `/ide diff [<path>]`, `/ide open <path>[:line]` |
 | `/review [--staged\|<ref>]` | have the model review a local diff; no network, no token |
 | `/pr-comments [<n>] [--show]` | the comments on one GitHub pull request, printed then sent |
-| `/hooks` | the commands this project runs automatically; `/hooks off` stops them |
+| `/hooks` | the commands that run automatically, yours and this project's; `/hooks off` stops both |
 | `/jobs` | background commands still running |
-| `/mcp` | MCP servers: status, `/mcp restart <name>`, `/mcp refresh` |
+| `/mcp` | MCP servers, yours and this project's: status, `/mcp restart <name>`, `/mcp refresh` |
 | `/memory` | show the project memory (CLAUDE.md) |
 | `/init` | have the model write a CLAUDE.md for this project |
 | `/rewind` | undo turns: conversation and edited files |
@@ -183,7 +191,35 @@ their message positions no longer describe the transcript.
 `/save <name>` keeps a named copy (`<name>.session.json`) the autosave
 never overwrites, and `/sessions` lists everything saved in the directory -
 the live session, the safety copy, and the named ones, with dates and
-sizes - and resumes whichever you pick.
+sizes - and resumes whichever you pick. `--continue` (`-c`) takes the most
+recently written of exactly that set and asks nothing, naming the file it
+took. One rule decides what counts as a saved conversation, in
+`uAgent.IsSessionFile`, and both the picker and `--continue` go through it -
+the approvals file lives in the same directory, and a "newest `.json`" rule
+would load it as a transcript.
+
+Two differences from Claude Code, said rather than glossed. There `--resume`
+is the picker; here it keeps the meaning it has always had - this directory's
+`session.json`, loaded silently - because a new flag does not get to change
+what an existing one loads, and `/sessions` was already the picker. And
+`--continue` is interactive only: under `-p` it is a startup error, with
+`--session-file <path>` as the answer, because a script that continued
+"whichever conversation was saved last" would continue a different one
+depending on what you did in the REPL an hour ago. Giving both `--resume` and
+`--continue` is a startup error too - they name different files, and either
+precedence would be a guess.
+
+Escape pressed twice on a prompt line that was already empty opens `/rewind`.
+It is the only new meaning Escape has: the first press still clears the line,
+a press on a line with text in it still just clears, and with `/vim` on
+Escape leaves insert mode both times and never rewinds - a vim user's fingers
+press it twice to be sure, and stealing that would cost more than the
+shortcut is worth. It fires at the REPL prompt only, never in the permission
+question or the `/model`, `/sessions` and `/rewind` pickers. `uTerm` sits
+below `uTools` and cannot reach a slash command, so the word is pushed down
+from `pasclaude.lpr` into `uTerm.EscEscCommand` - empty by default, so a
+wiring mistake is a shortcut that does nothing - and submitted as though you
+had typed it, through the one dispatcher every other command goes through.
 
 A slash command nobody built in is looked up in `.pasclaude\commands\`:
 `/shout loud words` reads `commands\shout.md` and sends its contents as the
@@ -367,8 +403,10 @@ conversation on a dropped connection is worse than no compaction.
 
 The conversation is written to `.pasclaude\session.json` after every turn, so
 the session worth keeping - the one that ended in a crash or a closed window -
-is already on disk. `--resume` picks it up at startup, `/resume` does it later,
-and `/save` forces a write.
+is already on disk. `--resume` picks it up at startup and `/resume` does the
+same later; `--continue` takes the most recently written save instead -
+whichever of the live file, the safety copy or a `/save` that is - and
+`/save` forces a write.
 
 The API key is never stored. It belongs in the environment, and writing it into
 a file inside the user's project is how secrets end up committed.
@@ -408,10 +446,19 @@ history of the turn currently running. It is skipped by `list_dir` and `search`
 and refused by the path guard, including by a roundabout path. A file merely
 named similarly, like `.pasclaude-notes.md`, is unaffected.
 
-Starting in a directory that already holds a session, without `--resume`, moves
-that session to `session.prev.json` before anything can overwrite it. Two
+Starting in a directory that already holds a session, without `--resume`,
+moves that session to `session.prev.json` before anything can overwrite it. Two
 windows open on one project is not exotic, and the second one used to destroy
 the first's conversation on its very first save.
+
+`--resume` is the one exemption, and it is exempt because it loaded that exact
+file: the copy would be a copy of what is about to be written back. `--continue`
+is not exempt, though it briefly was. It takes whichever save is newest, which
+may be a `/save` copy, and loads nothing at all when the newest one will not
+parse - and in both of those the first turn writes over a `session.json`
+nobody read. So the copy is taken whenever the file about to be overwritten is
+not the file that was loaded, which is the question that actually matters
+rather than which flag was typed.
 
 ## Tools
 
@@ -555,15 +602,32 @@ sorted keys, trailing newline), byte-identical to what nbformat produces:
 round-trip fidelity here means "the user's git diff shows one changed line",
 not "Jupyter still opens it". A notebook someone formatted differently is
 reformatted once on the first edit, which the permission prompt announces.
-One deliberate deviation: nbformat escapes non-ASCII as `\uXXXX` and we emit
-raw UTF-8, so a notebook containing non-ASCII text shows those lines as
-changed after the first edit. Both forms are legal JSON. A source replace
+Non-ASCII is written raw, which is what nbformat does too - its writer passes
+`ensure_ascii=False` to `json.dumps`, against that function's own default -
+so an accent, a CJK character or an emoji outside the BMP comes back as the
+bytes it went in as and no line the user did not touch moves. This README
+used to claim the opposite, that escaping was a deliberate deviation; it was
+not a deviation and it was not deliberate, it was untested, and the fixture
+that now checks it was written by nbformat itself. A file that arrived with
+`\uXXXX` escapes in it, which some other writer produced, is normalised to
+the raw form on the first edit - a real change, and a change towards what
+Jupyter would have written. The line array is cut where Python's
+`str.splitlines(True)` cuts it, which is on eleven things and not on `\n`
+alone: a form feed page break in a Python source used to make one array
+element here where Jupyter makes two. A source replace
 keeps the cell's outputs and execution count - the user approved "change
 this cell's code", not "throw away the plot it produced" - and the cell view
-labels them, so a later read shows the model they are now stale. Only
-nbformat 4 is supported; a v3 notebook is refused by name rather than
-half-understood, because rewriting one as v4 would silently discard its
-worksheet structure.
+labels them, so a later read shows the model they are now stale.
+
+Only nbformat 4 is supported. A v3 notebook is refused by name rather than
+upgraded, and that stayed the answer after the upgrade was measured rather
+than guessed at: nbformat's own converter flattens the worksheets, joins a
+heading cell's lines into one, and draws every new cell id from a random word
+corpus, so the same v3 file converted twice gives two different v4 files. A
+conversion that is not reproducible cannot be the no-op an edit has to be,
+and it rewrites every line of a document whose one guarantee is that an edit
+touches the cell it names. The error names the tool that owns the conversion
+instead of only saying no.
 
 Shell commands can outlive the tool call that started them. `bash` takes
 `run_in_background`; setting it returns a job id straight away instead of
@@ -621,10 +685,14 @@ cancellation: Esc cancels the model's reply, not the user's build. At most
 eight run at once, and a job that writes more than 16 MB is stopped and says
 so.
 
-Two limits are worth stating rather than hiding. The 16 MB cap is only
-enforced when something sweeps the table - a launch, a poll, a list - so an
-unpolled job can overrun it until the next tool call, the same shape of
-limitation the foreground 120-second deadline already has. And a job still running at exit
+Two limits are worth stating rather than hiding. The 16 MB cap is checked on
+a throttled tick that runs at the top of every executed tool call, on every
+chunk of a streaming reply, and before every prompt is drawn, so enforcement
+no longer depends on the model choosing to start, poll or list a job. It is a
+bound and not a guarantee: nothing here is in the child's write path, so a
+child can still write between two ticks, and while the user is sitting at the
+prompt the program is blocked in a console read with no timeout and nothing
+ticks at all. And a job still running at exit
 is stopped by design, so a user who wanted a truly detached server will find
 it gone; that is the deliberate trade against orphaning, which the launch
 message and `/jobs` make visible.
@@ -978,6 +1046,20 @@ block this client never understood is one it cannot correctly rebuild, so it
 is not rebuilt. Making `bkResult` the fallback for every unrecognised type
 fixes `redacted_thinking` and whatever ships next for free.
 
+Exactly one block type is now understood far enough to be shortened. A search
+result set is echoed back on every request for the rest of the session and is
+by a wide margin the largest thing in the transcript - a title and a url are a
+few hundred bytes, and then there is an opaque blob of page content per result
+that runs to several kilobytes - so a single verbose search taxes every turn
+that follows it. A `web_search_tool_result` larger than 32 KB is therefore
+clipped as it is captured: whole results are dropped off the end until it
+fits, the last surviving result's title gains a note saying how many went, and
+the status line on screen says so at the time. The first result is never
+dropped, because an empty array would read as a search that found nothing.
+Nothing inside a result that survives is regenerated, shortened or reordered,
+so the sentence above about not rebuilding what this client does not
+understand stays exactly true of every byte that is sent.
+
 Whether a subscription OAuth token may declare this tool, and whether the
 dated type string `web_search_20260209` is still current, are things only a
 live server can answer - and a rejected declaration would 400 every turn for
@@ -1182,6 +1264,12 @@ What this does not protect against, stated plainly:
   `.pasclaude` and is therefore unreachable by the tools. The asymmetry is
   deliberate - hooks have no convention pushing them to the root, so they take
   the stricter placement for free - and should not be "fixed" for symmetry.
+  The user's own two files, `%USERPROFILE%\.pasclaude\hooks.json` and
+  `%USERPROFILE%\.pasclaude\mcp.json`, sit outside every root, so no clone can
+  ship one; and `.pasclaude` is refused at the top level of every root
+  including added ones, so `--add-dir %USERPROFILE%` does not make them
+  reachable either. That placement, not a prompt, is what makes it safe to
+  trust them without asking.
 
 ## MCP servers
 
@@ -1194,6 +1282,24 @@ session root, in the shape the rest of the ecosystem uses.
              "env": {"GITHUB_TOKEN": "${GH_TOKEN}"}}
 }}
 ```
+
+You can name your own in `%USERPROFILE%\.pasclaude\mcp.json`, same shape, and
+those apply to every project you open. That file is read *first*, and its
+servers skip the per-command-line spawn prompt: the prompt exists because a
+repository you cloned chose a program, and this file is you choosing one. It
+does not skip the per-call permission - deciding to run a program of your own
+is not approving every call the model makes to it, and `/yolo` is still what
+answers that. If the project's `.mcp.json` names a server you already have, the
+project's is refused and `/mcp` says so by name. That is the opposite of the
+nearer-wins rule skills, styles, commands and agents use, on purpose: those
+resolve inert text and this one resolves a program to spawn, so under
+nearer-wins a repository could call its server `github`, displace yours, and
+inherit the model's whole session habit of calling `mcp__github__*` - and the
+fresh spawn prompt is no defence, because "may this run" is not the question
+that went wrong. Your servers' discovery cache is written to
+`%LOCALAPPDATA%\pasclaude\mcp-cache.json` rather than the project's, because
+the project cache is a file the project can write and the cache is read back as
+tool declarations for a server that is approved by construction.
 
 Their tools become ordinary tools, named `mcp__<server>__<tool>`. stdio
 transport only; an entry carrying a `url`, or a `type` other than stdio, is
@@ -1358,8 +1464,32 @@ nested `{"matcher":...,"hooks":[...]}` entry shape, which is detected and
 reported rather than supported, because two accepted shapes is two parsers and
 twice the surface to fuzz.
 
-`/hooks` shows the file, whether hooks are running, the fingerprint and one
-line per hook. `/hooks off` turns them off for the session.
+Hooks come from two files and the trust between them is deliberately
+asymmetric. `%USERPROFILE%\.pasclaude\hooks.json` is yours: it is loaded
+without a fingerprint and without a prompt, because prompting somebody about a
+file only they can write is noise that teaches them to answer yes, and every
+yes it trains is spent later on the project prompt that matters. The project's
+`.pasclaude\hooks.json` keeps its prompt exactly as it was. Your file loads
+first, so for every event your hooks fire before the project's - and since the
+first block wins and stops the list, that order is the rule and not a detail: a
+project file that fired first could pre-empt your own audit hook. A project
+file can never remove, disable or shadow one of yours; there is no key that
+removes a hook, and the eight-per-event ceiling counts what is already loaded,
+so a project file listing nine `PreToolUse` entries crowds out its own
+overflow. Running pasclaude in `%USERPROFILE%` makes the two paths one file: it
+is loaded once, as yours, with nothing asked about it, and `/hooks` names it
+once rather than listing it as loaded and then again as absent. Whether the two
+are one file is decided against the spelling Windows resolves each directory
+to, not against the text of the paths: comparing the typed strings meant a
+junction, a `SUBST` drive or an 8.3 short name reaching your home directory by
+a second name loaded that one file twice, fired every hook in it twice, and
+asked you to trust a file of your own - reproduced with a junction before it
+was fixed, not a worry about one.
+
+`/hooks` shows both files, whether hooks are running, the project fingerprint
+and one line per hook with its scope. `/hooks off` turns off *both* for the
+session, which it says out loud - a switch that left some hooks running would
+be a lie.
 
 **Hooks are an interactive-only feature**, and that is a flag rather than an
 accident of where a branch halts. `uHooks.HooksAllowed` ships false; the host
@@ -1377,6 +1507,11 @@ loads or fires hooks, and reports `hooks.json is present but not enabled for
 this session` instead. Note also that the CI deny floor cannot cover a hook
 at all - `uHooks` sits below `uTools`, so no hook command is ever matched
 against a rule - which is why the answer here is structural and not a rule.
+The user-scope file changes none of this. `HooksAllowed` is checked *first and
+alone* in `LoadHooks`, ahead of the project's trust answer, so it governs both
+scopes: an unattended run parses neither file. A user-scope hook is not an
+exemption from that byte, and making it one would turn the flag back into a
+condition somebody has to remember.
 
 ## Skills and plugins
 
@@ -1503,10 +1638,52 @@ creates `styles\explanatory.md` after you set your own - pasclaude refuses it
 rather than substituting, falls back to `default` and prints both sources in
 yellow. Re-run `/output-style <name>` to consent to the new source.
 
-One papercut, worth saying out loud: the body is read once, when you set the
-style, because `SessionNote` runs on every request and must not touch the disk.
-Edit a style file and it applies after you re-run `/output-style <name>` - the
-same shape as the skills cache and `/skills`, and `/help` says so.
+Edit a style file and it applies by itself, from the next turn. The body is
+still cached rather than re-read per request - `SessionNote` runs while a
+request body is being built, and putting a file read, a UTF-8 repair and a
+frontmatter parse there would put the parse FAILURE there too, so a file caught
+half-written by an editor would decide the style for a request already in
+flight. Instead `StyleNote` stats the file it read and re-reads only when the
+stamp or the size moved: one directory lookup on the ordinary turn, where
+nothing changed and the cached paragraph goes out byte-identical. A built-in
+style has no file and never touches the disk at all.
+
+Two residuals, both deliberate. The stamp `FindFirst` reports is a DOS
+timestamp with two-second granularity, so an edit that lands inside the same
+tick and leaves the file exactly the same length is not seen - re-running
+`/output-style <name>` still forces the read. And a file that has become
+unreadable, unparseable or deleted does NOT empty the style: what was working
+stays in force, and a yellow line before the next prompt says which file and
+why, once, rather than once a turn.
+
+## Adding to the system prompt
+
+`--append-system-prompt "<text>"` puts your own paragraph into the system
+prompt for this run. It ADDS and can never replace: the guidelines, the session
+root, this project's `CLAUDE.md` and everything they `@import` are all still
+assembled above it, exactly as they were. It goes LAST, after the project's own
+instructions, and that order is the argument for the flag - everything above it
+was written by whoever last committed to the tree, and a standing instruction
+typed at the keyboard should not lose the recency position to a file out of a
+clone. The model is told where it came from: the paragraph is introduced as
+`Additional instructions, given on this run's command line:`.
+
+Give the flag more than once and the values accumulate in the order they were
+given, a blank line apart - "append" read literally, because the alternative
+silently discards text you typed. The total is capped at 4096 bytes and the run
+STOPS past that rather than sending half of it: a standing rule the model
+received part of is worse than one it never received. The banner names the byte
+count, because text in the most trusted position of every request should not be
+invisible.
+
+There is deliberately no `settings.json` key and no approvals-file key for
+this. A project file that could append to the system prompt is a project file
+that can rewrite the agent's standing instructions from inside a clone - the
+same risk `.mcp.json` and `hooks.json` are gated for, except that those two
+announce themselves and can be trusted per tree, where a system-prompt line
+would be invisible in every reply it shaped. Command line only means the person
+who typed it was at the keyboard. Something long belongs in `CLAUDE.md`, where
+`/memory` can show it back to you.
 
 ## Images
 
@@ -1736,7 +1913,9 @@ no `r`/`R`/`s`, no `o`/`O`, no `gg`/`G`, no `%`. Most of those exist to move
 around a buffer, and there is no buffer here. Two things do get worse when you
 turn it on, and `/vim on` says so: Esc stops clearing the line (Ctrl+U still
 does), and a paste that arrives while you are in normal mode is read as
-commands. `/vim save` keeps the setting; `/keys` prints the current table.
+commands. Esc-Esc for `/rewind` is off with vim on for the same reason - two
+presses mean "definitely normal mode" to fingers older than this program.
+`/vim save` keeps the setting; `/keys` prints the current table.
 
 **Rebinding.** `%USERPROFILE%\.pasclaude\keys.json`:
 
@@ -1845,6 +2024,28 @@ Exactly one `result` per turn is the contract and the process never exits
 without one, so a driver knows the run is over when it sees the result line and
 then stdout closes.
 
+`hook` is `{"type":"hook","event":"PreToolUse","tool_name":"write_file",
+"detail":"...","blocked":true}` and is emitted once per fire that actually ran
+a child - never for the empty fire that happens around every tool call when no
+matcher matched, or a driver counting hooks would be counting tools. `blocked`
+is the field it exists for: a hook that ran and let the call through and a hook
+that refused it both end up in the same `tool_result`, one as content and one
+as an error, so a driver that wanted to log refusals had to infer which from a
+string. The detail is the hook's own output, repaired to UTF-8 and cut to
+16 KB with `[hook detail truncated]` when the hooks of one event together
+printed more than that; control bytes are escaped by the encoder, so a hook
+that prints ten lines still occupies exactly one line of the protocol. Only
+`stream-json` gets it - `json` is one object for the whole run, and the text
+REPL already shows a hook's words in the tool result and its failures as
+notices, so it gains nothing.
+
+The honest caveat: **pasclaude's own `-p` never fires a hook**, because hooks
+are interactive-only and every SDK format needs `-p`, `--status` or `--doctor`
+(see *Hooks* below). The seam is armed under `stream-json` and there is
+nothing in the shipped CLI to report through it; a program that embeds `uSdk`,
+drives `SdkRun` in process and sets `uHooks.HooksAllowed` itself is the caller
+that sees the event today.
+
 The permission exchange is the part worth an example. pasclaude emits
 
 ```json
@@ -1881,7 +2082,9 @@ band, as an ordinary `tool_result` with `is_error` true naming the refusal -
 print mode's existing deny-by-default rule, not a new one. An SDK run never
 reads or writes the approvals file and never writes `session.json` or
 `history.txt`, so a driver's throwaway question neither inherits a human's
-standing approvals nor manufactures new ones. It never loads hooks and never
+standing approvals nor manufactures new ones. It never loads hooks - that is
+the one byte `HooksAllowed`, which is set only on the interactive path, and it
+is why the `hook` event above has nothing to carry under `-p` - and never
 spawns an MCP server, for the same structural reason: it halts before that
 startup work runs.
 
@@ -1930,7 +2133,10 @@ is a startup error - interactive sessions already have `/resume` and the
 session picker, and a second way to name one file is a second thing to keep
 consistent. `--resume` under `-p` without `--session-file` is a startup error
 too, and that one is the point of the design: guessing the directory's session
-file is exactly what `-p` has always declined to do.
+file is exactly what `-p` has always declined to do. `--continue` under `-p` is
+refused outright, with no `--session-file` escape, because it is the stronger
+version of the same problem - `--resume` at least names one fixed file, where
+`--continue` takes whichever transcript happens to have been written last.
 
 On turn one there is no file yet, and that is not an error - the driver passes
 the same arguments every time and the first call simply starts fresh, tested
@@ -1994,7 +2200,9 @@ files, so nearer still wins. The facade ships with
 the tree you point a session at write part of the system prompt is a
 deliberate act, like assigning `Ask`, and an embedder that clones a
 stranger's repository into the working directory leaves the line out and gets
-the guidelines only.
+the guidelines only. `--no-project-context` is that same decision made from
+the command line, for the caller who is running the shipped binary against a
+tree rather than embedding the unit.
 
 ## Pull requests: /review and /pr-comments
 
@@ -2205,7 +2413,8 @@ structurally instead, as **Hooks** above describes.
 **The project's own instruction files are switched off the same way, and for
 a reason the deny floor also cannot reach.** `uSdk.SdkProjectContextAllowed`
 ships false; the host sets it true unless the mode is one of the two `--ci`
-verbs, and `SdkProjectContext` re-reads it where the files are opened rather
+verbs *or* `--no-project-context` was given, and `SdkProjectContext` re-reads
+it where the files are opened rather
 than at the call site, so clearing that byte stops every caller at once -
 including `TSdkSession`, which builds a prompt of its own. It matters for the
 same reason hooks did: `--ci report` runs after `actions/checkout`, so
@@ -2217,16 +2426,27 @@ because the flattering reading is wrong: neither `--ci` verb runs a turn, so
 what the flag stops there is the *read and the assembly* rather than a
 delivery to a model, and a `--ci` run that skipped files says so in a line
 that also says it asked no model anything - the answer in that build log came
-from the `-p` step above it, which loads them. The
+from the `-p` step above it, which loads them unless it too passes
+`--no-project-context`, and in the shipped template it does. The
 user-level memory in `%USERPROFILE%\.pasclaude\CLAUDE.md` still loads: the
 question the flag asks is which *tree* wrote the prompt, and the template
 builds the agent from a clone in `RUNNER_TEMP` before checking the head out,
-so nothing in a pull request can write that path. The narrowing is real and
-so is its limit, stated rather than hidden: the step that actually runs the
-model is an ordinary `-p` in the checked-out head, and it still loads those
-files, because `-p` losing a project's instructions would break what
-**Scripted sessions** promises. This shrinks the surface; it does not close
-it.
+so nothing in a pull request can write that path.
+
+The step that actually runs the model is an ordinary `-p` in the checked-out
+head, and it passes `--no-project-context`. A flag on the command line rather
+than a mode inferred from the prompt, and that distinction is the whole of it:
+the prompt is the attacker-supplied text, so anything keyed on its contents is
+a behaviour the attacker chooses, and the fail-open case would be a comment
+crafted so the marker is not recognised. The flag clears the same byte, so
+`SdkProjectContext` needs no second rule; the two terms meet in
+`uSdk.SdkProjectContextDecide`, an `and` of two negatives, so neither can
+widen the other and there is deliberately no argument that turns the loader
+back on. `-p` *without* the flag loads a project's files exactly as the REPL
+does, which is what **Scripted sessions** promises, and `ux` asserts both
+directions over real files on disk. What is left of a branch's contribution to
+that request is its skill catalogue, which is in the `skill` tool's own
+description and not in the prompt.
 
 **The two modes.** `--ci prepare --ci-in <event> --ci-out <prompt>
 [--ci-pr <pr.json>]` decides whether to answer, writes the prompt file when it
@@ -2350,13 +2570,13 @@ else, and `SettingsParseTier` takes **bytes**, never a path - the
 `uTerm.KeysParse` rule - so the unit can never learn a configuration location
 and every suite drives it with no filesystem.
 
-Twenty-nine more names are in the same table as refusals, honoured at no tier
+Thirty more names are in the same table as refusals, honoured at no tier
 including the user one: `permissions`, `allow_edits`, `allow_bash`,
 `allow_fetch`, `bash_programs`, `trusted`, `deny`, `sandbox`,
-`permission_mode`, `add_dir`, `additionalDirectories`, `env`, `apiKey`,
-`apiKeyHelper`, `auth`, `credential`, `login`, `mcpServers`, `plugins`, `vim`,
-`bindings`, `hooks`, bare `telemetry`, bare `ide`, `github`, `report_dir`,
-`redact`, `doctor`, `bug`.
+`permission_mode`, `append_system_prompt`, `add_dir`, `additionalDirectories`,
+`env`, `apiKey`, `apiKeyHelper`, `auth`, `credential`, `login`, `mcpServers`,
+`plugins`, `vim`, `bindings`, `hooks`, bare `telemetry`, bare `ide`, `github`,
+`report_dir`, `redact`, `doctor`, `bug`.
 They are there on purpose. The realistic failure is not an attack, it is
 somebody pasting Claude Code's `settings.json` and believing it took effect, so
 each one produces a sentence naming the file that really owns it - `vim` and
@@ -2364,8 +2584,12 @@ each one produces a sentence naming the file that really owns it - `vim` and
 `deny.json`, `permissions` at the approvals file under `%LOCALAPPDATA%`, bare
 `ide` at the two dotted keys, and `github` at `GH_TOKEN`, `GITHUB_TOKEN` and
 the `gh` CLI, since no file names the token and none names the host.
-`report_dir` and `redact` are pre-refused so that adding them later is a
-review conflict rather than a one-line insertion.
+`append_system_prompt` points at the command-line flag of that name and is
+refused at the user tier too, which is stricter than `output_style` beside it:
+a style adds a paragraph about prose whose body has one reader, where this
+would add arbitrary standing instructions to the most trusted position in every
+request. `report_dir` and `redact` are pre-refused so that adding them later is
+a review conflict rather than a one-line insertion.
 
 A file with **any** problem in it contributes **nothing** - bad JSON, not an
 object, an unknown key, a wrong type, an out-of-range integer, a key at a tier
@@ -2988,7 +3212,9 @@ subagent gate: inside a raised depth the schema is exactly three tools and
 `write_file` returns "not available to a subagent" *and* leaves no file on
 disk. `ux` covers the walk depths (a ten-level tree found at `depth: 12`, a
 `depth: 99` clamped to output byte-identical to `depth: 12`), the notebook
-round trip against a fixture written in nbformat's exact layout, and the
+round trip against two fixtures nbformat itself wrote - one ASCII, one with
+an accent, a CJK pair and two emoji outside the BMP that have to survive an
+edit to a different cell byte for byte - and the
 `/jobs` listing. `fuzz` covers the hostile half: `(a+)+$` over 60 characters
 asserted to return in under two seconds, eight malformed patterns, a
 truncated and a 1 MB-output notebook, nine job launches against a limit of
@@ -3733,6 +3959,15 @@ Details worth knowing if you touch this code:
   to clear a four-character lead that disappeared; the append fast path is
   `Inc(PrevLen)`. Anything else ever added to the painted line goes through
   `EditLead` and respects that meaning.
+* **A user-scope config file is loaded because it is the USER's, never because
+  it is inside a root.** `%USERPROFILE%\.pasclaude\hooks.json` and
+  `mcp.json` are trusted without a prompt on exactly that argument - they live
+  outside every root, so no clone ships one, and `.pasclaude` is refused at the
+  top of every root including added ones. The added-root promise ("it grants
+  file access and nothing else") is untouched by this: `--add-dir
+  %USERPROFILE%` does not make either file executable configuration for that
+  directory, it just makes the *other* files there readable. Anything that
+  starts resolving these two by walking roots has inverted the argument.
 * **Every new path under `.pasclaude` bypasses `SafePath` and must say so.**
   `SafePath` refuses that directory by design, so the substitute guard is the
   established one and no feature may invent a second: filter the bare name for

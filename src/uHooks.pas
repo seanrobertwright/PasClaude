@@ -62,6 +62,26 @@ type
 
   THookNotice = procedure(const Msg: string);
 
+  { One FINISHED fire, in fields, for whoever is watching this session from
+    outside.  Deliberately NOT merged into THookNotice, which it superficially
+    resembles: a notice is one sentence about a hook that went wrong, written
+    for a person, where this is the outcome of a fire that worked, and its
+    consumer is a parser.  A driver told "hook exited 3 and was ignored" can
+    print it; a driver told Blocked cannot mistake a refusal for a comment.
+
+    Pushed down rather than reached for, because the ladder runs the other
+    way: this unit sits below uTools and cannot see uSdk, which is where the
+    line format lives.  Same shape as OnHookNotice and HookRootDir above it. }
+  THookReport = procedure(const Event, ToolName, Detail: string;
+    Blocked: Boolean);
+
+  { Which of the two files an entry came from.  There are exactly two and
+    there will not be a third: a hook is executable configuration, and every
+    additional place one can arrive from is another place somebody has to be
+    told about.  The order of the enumeration is the load order and the firing
+    order, which is not a coincidence - see LoadHooks. }
+  THookScope = (hsUser, hsProject);
+
 const
   HookDefaultTimeoutMs = 10000;
   HookMinTimeoutMs     = 500;
@@ -80,6 +100,11 @@ const
     the second line of defence, not the first. }
   HookMatchBudget      = 100000;
   HooksFileName        = 'hooks.json';
+  { One file name, two homes: <root>\.pasclaude\hooks.json and
+    %USERPROFILE%\.pasclaude\hooks.json.  The directory name is a constant for
+    the same reason HookTrustKey is - it is now spelled in two path builders
+    instead of one, and two copies of a literal drift. }
+  HookStateDirName     = '.pasclaude';
   HookTmpDirName       = 'tmp';
   { The key this feature's approval is recorded under in permissions.json's
     "trusted" object.  Named here because uTools writes it and the host reads
@@ -111,21 +136,73 @@ var
     silence, not an error - the same shape uTools uses for MCP progress. }
   OnHookNotice: THookNotice = nil;
 
+  { Who hears about a fire that ran something.  Nil is silence and is the
+    default, which is what keeps the console out of this: the REPL never sets
+    it, so a person sees exactly the output they saw before - the hook's words
+    in the tool result and a notice when one misbehaves - and nothing new.
+    uSdk.SdkInstallHookReporter is the only writer, and it points this at the
+    protocol emitter for stream-json and clears it for every other format.
+
+    It is a var and not a parameter for the same reason OnHookNotice is: the
+    five sites that fire hooks are spread across uTools and the host, none of
+    them knows what a driver is, and threading a callback through RunTool
+    would have made the tool layer carry a fact about an output format. }
+  OnHookFired: THookReport = nil;
+
   { The session root, supplied from above because the ladder runs the other
     way: this unit may not know that uTools exists, so uTools' initialization
     hands it a way to ask.  Nil falls back to the current directory, which is
     what the root is at startup anyway. }
   HookRootDir: function: string = nil;
 
-{ True when .pasclaude\hooks.json exists.  Distinct from HooksEnabled: a file
-  the user refused is configured and not enabled, and /hooks says so. }
+{ True when THIS PROJECT's .pasclaude\hooks.json exists and is a file the
+  project actually owns.  Distinct from HooksEnabled: a file the user refused
+  is configured and not enabled, and /hooks says so.
+
+  It stays the PROJECT question, deliberately, because it is what gates the
+  trust prompt - the host asks about a project file and about nothing else.
+  When the session root IS the home directory the two paths name one file, and
+  that file is the USER's: ProjectHooksAreTheUsers makes this False there, so
+  the host never asks a question whose answer it would then ignore.  Anything
+  that only wants to know "are there hooks anywhere" wants AnyHooksConfigured;
+  asking this one for that is how a display ends up denying what is running. }
 function HooksConfigured: Boolean;
 function HooksFilePath: string;
 
-{ FNV-1a 64 over the file's bytes, lowercase hex.  A change detector, not a
-  defence against somebody who can already edit permissions.json: what it buys
-  is that editing hooks.json re-asks, because an "always" that survived the
-  text changing under it would be an approval of something never read. }
+{ %USERPROFILE%\.pasclaude\hooks.json - the user's own hooks, which apply to
+  every project they open.  '' when %USERPROFILE% is unset, which is not an
+  error: it means there are none, and it is also how a test process gets a
+  deterministic answer instead of the developer's real home directory. }
+function UserHooksFilePath: string;
+function UserHooksConfigured: Boolean;
+
+{ True when the session root IS the home directory, so HooksFilePath and
+  UserHooksFilePath are one file.  Consulted by HooksConfigured, LoadHooks and
+  the /hooks panel, and it has to be all three or they disagree: loading it
+  twice would double-fire every hook, letting the project branch claim it would
+  prompt somebody about their own file, and a panel that only asked one of them
+  would print the same path as loaded and as absent.  "The same directory" is
+  decided against the resolved spelling, not the typed one - see the body. }
+function ProjectHooksAreTheUsers: Boolean;
+
+{ The question a DISPLAY asks: is there a hook file of either scope.  A
+  diagnostic that reported "none configured" while a user hook was firing
+  would be denying what is running, which is the one thing it must never do. }
+function AnyHooksConfigured: Boolean;
+
+{ 'user' | 'project'.  One spelling, so a panel, a /doctor line and a test all
+  compare against the same two words. }
+function HookScopeName(S: THookScope): string;
+
+{ FNV-1a 64 over the PROJECT file's bytes, lowercase hex.  A change detector,
+  not a defence against somebody who can already edit permissions.json: what it
+  buys is that editing hooks.json re-asks, because an "always" that survived
+  the text changing under it would be an approval of something never read.
+
+  Project-only, and that is the whole shape of the asymmetry.  The user's file
+  is never the subject of a question, so it has no fingerprint: a recorded
+  trust for a question nobody asked would be a lie sitting in permissions.json
+  claiming somebody consented to bytes they were never shown. }
 function HookFingerprint: string;
 
 { One line per loaded hook: event, matcher and command. }
@@ -138,6 +215,10 @@ function HookSummary: string;
   parse wrong exactly where the report needed to be right. }
 function HookEntryCount: Integer;
 function HookCommandAt(I: Integer): string;      { '' when out of range }
+{ 'user' or 'project'; '' when out of range.  /doctor needs it because telling
+  somebody to fix a command in this project's hooks.json when the command came
+  from their home directory is advice that cannot work. }
+function HookScopeAt(I: Integer): string;
 
 { The same rendering, straight off a file that has not been loaded.  It exists
   because the approval prompt has to show what the file says before the file is
@@ -147,9 +228,11 @@ function HookCommandAt(I: Integer): string;      { '' when out of range }
   transcript produced. }
 function HookSummaryOf(const Path: string): string;
 
-{ Reads and compiles the table.  Trusted False loads nothing at all, which is
-  the deny-by-default answer to a config nobody approved.  Notes carries one
-  line per thing the file asked for that will not happen. }
+{ Reads and compiles the table from BOTH scopes.  Trusted is the answer to the
+  question about the PROJECT file and has never meant anything else; the user's
+  own file is loaded whatever it says.  HooksAllowed gates the whole call, both
+  scopes, first and alone.  Notes carries one line per thing either file asked
+  for that will not happen, and every line from the user's file names it. }
 procedure LoadHooks(Trusted: Boolean; out Notes: string);
 procedure ClearHooks;
 function HooksEnabled: Boolean;
@@ -162,7 +245,9 @@ function HookCall(Ev: THookEvent): THookCall;
 
 { Runs every hook registered for Call.Event, in file order, stopping at the
   first block.  Never raises: a hook is a foreign program and the tool layer
-  above has no catch. }
+  above has no catch.  Reports the outcome through OnHookFired when anything
+  actually ran, which is how a driver learns a hook happened without having to
+  read it back out of the tool result it changed. }
 function FireHooks(const Call: THookCall): THookOutcome;
 
 { The primitive.  Returns the child's exit code, or -1 when the spawn itself
@@ -196,6 +281,7 @@ type
     Matcher: string;
     Command: string;
     TimeoutMs: Integer;
+    Scope: THookScope;   { which file it came from; display and /doctor only }
     Rx: TRegex;          { nil matches everything, by absence or by design }
   end;
 
@@ -219,12 +305,126 @@ end;
 
 function StateDir: string;
 begin
-  Result := IncludeTrailingPathDelimiter(RootPath) + '.pasclaude' + PathDelim;
+  Result := IncludeTrailingPathDelimiter(RootPath) + HookStateDirName + PathDelim;
 end;
 
 function HooksFilePath: string;
 begin
   Result := StateDir + HooksFileName;
+end;
+
+function UserHooksFilePath: string;
+var
+  Home: string;
+begin
+  Result := '';
+  { SysUtils. qualified deliberately, the same note ApprovalsPath, GlobalDenyPath
+    and SkillsDirUser each carry: the Windows unit's raw API of this name is in
+    scope here and shadows it.  Reading the environment is not reaching upward
+    through the ladder - uAuth and uTools read it at the same altitude, and the
+    one fact this unit genuinely cannot know, the session root, still arrives
+    the way it always did, through HookRootDir. }
+  Home := Trim(SysUtils.GetEnvironmentVariable('USERPROFILE'));
+  if Home = '' then Exit;
+  Result := IncludeTrailingPathDelimiter(Home) + HookStateDirName + PathDelim +
+    HooksFileName;
+end;
+
+function UserHooksConfigured: Boolean;
+begin
+  Result := (UserHooksFilePath <> '') and FileExists(UserHooksFilePath);
+end;
+
+{ FPC 3.2.2's Windows unit declares neither, and both are ordinary kernel32
+  exports.  uTools carries the same pair for its deny rules, which is where the
+  need was first measured; this unit is BELOW uTools and cannot call into it,
+  so the two declarations sit in two files rather than one being imported
+  upward.  Duplicating four lines of external declaration was judged the
+  cheaper of the two evils - the alternative is a canonicaliser pushed down
+  from pasclaude.lpr as a function variable, which is the HookRootDir shape and
+  is reserved for facts this unit genuinely cannot compute.  A path is not one
+  of those: it is Win32, and Win32 is already in this unit's uses clause. }
+const
+  FILE_FLAG_BACKUP_SEMANTICS_ = $02000000;
+
+function GetFinalPathNameByHandleW(H: THandle; Buf: PWideChar;
+  Cch, Flags: DWORD): DWORD; stdcall; external 'kernel32'
+  name 'GetFinalPathNameByHandleW';
+function GetLongPathNameW(Src, Buf: PWideChar; Cch: DWORD): DWORD; stdcall;
+  external 'kernel32' name 'GetLongPathNameW';
+
+{ The long, junction-free, filesystem-cased spelling of an EXISTING directory,
+  or ExpandFileName's answer when Windows will not give one up.  Directories
+  and not the two hooks.json paths themselves, deliberately: the file may not
+  exist on either side while the directory containing it always does, and both
+  paths append the identical .pasclaude\hooks.json tail, so the directories
+  answer exactly the same question and answer it on names the API can resolve. }
+function ResolvedDir(const D: string): string;
+var
+  W, Out_: UnicodeString;
+  H: THandle;
+  N: DWORD;
+begin
+  Result := ExcludeTrailingPathDelimiter(ExpandFileName(D));
+  if Result = '' then Exit;
+  W := UnicodeString(Result);
+  SetLength(Out_, 1024);
+  H := CreateFileW(PWideChar(W), 0, FILE_SHARE_READ or FILE_SHARE_WRITE or
+    FILE_SHARE_DELETE, nil, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS_, 0);
+  if H <> INVALID_HANDLE_VALUE then
+  begin
+    N := GetFinalPathNameByHandleW(H, PWideChar(Out_), Length(Out_), 0);
+    CloseHandle(H);
+    if (N > 0) and (N < DWORD(Length(Out_))) then
+    begin
+      SetLength(Out_, N);
+      Result := string(Out_);
+      { The API answers in \\?\ form, which nothing else in this program
+        spells that way.  Normalised here so a caller comparing two of these
+        never has one prefixed and the other not. }
+      if Copy(Result, 1, 8) = '\\?\UNC\' then
+        Result := '\\' + Copy(Result, 9, MaxInt)
+      else if Copy(Result, 1, 4) = '\\?\' then
+        Result := Copy(Result, 5, MaxInt);
+      Exit(ExcludeTrailingPathDelimiter(Result));
+    end;
+    SetLength(Out_, 1024);
+  end;
+  { No handle - the directory is gone, or held in a way that refuses one.
+    This expands an 8.3 name without opening anything, but it does not follow
+    a junction; a wrong answer here is the OLD answer, which is the same
+    failure the compare had before any of this was written. }
+  N := GetLongPathNameW(PWideChar(W), PWideChar(Out_), Length(Out_));
+  if (N > 0) and (N < DWORD(Length(Out_))) then
+  begin
+    SetLength(Out_, N);
+    Result := ExcludeTrailingPathDelimiter(string(Out_));
+  end;
+end;
+
+function ProjectHooksAreTheUsers: Boolean;
+var
+  Home: string;
+begin
+  { ExpandFileName ALONE was what stood here, and it was not enough.  It
+    normalises a relative root and a trailing delimiter and nothing else: a
+    junction, a SUBST drive or an 8.3 short name reaches the same directory by
+    a second spelling, the compare says the two files are different, and the
+    ONE physical hooks.json is then loaded twice - once as the user's with no
+    prompt, once as the project's with one - so every hook in it fires twice
+    and the user is asked to trust their own file.  Demonstrated with a
+    junction beside a real home directory before this was changed, so it is a
+    reproduction rather than a worry.
+
+    Compared as DIRECTORIES because that is what Windows can canonicalise: the
+    home directory and the session root both exist by the time anything asks,
+    where either hooks.json may not.  The tail both paths append is identical,
+    so the two questions are the same question.  Still case-insensitive on top,
+    because C:\Users\x and C:\USERS\X are one directory even after the API has
+    had its say and the fallback path may not have normalised the case. }
+  Home := Trim(SysUtils.GetEnvironmentVariable('USERPROFILE'));
+  if Home = '' then Exit(False);
+  Result := CompareText(ResolvedDir(Home), ResolvedDir(RootPath)) = 0;
 end;
 
 { The scratch directory for one hook call's two files.  Like every other path
@@ -425,7 +625,20 @@ end;
 
 function HooksConfigured: Boolean;
 begin
-  Result := FileExists(HooksFilePath);
+  { A file that is both the project's and the user's is the user's - the scope
+    that asks nothing.  Reporting it as configured here would make the host
+    prompt about a file only the person answering can write. }
+  Result := FileExists(HooksFilePath) and not ProjectHooksAreTheUsers;
+end;
+
+function AnyHooksConfigured: Boolean;
+begin
+  Result := HooksConfigured or UserHooksConfigured;
+end;
+
+function HookScopeName(S: THookScope): string;
+begin
+  if S = hsUser then Result := 'user' else Result := 'project';
 end;
 
 function HooksEnabled: Boolean;
@@ -535,7 +748,13 @@ begin
   Result := Round(D);
 end;
 
-procedure LoadEntry(Ent: TJson; Ev: THookEvent; var Notes: string);
+{ Where is '' for the project file and ' in <path>' for the user's.  Two files
+  feeding one Notes string must each say which one they are, or a user reading
+  a complaint about a matcher has no way to know which file to open - and the
+  project's wording is unchanged byte for byte when Where is '', which is what
+  keeps every existing assertion about these sentences honest. }
+procedure LoadEntry(Ent: TJson; Ev: THookEvent; Scope: THookScope;
+  const Where: string; var Notes: string);
 var
   H: THookEntry;
   Cmd, Matcher, Err: string;
@@ -544,7 +763,7 @@ begin
   if Length(Hooks) >= MaxHookEntries then Exit;
   if (Ent = nil) or (Ent.Kind <> jkObj) then
   begin
-    Note(Notes, HookEventName(Ev) + ': an entry is not an object; ignored');
+    Note(Notes, HookEventName(Ev) + ': an entry is not an object; ignored' + Where);
     Exit;
   end;
   { Claude Code nests {"matcher":...,"hooks":[{"type":"command",...}]}.  It is
@@ -556,7 +775,7 @@ begin
   begin
     Note(Notes, HookEventName(Ev) + ': this entry uses the nested ' +
       '{"matcher":...,"hooks":[...]} shape; pasclaude wants a flat ' +
-      '{"matcher":...,"command":...} entry');
+      '{"matcher":...,"command":...} entry' + Where);
     Exit;
   end;
 
@@ -564,7 +783,7 @@ begin
   if (T = nil) or (T.Kind <> jkStr) or (Trim(T.AsString) = '') then
   begin
     Note(Notes, HookEventName(Ev) + ': an entry has no "command" string; ' +
-      'ignored');
+      'ignored' + Where);
     Exit;
   end;
   Cmd := Trim(T.AsString);
@@ -576,7 +795,7 @@ begin
   if (Matcher <> '') and not (Ev in [hePreTool, hePostTool]) then
   begin
     Note(Notes, HookEventName(Ev) + ': "matcher" only applies to tool events; ' +
-      'ignored for this one');
+      'ignored for this one' + Where);
     Matcher := '';
   end;
 
@@ -588,7 +807,7 @@ begin
     if not TRegex.Compile(Matcher, False, H.Rx, Err) then
     begin
       Note(Notes, HookEventName(Ev) + ': matcher ' + Matcher +
-        ' will not compile (' + Err + '); that hook is off');
+        ' will not compile (' + Err + '); that hook is off' + Where);
       Exit;
     end;
 
@@ -596,6 +815,7 @@ begin
   H.Event := Ev;
   H.Matcher := Matcher;
   H.Command := Cmd;
+  H.Scope := Scope;
   H.TimeoutMs := ClampTimeout(Ent.Num('timeout_ms', 0),
     (T <> nil) and (T.Kind = jkNum));
 
@@ -603,35 +823,33 @@ begin
   Hooks[High(Hooks)] := H;
 end;
 
-procedure LoadHooks(Trusted: Boolean; out Notes: string);
+{ One file into the shared table.  Everything from the read to the parse used
+  to be the body of LoadHooks and is unchanged apart from Where and Scope: the
+  point of splitting it is that two scopes must be two calls to ONE parser,
+  because a second parser would be a second set of failure modes for a file
+  shape whose failure modes are the whole of what the fuzz suite pins. }
+procedure LoadHookFile(const Path, Where: string; Scope: THookScope;
+  var Notes: string);
 var
   Text, Key: string;
   Root, Map, Arr: TJson;
-  I, J, Taken: Integer;
+  I, J, Taken, Seeded: Integer;
   Ev: THookEvent;
 begin
-  ClearHooks;
-  Notes := '';
-  SweepTmp;
-  { Deny by default, and structurally: an untrusted file is not parsed at all,
-    so there is no path by which a matcher from it could even be compiled.
-    HooksAllowed is checked in the same breath and for the same reason - a run
-    with nobody in the room cannot answer the trust question, so its answer is
-    no, and the file is not parsed there either. }
-  if not (Trusted and HooksAllowed) then Exit;
-  if not ReadWholeFile(HooksFilePath, Text) then Exit;
+  if Path = '' then Exit;
+  if not ReadWholeFile(Path, Text) then Exit;
 
   Root := JsonParse(Text);
   if Root = nil then
   begin
-    Note(Notes, HooksFileName + ' is not valid JSON; no hooks are loaded');
+    Note(Notes, HooksFileName + ' is not valid JSON; no hooks are loaded' + Where);
     Exit;
   end;
   try
     if Root.Kind <> jkObj then
     begin
       Note(Notes, HooksFileName + ' should be an object like ' +
-        '{"hooks":{"PreToolUse":[...]}}; no hooks are loaded');
+        '{"hooks":{"PreToolUse":[...]}}; no hooks are loaded' + Where);
       Exit;
     end;
     { The outer "hooks" wrapper was originally kept against the day a
@@ -647,7 +865,8 @@ begin
     Map := Root.Find('hooks');
     if (Map = nil) or (Map.Kind <> jkObj) then
     begin
-      Note(Notes, HooksFileName + ' has no "hooks" object; no hooks are loaded');
+      Note(Notes, HooksFileName + ' has no "hooks" object; no hooks are loaded' +
+        Where);
       Exit;
     end;
 
@@ -661,47 +880,121 @@ begin
           user exactly which of its events pasclaude will not fire, instead of
           appearing to work. }
         Note(Notes, Key + ': pasclaude does not fire this event (it fires ' +
-          'PreToolUse, PostToolUse, UserPromptSubmit, Stop and SessionStart)');
+          'PreToolUse, PostToolUse, UserPromptSubmit, Stop and SessionStart)' +
+          Where);
         Continue;
       end;
       Arr := Map.Item(I);
       if (Arr = nil) or (Arr.Kind <> jkArr) then
       begin
-        Note(Notes, Key + ': should be an array of entries; ignored');
+        Note(Notes, Key + ': should be an array of entries; ignored' + Where);
         Continue;
       end;
-      Taken := 0;
+      { Seeded with what is already loaded rather than zero, because the
+        ceiling is a ceiling on the EVENT and not on the file: eight PreToolUse
+        hooks is eight children before one tool call, whichever files they came
+        from.  The user loads first, so the entries this crowds out are always
+        the project's own overflow - a project file can never push a user hook
+        past the cap and out of the table. }
+      Taken := HookCount(Ev);
+      Seeded := Taken;
       for J := 0 to Arr.Count - 1 do
       begin
         if Taken >= MaxHooksPerEvent then
         begin
-          Note(Notes, Format('%s: only the first %d hooks are used (%d were ' +
-            'listed)', [Key, MaxHooksPerEvent, Arr.Count]));
+          { Two sentences because one would be a puzzle.  "only the first 8 are
+            used (8 were listed)" is what the single-file wording says when the
+            other scope already took a slot, and a user reading that would go
+            looking for a ninth entry that is not in the file they opened. }
+          if Seeded = 0 then
+            Note(Notes, Format('%s: only the first %d hooks are used (%d were ' +
+              'listed)', [Key, MaxHooksPerEvent, Arr.Count]) + Where)
+          else
+            Note(Notes, Format('%s: only the first %d hooks are used for this ' +
+              'event, and %d of them came from the other hooks.json (%d were ' +
+              'listed here)',
+              [Key, MaxHooksPerEvent, Seeded, Arr.Count]) + Where);
           Break;
         end;
         if Length(Hooks) >= MaxHookEntries then
         begin
           Note(Notes, Format('at most %d hooks in total; the rest of the file ' +
-            'is ignored', [MaxHookEntries]));
+            'is ignored', [MaxHookEntries]) + Where);
           Break;
         end;
-        LoadEntry(Arr.Item(J), Ev, Notes);
+        LoadEntry(Arr.Item(J), Ev, Scope, Where, Notes);
         Inc(Taken);
       end;
     end;
   finally
     Root.Free;
   end;
+end;
+
+{ The two files, in the order that decides which hook gets to block first.
+
+  HooksAllowed is the first gate and it is now the ONLY unattended gate, which
+  is the load-bearing change here.  It used to sit inside `Trusted and
+  HooksAllowed`, which was correct while there was one file; with two it would
+  have let a user-scope hook run under -p and the --ci verbs the moment the
+  project's answer stopped being the only answer.  That is exactly what commit
+  43daa12 closed, and this does not spend it: neither scope is even READ when
+  the flag is false.
+
+  Trusted is now what it always meant and never quite said - the answer to the
+  question about the PROJECT file.  The user's own file is not fingerprinted
+  and is never prompted for.  Prompting somebody about a file only they can
+  write is noise that teaches them to answer yes, and every yes it trains is
+  spent later on the prompt that matters.  Two facts make that safe rather than
+  merely convenient: the file lives under %USERPROFILE%, which is outside every
+  root, so no clone can ship it; and SafePath refuses .pasclaude at the top
+  level of EVERY root, added ones included, so the model's own path-taking
+  tools cannot write it even under --add-dir %USERPROFILE%.  The honest
+  residual, said out loud rather than left to be discovered: a bash program the
+  user approved can still edit it, exactly as it can already edit the project's
+  hooks.json, so the asymmetry is not made worse - it is made broader, because
+  a hook installed there runs in every project.
+
+  MERGE RULE.  Both tables coexist, appended, the user's first.  FireHooks
+  walks the one array in index order and stops at the first block, so for every
+  event the user's hooks fire before the project's.  That ordering is the rule
+  and not a cosmetic detail: if the project fired first it could pre-empt the
+  user's audit hook by blocking ahead of it.  A project file can never remove,
+  disable or shadow a user hook - there is no key that removes one, and the
+  per-event ceiling is seeded with what is already loaded.
+
+  ROOT = HOME.  Running pasclaude in %USERPROFILE% makes the two paths one
+  file.  It is loaded once, as the user's, with no prompt: HooksConfigured is
+  False there, so TrustHooks returns False without asking, and the project
+  branch is skipped here as well.  Both have to consult
+  ProjectHooksAreTheUsers or the two disagree. }
+procedure LoadHooks(Trusted: Boolean; out Notes: string);
+begin
+  ClearHooks;
+  Notes := '';
+  SweepTmp;
+  if not HooksAllowed then Exit;
+  LoadHookFile(UserHooksFilePath, ' in ' + UserHooksFilePath, hsUser, Notes);
+  { Deny by default, and structurally: an untrusted project file is not parsed
+    at all, so there is no path by which a matcher from it could even be
+    compiled. }
+  if Trusted and not ProjectHooksAreTheUsers then
+    LoadHookFile(HooksFilePath, '', hsProject, Notes);
   Loaded := True;
 end;
 
-function SummaryLine(const EvName, Matcher, Cmd: string): string;
+{ A leading scope column, because with two files a line that says only
+  "PreToolUse * -> whatever" cannot be acted on: the user has to know which
+  file to open before they can change anything.  One renderer for both readers,
+  which is the reason HookSummaryOf exists as a second READER of the same
+  shape rather than as a second parser with its own layout. }
+function SummaryLine(const Scope, EvName, Matcher, Cmd: string): string;
 var
   M: string;
 begin
   M := Matcher;
   if M = '' then M := '*';
-  Result := Format('  %-16s %-24s ->  %s'#10, [EvName, M, Cmd]);
+  Result := Format('  %-8s %-16s %-24s ->  %s'#10, [Scope, EvName, M, Cmd]);
 end;
 
 function HookSummary: string;
@@ -710,8 +1003,8 @@ var
 begin
   Result := '';
   for I := 0 to High(Hooks) do
-    Result := Result + SummaryLine(HookEventName(Hooks[I].Event),
-      Hooks[I].Matcher, Hooks[I].Command);
+    Result := Result + SummaryLine(HookScopeName(Hooks[I].Scope),
+      HookEventName(Hooks[I].Event), Hooks[I].Matcher, Hooks[I].Command);
 end;
 
 function HookEntryCount: Integer;
@@ -723,6 +1016,12 @@ function HookCommandAt(I: Integer): string;
 begin
   if (I < 0) or (I > High(Hooks)) then Exit('');
   Result := Hooks[I].Command;
+end;
+
+function HookScopeAt(I: Integer): string;
+begin
+  if (I < 0) or (I > High(Hooks)) then Exit('');
+  Result := HookScopeName(Hooks[I].Scope);
 end;
 
 function HookSummaryOf(const Path: string): string;
@@ -765,7 +1064,11 @@ begin
         T := Ent.Find('matcher');
         if (T <> nil) and (T.Kind = jkStr) then M := Trim(T.AsString);
         if not uJson.IsValidUtf8(M) then M := uJson.OemToUtf8(M);
-        Result := Result + SummaryLine(Map.Key(I), M, Cmd);
+        { 'project' unconditionally, because this reader exists for exactly one
+          caller: the trust prompt, which is only ever asked about the project
+          file.  The user's file reaches no prompt at all. }
+        Result := Result + SummaryLine(HookScopeName(hsProject), Map.Key(I),
+          M, Cmd);
         Inc(Shown);
       end;
     end;
@@ -886,7 +1189,15 @@ begin
   Res.Text := Res.Text + Text;
 end;
 
-function FireHooks(const Call: THookCall): THookOutcome;
+{ The fire itself.  FireHooks below is this plus the one report, and the split
+  is the whole reason it exists: the loop leaves by three doors - a block from
+  exit 2, a block from a "deny" decision, and the fall-through - so reporting
+  inside it would be three copies of the same three lines, and the fourth exit
+  somebody adds next year would be the one that forgot.  Rejected the
+  alternative of a try..finally around the body, because a report has to see
+  the finished Result and the finally would run on an exception too, where
+  there is no outcome to describe. }
+function FireAll(const Call: THookCall): THookOutcome;
 var
   I, Code: Integer;
   Out_, Body, Decision: string;
@@ -978,6 +1289,29 @@ begin
       Absorb(Result, Out_);
     end;
   end;
+end;
+
+function FireHooks(const Call: THookCall): THookOutcome;
+begin
+  Result := FireAll(Call);
+  if not Assigned(OnHookFired) then Exit;
+  { Ran = 0 is not an event and must never become a line.  RunTool fires
+    PreToolUse and PostToolUse around EVERY tool call whether or not a matcher
+    matched, and whether or not there is a hooks.json at all - so reporting the
+    empty fire would put two lines on a driver's stream per tool call to say
+    that nothing happened, and a driver counting hook lines would in fact be
+    counting tool calls.  The block that never ran a child is covered by this
+    too: FireAll cannot block without running something.
+
+    Blocked is passed through rather than recomputed from the text, because
+    the two are not the same question - a hook that exits 0 and prints an
+    objection has not refused anything, and a hook that exits 2 with no output
+    at all has.  Detail is the outcome's own words, trimmed and nothing more;
+    what an unparseable byte in them does to the line is decided by the
+    encoder, which is the only place that knows what a line is. }
+  if Result.Ran = 0 then Exit;
+  OnHookFired(HookEventName(Call.Event), Call.ToolName, Trim(Result.Text),
+    Result.Blocked);
 end;
 
 finalization
