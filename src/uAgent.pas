@@ -82,6 +82,31 @@ type
   end;
   TModelUsageList = array of TModelUsage;
 
+  { One row of "what is the transcript made of", for /context.
+
+    BYTES AND NOT TOKENS, and that is the whole honesty of this record.  The
+    API reports prompt tokens for a request as a WHOLE and never per block, so
+    a tokens column here would be an invention - the same class of invention as
+    the price table this program refuses to ship, and wrong in the same way,
+    because prose, base64 and JSON keys do not tokenize at one ratio.  What can
+    be measured exactly is the bytes each kind of block contributes to the
+    document that gets posted, and a share of those bytes is what actually
+    answers the question somebody types /context to ask, which is "what do I
+    evict".  The measured token total is printed beside the table as one
+    number, where it is true.
+
+    Bytes of the block's own JSON, not of its text: a tool_result's key names
+    and quoting are re-sent every turn exactly as its content is, and a
+    breakdown that counted only payloads would under-report the cheapest thing
+    to fix.  Blocks is the count contributing, so "2 images, 8 KB" and "40
+    images, 8 KB" read differently, as they should. }
+  TContextPart = record
+    Name: string;
+    Bytes: Int64;
+    Blocks: Integer;
+  end;
+  TContextParts = array of TContextPart;
+
   { bkServerToolUse is a tool the API runs for us: same shape as bkToolUse,
     but no RunTool ever sees it.  bkResult is a verbatim passthrough of a
     block this client does not interpret and must nevertheless echo back on
@@ -308,6 +333,18 @@ type
     { Bytes the transcript currently occupies as JSON. }
     function TranscriptBytes: Integer;
     function MessageCount: Integer;
+    { The same bytes, split by what kind of block they are in.  Always the same
+      six rows in the same order, zeros included, because a table whose rows
+      appear and disappear is a table a reader has to re-read every time and a
+      renderer has to decide about; deciding not to print a zero is the
+      caller's job and one it can do by looking.
+
+      The sum of Bytes is deliberately NOT TranscriptBytes: this counts the
+      blocks and that counts the whole document, so the array separators and
+      the role keys wrapping each message are outside every row.  The renderer
+      says so rather than quietly making the columns add up, because the gap is
+      real overhead that no eviction can reach. }
+    function ContextComposition: TContextParts;
     { Prompt tokens of the most recent request - the context's true size.
       Zero until a request has been made. }
     function ContextTokens: Int64;
@@ -1516,6 +1553,86 @@ end;
 function TAgent.MessageCount: Integer;
 begin
   Result := FMessages.Count;
+end;
+
+function TAgent.ContextComposition: TContextParts;
+const
+  { The row order, and it is the reading order rather than the size order: a
+    table that re-sorted itself as a session grew would make two runs of the
+    same command impossible to compare by eye, which is most of what somebody
+    does with this. }
+  PartUserText    = 0;
+  PartReplyText   = 1;
+  PartThinking    = 2;
+  PartToolCalls   = 3;
+  PartToolResults = 4;
+  PartImages      = 5;
+var
+  I, J, Slot: Integer;
+  Msg, Content, Blk: TJson;
+  Role, Kind: string;
+
+  procedure Add(Index: Integer; B: TJson);
+  begin
+    if B = nil then Exit;
+    Inc(Result[Index].Blocks);
+    Result[Index].Bytes := Result[Index].Bytes + Length(B.ToJson);
+  end;
+
+begin
+  SetLength(Result, 6);
+  Result[PartUserText].Name    := 'your messages';
+  Result[PartReplyText].Name   := 'replies';
+  Result[PartThinking].Name    := 'thinking';
+  Result[PartToolCalls].Name   := 'tool calls';
+  Result[PartToolResults].Name := 'tool results';
+  Result[PartImages].Name      := 'images';
+  for I := 0 to High(Result) do
+  begin
+    Result[I].Bytes := 0;
+    Result[I].Blocks := 0;
+  end;
+
+  for I := 0 to FMessages.Count - 1 do
+  begin
+    Msg := FMessages.Item(I);
+    if Msg = nil then Continue;
+    Role := Msg.Str('role');
+    Content := Msg.Find('content');
+    { A content that is not an array is a shape this program never composes and
+      ValidTranscript never admits, so it cannot arrive from a loaded session
+      either.  Counted as text by role rather than skipped, because a row of
+      zeros next to a transcript that is plainly not empty is the one output
+      here that would read as a bug in the table instead of a surprise in the
+      data. }
+    if (Content = nil) or (Content.Kind <> jkArr) then
+    begin
+      if Role = 'assistant' then Add(PartReplyText, Msg)
+      else Add(PartUserText, Msg);
+      Continue;
+    end;
+    for J := 0 to Content.Count - 1 do
+    begin
+      Blk := Content.Item(J);
+      if Blk = nil then Continue;
+      Kind := Blk.Str('type');
+      { tool_result rides in a USER message and text rides in both, so the
+        block type decides first and the role only breaks the text tie.  Doing
+        it the other way round - role first - is what would file every tool
+        result under "your messages", which is the row somebody would then try
+        and fail to make smaller by typing less. }
+      if Kind = 'tool_result' then Slot := PartToolResults
+      else if Kind = 'tool_use' then Slot := PartToolCalls
+      else if Kind = 'server_tool_use' then Slot := PartToolCalls
+      else if Kind = 'web_search_tool_result' then Slot := PartToolResults
+      else if Kind = 'thinking' then Slot := PartThinking
+      else if Kind = 'redacted_thinking' then Slot := PartThinking
+      else if Kind = 'image' then Slot := PartImages
+      else if Role = 'assistant' then Slot := PartReplyText
+      else Slot := PartUserText;
+      Add(Slot, Blk);
+    end;
+  end;
 end;
 
 procedure TAgent.TruncateMessages(Count: Integer);

@@ -608,6 +608,113 @@ begin
   end;
 end;
 
+{ /context's table, which is the part of that command a suite can reach: the
+  render is console output in the main block and the classification is not.
+
+  Driven through a hand-written session file rather than through the append
+  methods, because three of the six kinds - tool_result, image and thinking -
+  are composed by paths that need a transport, a clipboard or a real tool run
+  to reach, and the thing under test is a decision about a block's `type`
+  string.  Feeding it the exact JSON is both closer to what the classifier
+  actually sees and the only way to cover all six in one transcript.
+
+  The assertions are about WHICH ROW, not about byte counts.  A row's size is
+  the length of a JSON literal in this file and asserting it would break every
+  time somebody rewords the fixture; which bucket a block lands in is the
+  behaviour, and getting it wrong is silent - a tool_result filed under "your
+  messages" reads as a user who typed 180 KB. }
+procedure TestContextComposition;
+const
+  { A transcript with one of everything, in a legal order: the tool_use is
+    answered by the tool_result that follows it, which is what ValidTranscript
+    demands and what makes this a document the program could really hold. }
+  Doc =
+    '{"version":1,"model":"m","turns":1,"tokens_in":0,"tokens_out":0,' +
+    '"messages":[' +
+    '{"role":"user","content":[{"type":"text","text":"question"}]},' +
+    '{"role":"assistant","content":[' +
+      '{"type":"thinking","thinking":"reasoning","signature":"sig"},' +
+      '{"type":"text","text":"answer"},' +
+      '{"type":"tool_use","id":"t1","name":"read_file","input":{"path":"x"}}]},' +
+    '{"role":"user","content":[' +
+      '{"type":"tool_result","tool_use_id":"t1","content":"file contents"}]},' +
+    '{"role":"user","content":[{"type":"image","source":{"type":"base64",' +
+      '"media_type":"image/png","data":"AAAA"}}]}]}';
+var
+  A: TAgent;
+  Parts: TContextParts;
+  Err, Path: string;
+  I: Integer;
+  Sum: Int64;
+
+  function Part(const Name: string): TContextPart;
+  var
+    K: Integer;
+  begin
+    Result.Name := '';
+    Result.Bytes := 0;
+    Result.Blocks := 0;
+    for K := 0 to High(Parts) do
+      if Parts[K].Name = Name then Exit(Parts[K]);
+  end;
+
+begin
+  WriteLn('-- context --');
+  Path := IncludeTrailingPathDelimiter(TmpRoot) + 'ctx' + PathDelim +
+    'session.json';
+  ForceDirectories(ExtractFilePath(Path));
+  WriteFileText(Path, Doc);
+
+  A := TAgent.Create('k', 'm', 'sys');
+  try
+    { An empty agent first: six rows, all zero.  The row set is fixed rather
+      than built from what happens to be present, so a caller never has to
+      handle a missing row and a reader never has to wonder whether "images"
+      is absent or zero. }
+    Parts := A.ContextComposition;
+    Check(Length(Parts) = 6, 'the table is six rows before anything is said');
+    Sum := 0;
+    for I := 0 to High(Parts) do Sum := Sum + Parts[I].Bytes;
+    Check(Sum = 0, 'and every one of them is zero');
+
+    Check(A.LoadSession(Path, Err), 'the fixture loads: ' + Err);
+    Parts := A.ContextComposition;
+    Check(Length(Parts) = 6, 'still six rows');
+
+    Check(Part('your messages').Blocks = 1,
+      'the question is one block of yours');
+    Check(Part('replies').Blocks = 1, 'the answer is one reply block');
+    Check(Part('thinking').Blocks = 1, 'the thinking block is its own row');
+    Check(Part('tool calls').Blocks = 1, 'the tool_use is a call');
+    Check(Part('images').Blocks = 1, 'and the image is an image');
+
+    { The one that matters most.  A tool_result rides in a USER message, so a
+      classifier that asked about the role before the block type would file it
+      here - and the row somebody would then try to shrink by typing less is
+      the row they cannot affect at all. }
+    Check(Part('tool results').Blocks = 1,
+      'the tool_result is a result and not one of your messages');
+    Check(Part('your messages').Blocks = 1,
+      'which is why your row still counts one block and not two');
+
+    { Bytes are per block and not per message: the assistant turn holds three
+      blocks that land in three different rows, so no row may carry the whole
+      message.  Compared against the message's own length, which is the
+      number a role-first implementation would have produced. }
+    Check(Part('replies').Bytes > 0, 'a row that has a block has bytes');
+    Check(Part('replies').Bytes < Length(Doc) div 2,
+      'and no row swallowed a whole message');
+
+    Sum := 0;
+    for I := 0 to High(Parts) do Sum := Sum + Parts[I].Bytes;
+    Check(Sum < A.TranscriptBytes,
+      'the rows sum to less than the transcript: the difference is the ' +
+      'message framing no eviction reaches');
+  finally
+    A.Free;
+  end;
+end;
+
 procedure TestSession;
 var
   A: TAgent;
@@ -7428,6 +7535,7 @@ begin
     TestDiff;
     TestPreview;
     TestCompact;
+    TestContextComposition;
     TestSession;
     TestNewestSessionIsWhatContinueTakes;
     TestSdkResumePolicy;

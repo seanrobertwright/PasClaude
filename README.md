@@ -154,6 +154,7 @@ in the system prompt at all.
 | `/yolo` | approve every tool for the rest of the session (bypass mode) |
 | `/sandbox [level]` | `off`, `limits` or `low`: how confined child processes are |
 | `/cost` | turns and tokens used |
+| `/context` | what is filling the context window, by kind |
 | `/config` | settings and the tier each came from; `get`, `set [--local]`, `unset`, `reload` |
 | `/telemetry` | metrics state; `preview` shows the exact JSON, `send` flushes now |
 | `/login [key]` | which credential answers; `key` stores one of pasclaude's own |
@@ -408,6 +409,34 @@ compaction is the summarizing kind - the measured trigger fires at a size
 where the old turns are worth one request to keep - and falls back to the
 plain trim if the summary request fails, because a session that cannot
 summarize must still not outgrow the window.
+
+`/context` is what to type before deciding which of those to do. The
+statusline meter and `/cost` both answer *how full*; this answers *with what*,
+which is the question somebody actually has when they are choosing between
+`/compact`, `/clear` and evicting images. It prints two groups, and the split
+is the cache breakpoint rather than a cosmetic one: the system prompt and the
+tool declarations sit ahead of it and cost a tenth on a hit, while every byte
+of the conversation is re-sent at full price every turn. The conversation is
+broken into six fixed rows - your messages, replies, thinking, tool calls, tool
+results, images - with a block count beside each, so `2 images, 8 KB` and
+`40 images, 8 KB` read differently, as they should.
+
+**One measured number, and everything else in bytes.** The API reports prompt
+tokens for a request as a *whole* and never per block, so the token figure is
+the one the server sent and the table beside it is byte shares. A tokens column
+per row would mean inventing a bytes-per-token ratio and applying it to prose,
+base64 and JSON keys alike - the same class of invention as the price table
+this program refuses to ship, and wrong the same way. What is honest is the
+session's own measured ratio, printed once at the foot as a single figure you
+can apply yourself. The rows also sum to *less* than the transcript, and the
+gap is named rather than absorbed: the role keys and array punctuation wrapping
+every message are real bytes that no eviction can reach.
+
+The classification is by block type first and role second, which matters for
+exactly one row: a `tool_result` rides in a *user* message, so asking about the
+role first would file every tool result under "your messages" - and that is the
+row somebody would then try, and fail, to shrink by typing less. `ux` asserts
+it.
 
 `/compact full` is the expensive kind: it asks the model to summarize the
 conversation - what was asked, what was done, exact paths, decisions and

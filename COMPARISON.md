@@ -90,7 +90,7 @@ the security posture, and each carries its argument at the site that enforces it
 | Retry on overload | ✅ `fallbackModel` chain (up to 3), StopFailure hook event names rate_limit/overloaded/etc. | 🟨 3 retries with widening delay on 429/529/5xx, interruptible sleeps, honours `Retry-After` clamped to 60 s; no fallback model |
 | Prompt caching | ✅ | ✅ two `cache_control` breakpoints (system+tools, last message); `/cost` shows cache counters |
 | Interruption | ✅ Esc stops the turn, keeps work so far | ✅ Esc or Ctrl+C mid-stream; partial text kept, pending tool not run, transcript unwound to an API-legal shape; Ctrl+Break deliberately still kills the process |
-| Context inspection | ✅ `/context` coloured grid with suggestions | 🟨 statusline context meter vs the compaction point; `/cost` shows measured `context:` tokens |
+| Context inspection | ✅ `/context` coloured grid with suggestions | 🟨 `/context` — two groups split at the cache breakpoint (prefix vs conversation) and six fixed rows with block counts, plus the statusline meter and `/cost`'s measured `context:` tokens. **Bytes per row, not tokens**: the API reports prompt tokens per request and never per block, so the shares are byte shares and the session's measured bytes-per-token is printed once as a figure you can apply yourself. No suggestions, no colour grid |
 | Cost tracking | ✅ `/usage` with dollar costs, plan limits, rate limits | 🟨 `/cost` — turns, tokens by kind, per-model token rows, cache counters. **No money, deliberately**: pasclaude ships no price table, and a hardcoded one "becomes a lie the first time a model is repriced" |
 | Model selection | ✅ `/model`, settings `model`, `availableModels` allowlist, `fallbackModel` | ✅ `/model` fetches the live list from `GET /v1/models` (the only authority — a dateless alias can't 404 like a dated snapshot); `/model <name>` unvalidated by design |
 | Model aliases/routing | ✅ alias names (`sonnet`, `opus`, `haiku`, …), per-skill/per-agent model overrides | 🟨 four dateless aliases (`opus`, `sonnet`, `haiku`, `opusplan` — a profile resolved per request by plan mode) plus two routed roles (subagent, compaction summary); user-scope only; a repository may never choose the model that reviews it |
@@ -212,6 +212,9 @@ skills/workflows and aliases); pasclaude ships ~40 built-ins plus custom command
 | `/config` | `/config [key=value]` | 🟨 both; pasclaude prints the tier of every key and refuses 32 Claude-Code-shaped keys by name with a pointer to the file that really owns them |
 | `/exit` | `/exit` (`/quit`) | ✅ |
 
+`/context` exists on both sides now, differently: Claude Code renders a coloured grid
+with suggestions, pasclaude a two-group byte table split at the cache breakpoint.
+
 **pasclaude-only commands**: `/pr-comments` (GET-only GitHub client), `/cwd`,
 `/remove-dir`, `/jobs`, `/paste` (clipboard image), `/keys`, `/think`, `/web`,
 `/telemetry preview|send`, `/deny`, `/mode`, `/plan`, `/yolo`, `/sandbox`,
@@ -219,7 +222,7 @@ skills/workflows and aliases); pasclaude ships ~40 built-ins plus custom command
 
 **Claude Code commands with no pasclaude equivalent** (selection): `/agents`,
 `/branch`, `/fork`, `/background`, `/btw`, `/subtask`, `/tasks`, `/list-agents`,
-`/context`, `/copy`, `/export`, `/goal`, `/effort`, `/fast`, `/advisor`,
+`/copy`, `/export`, `/goal`, `/effort`, `/fast`, `/advisor`,
 `/autocompact`, `/autofix-pr`, `/security-review`, `/simplify`, `/permissions`,
 `/install-github-app`, `/install-slack-app`, `/keybindings`, `/mobile`, `/desktop`,
 `/teleport`, `/remote-control`, `/chrome`, `/color`, `/cd`, `/focus`, `/insights`,
@@ -552,9 +555,10 @@ If the goal is the closest useful thing, in order:
    been answering two questions, and the project's `.mcp.json` stays unread. The
    residual it leaves is that a bare `-p` denies every call it can now declare, so the
    callers who benefit are the driver and `--dangerously-skip-permissions`.
-3. **`/context`** (§2, §6) — automatic compaction is the most opaque thing the program
-   does to a user, and the statusline meter answers "how full" without answering "with
-   what".
+3. ~~**`/context`**~~ — **done**; see §2. The interesting constraint turned out to be
+   the units: the API reports prompt tokens per request and never per block, so the
+   rows are byte shares and the one measured token figure stands beside them rather
+   than being spread across them.
 4. **MCP over HTTP/SSE** (§10) — the one item that changes what the program can be
    pointed at, and the only one here deserving a round of its own. `uMcp` already owns
    the framing, the validation, the caps and the deadlines; a second transport goes

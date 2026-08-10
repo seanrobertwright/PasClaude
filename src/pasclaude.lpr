@@ -228,16 +228,16 @@ end;
 { ------------------------------------------------------------- completion -- }
 
 const
-  { Forty-three entries.  The bound is hand-maintained and a wrong one
+  { Forty-four entries.  The bound is hand-maintained and a wrong one
     produces NO compile error, only a command that silently stops
     tab-completing, so it is counted rather than trusted. }
-  SlashCommands: array[0..42] of string = (
+  SlashCommands: array[0..43] of string = (
     '/help', '/clear', '/compact', '/config', '/deny', '/diff', '/hooks',
     '/ide', '/jobs', '/mcp', '/memory', '/init', '/mode', '/plan', '/rewind',
     '/review', '/pr-comments',
     '/sandbox', '/sessions', '/skills', '/plugins', '/think', '/web',
     '/add-dir', '/remove-dir', '/resume', '/save', '/cwd', '/model', '/yolo',
-    '/cost', '/telemetry', '/output-style', '/paste', '/vim', '/keys',
+    '/cost', '/context', '/telemetry', '/output-style', '/paste', '/vim', '/keys',
     '/login', '/logout', '/status', '/doctor', '/bug', '/exit', '/quit');
 
 { Candidates for the token being completed: slash commands when the token
@@ -668,6 +668,7 @@ begin
   EmitCLn(clGrey,   '  /config        settings and where each value came from;');
   EmitCLn(clGrey,   '                 get <k>, set [--local] <k> <v>, unset, reload');
   EmitCLn(clGrey,   '  /cost          tokens used so far');
+  EmitCLn(clGrey,   '  /context       what is filling the context window');
   EmitCLn(clGrey,   '  /telemetry     usage metrics: off unless YOUR settings');
   EmitCLn(clGrey,   '                 file turns them on; preview shows the');
   EmitCLn(clGrey,   '                 exact JSON, send flushes now');
@@ -3276,6 +3277,134 @@ end;
   half is that a user can READ what would leave the machine before trusting
   it.  It prints uTelem.TelemBuildPayload, which is the same function the
   sender calls - not a description of it - so the two cannot drift apart. }
+{ /context - what is filling the window, and what the honest units are.
+
+  The statusline already answers "how full"; this answers "with what", which
+  is the question somebody actually has when they are deciding whether to
+  /compact, /clear or evict images.
+
+  ONE MEASURED NUMBER AND EVERYTHING ELSE IN BYTES.  The API reports prompt
+  tokens for a request as a WHOLE and never per block, so the token figure
+  here is the one the server sent and the table beside it is byte shares.
+  Filling in a tokens column per row would mean inventing a bytes-per-token
+  ratio and applying it to prose, base64 and JSON keys alike, which is the
+  same class of invention as the price table this program refuses to ship,
+  and wrong for the same reason.  What IS honest is the session's own measured
+  ratio, printed once at the foot as a single figure the reader can apply
+  themselves if they want to - measured, not assumed, and visibly one number
+  rather than a column pretending to be six.
+
+  The two groups are the cache breakpoint, and that is the useful split rather
+  than a cosmetic one: the system prompt and the tool declarations sit ahead of
+  it and cost 90% less on a hit, while every byte of the conversation is
+  re-sent at full price every turn.  A user looking at a large "tool results"
+  row is looking at the thing that is actually expensive. }
+procedure ShowContext;
+var
+  Parts: TContextParts;
+  Sch: TJson;
+  I, Tools, McpTools: Integer;
+  SysBytes, ToolBytes, ConvBytes, Total: Int64;
+  Name: string;
+  Ratio: Double;
+
+  { Right-aligned so the columns can be compared down the page rather than
+    read across.  UiCount and not a raw integer: this is a proportion at a
+    glance, and six digits of precision on a number nobody adds up by hand
+    would cost the glance. }
+  procedure Row(const Caption: string; B: Int64; Share: Int64; Blocks: Integer);
+  var
+    Line: string;
+  begin
+    Line := Format('    %-18s %8s', [Caption, uTerm.UiCount(B)]);
+    if Share > 0 then
+      Line := Line + Format('  %3d%%', [Round((B * 100) / Share)]);
+    if Blocks = 1 then
+      Line := Line + '   1 block'
+    else if Blocks > 1 then
+      Line := Line + Format('   %d blocks', [Blocks]);
+    { Trailing spaces are invisible until somebody pipes this into a file or a
+      diff, which is exactly when they are annoying and exactly when nobody is
+      watching the screen to notice. }
+    EmitCLn(clGrey, TrimRight(Line));
+  end;
+
+begin
+  SysBytes := Length(uSdk.SdkFullSystem);
+  ToolBytes := 0;
+  Tools := 0;
+  McpTools := 0;
+  Sch := uTools.ToolsSchema;
+  if Sch <> nil then
+  try
+    ToolBytes := Length(Sch.ToJson);
+    Tools := Sch.Count;
+    for I := 0 to Sch.Count - 1 do
+      if Copy(Sch.Item(I).Str('name'), 1, 5) = 'mcp__' then Inc(McpTools);
+  finally
+    Sch.Free;
+  end;
+
+  Parts := Agent.ContextComposition;
+  ConvBytes := 0;
+  for I := 0 to High(Parts) do ConvBytes := ConvBytes + Parts[I].Bytes;
+  Total := SysBytes + ToolBytes + ConvBytes;
+
+  if (Agent.ContextTokens > 0) and (CompactTokens > 0) then
+    EmitCLn(clGrey, Format('  %s tokens measured in the last request, ' +
+      '%d%% of the %s compaction point',
+      [uTerm.UiCount(Agent.ContextTokens),
+       Round((Agent.ContextTokens * 100) / CompactTokens),
+       uTerm.UiCount(CompactTokens)]))
+  else if Agent.ContextTokens > 0 then
+    EmitCLn(clGrey, Format('  %s tokens measured in the last request',
+      [uTerm.UiCount(Agent.ContextTokens)]))
+  else
+    EmitCLn(clGrey, '  nothing measured yet - the token count arrives with ' +
+      'the first reply');
+
+  EmitCLn(clGrey, '');
+  EmitCLn(clGrey, '  ahead of the cache breakpoint, 90% off on a hit:');
+  Row('system prompt', SysBytes, 0, 0);
+  if McpTools > 0 then
+    Name := Format('%d tools, %d MCP', [Tools, McpTools])
+  else
+    Name := Format('%d tools', [Tools]);
+  Row(Name, ToolBytes, 0, 0);
+
+  EmitCLn(clGrey, '');
+  EmitCLn(clGrey, '  the conversation, re-sent in full every turn:');
+  for I := 0 to High(Parts) do
+    if Parts[I].Bytes > 0 then
+      Row(Parts[I].Name, Parts[I].Bytes, ConvBytes, Parts[I].Blocks);
+  if ConvBytes = 0 then
+    EmitCLn(clGrey, '    (empty)');
+
+  EmitCLn(clGrey, '');
+  { TranscriptBytes and not the row sum: the difference is the role keys and
+    array punctuation wrapping every message, which is real and which no
+    eviction can reach, so it is named rather than absorbed into a row.  Only
+    when there IS a conversation, because on an empty transcript the figure is
+    the two bytes of "[]" and the sentence reads as a defect rather than as
+    the disclosure it is. }
+  if ConvBytes > 0 then
+    EmitCLn(clGrey, Format('  %s bytes in %d messages, plus %s of message ' +
+      'framing no eviction reaches',
+      [uTerm.UiCount(Total), Agent.MessageCount,
+       uTerm.UiCount(Agent.TranscriptBytes - ConvBytes)]))
+  else
+    EmitCLn(clGrey, Format('  %s bytes, all of it prefix - the conversation ' +
+      'has not started', [uTerm.UiCount(Total)]));
+  if Agent.ContextTokens > 0 then
+  begin
+    Ratio := Total / Agent.ContextTokens;
+    EmitCLn(clGrey, Format('  this session measured %.1f bytes per token; ' +
+      'the rows are byte shares, because the API', [Ratio]));
+    EmitCLn(clGrey, '  reports tokens for a request as a whole and never ' +
+      'per block');
+  end;
+end;
+
 procedure ShowTelemetry(const Arg: string);
 var
   S: TTelemState;
@@ -4398,6 +4527,8 @@ begin
            Rows[ArgI].CacheRead, Rows[ArgI].CacheWrite]));
     end;
   end
+  else if Cmd = '/context' then
+    ShowContext
   else if Cmd = '/telemetry' then
     ShowTelemetry(Arg)
   else
