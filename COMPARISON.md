@@ -1,9 +1,12 @@
 # pasclaude vs Claude Code — Side-by-Side Feature Comparison
 
 **Snapshot date:** 2026-08-09.
-**pasclaude side:** branch `feat/integrations`, commit `e0f13a4`, `v0.1` — compiled from
+**pasclaude side:** branch `feat/integrations` at `67e0b71`, `v0.1` — compiled from
 `src/` (22 units), `README.md`, and `FEATURES-NOT-YET.md`, with source-level evidence
-cited per claim where it matters.
+cited per claim where it matters. The rows were drafted against the working tree
+rather than against the commit below it, which is why several already describe the
+round that landed in `67e0b71`: `uArgs`, the 250 ms prompt idle tick, verbatim
+notebook escapes and the user-scope MCP spool move.
 **Claude Code side:** the official documentation at `code.claude.com/docs` (fetched
 live on the snapshot date). Claude Code versions referenced there reach into the
 `v2.1.2xx` series. Claude Code ships roughly weekly and moves fast; anything written
@@ -25,6 +28,36 @@ about it decays. Treat this document as a point-in-time photograph, not a live d
 - 🟨 implemented, deliberately narrower or differently designed
 - ❌ not implemented
 - ⊘ deliberately refused, with the reason documented in the pasclaude sources
+
+## How to read a ❌
+
+The legend above separates *refused* from *not implemented*, and that separation is
+the most useful thing in this document — but ❌ is still doing two very different
+jobs, and a reader counting marks will misjudge the distance badly. Every ❌ below is
+one of two kinds:
+
+**Structural** — a property of the language, the platform or the process model, which
+no amount of ordinary work closes. Three facts account for almost all of them:
+
+1. **Windows only, by construction.** A port touches five of twenty-one units —
+   `uHttp` (WinHTTP), `uTerm` (the Win32 console and the 250 ms wait the idle tick is
+   built on), `uSandbox` (job objects, integrity levels), `uImage` (`CF_DIB`), and the
+   path conventions in `uTools` that the deny rules and the root guard both require to
+   be canonical. The reason `uSandbox` is unportable is exactly the reason it is
+   testable: it imports `Windows` and `SysUtils` and nothing else.
+2. **No threads.** Five separate ❌ rows are this one fact wearing different names —
+   parallel subagents (§9), agent teams (§9), sequential MCP first-connect (§10), the
+   wire `interrupt` refused by name (§16), and one session per process (§16).
+3. **No distribution story.** Auto-update, `/upgrade` and `/release-notes` (§1, §6)
+   cannot be cloned without first inventing the pipeline they report on.
+
+**Residual** — nobody has done it and nothing structural stops anyone. This is the
+much smaller set, and §23 ranks the four that would actually move the program.
+
+⊘ is a third thing again, and it is not work. Closing that column does not finish the
+project; it reverses it. The settings scope table (§14), the CI ceiling (§17), the
+refusal of `exit_plan_mode` (§4) and of a plugin downloader (§13) are load-bearing for
+the security posture, and each carries its argument at the site that enforces it.
 
 ---
 
@@ -115,7 +148,7 @@ Tool-result budgeting: Claude Code caps MCP output at 25k tokens by default
 | --- | --- | --- |
 | Permission modes | `default` (UI label "Manual"), `acceptEdits` (also auto-accepts mkdir/touch/mv/cp in workdir), `plan`, `auto` (background safety classifier), `dontAsk` (auto-deny unless pre-approved), `bypassPermissions`; cycled with Shift+Tab. Bypass keeps circuit breakers: `rm -rf /` and `~` still prompt, incl. via `$(...)`/backticks/process substitution | `ask`, `accept-edits`, `plan`, `bypass` via `--permission-mode`, `--dangerously-skip-permissions`, `/mode`, `/plan`, `/yolo`. No classifier, no auto mode |
 | Plan mode | ✅ read-only research phase with an `ExitPlanMode` tool the model invokes | 🟨 plan enforced as a boundary in `RunTool` above the gate (allowlist of 7 read-only tools) so even bypass cannot lift it. `exit_plan_mode` tool ⊘ — "a tool that lets the model leave plan mode is a tool that lets it grant itself write access"; leaving is always a keystroke |
-| Rule lists | `permissions.allow/ask/deny` in settings; rich syntax `Bash(npm run test *)`, `Read(./.env)`, `Edit(...)`, `WebFetch(domain:…)`, `mcp__server__tool`; rules merge across scopes | 🟨 deny-only: `tool:<glob>`, `bash:<program-glob>`, `path:<glob>` from `%LOCALAPPDATA%\pasclaude\deny.json` and the approvals file. Checked **above every allow-all, the bash prefix table, nil-Ask, and PreToolUse hook allows** — nothing overrides one. Allow lists exist only as persisted "always" grants. `bash:` filters are documented as evadable (`tool:bash` is the airtight form); `path:` doesn't cover shell access |
+| Rule lists | `permissions.allow/ask/deny` in settings; rich syntax `Bash(npm run test *)`, `Read(./.env)`, `Edit(...)`, `WebFetch(domain:…)`, `mcp__server__tool`; rules merge across scopes | 🟨 deny-only: `tool:<glob>`, `bash:<program-glob>`, `path:<glob>` from `%LOCALAPPDATA%\pasclaude\deny.json` and the approvals file. Checked **above every allow-all, the bash prefix table, nil-Ask, and PreToolUse hook allows** — nothing overrides one. Allow lists exist only as persisted "always" grants — and a settings-based one is ⊘ rather than unbuilt: `permissions`, `allow_edits`, `allow_bash`, `allow_fetch` and `bash_programs` are each refused by name in `uSettings`, pointing at the approvals file that owns the thing. `bash:` filters are documented as evadable (`tool:bash` is the airtight form); `path:` doesn't cover shell access |
 | Standing approvals | stored in `.claude/settings.local.json` ("don't ask again") | 🟨 `%LOCALAPPDATA%\pasclaude\approvals\<project>-<hash>.json` — **outside the repository on purpose**, widen-only, hand-editable; `/yolo` sessions never write it, `-p` never reads it. A repository cannot ship the file that answers its own permission questions |
 | Enterprise policy | ✅ managed settings via MDM plist / Windows registry / `managed-settings.json(+.d)`, fail-closed security fields | ❌ ⊘ no managed tier; the settings scope table refuses the concept at the project level instead |
 | Additional directories | ✅ `--add-dir`, `/add-dir` | ✅ same; additionally: an added root grants *file access only* (its hooks, MCP, skills, agents, CLAUDE.md are unread); relative paths keep one resolution base; never persisted; max 8 |
@@ -176,7 +209,7 @@ skills/workflows and aliases); pasclaude ships ~40 built-ins plus custom command
 | vim mode | `editorMode: vim` in settings (+ `vimInsertModeRemaps`) | 🟨 pasclaude `/vim [on|off|save]` + `/keys` + `keys.json` rebinding (user-scope only); no visual mode, registers, counts, text objects — "a prompt is one line" |
 | `/output-style` | `/output-style` | 🟨 pasclaude styles ADD a paragraph and can never replace a system prompt; 2 KB cap |
 | `/save`, `/sessions` | session management lives in `--resume`/`--continue` | 🟨 pasclaude's named copies + picker vs CC's transcript store |
-| `/config` | `/config [key=value]` | 🟨 both; pasclaude prints the tier of every key and refuses 27 Claude-Code-shaped keys by name with a pointer to the file that really owns them |
+| `/config` | `/config [key=value]` | 🟨 both; pasclaude prints the tier of every key and refuses 30 Claude-Code-shaped keys by name with a pointer to the file that really owns them |
 | `/exit` | `/exit` (`/quit`) | ✅ |
 
 **pasclaude-only commands**: `/pr-comments` (GET-only GitHub client), `/cwd`,
@@ -328,7 +361,7 @@ cannot be shadowed in pasclaude.
 | --- | --- | --- |
 | Tiers | managed policy > CLI args > `.claude/settings.local.json` > `.claude/settings.json` > `~/.claude/settings.json` | user > project > local, resolved **per key** by a scope table with one writer and one enforcement point |
 | What a project may set | almost anything (trust step applies) | 🟨 exactly 4 display/economy keys — `output_style`, `thinking_budget`, `tool_result_bytes`, `auto_compact_tokens` — and the numeric three only in the direction that costs the *user* less; a repository cannot turn thinking on at all, and may only push compaction later |
-| Paste-compatibility | n/a | 27 Claude-Code-shaped keys (`permissions`, `env`, `mcpServers`, `hooks`, `apiKey`, `sandbox`, …) are refused **by name with a sentence naming the file that really owns them** |
+| Paste-compatibility | n/a | 30 Claude-Code-shaped keys (`permissions`, `env`, `mcpServers`, `hooks`, `apiKey`, `sandbox`, …) are refused **by name with a sentence naming the file that really owns them** — 46 entries in the table, 16 honoured. Two known omissions in §22 |
 | `env` key | ✅ injects environment | ⊘ refused — environment is inherited from whatever launched the program |
 | Hot reload | settings watched; hooks/permissions/apiKeyHelper reload live | `/config reload`; the system prompt is frozen at session start for cache reasons (documented) |
 | Backups of config | ✅ 5 timestamped backups | read-modify-write preserves hand-written blocks |
@@ -468,6 +501,62 @@ Most differences are Claude Code being larger; a few run the other way:
 
 ---
 
+## 22. One gap in our own table
+
+Everything above measures this program against another one. This entry does not: it
+is a defect against a standard the repository set for itself, which makes it the only
+item here that needs no comparison to justify acting on.
+
+The `scRefused` block in `src/uSettings.pas` exists because, in its own words, a key
+nothing knows about is a key that fails silently — so every key somebody might paste
+out of Claude Code's `settings.json` should sit in the table as a refusal naming the
+file that really owns it. Two do not:
+
+* **`statusLine`** — a real Claude Code key (§7), neither honoured nor refused here.
+  A user who pastes it gets whatever the unknown-key path does, rather than a sentence
+  saying the status line is compiled in.
+* **`outputStyle`** — the camel-case spelling of the honoured `output_style`. The
+  table already carries `additionalDirectories` beside `add_dir` for exactly this
+  reason; this pair is missing the same treatment.
+
+Two entries, one line and a `Note` each. It is the smallest actionable item in this
+document and the only one that is a bug rather than a difference.
+
+## 23. What to actually do
+
+If the goal is an exact clone: don't. The three structural facts under *How to read a
+❌* each cost more than every residual in this document combined, and the ⊘ column is
+not work at all.
+
+If the goal is the closest useful thing, in order:
+
+1. **`statusLine` and `outputStyle` into the refusal table** (§22) — an hour, and it
+   is the repository's own rule rather than anybody else's feature.
+2. **`-p` reads the user-scope `mcp.json`** (§10) — the cheapest real capability on
+   the list. A scripted run currently has no MCP tools at all, which makes print mode
+   strictly less capable than the REPL in a way nothing about the design requires, and
+   the trust argument for the user's own file is already made and already relied on.
+3. **`/context`** (§2, §6) — automatic compaction is the most opaque thing the program
+   does to a user, and the statusline meter answers "how full" without answering "with
+   what".
+4. **MCP over HTTP/SSE** (§10) — the one item that changes what the program can be
+   pointed at, and the only one here deserving a round of its own. `uMcp` already owns
+   the framing, the validation, the caps and the deadlines; a second transport goes
+   behind the same interface and `uHttp` exists. The hard part is not the protocol but
+   the trust question: the spawn prompt shows an expanded command line, a URL has none,
+   so both the prompt and the "always" fingerprint need a new input.
+
+**`SubagentStop` is the one ⊘ worth reopening** (§11). The recorded reason is that a
+subagent is read-only and invisible, so "block" has no legal meaning inside one — and
+that is an argument about *blocking*, not about *notifying*. A fire that cannot block
+is still useful and does not need the meaning that was refused.
+
+Nothing structural unless the project's charter changes. If it ever does, threads
+before platforms: threads collapse five listed gaps into one piece of work, whereas a
+port buys reach and closes nothing.
+
+---
+
 ## Sources
 
 **pasclaude:** `README.md` (4,184 lines), `FEATURES-NOT-YET.md` (1,587 lines), and a
@@ -484,3 +573,16 @@ headless, github-actions. Pages fetched once and partially truncated where noted
 the text (checkpointing, vs-code, jetbrains, output-styles, statusline, env-vars,
 context-window, agent-teams and the provider pages were covered only incidentally).
 Claude Code changes continuously; re-verify before relying on any row of this document.
+
+**Two grades of claim, deliberately not mixed.** Every statement about pasclaude is
+read out of this tree and is checkable against the code that implements it. Every
+statement about Claude Code comes from the documentation above, fetched once on the
+snapshot date and not compared against a running install. That is why this file sits
+at the top level and not inside `FEATURES-NOT-YET.md`, where the stricter standard
+applies to every line; merging them would quietly lower it.
+
+A second document, `GAP-ANALYSIS.md`, covered the same question from the other
+direction and was folded in here rather than kept beside this one. What it
+contributed: the structural/refused/residual split under *How to read a ❌*, the
+correction that a settings-based allow list is refused rather than unbuilt (§4), the
+count of the refusal table (§14 — it is thirty, not twenty-seven), §22 and §23.
