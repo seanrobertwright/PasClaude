@@ -3611,6 +3611,72 @@ begin
   WipeTree(Extra);
 end;
 
+{ -p reads the USER's mcp.json and still reads no project file.
+
+  The whole feature is one loader that merges one file instead of two, so the
+  assertion that matters is the negative one: with BOTH files on disk,
+  LoadMcpConfigUser must come back with exactly the user's server and the
+  project's must be absent by name.  A version of this that only checked the
+  count would pass with the scopes swapped.
+
+  McpApproveAll is driven with a nil Ask on purpose, because that is what the
+  host passes on the print-mode path and the safety of doing so is a property
+  of the table rather than of the call: a user-scope server is approved without
+  being counted into NeedAsk, so the prompt loop is never entered.  A project
+  server in the table would enter it, which is the second reason the negative
+  assertion above is worth making - a regression that let .mcp.json through
+  here would not merely widen the grant, it would reach a nil Ask with a
+  question to ask. }
+procedure TestMcpUserScopeUnderPrintMode;
+var
+  Err, Home, Proj: string;
+begin
+  Home := SysUtils.GetEnvironmentVariable('USERPROFILE');
+  Check(Home <> '', 'the suite has a home directory of its own to write into');
+  Proj := SkillRoot + PathDelim + 'mcp-print';
+  WipeTree(Proj);
+  ForceDirectories(Proj);
+  uTools.RootDir := Proj;
+
+  PutFile(IncludeTrailingPathDelimiter(Home) + StateDirName + PathDelim +
+    'mcp.json',
+    '{"mcpServers":{"mine":{"command":"cmd.exe","args":["/c","echo"]}}}');
+  PutFile(IncludeTrailingPathDelimiter(Proj) + '.mcp.json',
+    '{"mcpServers":{"theirs":{"command":"cmd.exe","args":["/c","echo"]}}}');
+
+  { The interactive loader first, so the fixture is known to declare two
+    servers before the print-mode one is asked to declare fewer.  Without this
+    a broken fixture and a working narrowing look identical. }
+  ClearMcpServers;
+  Check(LoadMcpConfigAll(Err), 'both files load in an interactive run: ' + Err);
+  Check(McpServerCount = 2,
+    Format('and declare two servers between them (%d)', [McpServerCount]));
+
+  ClearMcpServers;
+  Check(LoadMcpConfigUser(Err), 'the user file alone loads under -p: ' + Err);
+  Check(McpServerCount = 1,
+    Format('and declares one server, not two (%d)', [McpServerCount]));
+  { By name, not by counting.  A count alone passes with the two scopes
+    swapped, which is the exact regression this test exists to catch. }
+  Check(McpServerScope('mine') = 'user', 'the one that loaded is the user''s');
+  Check(McpServerScope('theirs') = '',
+    'and the project''s server is not in the table at all');
+
+  { Nil Ask, exactly as the host passes it, and the server comes out approved
+    without anything having been asked.  Nothing here spawns: approval and
+    connection are separate, and this asserts the first without paying for the
+    second. }
+  McpApproveAll(nil, nil);
+  Check(McpServerApproved('mine'),
+    'a nil Ask still approves a server the user chose');
+
+  ClearMcpServers;
+  uTools.RootDir := SkillRoot;
+  WipeTree(Proj);
+  DeleteFile(IncludeTrailingPathDelimiter(Home) + StateDirName + PathDelim +
+    'mcp.json');
+end;
+
 procedure TestSkillFrontmatter;
 var
   N, D, B, E: string;
@@ -7507,6 +7573,7 @@ begin
   TestPlanToolListAndPrintRule;
   TestToolRegistry;
   TestMcpApprovals;
+  TestMcpUserScopeUnderPrintMode;
   TestMcpPermissionClass;
   TestMcpScripted;
   TestMcpServerProcess;

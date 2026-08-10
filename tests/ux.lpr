@@ -5572,13 +5572,22 @@ end;
   and afterwards nothing that decides authority has moved. }
 procedure TestSettingsRefusedKeys;
 const
-  Names: array[0..15] of string = ('permissions', 'allow_edits', 'allow_bash',
+  Names: array[0..17] of string = ('permissions', 'allow_edits', 'allow_bash',
     'allow_fetch', 'deny', 'sandbox', 'permission_mode', 'add_dir', 'env',
     'apiKey', 'mcpServers', 'plugins', 'vim', 'bindings', 'hooks',
     { The newest of them, and the one whose absence would be hardest to
       notice: a project file that could append to the system prompt could
       rewrite every standing instruction the agent has. }
-    'append_system_prompt');
+    'append_system_prompt',
+    { Two spellings the table had missed until an audit went looking, and they
+      are the two shapes of silent failure this list exists to prevent.
+      statusLine names a PROGRAM in Claude Code, so a project able to set it
+      would run one every repaint - ide.command's hole without the slash
+      command.  outputStyle is a near miss on output_style, which any tier may
+      set: the user can see the working key in their own file and has no way
+      to tell why theirs does nothing, which is the case where silence costs
+      most. }
+    'statusLine', 'outputStyle');
 var
   Problems: TStringArray;
   Doc: string;
@@ -5781,7 +5790,7 @@ end;
   assertion that catches the round's most likely silent failure. }
 procedure TestSettingDefsAreComplete;
 var
-  I, J: Integer;
+  I, J, Anyone, UserOnly, Refused: Integer;
 begin
   for I := 0 to SettingCount - 1 do
   begin
@@ -5791,6 +5800,29 @@ begin
       Check(Trim(SettingDefs[I].Note) <> '',
         'and a note: ' + SettingDefs[I].Name);
   end;
+  { The census, and it is here because the comment above SettingDefs said
+    "fourteen real keys" from before ide.enabled and ide.command joined the
+    table.  Nothing failed; the number simply stopped being true, quietly, in
+    the one place a reader checks to decide whether the README's scope table
+    is complete.  A number in prose drifts and a number in an assertion does
+    not, so these three are the same figures the README publishes and a key
+    added without a decision about its Scope column now fails the run.
+    Change them only together with the table and the README. }
+  Anyone := 0;
+  UserOnly := 0;
+  Refused := 0;
+  for I := 0 to SettingCount - 1 do
+    case SettingDefs[I].Scope of
+      scAny: Inc(Anyone);
+      scUserOnly: Inc(UserOnly);
+      scRefused: Inc(Refused);
+    end;
+  Check(Anyone = 4, Format('four keys any tier may set (%d)', [Anyone]));
+  Check(UserOnly = 12, Format('twelve are the user''s alone (%d)', [UserOnly]));
+  Check(Refused = 32, Format('and thirty-two are refused by name (%d)',
+    [Refused]));
+  Check(Anyone + UserOnly + Refused = SettingCount,
+    'every scope value is one of the three the enum declares');
   { And no duplicate, which SettingIndex's first-match walk would hide: the
     second tuple would simply never be reachable, scope column and all. }
   for I := 0 to SettingCount - 1 do

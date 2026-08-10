@@ -243,12 +243,32 @@ the approvals file being read, so a scripted run inherits every refusal and
 no grant - strictly stricter than the interactive session that started with
 the same flags, which is the rule. `--dangerously-skip-permissions` is the
 one way past that, and it prints a warning to stderr when it is used.
-It also loads no hooks and spawns no MCP server:
-a scripted run cannot be the thing that first executes a project's code. The
-MCP half of that is where it halts; the hooks half is now a flag,
-`uHooks.HooksAllowed`, false unless the run is the REPL - see **Hooks** for
-which four modes that took it away from and why a `finally` position was not
-enough.
+It also loads no hooks, and spawns no MCP server the *project* declared: a
+scripted run cannot be the thing that first executes a project's code. The
+hooks half is a flag, `uHooks.HooksAllowed`, false unless the run is the REPL -
+see **Hooks** for which four modes that took it away from and why a `finally`
+position was not enough.
+
+The MCP half used to be the same sentence and is now two. Your own
+`%USERPROFILE%\.pasclaude\mcp.json` **is** read under `-p` and its servers do
+start; the project's `.mcp.json` is not read at all. The distinction is the one
+the spawn prompt already makes: that prompt exists so somebody can decide
+whether to trust a program the *project* chose, and a scripted run has nobody
+to answer it - but a program *you* chose is approved without any prompt in the
+REPL today, and keeping it out of `-p` was the same grant withheld from the one
+caller that could not object. `McpApproveAll` is handed a nil `Ask` there and
+never reaches a question, because only project servers are counted into the
+prompt loop.
+
+What that buys depends on who is driving. A bare `-p` has a nil `Ask`, so it
+declares your MCP tools and then refuses every call to them exactly as it
+refuses every other gated tool, and says so in its output. The callers that
+gain are the two that can answer: a `--input-format stream-json` driver
+answering `permission_request` lines, and `--dangerously-skip-permissions`.
+Connection notices are suppressed on this path, because under
+`--output-format json` and `stream-json` stdout carries the protocol - a server
+that fails to start is visible in its stderr spool and in the `/doctor` ledger
+rather than on screen.
 
 Pressing `Esc` while a reply is streaming stops it, and so does `Ctrl+C`:
 outside the prompt the default Ctrl+C handler would kill the process
@@ -1261,9 +1281,13 @@ repository chose is a different sentence. That survived the move to bypass
 mode for free - bypass is one line inside `Permit`, and neither the server
 spawn prompt nor the hooks fingerprint prompt goes through `Permit`. Print
 mode is structurally unable to
-reach either prompt - it halts before the config is read, and would arrive
-with a nil `Ask` and deny everything if it did - so a scripted run can never
-be the thing that first executes a project's code. And enabling a plugin
+reach either prompt, and still is: it reads no project config at all, and
+would arrive with a nil `Ask` and deny everything if it did - so a scripted run
+can never be the thing that first executes a project's code. That is now a
+statement about the *project's* files specifically. Print mode does read your
+own `mcp.json` and start its servers, which reaches no prompt either, for the
+opposite reason: those servers are approved without one in every mode, so there
+was never a question for a nil `Ask` to fail to answer. And enabling a plugin
 activates its commands, agents and skills and nothing else; a plugin manifest
 naming a hook or a server is reported by `/plugins` and never acted on.
 
@@ -2647,13 +2671,13 @@ else, and `SettingsParseTier` takes **bytes**, never a path - the
 `uTerm.KeysParse` rule - so the unit can never learn a configuration location
 and every suite drives it with no filesystem.
 
-Thirty more names are in the same table as refusals, honoured at no tier
+Thirty-two more names are in the same table as refusals, honoured at no tier
 including the user one: `permissions`, `allow_edits`, `allow_bash`,
 `allow_fetch`, `bash_programs`, `trusted`, `deny`, `sandbox`,
 `permission_mode`, `append_system_prompt`, `add_dir`, `additionalDirectories`,
 `env`, `apiKey`, `apiKeyHelper`, `auth`, `credential`, `login`, `mcpServers`,
 `plugins`, `vim`, `bindings`, `hooks`, bare `telemetry`, bare `ide`, `github`,
-`report_dir`, `redact`, `doctor`, `bug`.
+`report_dir`, `redact`, `doctor`, `bug`, `statusLine`, `outputStyle`.
 They are there on purpose. The realistic failure is not an attack, it is
 somebody pasting Claude Code's `settings.json` and believing it took effect, so
 each one produces a sentence naming the file that really owns it - `vim` and
@@ -2666,7 +2690,20 @@ refused at the user tier too, which is stricter than `output_style` beside it:
 a style adds a paragraph about prose whose body has one reader, where this
 would add arbitrary standing instructions to the most trusted position in every
 request. `report_dir` and `redact` are pre-refused so that adding them later is
-a review conflict rather than a one-line insertion.
+a review conflict rather than a one-line insertion. The last two are the two
+shapes of silent failure this list exists to catch, and both were missing until
+an audit went looking. `statusLine` names a *program* in Claude Code, so it is
+`ide.command`'s hole without the slash command in front of it - a clone able to
+set it would run something of its choosing every time the screen repainted -
+and here the status line is compiled in and runs nothing at all. `outputStyle`
+is the near miss on `output_style`, which any tier may set, and a near miss is
+where silence costs most: the user can see the working key in somebody else's
+file and has no way to tell why theirs does nothing. `SettingIndex` compares
+names with `=` and nothing lowercases an incoming key, so the two spellings are
+genuinely two entries and neither shadows the other. The counts above are
+asserted in `ux` now rather than only written down - the sentence introducing
+the honoured keys in `uSettings` had said "fourteen" since before the two `ide`
+keys were added, which broke nothing and stopped being true.
 
 A file with **any** problem in it contributes **nothing** - bad JSON, not an
 object, an unknown key, a wrong type, an out-of-range integer, a key at a tier

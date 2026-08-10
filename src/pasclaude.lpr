@@ -5508,6 +5508,49 @@ begin
       if PrintMode then
       begin
         Agent.Ask := nil;
+
+        { The user's MCP servers, and only the user's.  LoadMcpConfigUser and
+          not LoadMcpConfigAll, which is the whole of the decision: the
+          project's .mcp.json is still unread here, because the spawn prompt is
+          how somebody decides whether to trust a program the PROJECT chose and
+          there is nobody at this keyboard to answer it.  The user's file names
+          programs the user chose and McpApproveAll approves it without a
+          question in the REPL already; withholding it from -p was the same
+          grant kept from the one caller that could not object.
+
+          McpApproveAll is passed a nil Ask and that is safe by construction
+          rather than by luck: it counts only PROJECT servers into NeedAsk and
+          returns before touching Ask when the count is zero, so with a
+          user-only table there is no path to a prompt.  Passing @AskPermission
+          here would be worse than useless - it would be a console read in a
+          run whose stdin may be a pipe - and passing nil is what makes the
+          absence of project servers load-bearing instead of incidental.
+
+          Notices are nil for the same reason StartupNote exists two screens
+          up: under --output-format json and stream-json stdout carries the
+          protocol, and a line of prose about connecting to a server is a
+          broken document.  A server that fails to come up is visible where it
+          was always visible - its stderr spool, named by /mcp in a session
+          that has one - and the model simply gets no tools from it.
+
+          The per-call gate is untouched.  A bare -p has a nil Agent.Ask one
+          line above and denies every MCP call, exactly as it denies every
+          other gated tool; what makes this worth doing is the driver below,
+          which answers permission_request lines, and --dangerously-skip-
+          permissions for the blunt case. }
+        if uTools.LoadMcpConfigUser(McpErr) then
+        begin
+          uTools.McpApproveAll(nil, nil);
+          uTools.McpConnectApproved(nil);
+        end;
+        { Not printed, for the reason above, but not swallowed either: the
+          ledger is what /doctor reads back and what --output-format json
+          reports as a notice, so a malformed user mcp.json is still findable
+          without putting a sentence on a protocol stream. }
+        if McpErr <> '' then
+          uDiag.DiagNote('mcp', uDiag.dlWarn, McpErr,
+            'the file is ' + uTools.UserMcpConfigPath);
+
         { The SDK path branches here, at exactly the point print mode already
           branches: before HistoryLoad, LoadPermissions, the banner and the
           session backup.  That is the cheapest possible proof the interactive

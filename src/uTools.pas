@@ -1106,6 +1106,31 @@ function LoadMcpConfig(const Path: string; out Err: string): Boolean;
   project's.  See MergeMcpConfig for why the order decides a name collision. }
 function LoadMcpConfigAll(out Err: string): Boolean;
 
+{ The USER's file and nothing else, for a run with nobody at the keyboard.
+
+  This exists because -p used to read neither file and that was one decision
+  answering two different questions.  The argument that kept MCP out of print
+  mode is about the PROJECT's file: a scripted run must not be the thing that
+  first executes a repository's code, because the spawn prompt is how a person
+  decides whether to trust a program the project chose, and there is nobody
+  there to answer it.  Every word of that still holds and .mcp.json is still
+  unread under -p.  None of it is true of %USERPROFILE%\.pasclaude\mcp.json,
+  which names programs the USER chose and which McpApproveAll already approves
+  without asking anything, in the REPL, today.  Refusing to load it under -p
+  was not a smaller grant; it was the same grant withheld from the one caller
+  that could not object.
+
+  What does NOT change: the per-CALL gate in McpRun.  A plain -p run has a nil
+  Ask and therefore denies every MCP call, exactly as it denies every other
+  gated tool - so the tools are declared and refused, and the run says so.
+  What makes the feature worth having is the driver: --input-format stream-json
+  answers permission_request lines, so an embedding program can allow the calls
+  it wants, and --dangerously-skip-permissions is the blunt other way.
+
+  ClearMcpServers first, like LoadMcpConfigAll, so calling either one after the
+  other is defined rather than additive. }
+function LoadMcpConfigUser(out Err: string): Boolean;
+
 { 'user' | 'project' for a configured server; '' when the name is unknown. }
 function McpServerScope(const Name: string): string;
 { Whether the spawn gate has been answered for this server.  Exposed so a
@@ -7845,6 +7870,20 @@ begin
   ClearMcpServers;
   MergeMcpConfig(UserMcpConfigPath, UserMcpConfigPath, msUser, Err);
   MergeMcpConfig(McpConfigPath, ExtractFileName(McpConfigPath), msProject, Err);
+  Result := Length(McpServers) > 0;
+end;
+
+{ Line for line LoadMcpConfigAll above without its second MergeMcpConfig, and
+  written that way on purpose rather than as a scope parameter on the existing
+  function: the two callers are answering different questions and a Boolean
+  argument would put the print-mode decision inside a function whose header
+  explains the interactive one.  The header on the declaration is where the
+  argument lives. }
+function LoadMcpConfigUser(out Err: string): Boolean;
+begin
+  Err := '';
+  ClearMcpServers;
+  MergeMcpConfig(UserMcpConfigPath, UserMcpConfigPath, msUser, Err);
   Result := Length(McpServers) > 0;
 end;
 

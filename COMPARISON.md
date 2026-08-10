@@ -209,7 +209,7 @@ skills/workflows and aliases); pasclaude ships ~40 built-ins plus custom command
 | vim mode | `editorMode: vim` in settings (+ `vimInsertModeRemaps`) | 🟨 pasclaude `/vim [on|off|save]` + `/keys` + `keys.json` rebinding (user-scope only); no visual mode, registers, counts, text objects — "a prompt is one line" |
 | `/output-style` | `/output-style` | 🟨 pasclaude styles ADD a paragraph and can never replace a system prompt; 2 KB cap |
 | `/save`, `/sessions` | session management lives in `--resume`/`--continue` | 🟨 pasclaude's named copies + picker vs CC's transcript store |
-| `/config` | `/config [key=value]` | 🟨 both; pasclaude prints the tier of every key and refuses 30 Claude-Code-shaped keys by name with a pointer to the file that really owns them |
+| `/config` | `/config [key=value]` | 🟨 both; pasclaude prints the tier of every key and refuses 32 Claude-Code-shaped keys by name with a pointer to the file that really owns them |
 | `/exit` | `/exit` (`/quit`) | ✅ |
 
 **pasclaude-only commands**: `/pr-comments` (GET-only GitHub client), `/cwd`,
@@ -253,7 +253,7 @@ cannot be shadowed in pasclaude.
 | Transcript viewer | ✅ `Ctrl+O`, navigation keys, native scrollback export | ❌ (session file + `/bug --transcript` instead) |
 | Themes | `/theme`, colour config | ⊘ fixed amber palette (13 colours, 16-colour console fallback) |
 | Spinner | ✅ spinner + tips | ❌ none anywhere |
-| Statusline | custom script protocol (`/statusline`, JSON in/out) | 🟨 built-in statusline only: model, branch, context/session meters, loaded counts, mode |
+| Statusline | custom script protocol (`/statusline`, JSON in/out) | 🟨 built-in statusline only: model, branch, context/session meters, loaded counts, mode. The `statusLine` settings key is ⊘ refused by name — it names a program to run, which is `ide.command`'s hole with nobody typing anything |
 | Esc-Esc | rewind menu | ✅ submits `/rewind` on an already-empty prompt; never inside pickers or permission prompts; disabled under `/vim` where Esc means normal mode |
 | Keybinding config | `/keybindings` | ✅ `%USERPROFILE%\.pasclaude\keys.json`; a binding structurally cannot reach a permission prompt (chord grammar can't spell `y`/`a`/`n`; actions are editor verbs; non-REPL prompts read through an empty profile) |
 
@@ -309,7 +309,7 @@ cannot be shadowed in pasclaude.
 | Tool naming | `mcp__server__tool`, plugin-scoped variant | ✅ same convention, composed against the API's 64-char ceiling |
 | Prompts/resources/sampling/elicitation | ✅ (prompts as slash commands; elicitation hooks) | ❌ tools only; the client advertises no capabilities |
 | Tool search / deferred loading | ✅ `ENABLE_TOOL_SEARCH`, `alwaysLoad` | ❌ tool list frozen for the session (prompt-cache reasons); discovery cache in `mcp-cache.json` |
-| In headless mode | ✅ | ❌ `-p` spawns no servers — "a scripted run cannot be the thing that first executes a project's code" |
+| In headless mode | ✅ | 🟨 `-p` reads the **user's** `mcp.json` and spawns its servers; the project's `.mcp.json` is still unread, because "a scripted run cannot be the thing that first executes a project's code" is an argument about the file the *project* wrote. A bare `-p` then denies every call (nil Ask, like every other gated tool); a `--input-format stream-json` driver answers `permission_request` and gets real use out of them |
 
 ---
 
@@ -361,7 +361,7 @@ cannot be shadowed in pasclaude.
 | --- | --- | --- |
 | Tiers | managed policy > CLI args > `.claude/settings.local.json` > `.claude/settings.json` > `~/.claude/settings.json` | user > project > local, resolved **per key** by a scope table with one writer and one enforcement point |
 | What a project may set | almost anything (trust step applies) | 🟨 exactly 4 display/economy keys — `output_style`, `thinking_budget`, `tool_result_bytes`, `auto_compact_tokens` — and the numeric three only in the direction that costs the *user* less; a repository cannot turn thinking on at all, and may only push compaction later |
-| Paste-compatibility | n/a | 30 Claude-Code-shaped keys (`permissions`, `env`, `mcpServers`, `hooks`, `apiKey`, `sandbox`, …) are refused **by name with a sentence naming the file that really owns them** — 46 entries in the table, 16 honoured. Two known omissions in §22 |
+| Paste-compatibility | n/a | 32 Claude-Code-shaped keys (`permissions`, `env`, `mcpServers`, `hooks`, `apiKey`, `sandbox`, `statusLine`, …) are refused **by name with a sentence naming the file that really owns them** — 48 entries in the table, 16 honoured, and the three scope counts are asserted in `ux` rather than only written down |
 | `env` key | ✅ injects environment | ⊘ refused — environment is inherited from whatever launched the program |
 | Hot reload | settings watched; hooks/permissions/apiKeyHelper reload live | `/config reload`; the system prompt is frozen at session start for cache reasons (documented) |
 | Backups of config | ✅ 5 timestamped backups | read-modify-write preserves hand-written blocks |
@@ -501,26 +501,41 @@ Most differences are Claude Code being larger; a few run the other way:
 
 ---
 
-## 22. One gap in our own table
+## 22. One gap in our own table — closed
 
-Everything above measures this program against another one. This entry does not: it
-is a defect against a standard the repository set for itself, which makes it the only
-item here that needs no comparison to justify acting on.
+Everything above measures this program against another one. This entry did not: it
+was a defect against a standard the repository set for itself, which made it the only
+item here that needed no comparison to justify acting on. It is recorded rather than
+deleted because the *reason* it was possible has not gone anywhere.
 
 The `scRefused` block in `src/uSettings.pas` exists because, in its own words, a key
 nothing knows about is a key that fails silently — so every key somebody might paste
 out of Claude Code's `settings.json` should sit in the table as a refusal naming the
-file that really owns it. Two do not:
+file that really owns it. Two did not, and both are now entries:
 
-* **`statusLine`** — a real Claude Code key (§7), neither honoured nor refused here.
-  A user who pastes it gets whatever the unknown-key path does, rather than a sentence
-  saying the status line is compiled in.
-* **`outputStyle`** — the camel-case spelling of the honoured `output_style`. The
-  table already carries `additionalDirectories` beside `add_dir` for exactly this
-  reason; this pair is missing the same treatment.
+* **`statusLine`** — a real Claude Code key (§7) naming a *program* whose output
+  becomes the status line. Refused twice over: pasclaude's status line is compiled in
+  and runs nothing, and a settings-settable command is `ide.command`'s hole without
+  the slash command in front of it — a clone able to set it would run a program of its
+  choosing every time the screen repainted.
+* **`outputStyle`** — the camel-case spelling of the honoured `output_style`, which
+  any tier may set. The near miss is where silence costs most: the user can see the
+  working key in somebody else's file and has no way to tell why theirs does nothing.
+  `SettingIndex` compares with `=` and nothing lowercases an incoming key, so the two
+  spellings are genuinely two entries and neither shadows the other.
 
-Two entries, one line and a `Note` each. It is the smallest actionable item in this
-document and the only one that is a bug rather than a difference.
+**What the audit found on the way, which is the part worth keeping.** The sentence
+introducing the table said *"Fourteen real keys"* and had said so since before
+`ide.enabled` and `ide.command` were added. Nothing failed; the number simply stopped
+being true, quietly, in the one place a reader checks to decide whether the README's
+scope table is complete — and this document inherited the error from the other side,
+publishing twenty-seven refusals where the code had thirty. Three prose counts, two of
+them wrong, none of them load-bearing enough for anything to notice.
+
+So the fix is not the two entries. It is that `TestSettingDefsAreComplete` now counts
+the scope column — four `scAny`, twelve `scUserOnly`, thirty-two `scRefused`, summing
+to `SettingCount` — and a key added without a decision about its column fails the run.
+A number in prose drifts; a number in an assertion does not.
 
 ## 23. What to actually do
 
@@ -530,12 +545,13 @@ not work at all.
 
 If the goal is the closest useful thing, in order:
 
-1. **`statusLine` and `outputStyle` into the refusal table** (§22) — an hour, and it
-   is the repository's own rule rather than anybody else's feature.
-2. **`-p` reads the user-scope `mcp.json`** (§10) — the cheapest real capability on
-   the list. A scripted run currently has no MCP tools at all, which makes print mode
-   strictly less capable than the REPL in a way nothing about the design requires, and
-   the trust argument for the user's own file is already made and already relied on.
+1. ~~**`statusLine` and `outputStyle` into the refusal table**~~ — **done**; see §22,
+   which also records the stale prose count the audit turned up and the assertion that
+   now stops the next one.
+2. ~~**`-p` reads the user-scope `mcp.json`**~~ — **done**; see §10. One decision had
+   been answering two questions, and the project's `.mcp.json` stays unread. The
+   residual it leaves is that a bare `-p` denies every call it can now declare, so the
+   callers who benefit are the driver and `--dangerously-skip-permissions`.
 3. **`/context`** (§2, §6) — automatic compaction is the most opaque thing the program
    does to a user, and the statusline meter answers "how full" without answering "with
    what".

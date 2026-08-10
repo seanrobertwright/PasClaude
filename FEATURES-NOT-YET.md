@@ -314,8 +314,39 @@ there rather than with the checkboxes, all of which are ticked.
   With no home at all the spool path is empty and the child's stderr goes to
   `NUL`, which is written and tested but unreachable for a user server today,
   since a user server can only exist if `%USERPROFILE%` named the `mcp.json`
-  that declared it. And `-p` reads NEITHER file, so a scripted run still has no
-  MCP tools at all.*
+  that declared it. `-p` now reads the USER's file, and only the user's: one
+  decision had been answering two questions, and separating them is the whole
+  change. The argument that kept MCP out of print mode is about the PROJECT's
+  file — a scripted run must not be the thing that first executes a
+  repository's code, because the spawn prompt is how somebody decides whether
+  to trust a program the project chose and there is nobody there to answer it.
+  Every word of that still holds and `.mcp.json` is still unread under `-p`.
+  None of it was ever true of `%USERPROFILE%\.pasclaude\mcp.json`, which names
+  programs the user chose and which `McpApproveAll` approves without asking
+  anything in the REPL today; withholding it from `-p` was not a smaller grant
+  but the same grant kept from the one caller that could not object.
+  `LoadMcpConfigUser` is one `MergeMcpConfig` where `LoadMcpConfigAll` has two,
+  written as a second function rather than a scope flag on the first, because a
+  Boolean argument would put the print-mode decision inside a function whose
+  header explains the interactive one. `McpApproveAll` is passed a **nil** Ask
+  there, and that is safe by construction rather than by luck: a user-scope
+  server is approved without being counted into `NeedAsk`, so with a user-only
+  table the prompt loop is never entered at all — `smoke` drives that exact
+  call and asserts the project's server is absent by name, because a
+  regression that let `.mcp.json` through would not merely widen the grant, it
+  would reach a nil Ask holding a question.
+  Still missing on that half: a bare `-p` has a nil `Agent.Ask`, so it declares
+  the tools and then denies every call to them, exactly as it denies every
+  other gated tool — the run says so in its output, and the feature is worth
+  having because of the two callers that can answer. A
+  `--input-format stream-json` driver answers `permission_request` lines, and
+  `--dangerously-skip-permissions` is the blunt way. Connection notices are
+  suppressed on this path because stdout carries the protocol under
+  `json` and `stream-json`, so a server that fails to come up is visible only
+  in its stderr spool and in the `/doctor` ledger, never on screen; and the
+  first-run connect is still sequential, so N servers of your own each taking
+  their 10 s deadline is a 10N-second scripted start with nothing printed while
+  it happens.*
 - [x] ~~**Hooks** — no PreToolUse/PostToolUse or other lifecycle hooks.~~
   *Built: `.pasclaude\hooks.json` runs commands at PreToolUse, PostToolUse,
   UserPromptSubmit, Stop and SessionStart, with an optional regex matcher on

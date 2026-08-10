@@ -130,12 +130,17 @@ const
     multi-megabyte document before anything else has run. }
   MaxSettingsBytes = 256 * 1024;
 
-  { Fourteen real keys, four of which a project may set, plus every name a
+  { Sixteen real keys, four of which a project may set, plus every name a
     user might paste out of Claude Code's settings.json.  Growing this table
     is the natural way to add a setting, which is exactly why the Scope column
     has to be filled in at the same moment: the load position (above the
-    print-mode halt) is legal ONLY because nothing here can grant. }
-  SettingCount = 46;
+    print-mode halt) is legal ONLY because nothing here can grant.
+
+    The count in that first sentence had been fourteen since before ide.enabled
+    and ide.command were added, which is the whole argument for the assertion
+    in ux: a number in a comment drifts silently, and this one is the number a
+    reader uses to decide whether the table in the README is complete. }
+  SettingCount = 48;
   SettingDefs: array[0..SettingCount - 1] of TSettingDef = (
     { ---- scAny: display and economy.  A project may set these. ---- }
     (Name: 'output_style'; Kind: skStr; Scope: scAny;
@@ -352,7 +357,36 @@ const
      Lo: 0; Hi: 0; ProjMax: 0; Dflt: 0; Cheap: chNone; Shape: shNone;
      Note: 'there is no GitHub settings key: the API host is compiled in ' +
        'and the token comes from GH_TOKEN, GITHUB_TOKEN or the gh CLI; no ' +
-       'file names either')
+       'file names either'),
+
+    { ---- scRefused: two spellings this table had missed, and the reason they
+      belong here is the block comment above rather than anything new.  A key
+      nothing knows about is a key that fails silently, and both of these are
+      keys somebody will paste.
+
+      statusLine is a real Claude Code key naming a PROGRAM whose output
+      becomes the status line.  It is refused twice over: pasclaude's status
+      line is compiled in and has no hook to run anything, and a settings-
+      settable command is the ide.command hole three screens up wearing a
+      different name - a cloned repository that could set it would be a cloned
+      repository running a program of its choosing every time the screen
+      repainted, which is worse than /ide because nobody has to type anything.
+
+      outputStyle is the camel-case spelling of output_style, which IS
+      honoured at any tier.  It sits here for exactly the reason
+      additionalDirectories sits beside add_dir: the near miss is the case
+      where silence is worst, because the user can see the working key in
+      their own file and has no way to tell why theirs does nothing.  Note
+      that SettingIndex compares names with = and nothing lowercases an
+      incoming key, so the two spellings really are two entries and neither
+      can shadow the other. ---- }
+    (Name: 'statusLine'; Kind: skStr; Scope: scRefused;
+     Lo: 0; Hi: 0; ProjMax: 0; Dflt: 0; Cheap: chNone; Shape: shNone;
+     Note: 'the status line is compiled in and runs no program; there is no ' +
+       'key that names one, at any tier'),
+    (Name: 'outputStyle'; Kind: skStr; Scope: scRefused;
+     Lo: 0; Hi: 0; ProjMax: 0; Dflt: 0; Cheap: chNone; Shape: shNone;
+     Note: 'the key is spelled output_style, and that one any tier may set')
   );
 
 function SettingIndex(const Name: string): Integer;      { -1 = unknown }
