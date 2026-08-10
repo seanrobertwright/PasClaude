@@ -1367,7 +1367,54 @@ session root, in the shape the rest of the ecosystem uses.
 ```
 
 You can name your own in `%USERPROFILE%\.pasclaude\mcp.json`, same shape, and
-those apply to every project you open. That file is read *first*, and its
+those apply to every project you open. **That file, and only that file, may
+also name a URL:**
+
+```json
+{"mcpServers": {
+  "remote": {"url": "https://mcp.example.com/mcp",
+             "headers": {"Authorization": "Bearer ${MY_TOKEN}"}}
+}}
+```
+
+Stateless Streamable HTTP: one POST per JSON-RPC message, and the answer comes
+back as one `application/json` document or as a `text/event-stream`, either of
+which is framed into exactly the bytes the pipe path already produces. A
+pretty-printed JSON body is compacted first, because a newline inside an object
+would otherwise frame one message as several; an SSE payload split across
+several `data:` lines is rejoined per the grammar before it is parsed. The URL
+faces the same rule as every other URL here - https anywhere, plain http only
+when the host is exactly `127.0.0.1` or `localhost` - and it is checked when
+the server is opened rather than at first use, so a refusal names the URL
+instead of reading as a server that would not talk to us.
+
+**A project's `.mcp.json` may not name a URL, and this is the one place a
+project entry is refused where a program would merely have prompted.** The
+prompt cannot carry the question. For a program it shows a command line, and
+"may this repository run this" is answerable by looking at it. For a URL the
+grant is that every argument the model passes to that tool - file contents,
+paths, whatever it read on your machine - is posted to a host the *repository*
+chose, and no prompt showing a URL asks that in a form anybody can weigh. A
+stdio server from a project can at least be read before it runs; a remote one
+cannot be read at all. Not softened to a loopback exception either: `127.0.0.1`
+in a cloned repository's file is a port on *your* machine that the repository
+picked, and "it is only local" is exactly the sentence that makes that sound
+safe.
+
+What is refused on the transport itself, by name: a server that requires a
+session. The spec lets one hand back an `Mcp-Session-Id` on initialize and
+demand it afterwards; this client carries none, so such a server refuses the
+first real request and the error says what that most likely means rather than
+reporting a bare 400. Half-supporting it - accepting the id and not resending
+it - would produce a client that works for one call and then fails in a way
+nobody can read. There is also no GET listening stream (a server pushing
+notifications needs a reader off the caller's thread, and one thread is what
+this program's concurrency arguments rest on), no `Last-Event-Id` resumption,
+no WebSocket, and no deprecated two-endpoint HTTP+SSE. And a POST is atomic
+from here, so Ctrl+C cannot cut a request already on the wire the way it can on
+the pipe path; the deadline is what bounds it.
+
+That file is read *first*, and its
 servers skip the per-command-line spawn prompt: the prompt exists because a
 repository you cloned chose a program, and this file is you choosing one. It
 does not skip the per-call permission - deciding to run a program of your own
@@ -3867,7 +3914,7 @@ pinned instead is that the success path leaves the error string empty.
 | `uDiff` | line diff used to preview a change before it is approved |
 | `uRegex` | NFA regex: compile a pattern, match a line, spend a budget |
 | `uNotebook` | `.ipynb` cell view, cell edits, nbformat's exact layout |
-| `uMcp` | MCP stdio client: two pipes, JSON-RPC, a deadline on every wait |
+| `uMcp` | MCP client: pipes or streamable HTTP, JSON-RPC, a deadline on every wait |
 | `uHooks` | a child process with a deadline, the hook table, hook dispatch |
 | `uSandbox` | the one spawn: job object, integrity level, scratch `%TEMP%` |
 | `uSettings` | the key table, the scope question, the one writer |
@@ -3880,9 +3927,15 @@ pinned instead is that the success path leaves the error string empty.
 | `uArgs` | argv to a record: every flag, every refusal, no side effect |
 | `pasclaude.lpr` | REPL, slash commands, rendering |
 
-The ladder is strict: `uSandbox` -> `uJson` -> `uHttp`/`uDiff`/`uRegex`/
+The ladder is strict: `uSandbox` -> `uJson` -> `uHttp` -> `uDiff`/`uRegex`/
 `uNotebook`/`uMcp`/`uHooks`/`uSettings`/`uAuth`/`uTelem` -> `uTools` ->
-`uAgent` -> `uDiag` -> `uSdk` -> `uArgs` -> `pasclaude.lpr`. `uArgs` is above
+`uAgent` -> `uDiag` -> `uSdk` -> `uArgs` -> `pasclaude.lpr`. `uHttp` moved out
+of that group and below it when `uMcp` gained the HTTP transport: the two had
+been peers, and one edge between them is what a second transport costs. It
+creates no cycle - `uHttp` imports `Windows` and `SysUtils` and nothing of ours
+- and it is worth stating rather than leaving to be inferred from a `uses`
+clause, because the group is otherwise a set of units that genuinely cannot see
+each other. `uArgs` is above
 `uSdk` and `uCi` because one record has to name a `TSdkFormat` and a `TCiFloor`
 at once, and those two units are peers that cannot see each other - so the
 ladder did not merely permit the argument parser's home, it chose it. Being the

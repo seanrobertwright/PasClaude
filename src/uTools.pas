@@ -7131,6 +7131,12 @@ type
   TMcpServerRec = record
     Name, Command, Hash, WorkDir, Transport: string;
     Note, LastErr, ErrLog: string;
+    { The HTTP half.  Http is the discriminator and the other two are only
+      meaningful under it; Command still carries the URL as its display string,
+      so every panel, cache key and notice that already reads Command to say
+      what a server IS keeps working without a branch. }
+    Http: Boolean;
+    Url, Headers: string;
     EnvPairs: array of string;
     TimeoutMs: Integer;
     Status: TMcpStatus;
@@ -7301,7 +7307,7 @@ begin
   case S of
     mcPending:     Result := 'pending approval';
     mcDenied:      Result := 'denied';
-    mcUnsupported: Result := 'unsupported transport (stdio only)';
+    mcUnsupported: Result := 'unsupported';
     mcCached:      Result := 'cached, connects on first use';
     mcConnected:   Result := 'connected';
     mcDead:        Result := 'dead';
@@ -7645,7 +7651,7 @@ function MergeMcpConfig(const Path, Label_: string; Scope: TMcpScope;
   var Err: string): Integer;
 var
   F: TFileStream;
-  Text, Name, Cmd, PErr: string;
+  Text, Name, Cmd, PErr, HdrName, HdrVal: string;
   Root, Servers, S, A, E: TJson;
   I, J, Held: Integer;
   Args: array of string;
@@ -7784,21 +7790,110 @@ begin
       Rec.Skipped := 0;
       SetLength(Rec.Tools, 0);
       SetLength(Rec.EnvPairs, 0);
+      { Rec is one local reused for every entry in the file, so a field added
+        to it has to be cleared HERE or it carries over.  Http carrying over is
+        not a cosmetic bug: the entry after a url server would be sent down the
+        HTTP connect path with no url, and the first version of this shipped
+        exactly that - every stdio server in the suite failed to connect,
+        because a local record's Boolean starts as whatever was on the stack. }
+      Rec.Http := False;
+      Rec.Url := '';
+      Rec.Headers := '';
       Rec.TimeoutMs := Round(S.Num('timeoutMs', uMcp.McpCallMs));
       if Rec.TimeoutMs < 1000 then Rec.TimeoutMs := 1000;
       if Rec.TimeoutMs > 600000 then Rec.TimeoutMs := 600000;
 
       Rec.Transport := LowerCase(Trim(S.Str('type')));
       if Rec.Transport = '' then Rec.Transport := 'stdio';
-      { Listed, never silently dropped.  A user who wrote an http entry and
-        saw nothing at all would conclude the feature is broken rather than
-        that this build does not speak that transport. }
+
+      { A url entry.  Two answers, and which one you get depends entirely on
+        WHOSE FILE IT IS - the same asymmetry the spawn prompt already draws,
+        pushed to its conclusion for a transport where the risk is larger.
+
+        USER SCOPE: a real server.  You named a host, and a host you named is
+        no more of a grant than a program you named; McpApproveAll already
+        approves your own servers without a question, and the per-call gate is
+        untouched.
+
+        PROJECT SCOPE: refused by name, and this is the one place a project
+        entry is refused where the stdio equivalent would merely have prompted.
+        The reason is that the prompt cannot carry the question.  For a
+        program, the prompt shows a command line and "may this repository run
+        this" is answerable by looking at it.  For a URL, the thing being
+        granted is that every argument the model passes to that tool - file
+        contents, paths, whatever it read on your machine - is posted to a host
+        the REPOSITORY chose, and no prompt showing a URL asks that question in
+        a form anybody can weigh.  A stdio server from a project can at least
+        be read before it runs; a remote one cannot be read at all.
+        Deliberately not softened to a loopback exception either: 127.0.0.1 in
+        a repository's .mcp.json is a port on YOUR machine that the repository
+        picked, and "it is only local" is exactly the sentence that makes that
+        sound safe. }
       if (S.Find('url') <> nil) or (Rec.Transport <> 'stdio') then
       begin
-        Rec.Status := mcUnsupported;
-        Rec.Command := Trim(S.Str('url'));
+        Rec.Url := Trim(McpExpandVars(S.Str('url')));
+        Rec.Command := Rec.Url;
         if Rec.Command = '' then Rec.Command := Trim(S.Str('command'));
-        Rec.Note := 'this build speaks stdio only';
+
+        if Scope <> msUser then
+        begin
+          Rec.Status := mcUnsupported;
+          Rec.Note := 'a url server may only be declared in your own ' +
+            'mcp.json, never a project''s';
+          SetLength(McpServers, Length(McpServers) + 1);
+          McpServers[High(McpServers)] := Rec;
+          Inc(Result);
+          Continue;
+        end;
+
+        if (Rec.Transport <> 'stdio') and (Rec.Transport <> 'http') and
+           (Rec.Transport <> 'streamable-http') then
+        begin
+          Rec.Status := mcUnsupported;
+          Rec.Note := 'unsupported transport "' + Rec.Transport +
+            '"; this build speaks stdio and streamable http';
+          SetLength(McpServers, Length(McpServers) + 1);
+          McpServers[High(McpServers)] := Rec;
+          Inc(Result);
+          Continue;
+        end;
+
+        if Rec.Url = '' then
+        begin
+          NoteReason(Err, Label_ + ': refused an http server with no url');
+          Continue;
+        end;
+
+        { Headers, expanded like everything else so ${TOKEN} works, and
+          composed into the CRLF block uMcp passes through verbatim.  A name or
+          a value carrying CR or LF is dropped rather than cut: a header value
+          with a newline in it is header injection, and this is the one place
+          a file the user wrote meets a request this program composes. }
+        E := S.Find('headers');
+        if (E <> nil) and (E.Kind = jkObj) then
+          for J := 0 to E.Count - 1 do
+          begin
+            HdrName := Trim(E.Key(J));
+            HdrVal := Trim(McpExpandVars(E.Item(J).AsString));
+            if (HdrName = '') or (Pos(#13, HdrName) > 0) or
+               (Pos(#10, HdrName) > 0) or (Pos(':', HdrName) > 0) or
+               (Pos(#13, HdrVal) > 0) or (Pos(#10, HdrVal) > 0) then
+            begin
+              NoteReason(Err, Label_ + ': dropped a header that cannot be ' +
+                'sent (' + HdrName + ')');
+              Continue;
+            end;
+            if Rec.Headers <> '' then Rec.Headers := Rec.Headers + #13#10;
+            Rec.Headers := Rec.Headers + HdrName + ': ' + HdrVal;
+          end;
+
+        Rec.Http := True;
+        { No hash, and that is not an omission.  A fingerprint exists so an
+          "always" can be revoked when the thing it covered changes, and a
+          user-scope server is never prompted for in the first place - so there
+          is nothing for a hash to protect.  A project-scope url never reaches
+          here to need one. }
+        Rec.Hash := '';
         SetLength(McpServers, Length(McpServers) + 1);
         McpServers[High(McpServers)] := Rec;
         Inc(Result);
@@ -8148,8 +8243,16 @@ begin
     stderr is going to NUL and there is nothing to make. }
   if McpServers[I].ErrLog <> '' then
     ForceDirectories(ExtractFilePath(McpServers[I].ErrLog));
-  C := uMcp.McpSpawn(McpServers[I].Name, McpServers[I].Command,
-    McpServers[I].WorkDir, McpServers[I].ErrLog, McpServers[I].EnvPairs, Err);
+  { The one branch the connect path needs.  Everything after it - the
+    handshake, the failure handling, the status - is the same code for both
+    transports, which is the whole point of putting the split inside uMcp's
+    send and poll rather than up here. }
+  if McpServers[I].Http then
+    C := uMcp.McpOpenHttp(McpServers[I].Name, McpServers[I].Url,
+      McpServers[I].Headers, Err)
+  else
+    C := uMcp.McpSpawn(McpServers[I].Name, McpServers[I].Command,
+      McpServers[I].WorkDir, McpServers[I].ErrLog, McpServers[I].EnvPairs, Err);
   if C < 0 then
   begin
     McpServers[I].Status := mcFailed;

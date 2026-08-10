@@ -27,6 +27,12 @@ const
     one the caller checked for. Nothing is better than almost something here. }
   HttpMaxLinkBytes = 4096;
 
+  { Content-Type is a token, a slash, a token and at most a parameter or two.
+    Anything past this is not a media type somebody meant, and the same
+    drop-whole rule applies for the same reason: half a media type is a media
+    type one character from the one the caller tested for. }
+  HttpMaxTypeBytes = 256;
+
 type
   { Called for every chunk of body bytes.  Return False to abort the transfer. }
   TChunkProc = function(const Data: string; Ctx: Pointer): Boolean;
@@ -52,6 +58,23 @@ type
       knows about no host in particular.  So the bytes go up and the trust
       decision stays up there with them. }
     Link: string;
+    { Content-Type, lower-cased and cut at the first ';' so a charset
+      parameter does not have to be handled by every caller; '' when absent or
+      over HttpMaxTypeBytes.
+
+      A third header, and it earns its place on the same test the other two
+      pass: it is a TRANSPORT fact rather than an application one.  Whether a
+      body is one JSON document or a stream of server-sent events is a
+      question about the bytes, not about what they mean, and the alternative
+      is every caller sniffing the first non-space character - which is a
+      guess that reads an opening brace at the front of an SSE comment as
+      JSON.  (Spelling that character out rather than showing it, because a
+      brace inside a brace comment opens a second comment level in FPC and
+      eats the terminator - which is exactly how this paragraph first reached
+      the compiler.)  This unit still forms no opinion about the value: MCP's
+      own two content types are named nowhere in here, and the caller compares
+      the string. }
+    ContentType: string;
   end;
 
 { POSTs Body to Url.  Headers is a CRLF-separated block ('' for none).
@@ -264,7 +287,7 @@ var
   Host, Path: string;
   Port: Word;
   Sess, Conn, Req: Pointer;
-  HdrW, HostW, PathW, VerbW, RetryW, LinkW, NameW: WideString;
+  HdrW, HostW, PathW, VerbW, RetryW, LinkW, TypeW, NameW: WideString;
   Status, Len: DWORD;
   Buf: array[0..8191] of Byte;
   Got: DWORD;
@@ -280,6 +303,7 @@ begin
   Result.Error := '';
   Result.RetryAfterMs := 0;
   Result.Link := '';
+  Result.ContentType := '';
 
   if not LoadWinHttp then
   begin
@@ -409,6 +433,27 @@ begin
             see, and again the answer to too long is nothing rather than a
             prefix. }
           if Length(Result.Link) > HttpMaxLinkBytes then Result.Link := '';
+        end;
+
+        { Content-Type, by the same call and the same rules.  Lower-cased and
+          cut at the ';' here rather than in the caller, because every caller
+          would otherwise write the same two lines and one of them would
+          eventually forget the charset parameter - `text/event-stream;
+          charset=utf-8` is a stream, and a caller comparing the whole string
+          for equality would decide it was not. }
+        NameW := 'Content-Type';
+        SetLength(TypeW, HttpMaxTypeBytes + 1);
+        Len := DWORD(Length(TypeW) * SizeOf(WideChar));
+        if wQueryHeaders(Req, WINHTTP_QUERY_CUSTOM, PWideChar(NameW),
+          PWideChar(TypeW), Len, nil) then
+        begin
+          SetLength(TypeW, Len div SizeOf(WideChar));
+          Result.ContentType := LowerCase(Trim(UTF8Encode(TypeW)));
+          if Length(Result.ContentType) > HttpMaxTypeBytes then
+            Result.ContentType := ''
+          else if Pos(';', Result.ContentType) > 0 then
+            Result.ContentType :=
+              Trim(Copy(Result.ContentType, 1, Pos(';', Result.ContentType) - 1));
         end;
 
         { On a non-2xx the body is an error document, not a stream, so it is

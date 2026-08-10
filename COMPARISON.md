@@ -300,7 +300,7 @@ cannot be shadowed in pasclaude.
 
 | Feature | Claude Code | pasclaude |
 | --- | --- | --- |
-| Transports | stdio, HTTP/streamable-HTTP, SSE, WebSocket | 🟨 **stdio only**; `url` entries listed as unsupported |
+| Transports | stdio, HTTP/streamable-HTTP, SSE, WebSocket | 🟨 stdio and **stateless streamable HTTP** (JSON or SSE responses, both framed into the same bytes the pipe path produces). A `url` server may be declared in **your own** `mcp.json` only — a project's is refused by name, because the grant is that every tool argument leaves for a host the *repository* chose and no prompt puts that in a weighable form. Session-requiring servers ⊘ refused by name; no GET listening stream, no `Last-Event-Id` resumption, no WebSocket, no deprecated two-endpoint HTTP+SSE |
 | Scopes | local / project (`.mcp.json`) / user / plugin / claude.ai connectors, precedence local→project→user→plugin→connectors | 🟨 user `%USERPROFILE%\.pasclaude\mcp.json` (trusted, loaded first) + project `.mcp.json`; a project entry may not take a user server's *name* — refused by name, not resolved |
 | Project server trust | approval prompt; `claude mcp reset-project-choices` | ✅ spawn prompt showing the expanded command line; "always" binds to a **hash of command+args+sorted env** — repointing an approved name at a different program asks again |
 | `claude mcp` CLI | add/add-json/remove/list/get/login/logout/serve/add-from-claude-desktop | 🟨 `/mcp` status, `/mcp restart <name>`, `/mcp refresh`; no CLI subcommands, no `serve` |
@@ -559,12 +559,16 @@ If the goal is the closest useful thing, in order:
    the units: the API reports prompt tokens per request and never per block, so the
    rows are byte shares and the one measured token figure stands beside them rather
    than being spread across them.
-4. **MCP over HTTP/SSE** (§10) — the one item that changes what the program can be
-   pointed at, and the only one here deserving a round of its own. `uMcp` already owns
-   the framing, the validation, the caps and the deadlines; a second transport goes
-   behind the same interface and `uHttp` exists. The hard part is not the protocol but
-   the trust question: the spawn prompt shows an expanded command line, a URL has none,
-   so both the prompt and the "always" fingerprint need a new input.
+4. ~~**MCP over HTTP/SSE**~~ — **done**, to a stated boundary; see §10. The prediction
+   that the hard part would be trust rather than protocol held, and the answer turned
+   out to be scope rather than a new prompt: a URL is a user-scope declaration or it is
+   refused. The transport itself is a third branch in `ConnSendRaw` and `ConnPoll` and
+   nothing else — the handshake, pagination, deadlines, line cap and every
+   hostile-input path are the same code for both.
+
+**The list is empty.** What replaces it is §21 and the `Still missing:` clauses, as
+before: the structural items under *How to read a ❌* are not a backlog, and the ⊘
+column is not work.
 
 **`SubagentStop` is the one ⊘ worth reopening** (§11). The recorded reason is that a
 subagent is read-only and invisible, so "block" has no legal meaning inside one — and

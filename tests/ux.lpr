@@ -4353,9 +4353,18 @@ begin
   Rows := uTools.McpServerList;
   Check(Length(Rows) = 2, Format('every configured server gets a line (%d)',
     [Length(Rows)]));
-  Check(Pos('stdio only', Row('remote')) > 0,
-    'an unsupported transport is reported, not silently dropped: ' +
+  { A url in a PROJECT's file is refused, and the refusal names the reason it
+    is refused rather than a capability we do have.  This assertion used to
+    read 'stdio only' and the change is the point: http is spoken now, and the
+    thing standing between this entry and a connection is whose file it is.
+    For a program the prompt can ask "may this repository run this"; for a URL
+    the grant is that every argument the model passes leaves for a host the
+    REPOSITORY chose, and no prompt puts that in a form anybody can weigh. }
+  Check(Pos('own mcp.json', Row('remote')) > 0,
+    'a url in a project file is refused for being in a project file: ' +
     Row('remote'));
+  Check(Pos('stdio only', Row('remote')) = 0,
+    'and not for a transport limit this build no longer has');
   Check(Pos('pending approval', Row('local')) > 0,
     'and a server nobody has answered for yet says so');
   { The whole row, not just the command column: a 4000-character command line
@@ -4378,8 +4387,8 @@ begin
   Rows := uTools.McpServerList;
   Check(Pos('denied', Row('local')) > 0,
     'a denied server is shown as denied: ' + Row('local'));
-  Check(Pos('stdio only', Row('remote')) > 0,
-    'and an unsupported one is not re-labelled by the approval pass');
+  Check(Pos('own mcp.json', Row('remote')) > 0,
+    'and a refused url is not re-labelled by the approval pass');
 
   Check(not uTools.McpRestart('nosuchserver', Err),
     'restarting a server that does not exist fails');

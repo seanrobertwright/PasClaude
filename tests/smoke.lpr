@@ -3627,6 +3627,208 @@ end;
   assertion above is worth making - a regression that let .mcp.json through
   here would not merely widen the grant, it would reach a nil Ask with a
   question to ask. }
+{ ---- MCP over streamable HTTP ---- }
+
+var
+  { The scripted HTTP server.  One reply per request, taken in order, so a
+    handshake and a tools/list are two entries and the test reads as a
+    conversation.  Anything past the end is a 500, which is how a test that
+    sends one request more than it scripted fails loudly rather than by
+    replaying the last answer. }
+  HttpReplies: array of record
+    Status: Integer;
+    CType: string;
+    Body: string;
+  end;
+  HttpAt: Integer = 0;
+  HttpLastBody: string = '';
+  HttpLastHeaders: string = '';
+  HttpPosts: Integer = 0;
+
+procedure ScriptHttp(Status: Integer; const CType, Body: string);
+var
+  N: Integer;
+begin
+  N := Length(HttpReplies);
+  SetLength(HttpReplies, N + 1);
+  HttpReplies[N].Status := Status;
+  HttpReplies[N].CType := CType;
+  HttpReplies[N].Body := Body;
+end;
+
+procedure ScriptHttpReset;
+begin
+  SetLength(HttpReplies, 0);
+  HttpAt := 0;
+  HttpPosts := 0;
+  HttpLastBody := '';
+  HttpLastHeaders := '';
+end;
+
+function McpHttpStub(const Url, Headers, Body: string;
+  OnChunk: TChunkProc; Ctx: Pointer): THttpResult;
+begin
+  Inc(HttpPosts);
+  HttpLastBody := Body;
+  HttpLastHeaders := Headers;
+  Result.Ok := True;
+  Result.Error := '';
+  Result.RetryAfterMs := 0;
+  Result.Link := '';
+  if HttpAt > High(HttpReplies) then
+  begin
+    Result.Status := 500;
+    Result.ContentType := 'text/plain';
+    Result.Body := 'no reply scripted';
+    Exit;
+  end;
+  Result.Status := HttpReplies[HttpAt].Status;
+  Result.ContentType := HttpReplies[HttpAt].CType;
+  Result.Body := HttpReplies[HttpAt].Body;
+  Inc(HttpAt);
+end;
+
+{ The framer, driven directly.  This is where a hostile body meets our line
+  framing, and it is a pure function, so it is asserted with strings rather
+  than through a connection. }
+procedure TestMcpHttpFrame;
+var
+  S: string;
+begin
+  Check(McpHttpFrame('', 'application/json') = '',
+    'an empty body frames nothing');
+  Check(McpHttpFrame('   ', 'text/event-stream') = '',
+    'and neither does whitespace');
+
+  { The framing guarantee: one message, one line, whatever the server's
+    formatting.  A pretty-printed body would otherwise be several lines and
+    the reader above would see several broken messages. }
+  S := McpHttpFrame('{'#10'  "jsonrpc": "2.0",'#10'  "id": 1'#10'}',
+    'application/json');
+  Check(Pos(#10, S) = Length(S),
+    'a pretty-printed JSON body is compacted to exactly one line');
+  Check(Pos('"id":1', S) > 0, 'and its content survives the compaction');
+
+  S := McpHttpFrame('data: {"jsonrpc":"2.0","id":7}'#10#10,
+    'text/event-stream');
+  Check(S = '{"jsonrpc":"2.0","id":7}'#10, 'one SSE event is one line: ' + S);
+
+  { CRLF, a comment, an event: name and an id: field - everything the grammar
+    allows around the payload, none of which this client uses. }
+  S := McpHttpFrame(': keepalive'#13#10 + 'event: message'#13#10 +
+    'id: 4'#13#10 + 'data: {"a":1}'#13#10#13#10, 'text/event-stream');
+  Check(S = '{"a":1}'#10,
+    'comments, event names and ids are read and dropped: ' + S);
+
+  { Two events in one body, which is what a server answering a batch does. }
+  S := McpHttpFrame('data: {"a":1}'#10#10'data: {"b":2}'#10#10,
+    'text/event-stream');
+  Check(S = '{"a":1}'#10'{"b":2}'#10, 'two events are two lines: ' + S);
+
+  { A payload split across data: lines is ONE message, joined per the grammar
+    before it is parsed - the case a naive implementation turns into two
+    unparseable halves. }
+  S := McpHttpFrame('data: {"a":'#10'data: 1}'#10#10, 'text/event-stream');
+  Check(S = '{"a":1}'#10, 'a split payload is rejoined, not broken: ' + S);
+
+  { A stream that ends without its blank line still delivered its message. }
+  S := McpHttpFrame('data: {"a":1}', 'text/event-stream');
+  Check(S = '{"a":1}'#10, 'an unterminated final event is still delivered');
+
+  { Unparseable bytes go up verbatim rather than being dropped, so the line
+    reader reports the server's own text and not silence. }
+  S := McpHttpFrame('not json at all', 'application/json');
+  Check(Pos('not json at all', S) > 0,
+    'a body that will not parse is passed through for the reader to report');
+
+  { No Content-Type is treated as JSON, which is the likelier mislabelling. }
+  Check(McpHttpFrame('{"a":1}', '') = '{"a":1}'#10,
+    'a missing content type is read as JSON');
+end;
+
+{ A whole conversation over HTTP, through the same handshake and tools/list
+  the pipe path uses.  That is the assertion: not that HTTP works, but that
+  NOTHING above the transport had to change to make it work. }
+procedure TestMcpHttpConversation;
+var
+  C: Integer;
+  Err, SN, SV, SP: string;
+  Arr: TJson;
+  Saved: uHttp.TPostProc;
+begin
+  Saved := uHttp.HttpTransport;
+  uHttp.HttpTransport := @McpHttpStub;
+  try
+    ScriptHttpReset;
+    { initialize, then the notification's 202 with no body, then tools/list. }
+    ScriptHttp(200, 'application/json',
+      '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18",' +
+      '"serverInfo":{"name":"remote","version":"2"}}}');
+    ScriptHttp(202, '', '');
+    ScriptHttp(200, 'text/event-stream',
+      'data: {"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"ask"},' +
+      '{"name":"tell"}]}}'#10#10);
+
+    C := McpOpenHttp('remote', 'https://example.invalid/mcp', '', Err);
+    Check(C >= 0, 'an http connection opens: ' + Err);
+    Check(HttpPosts = 0, 'and nothing is sent until the handshake');
+
+    Check(McpHandshake(C, SN, SV, SP, Err), 'the handshake completes: ' + Err);
+    Check(SN = 'remote', 'the server names itself');
+    Check(SP = '2025-06-18', 'and reports a protocol version');
+    Check(HttpPosts = 2, Format('initialize and the notification are two ' +
+      'posts (%d)', [HttpPosts]));
+    Check(Pos('Accept: application/json, text/event-stream', HttpLastHeaders) > 0,
+      'both content types are accepted, since the server picks');
+    Check(Pos('Content-Type: application/json', HttpLastHeaders) > 0,
+      'and the request says what it is sending');
+
+    { The reply came back as SSE and the caller cannot tell: this is the
+      whole point of framing below the protocol. }
+    Check(McpListTools(C, Arr, Err), 'tools/list succeeds over SSE: ' + Err);
+    if Arr <> nil then
+    try
+      Check(Arr.Count = 2, 'and both declarations arrive');
+      Check(Arr.Item(0).Str('name') = 'ask', 'in the order the server gave');
+    finally
+      Arr.Free;
+    end;
+    McpClose(C);
+
+    { A URL this program will not fetch is refused at open time, by the same
+      rule every other URL in the program faces - not at first use, where it
+      would read as a server that would not talk to us. }
+    Check(McpOpenHttp('bad', 'http://example.invalid/mcp', '', Err) < 0,
+      'plain http to a remote host is refused');
+    Check(Pos('https', Err) > 0, 'and the refusal says what is allowed: ' + Err);
+    Check(McpOpenHttp('bad', 'ftp://example.invalid/', '', Err) < 0,
+      'and so is a scheme nothing here speaks');
+
+    { The session refusal.  A server that answers the handshake and then
+      refuses is reported as what it most likely is, because a bare 400 leaves
+      the user unable to tell a wrong URL from an out-of-scope server. }
+    ScriptHttpReset;
+    ScriptHttp(200, 'application/json',
+      '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18",' +
+      '"serverInfo":{"name":"sessions","version":"1"}}}');
+    ScriptHttp(202, '', '');
+    ScriptHttp(400, 'text/plain', 'Bad Request: Mcp-Session-Id required');
+    C := McpOpenHttp('sessions', 'https://example.invalid/mcp', '', Err);
+    Check(C >= 0, 'a session-demanding server opens like any other');
+    Check(McpHandshake(C, SN, SV, SP, Err),
+      'and answers the handshake: ' + Err);
+    Check(not McpListTools(C, Arr, Err), 'then refuses the first real call');
+    Check(Pos('Mcp-Session-Id', Err) > 0,
+      'and the refusal names the session id: ' + Err);
+    Check(Pos('stateless', Err) > 0, 'and says what this build does speak');
+    McpClose(C);
+  finally
+    uHttp.HttpTransport := Saved;
+    ScriptHttpReset;
+    McpShutdownAll;
+  end;
+end;
+
 procedure TestMcpUserScopeUnderPrintMode;
 var
   Err, Home, Proj: string;
@@ -7573,6 +7775,8 @@ begin
   TestPlanToolListAndPrintRule;
   TestToolRegistry;
   TestMcpApprovals;
+  TestMcpHttpFrame;
+  TestMcpHttpConversation;
   TestMcpUserScopeUnderPrintMode;
   TestMcpPermissionClass;
   TestMcpScripted;

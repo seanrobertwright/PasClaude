@@ -244,9 +244,59 @@ there rather than with the checkboxes, all of which are ticked.
   rejected rather than truncated past 8 KB or depth 16, descriptions cut on a
   UTF-8 boundary, `annotations`/`title`/`outputSchema` dropped, 32 KB of
   declarations across all servers.
-  Still missing: stdio only — a `url` entry or a non-stdio `type` is listed as
-  unsupported and contributes nothing; HTTP, Streamable HTTP, SSE and WebSocket
-  are not implemented. Tools only — no prompts, resources, sampling, roots or
+  Streamable HTTP is spoken now, statelessly, and the shape of the change is
+  the claim worth checking: the whole transport is a third branch in
+  `ConnSendRaw` and a third branch in `ConnPoll`, and nothing else in `uMcp`
+  moved. The handshake, id matching, pagination, the deadlines, the line cap
+  and every hostile-input path already operated on bytes in and bytes out, so
+  they are the same code for both transports — a version that gave HTTP its own
+  handshake and its own list loop would have been two clients to keep in step,
+  and the second one would have been the one without the hostile-input tests.
+  A response arrives as one `application/json` document or as a
+  `text/event-stream`, and `McpHttpFrame` turns either into the newline-framed
+  bytes the pipe path already produces: a JSON body is re-emitted COMPACT
+  because a server is entitled to pretty-print and a newline inside an object
+  would frame one message as several, and an SSE payload split across several
+  `data:` lines is rejoined per the grammar before it is parsed rather than
+  delivered as two unparseable halves. `uHttp` gained one field to make that
+  possible, `ContentType`, which earns its place on the same test `Link` passed:
+  whether a body is one document or a stream is a fact about the bytes, and the
+  alternative is every caller sniffing the first character and reading a brace
+  at the front of an SSE comment as JSON.
+  **A `url` server may be declared in your own `mcp.json` and never in a
+  project's**, and that is the one place a project entry is refused where the
+  stdio equivalent would merely have prompted. The reason is that the prompt
+  cannot carry the question. For a program, it shows a command line and "may
+  this repository run this" is answerable by looking at it; for a URL, the thing
+  being granted is that every argument the model passes to that tool — file
+  contents, paths, whatever it read on your machine — is posted to a host the
+  REPOSITORY chose, and no prompt showing a URL asks that in a form anybody can
+  weigh. A stdio server from a project can at least be read before it runs; a
+  remote one cannot be read at all. Deliberately not softened to a loopback
+  exception either: `127.0.0.1` in a repository's `.mcp.json` is a port on YOUR
+  machine that the repository picked, and "it is only local" is exactly the
+  sentence that makes that sound safe.
+  Still missing: a server that requires a session is refused BY NAME. The spec
+  lets one hand back an `Mcp-Session-Id` on initialize and demand it after, and
+  this client carries none — so such a server answers the first real request
+  with 400 or 404 and the refusal says what that most likely means rather than
+  reporting a bare status. Refused rather than half-supported for the reason
+  nbformat v3 is: a session id accepted and not resent produces a client that
+  works for one call and then fails in a way nobody can read. Also absent, each
+  for its own reason: the GET listening stream, because a server pushing
+  notifications at us needs a reader that is not on the caller's thread and the
+  single-thread argument is what this whole unit rests on; `Last-Event-Id`
+  resumption; WebSocket; and the deprecated two-endpoint HTTP+SSE transport. A
+  POST is atomic from here, so Ctrl+C cannot cut a request already on the wire
+  where the pipe path checks every five milliseconds — what stops it hanging is
+  `HttpTimeoutMs`, set for the call and restored in a `finally` exactly as the
+  telemetry flush does it. And there is no fingerprint for a URL server,
+  deliberately: a fingerprint exists so an "always" can be revoked when what it
+  covered changes, and a user-scope server is never prompted for, so there is
+  nothing for one to protect.
+  Still missing on the older half: WebSocket and the non-stdio `type` values
+  beyond `http`/`streamable-http` are listed as unsupported and contribute
+  nothing. Tools only — no prompts, resources, sampling, roots or
   elicitation, and the client advertises no capabilities so a conformant server
   never asks. Handshake-era protocol only: we send 2025-06-18 and accept what
   comes back, so a server speaking only the 2026-07-28 revision, which removed
