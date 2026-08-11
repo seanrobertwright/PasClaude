@@ -139,11 +139,36 @@ uses SysUtils;
 const
   WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY = 4;
   WINHTTP_FLAG_SECURE                 = $00800000;
+  { THE TWO CORRECTED VALUES, and they are worth a paragraph because both were
+    wrong in shipped code and both failures were invisible to every offline
+    suite.  winhttp.h numbers these headers in a fixed table; being one out, or
+    two orders of magnitude out, does not fail the call - it silently answers
+    with a DIFFERENT header, which is the worst possible failure mode for a
+    constant.
+
+    RETRY_AFTER was 35, which is WINHTTP_QUERY_REFERER.  So the retry backoff
+    has never once seen a server's Retry-After: the query asked for Referer,
+    found none on an error response, and fell through to the default backoff
+    every time.  The behaviour was correct-looking because the fallback is
+    sane, and the test that proves Retry-After is honoured drives a STUB that
+    sets RetryAfterMs itself.
+
+    CUSTOM was 65, which is WINHTTP_QUERY_VARY.  Every by-name query in this
+    unit therefore returned the value of Vary regardless of the name asked
+    for - which is how /pr-comments came to follow a Link header that was
+    really `Accept,Accept-Encoding`, find no rel="next" in it, and report the
+    list as possibly incomplete.  That guard firing was the only visible
+    symptom, and it read as GitHub not sending a Link rather than as us not
+    reading one.
+
+    Found by pointing the net suite at real servers for the first time, which
+    is the whole argument for that suite existing. }
+  WINHTTP_QUERY_CONTENT_TYPE          = 1;
   WINHTTP_QUERY_STATUS_CODE           = 19;
-  WINHTTP_QUERY_RETRY_AFTER           = 35;
+  WINHTTP_QUERY_RETRY_AFTER           = 36;
   { Query a header by name: the name goes in pwszName, the value comes back in
     lpBuffer. }
-  WINHTTP_QUERY_CUSTOM                = 65;
+  WINHTTP_QUERY_CUSTOM                = 65535;
   WINHTTP_QUERY_FLAG_NUMBER           = $20000000;
   INTERNET_DEFAULT_HTTPS_PORT         = 443;
   INTERNET_DEFAULT_HTTP_PORT          = 80;
@@ -435,16 +460,22 @@ begin
           if Length(Result.Link) > HttpMaxLinkBytes then Result.Link := '';
         end;
 
-        { Content-Type, by the same call and the same rules.  Lower-cased and
-          cut at the ';' here rather than in the caller, because every caller
-          would otherwise write the same two lines and one of them would
-          eventually forget the charset parameter - `text/event-stream;
-          charset=utf-8` is a stream, and a caller comparing the whole string
-          for equality would decide it was not. }
-        NameW := 'Content-Type';
+        { Content-Type, lower-cased and cut at the ';' here rather than in the
+          caller, because every caller would otherwise write the same two lines
+          and one of them would eventually forget the charset parameter -
+          `text/event-stream; charset=utf-8` is a stream, and a caller
+          comparing the whole string for equality would decide it was not.
+
+          WINHTTP_QUERY_CONTENT_TYPE, the dedicated constant, and NOT
+          WINHTTP_QUERY_CUSTOM with the name - which is what this asked for
+          first and which came back with the value of `Vary` against a real
+          server.  The by-name path is what Link above uses and it is now under
+          suspicion for the same reason; see the note there.  Where WinHTTP
+          gives a header its own info level there is no reason to go through
+          the generic one, and one fewer string to get wrong. }
         SetLength(TypeW, HttpMaxTypeBytes + 1);
         Len := DWORD(Length(TypeW) * SizeOf(WideChar));
-        if wQueryHeaders(Req, WINHTTP_QUERY_CUSTOM, PWideChar(NameW),
+        if wQueryHeaders(Req, WINHTTP_QUERY_CONTENT_TYPE, nil,
           PWideChar(TypeW), Len, nil) then
         begin
           SetLength(TypeW, Len div SizeOf(WideChar));
