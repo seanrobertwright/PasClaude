@@ -294,6 +294,20 @@ guessing shorter re-hits the limit, guessing longer wastes the user's time.
 The value is clamped to a minute; a server asking for an hour is answered by
 giving up, not by an unkillable hour-long sleep.
 
+That sentence was aspirational until recently and is now true, which is worth
+saying rather than quietly fixing. `WINHTTP_QUERY_RETRY_AFTER` was declared as
+35, which is `WINHTTP_QUERY_REFERER`, so the query asked for the wrong header,
+found nothing, and fell through to the guess every single time. The same
+mistake was larger next door: `WINHTTP_QUERY_CUSTOM` was 65, which is
+`WINHTTP_QUERY_VARY`, so *every* by-name header read returned the value of
+`Vary` regardless of the name asked for - which is how `/pr-comments` came to
+follow a `Link` header that was really `Accept,Accept-Encoding`, find no
+`rel="next"` in it, and report the list as possibly incomplete. Neither failed
+loudly, because a wrong info level does not fail the call: it answers with a
+different header. Both were found the first time `tests\net.lpr` asked a real
+server for those headers, and both now have assertions there against servers
+nobody here wrote.
+
 At the prompt, the arrow keys move the caret and walk the command history,
 `Home`/`End` (or `Ctrl+A`/`Ctrl+E`) jump to either end, and `Ctrl+U` clears
 the line. `Ctrl+W`, `Ctrl+K`, `Alt+B`, `Alt+F` and `Ctrl+Z` are the readline
@@ -3244,6 +3258,23 @@ ownership here is manual, so a leak is a defect rather than noise.
   request body with a structured `authentication_error`. It also feeds real
   wire bytes into the decoder, one byte at a time, to cover the seam between
   the two.
+  It now also reads **response headers** off real servers, which is the class
+  of bug the offline suites are structurally unable to see: every one of them
+  drives a stub that fills `THttpResult` itself, so a query asking WinHTTP for
+  the wrong header passes them all. `Content-Type` is checked against an echo
+  service that sends a charset parameter, and `Link` against a paginated
+  GitHub endpoint that really sends `rel="next"` - the two assertions that
+  caught the wrong info levels described under **Run**. A GitHub rate-limit
+  answer is reported as a skip rather than a failure, because a 403 there is
+  not a header bug.
+  And MCP over streamable HTTP is driven end to end against a live public
+  server (DeepWiki's, no credential, stateless), so the handshake, the 202 with
+  no body, and a `tools/list` that arrives as real server-sent events are all
+  exercised against bytes nobody here wrote. A second case points the same
+  transport at an echo service that is not an MCP server at all and asserts the
+  handshake fails, with a message, inside its deadline - which is the property
+  the whole deadline design exists to provide and the one a mock cannot
+  honestly demonstrate.
 
 The suites were checked by mutation, not just by passing: reverting the
 `input_json_delta` accumulator to an assignment fails 4 assertions, flipping

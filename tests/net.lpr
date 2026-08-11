@@ -11,7 +11,7 @@ program net;
 
 {$mode objfpc}{$H+}
 
-uses SysUtils, uJson, uHttp, uAgent;
+uses SysUtils, uJson, uHttp, uMcp, uAgent;
 
 var
   Fails: Integer = 0;
@@ -101,6 +101,15 @@ begin
   finally
     Doc.Free;
   end;
+
+  { ContentType against real bytes, which is the only place that field has ever
+    met any.  postman-echo answers `application/json; charset=utf-8`, so this
+    covers both halves of what the reader does to it - the lower-casing and the
+    cut at the ';' - and it covers them on a header nobody here wrote.  A unit
+    test can only assert that our own parser agrees with our own fixture. }
+  Check(R.ContentType = 'application/json',
+    'Content-Type comes back cut at the charset and lower-cased: "' +
+    R.ContentType + '"');
 end;
 
 { Larger than one read buffer, so the multi-chunk path is exercised. }
@@ -293,6 +302,142 @@ end;
 
 { The GET path the fetch tool rides.  Same transport underneath, but the
   verb, the collected body and the byte cap are its own code. }
+{ ---- MCP over streamable HTTP, against a server nobody here wrote ---------
+
+  The transport this exercises was built and merged with every byte of its
+  input coming from a stub in smoke.  That suite is the better test of the
+  hostile cases - it can script a body no real server would send - and it is
+  the worse test of the ordinary one, because a mock agrees with whatever its
+  author believed about the protocol.  This is the assertion that the belief
+  was right.
+
+  DeepWiki's public endpoint is used because it needs no credential and is
+  stateless: it hands back no Mcp-Session-Id, which is exactly the subset this
+  client implements.  That makes it a fair test of what was built and not a
+  test of what was deliberately refused.
+
+  IT IS SOMEBODY ELSE'S SERVER, and this suite already accepts that dependency
+  for postman-echo and the Anthropic endpoint.  The failure message names the
+  host for the same reason those do: a run that fails here on a Tuesday is far
+  more likely to be their outage than our regression, and the person reading
+  the output should not have to work that out. }
+const
+  LiveMcpUrl = 'https://mcp.deepwiki.com/mcp';
+  TheirFault = ' (this is ' + LiveMcpUrl + ', not necessarily us)';
+
+procedure TestMcpOverRealHttp;
+var
+  C: Integer;
+  Err, SN, SV, SP: string;
+  Arr: TJson;
+  I: Integer;
+  Named: Boolean;
+begin
+  C := uMcp.McpOpenHttp('deepwiki', LiveMcpUrl, '', Err);
+  Check(C >= 0, 'a real MCP endpoint opens: ' + Err);
+  if C < 0 then Exit;
+  try
+    { The handshake, over a transport that has only ever met a fixture.  A real
+      server answers this one as text/event-stream, so the SSE framer is on the
+      path from the very first message rather than only on tools/list. }
+    Check(uMcp.McpHandshake(C, SN, SV, SP, Err),
+      'the handshake completes against a real server: ' + Err + TheirFault);
+    if not uMcp.McpAlive(C) then Exit;
+    Check(SN <> '', 'the server names itself: ' + SN);
+    Check(SP <> '', 'and reports a protocol version: ' + SP);
+
+    { The notification in the middle of that handshake comes back 202 with an
+      empty body.  Nothing upstream waits for it, and an empty body must frame
+      to nothing rather than to a blank line the reader would then try to
+      parse - which is a case only a real server produces naturally. }
+    Check(uMcp.McpState(C) = uMcp.msRunning,
+      'and the connection survived a 202 with no body');
+
+    Check(uMcp.McpListTools(C, Arr, Err),
+      'tools/list succeeds over real SSE: ' + Err + TheirFault);
+    if Arr = nil then Exit;
+    try
+      Check(Arr.Count > 0, Format('and the server declares tools (%d)',
+        [Arr.Count]));
+      Named := False;
+      for I := 0 to Arr.Count - 1 do
+        if Trim(Arr.Item(I).Str('name')) <> '' then Named := True;
+      Check(Named, 'at least one of them has a name we can compose from');
+      { Not asserted: WHICH tools. They are DeepWiki's to change, and a test
+        that pinned their catalogue would fail on their release rather than on
+        our regression. }
+    finally
+      Arr.Free;
+    end;
+  finally
+    uMcp.McpClose(C);
+  end;
+end;
+
+{ A real HTTPS server that is not an MCP server at all.  The question is not
+  whether this fails - of course it does - but HOW: cleanly, with a message,
+  and without hanging, which is the property the whole deadline design exists
+  to provide and which no mock can honestly demonstrate. }
+procedure TestMcpHttpAgainstNonMcp;
+var
+  C: Integer;
+  Err, SN, SV, SP: string;
+  Started: QWord;
+  Elapsed: QWord;
+begin
+  C := uMcp.McpOpenHttp('notmcp', 'https://postman-echo.com/post', '', Err);
+  Check(C >= 0, 'a non-MCP https endpoint opens like any other: ' + Err);
+  if C < 0 then Exit;
+  try
+    Started := GetTickCount64;
+    Check(not uMcp.McpHandshake(C, SN, SV, SP, Err),
+      'the handshake against a non-MCP server fails');
+    Elapsed := GetTickCount64 - Started;
+    Check(Err <> '', 'and says something: ' + Err);
+    { Well inside McpHandshakeMs.  The point is that it returns at all: an echo
+      service answers 200 with a body that is not a JSON-RPC reply, which is
+      the shape most likely to leave a client waiting for a message that will
+      never come. }
+    Check(Elapsed < 30000,
+      Format('and returns rather than hanging (%d ms)', [Elapsed]));
+  finally
+    uMcp.McpClose(C);
+  end;
+end;
+
+{ The Link header, against a server that really sends one.
+
+  This exists because of what the Content-Type work turned up: the first
+  version of that read used WINHTTP_QUERY_CUSTOM with the name 'Content-Type'
+  and came back with the value of `Vary`.  Link is read through that same
+  by-name path, and every existing test of pagination drives a STUB that sets
+  Result.Link itself - so the one line that actually asks WinHTTP for it had
+  never been exercised against a real response in this program's life.
+
+  GitHub's public API pages without a credential and sends a Link with
+  rel="next", which makes it the cheapest real check there is.  If this passes,
+  the by-name query works and Content-Type was special in some way; if it
+  fails, /pr-comments has been following a header nobody ever read. }
+procedure TestLinkHeaderIsReal;
+var
+  R: THttpResult;
+begin
+  R := HttpGet('https://api.github.com/repos/torvalds/linux/commits?per_page=1',
+    'user-agent: pasclaude-tests'#13#10'accept: application/vnd.github+json', 0);
+  Check(R.Ok, 'a paginated GitHub endpoint answers: ' + R.Error);
+  if not R.Ok then Exit;
+  { 403 is rate limiting, not a header bug, and it must not read as one. }
+  if R.Status <> 200 then
+  begin
+    Check(True, Format('skipped: GitHub answered %d (rate limit?), so the ' +
+      'Link read is untested this run', [R.Status]));
+    Exit;
+  end;
+  Check(R.Link <> '', 'the Link header is read back at all');
+  Check(Pos('rel="next"', R.Link) > 0,
+    'and it is the Link header rather than some other one: ' + R.Link);
+end;
+
 procedure TestRealGet;
 var
   R: THttpResult;
@@ -321,6 +466,9 @@ begin
   TestAnthropicErrorPath;
   TestRequestReachesApi;
   TestWireIntoDecoder;
+  TestMcpOverRealHttp;
+  TestMcpHttpAgainstNonMcp;
+  TestLinkHeaderIsReal;
   WriteLn;
   if Fails = 0 then
     WriteLn('all network tests passed')
