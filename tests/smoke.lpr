@@ -6795,8 +6795,10 @@ begin
     GhParseRemote('https://github.com/o/r', R);
     GhResolveToken(A);
 
-    { One followed link: five GETs, not four, and the second page comes from
-      the URL the Link named rather than one this program guessed. }
+    { One further page: five GETs, not four.  P2 is P1 with &page=2 on the end,
+      which is exactly what the loop composes, so this asserts the composed URL
+      is right - it is no longer the URL the Link named, and the three cases
+      below are where that distinction becomes visible. }
     GhBodies[1] := '[{"user":{"login":"a"},"body":"p1"}]';
     GhLinks[1] := Rel(P2);
     GhBodies[2] := '[{"user":{"login":"a"},"body":"p2"}]';
@@ -6804,7 +6806,7 @@ begin
       'a rel="next" is followed, making five GETs and not four');
     Check(GhCalls = 5, 'five requests: ' + IntToStr(GhCalls));
     Check(GhUrls[2] = P2,
-      'and the second page is fetched from the URL the Link named: ' +
+      'and the second page is the first one with &page=2 appended: ' +
       GhUrls[2]);
     Check((Length(Items) = 2) and (Items[0].Body = 'p1') and
       (Items[1].Body = 'p2'), 'items from both pages are kept in order');
@@ -6812,39 +6814,45 @@ begin
       'and a list that ended is not reported as truncated: ' + Info.Notice);
 
     { A Link naming another host.  This is the attack the compiled-in constant
-      cannot stop by itself, because nothing in a settings file was involved. }
+      cannot stop by itself, because nothing in a settings file was involved -
+      and under the URL-composing loop it stops being a decision at all, which
+      is the whole gain.  The old assertions here were that the link was
+      REFUSED and that a sentence said so; these are stronger and simpler,
+      because a URL that is never read cannot be followed by mistake, cannot be
+      followed by a future edit, and needs no rule kept correct. }
     GhReset;
     GhBodies[1] := '[{"user":{"login":"a"},"body":"p1"}]';
     GhLinks[1] := Rel('https://evil.com/repos/o/r/pulls/1/comments?page=2');
     Check(GhFetchPrComments(R, 1, A, Info, Items, E),
-      'a cross-host Link is not followed');
-    Check(GhCalls = 4, 'so there are still four requests: ' + IntToStr(GhCalls));
-    for I := 0 to 3 do
+      'a cross-host Link names a page that is simply never requested');
+    Check(GhCalls = 5,
+      'the second page is fetched from our own URL instead: ' +
+      IntToStr(GhCalls));
+    for I := 0 to GhCalls - 1 do
+      Check(Pos('evil.com', GhUrls[I]) = 0,
+        'the token never goes to the host a Link named: ' + GhUrls[I]);
+    for I := 0 to GhCalls - 1 do
       Check(Copy(GhUrls[I], 1, 23) = 'https://api.github.com/',
         'every request stayed on the compiled-in host: ' + GhUrls[I]);
-    for I := 0 to 3 do
-      Check(Pos('evil.com', GhUrls[I]) = 0,
-        'the token never goes to the host a Link named');
-    Check(Pos('A page link was refused', Info.Notice) > 0,
-      'and the refusal is named in the notice: ' + Info.Notice);
-    Check(Pos(GhApiBase, Info.Notice) > 0,
-      'which quotes the rule and names the only host a link may point at');
+    Check(GhUrls[2] = P2,
+      'and page two was ours, composed rather than accepted: ' + GhUrls[2]);
 
-    { The same sentence for a refusal that is not a cross-host one, and that
-      sameness is the point.  Eight different things make GhNextUrlOk say no
-      and only one of them is another host; a link to a different endpoint on
-      api.github.com itself is refused for the path rule.  Telling that user a
-      server had tried to redirect them off the host would be a lie on the one
-      line whose whole job is to report that something attacked them. }
+    { A same-host link to a different ENDPOINT, which used to be refused by the
+      path rule.  It is equally irrelevant now, and this case is kept because it
+      is the one that broke the feature in the field: GitHub answers
+      /repos/OWNER/REPO/... with a next link under /repositories/<id>/..., the
+      same resource canonically spelled, and the path rule turned it down.  A
+      loop that reads no next URL cannot make that mistake about anybody's
+      spelling. }
     GhReset;
     GhBodies[1] := '[{"user":{"login":"a"},"body":"p1"}]';
     GhLinks[1] := Rel('https://api.github.com/user/emails?per_page=100');
     Check(GhFetchPrComments(R, 1, A, Info, Items, E),
-      'a same-host link to another endpoint is refused as well');
-    Check(GhCalls = 4, 'costing no extra request: ' + IntToStr(GhCalls));
-    Check(Pos('A page link was refused', Info.Notice) > 0,
-      'and gets the same sentence, which claims no attack it cannot see: ' +
-      Info.Notice);
+      'a same-host link to another endpoint is ignored too');
+    Check(GhCalls = 5, 'and page two is still ours: ' + IntToStr(GhCalls));
+    for I := 0 to GhCalls - 1 do
+      Check(Pos('/user/emails', GhUrls[I]) = 0,
+        'the endpoint the Link named is never requested: ' + GhUrls[I]);
 
     { The page cap.  Every page offers another, for all three lists: one GET
       for the pull request and three for each list is ten. }
@@ -6904,17 +6912,20 @@ begin
     Check((Items[0].Body = 'n1') and (Items[299].Body = 'n300'),
       'in page order across all three');
 
-    { A link back at the page it came from.  The page cap would absorb it, but
-      it is named so the notice can be honest about a list that was cut by a
-      cycle rather than by length. }
+    { A link back at the page it came from.  There used to be an explicit check
+      for this, because following a self-referential URL re-read the same
+      hundred items until the page cap stopped it.  A cycle is now
+      INEXPRESSIBLE: the page number comes from a counter, so the next request
+      is always page 2 whatever the server points at, and the fixture's empty
+      second page ends the loop. }
     GhReset;
     GhBodies[1] := '[{"user":{"login":"a"},"body":"p1"}]';
     GhLinks[1] := Rel(P1);
     Check(GhFetchPrComments(R, 1, A, Info, Items, E),
-      'a Link pointing back at the page it came from is not followed');
-    Check(GhCalls = 4, 'and costs no extra request: ' + IntToStr(GhCalls));
-    Check(Length(Items) = 1, 'and the page is not read twice');
-    Check(Info.Notice <> '', 'and the list is reported as cut');
+      'a Link pointing back at the page it came from cannot cause a cycle');
+    Check(GhUrls[2] = P2,
+      'the next request advances to page two regardless: ' + GhUrls[2]);
+    Check(Length(Items) = 1, 'and the first page is not read twice');
 
     { The case the old count-based guess used to catch, and the reason it is
       not simply gone: a FULL page with no Link at all.  GitHub sends no Link

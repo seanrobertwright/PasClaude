@@ -1092,10 +1092,9 @@ var
   Base, N: string;
   J, U: TJson;
   Cut: Boolean;
-  WasCut, WasRefused, WasUnsure: array[0..2] of Boolean;
+  WasCut, WasUnsure: array[0..2] of Boolean;
   Names: array[0..2] of string;
   I, K: Integer;
-  AnyRefused: Boolean;
   Maybe: string;
 
   procedure AddItem(const C: TGhComment);
@@ -1111,9 +1110,13 @@ var
 
     Cut is set when one of OUR caps stopped the reading, which is a different
     sentence from "the list ended" and is why the loop distinguishes them.
-    Refused is set when the server named a next page somewhere we would not
-    go: that is not truncation by policy, it is an attempted redirect, and the
-    user is told about it separately.
+
+    There used to be a third flag here, Refused, for the case where the server
+    named a next page somewhere this program would not go.  It is gone with the
+    behaviour it described: the loop no longer requests a URL the server chose,
+    so there is no longer such a thing as a link we decline to follow.  It is
+    removed rather than left permanently False, because a flag that can never
+    be set is a sentence in the notice claiming something that cannot happen.
 
     Unsure is the third one, and it is the old count-based guess kept alive on
     the one input that still needs it.  Before pagination existed, a page that
@@ -1129,7 +1132,7 @@ var
     exact boundary, where the header is the only thing that could have told
     us, and it says "may not be all" rather than the flat claim Cut makes. }
   function ReadList(const Url: string; Kind: TGhCommentKind;
-    var Cut, Refused, Unsure: Boolean): Boolean;
+    var Cut, Unsure: Boolean): Boolean;
   var
     L: TJson;
     Idx, Taken, Pages, Total: Integer;
@@ -1197,25 +1200,38 @@ var
         if Full and (not Cut) then Unsure := True;
         Break;
       end;
-      if not GhNextUrlOk(Cur, Next) then
-      begin
-        Refused := True;
-        Break;
-      end;
-      { The cheap cycle, named rather than left to the page cap to absorb: a
-        link to the page it came from would otherwise burn all three requests
-        re-reading the same hundred items. }
-      if Next = Cur then
-      begin
-        Cut := True;
-        Break;
-      end;
       if Pages >= GhMaxPages then
       begin
         Cut := True;
         Break;
       end;
-      Cur := Next;
+      { THE SERVER'S LINK IS A SIGNAL, NOT AN ADDRESS.  rel="next" answers
+        "is there another page"; where that page lives is decided here, by
+        adding &page=N to the URL this function was given and has already been
+        requesting all along.
+
+        This replaces following the URL the server sent, and it is strictly
+        safer than what it replaces rather than a relaxation: no URL a server
+        chose is ever requested, so there is nothing for a cross-host link, a
+        credential-bearing redirect or a poisoned path to do.  The worst a
+        lying rel="next" can now buy is one extra request to our own URL, which
+        comes back empty and ends the loop.
+
+        It also fixes the feature, which had never once worked.  GitHub answers
+        /repos/OWNER/REPO/... with a next link under /repositories/<id>/... -
+        the same resource, canonically spelled - and GhNextUrlOk refused it for
+        moving the path, correctly, by its own rule.  That refusal was
+        unreachable until the WINHTTP_QUERY_CUSTOM fix made Link readable at
+        all, so the first time this program could see a next link was also the
+        first time it turned one down.  Every page past the first, on every
+        list, for the life of the feature.
+
+        Query-appended and not rebuilt: Url already carries per_page=100, so
+        &page= is the only part that moves and the first page stays exactly the
+        request it always was.  Pages counts pages fetched, so the page number
+        is Pages + 1 and no cycle is expressible - the old Next = Cur check
+        went with the URL that could repeat itself. }
+      Cur := Url + '&page=' + IntToStr(Pages + 1);
     until False;
     Result := True;
   end;
@@ -1231,7 +1247,6 @@ begin
   for I := 0 to 2 do
   begin
     WasCut[I] := False;
-    WasRefused[I] := False;
     WasUnsure[I] := False;
   end;
   Names[0] := 'inline review comments';
@@ -1269,11 +1284,11 @@ begin
   end;
 
   if not ReadList(Base + '/pulls/' + N + '/comments?per_page=100',
-    gckReview, WasCut[0], WasRefused[0], WasUnsure[0]) then Exit(False);
+    gckReview, WasCut[0], WasUnsure[0]) then Exit(False);
   if not ReadList(Base + '/pulls/' + N + '/reviews?per_page=100',
-    gckReviewBody, WasCut[1], WasRefused[1], WasUnsure[1]) then Exit(False);
+    gckReviewBody, WasCut[1], WasUnsure[1]) then Exit(False);
   if not ReadList(Base + '/issues/' + N + '/comments?per_page=100',
-    gckIssue, WasCut[2], WasRefused[2], WasUnsure[2]) then Exit(False);
+    gckIssue, WasCut[2], WasUnsure[2]) then Exit(False);
 
   { The notice names OUR cap, which is the honest sentence now that following
     exists: a list that simply ran out of pages says nothing, and a list this
@@ -1323,32 +1338,20 @@ begin
       Info.Notice := Maybe;
   end;
 
-  { A refusal is reported even when nothing was cut, because it is the one
-    user-visible trace of a server having tried to send this program - and the
-    token it carries - somewhere it would not go.
+  { The refusal notice that stood here is gone with the flag behind it.  It
+    reported that a server had named a next page somewhere this program would
+    not go - a true and useful sentence while the loop followed server-supplied
+    URLs, and an unreachable one now that it composes its own.
 
-    The rule is quoted, and what happened is not.  GhNextUrlOk refuses for
-    eight reasons - length, a non-printable byte, '..', an unparseable https
-    prefix, a colon or an at-sign in the host, the wrong host, and a path that
-    moved - and only one of them is the cross-host attack this sentence used
-    to name outright.  A same-host link to a differently-spelled canonical
-    path is refused too, and telling that user a server had tried to redirect
-    them off api.github.com would be a lie on the one line whose entire job is
-    to report that something attacked them.  Naming the invariant instead is
-    true of all eight and still says which link was dropped and why it might
-    matter. }
-  AnyRefused := False;
-  for I := 0 to 2 do
-    if WasRefused[I] then AnyRefused := True;
-  if AnyRefused then
-  begin
-    if Info.Notice <> '' then Info.Notice := Info.Notice + '.';
-    Info.Notice := Trim(Info.Notice + ' A page link was refused and that list ' +
-      'stops there: pasclaude follows rel="next" only to the same ' +
-      GhApiBase + ' path it just read, with the query the only part allowed ' +
-      'to move.');
-  end;
-
+    Worth recording what that notice actually did in its one working day.  It
+    was written for the cross-host attack and it fired on GitHub, every time,
+    because GitHub answers /repos/OWNER/REPO/... with a next link under
+    /repositories/<id>/... - the same resource, canonically spelled, and a
+    moved path by the rule's own reading.  So the first thing the sentence ever
+    reported was our own client declining ordinary pagination.  That is the
+    argument for composing the URL rather than vetting one: a rule strict
+    enough to be worth having is strict enough to refuse the legitimate case,
+    and the way out is not to loosen it but to stop needing it. }
   Result := True;
 end;
 

@@ -2443,19 +2443,29 @@ worked around: no replying, no resolving, no approving.
 Pagination exists now. `uHttp` returns the `Link` response header - one header
 by name, verbatim and unparsed, dropped whole rather than cut if it is over
 4 KB, because a truncated URL is a URL that is nearly right and nearly right
-is the worst thing an untrusted URL can be - and pasclaude follows
-`rel="next"`. But a next URL is a URL a *server* chose, so it is followed only
-when it is one pasclaude would have composed itself: `https`, the host exactly
-`api.github.com` with no port and no credential in it, and the same path as
-the page just read with only the query allowed to change. A `Link` that fails
-any of that is refused, the list stops there, and the notice says so by
-quoting the rule rather than guessing which half of it fired - eight different
-things make that check say no and only one of them is another host, so a
-notice that named the host every time would be wrong on the one line whose job
-is to tell you something tried to move you. That check is not decoration:
-a configurable API host is the one knob a credential must not have, and
-without the check a `Link` header *is* that knob, operated from the wire with
-no settings file involved and nothing for the scope table to refuse.
+is the worst thing an untrusted URL can be.
+
+**`rel="next"` is read as a signal, never as an address.** It answers "is there
+another page"; *where* that page lives is decided here, by putting `&page=N` on
+the URL pasclaude has been requesting all along. No URL a server chose is ever
+requested, so a cross-host link, a credential-bearing redirect and a poisoned
+path have nothing to act on - the worst a lying `rel="next"` buys is one extra
+request to our own URL, which comes back empty and ends the loop. A
+configurable API host is the one knob a credential must not have, and a `Link`
+header that gets followed *is* that knob, operated from the wire with no
+settings file involved.
+
+That replaced a stricter-looking rule that turned out to be the bug. Links used
+to be vetted before being followed - same scheme, same host, same path, query
+only - and GitHub answers `/repos/OWNER/REPO/...` with a next link under
+`/repositories/<id>/...`: the same resource, canonically spelled, and a moved
+path by that rule's own reading. So every page past the first, on every list,
+was refused. It went unnoticed because the refusal was unreachable until the
+`WINHTTP_QUERY_CUSTOM` fix made `Link` readable at all - the first time this
+program could see a next link was also the first time it turned one down. The
+lesson is in the shape rather than the constant: a rule strict enough to be
+worth having is strict enough to refuse the legitimate case, and the way out
+was not to loosen it but to stop needing it.
 
 At most three pages of 100 and 300 items a list - the page cap bounds requests
 carrying the token, the item cap bounds memory, and the two multiply to each

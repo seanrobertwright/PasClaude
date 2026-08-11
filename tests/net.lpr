@@ -11,7 +11,7 @@ program net;
 
 {$mode objfpc}{$H+}
 
-uses SysUtils, uJson, uHttp, uMcp, uAgent;
+uses SysUtils, uJson, uHttp, uMcp, uGitHub, uAgent;
 
 var
   Fails: Integer = 0;
@@ -438,6 +438,74 @@ begin
     'and it is the Link header rather than some other one: ' + R.Link);
 end;
 
+{ Pagination, past the first page, against a real pull request.
+
+  This is the assertion the feature never had.  GhMaxPages, GhMaxTotalItems and
+  the whole multi-page loop were written, reviewed and shipped, and not one
+  page past the first was ever fetched in this program's life: the Link header
+  was unreadable (a wrong WinHTTP info level), and once that was fixed the
+  next-URL guard refused GitHub's own canonical link for moving the path.  Both
+  bugs were invisible offline, because every offline test of pagination hands
+  the loop a stub Link it wrote itself.
+
+  So the check is deliberately the crudest possible one - more than one page's
+  worth of items came back - because that is precisely the fact that was false
+  for so long while everything more sophisticated looked right.
+
+  rust-lang/rust#141295 has over a hundred review comments and is closed, so
+  its counts do not move.  A 403 is rate limiting rather than a bug and reports
+  as a skip; this suite is meant to run without a credential, and GitHub's
+  unauthenticated allowance is small. }
+procedure TestPrCommentsPagesPastTheFirst;
+var
+  Repo: TGhRepo;
+  Auth: TGhAuth;
+  Info: TGhPrInfo;
+  Items: TGhCommentArray;
+  Err: TGhError;
+  I, Reviews: Integer;
+begin
+  Repo.Owner := 'rust-lang';
+  Repo.Name := 'rust';
+  Repo.Ok := True;
+  Repo.Why := '';
+  { The client is interactive-only and defaults to off, so a suite has to arm
+    it deliberately - the same gate that makes /pr-comments refuse under -p.
+    Restored below, because a flag left on by one test is a flag the next one
+    did not ask for. }
+  GitHubAllowed := True;
+  GhResolveToken(Auth);
+
+  if not GhFetchPrComments(Repo, 141295, Auth, Info, Items, Err) then
+  begin
+    GitHubAllowed := False;
+    if Err.Kind = gekRateLimit then
+      Check(True, 'skipped: GitHub rate limited this run, so pagination is ' +
+        'untested here')
+    else
+      Check(False, 'the pull request is readable: ' + Err.Text);
+    Exit;
+  end;
+
+  Reviews := 0;
+  for I := 0 to High(Items) do
+    if Items[I].Kind = gckReview then Inc(Reviews);
+
+  { GhMaxItems is the page size, so more than that many of ONE kind can only
+    have come from a second request. }
+  Check(Reviews > GhMaxItems,
+    Format('more than one page of review comments was read (%d, page size %d)',
+      [Reviews, GhMaxItems]));
+
+  { And it knows it finished.  The notice carries the cap sentence, the
+    possibly-incomplete sentence, or nothing; on a list that ends inside the
+    caps it must be nothing, because a client that reads everything and then
+    hedges is as unhelpful as one that stops early and says nothing. }
+  Check(Info.Notice = '',
+    'and the read completed without hedging: "' + Info.Notice + '"');
+  GitHubAllowed := False;
+end;
+
 procedure TestRealGet;
 var
   R: THttpResult;
@@ -469,6 +537,7 @@ begin
   TestMcpOverRealHttp;
   TestMcpHttpAgainstNonMcp;
   TestLinkHeaderIsReal;
+  TestPrCommentsPagesPastTheFirst;
   WriteLn;
   if Fails = 0 then
     WriteLn('all network tests passed')
