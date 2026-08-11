@@ -506,6 +506,50 @@ begin
   GitHubAllowed := False;
 end;
 
+{ Is HttpTimeoutMs actually in force, or merely assigned?
+
+  Same class of question as the two wrong info levels: WinHttpSetTimeouts'
+  return value is ignored, so a failed call - wrong constant, wrong signature,
+  missing export - would leave WinHTTP's own defaults in place and look exactly
+  like success from inside this program. The existing telemetry test asserts
+  the VARIABLE was set during the call, which is a different claim and passes
+  either way.
+
+  It matters because a promise rests on it: telemetry sets this so a collector
+  can never delay a turn, and GitHub sets it so a GET cannot inherit the 300s
+  streamed-answer window. If the option silently did nothing, both would wait
+  on WinHTTP's defaults instead.
+
+  postman-echo /delay/10 holds the response for ten seconds; the timeout is set
+  to two. A pass is a failure that arrives quickly - so both halves are
+  asserted, because a request that fails instantly for some unrelated reason
+  would satisfy the timing check alone. }
+procedure TestTimeoutIsReallyApplied;
+var
+  R: THttpResult;
+  Started, Elapsed: QWord;
+  Saved: Integer;
+begin
+  Saved := HttpTimeoutMs;
+  HttpTimeoutMs := 2000;
+  Started := GetTickCount64;
+  try
+    R := HttpGet('https://postman-echo.com/delay/10', '', 0);
+  finally
+    HttpTimeoutMs := Saved;
+  end;
+  Elapsed := GetTickCount64 - Started;
+
+  Check(not R.Ok, 'a 2s timeout gives up on a 10s response: ' +
+    IntToStr(R.Status) + ' ' + R.Error);
+  { Generous: the two-second receive timeout is one of four, and resolve and
+    connect spend real time before it starts counting.  The claim is that the
+    request did not sit for the server's full ten seconds. }
+  Check(Elapsed < 8000,
+    Format('and gives up on OUR clock rather than the server''s (%d ms)',
+      [Elapsed]));
+end;
+
 procedure TestRealGet;
 var
   R: THttpResult;
@@ -538,6 +582,7 @@ begin
   TestMcpHttpAgainstNonMcp;
   TestLinkHeaderIsReal;
   TestPrCommentsPagesPastTheFirst;
+  TestTimeoutIsReallyApplied;
   WriteLn;
   if Fails = 0 then
     WriteLn('all network tests passed')
