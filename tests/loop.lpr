@@ -12,7 +12,8 @@ program loop;
 
 {$mode objfpc}{$H+}
 
-uses SysUtils, Classes, uJson, uHttp, uHooks, uTools, uAgent, uSdk;
+uses SysUtils, Classes, uJson, uHttp, uTelem, uHooks, uTools, uAgent, uDiag,
+  uSdk;
 
 var
   Fails: Integer = 0;
@@ -538,6 +539,423 @@ begin
     A.Free;
   end;
   uTools.AllowAllEdits := True;
+end;
+
+{ A deny rule refuses inside RunTool rather than at the gate, which is a new
+  early exit on the path uAgent's one-tool_result-per-tool_use invariant
+  depends on.  The transcript has to be exactly what a permission denial
+  produces, or the next request is one the API rejects. }
+procedure TestDenyProducesToolResult;
+var
+  A: TAgent;
+  Err: string;
+  Doc, Msg, C: TJson;
+  Found: Integer;
+  I: Integer;
+begin
+  ResetScript;
+  uTools.RootDir := SessionDir;
+  uTools.ClearDenyRules;
+  { The most permissive state there is, so the refusal can only be the rule. }
+  uTools.AllowAllEdits := True;
+  uTools.AddDenyRule('path:secret.txt', 'test');
+
+  SetLength(Replies, 2);
+  Replies[0] := ToolReply('t1', 'write_file',
+    '{"path":"secret.txt","content":"x"}');
+  Replies[1] := TextReply('Understood, that path is off limits.');
+
+  A := MakeAgent;
+  try
+    A.Send('write the secret', Err);
+    Check(CallCount = 2, 'the turn continues after a deny rule refuses');
+    Check(not FileExists(IncludeTrailingPathDelimiter(SessionDir) +
+      'secret.txt'), 'and nothing was written');
+    Check(IsValidUtf8(Requests[1]), 'the follow-up body is valid UTF-8');
+
+    Doc := JsonParse(Requests[1]);
+    try
+      Msg := Doc.Find('messages').Item(2).Find('content');
+      Found := 0;
+      for I := 0 to Msg.Count - 1 do
+        if Msg.Item(I).Str('tool_use_id') = 't1' then Inc(Found);
+      Check(Found = 1, Format('exactly one tool_result for the tool_use (%d)',
+        [Found]));
+      C := Msg.Item(0);
+      Check(C.Bool('is_error'), 'marked as an error result');
+      Check(Pos('refused by deny rule', C.Str('content')) > 0,
+        'naming the refusal: ' + C.Str('content'));
+      Check(Pos('path:secret.txt', C.Str('content')) > 0,
+        'and the rule itself, so a rule is not mistaken for a bug');
+    finally
+      Doc.Free;
+    end;
+    Check(Prose = 'Understood, that path is off limits.',
+      'and the conversation reaches a normal reply');
+
+    { The one line the whole session-note design turns on. }
+    Doc := JsonParse(Requests[0]);
+    try
+      Check(Doc.Find('system').Count = 2,
+        'a session with rules in force carries a second system block');
+      Check(Doc.Find('system').Item(1).Find('cache_control') = nil,
+        'and it is deliberately not part of the cached prefix');
+    finally
+      Doc.Free;
+    end;
+  finally
+    A.Free;
+  end;
+  uTools.ClearDenyRules;
+
+  { And with everything at its default the body is what it always was. }
+  ResetScript;
+  SetLength(Replies, 1);
+  Replies[0] := TextReply('hello');
+  A := MakeAgent;
+  try
+    A.Send('hi', Err);
+    Doc := JsonParse(Requests[0]);
+    try
+      Check(Doc.Find('system').Count = 1,
+        'with no rules there is no second block at all');
+    finally
+      Doc.Free;
+    end;
+  finally
+    A.Free;
+  end;
+end;
+
+{ Adding a working directory is the only thing in this feature the model ever
+  learns about, and it must be told - a directory it cannot name is a
+  directory it wastes turns guessing at.  The other half matters more: with
+  one root the request body has to be exactly what it was before the feature
+  existed, or every session in the world re-reads its cached prefix. }
+procedure TestExtraRootsReachTheModel;
+var
+  A: TAgent;
+  Err, Norm, AErr, Extra, Text: string;
+  Doc, Sys: TJson;
+  Ok: Boolean;
+begin
+  ResetScript;
+  uTools.RootDir := SessionDir;
+  uTools.ClearDenyRules;
+  uTools.ClearWorkingDirs;
+
+  SetLength(Replies, 1);
+  Replies[0] := TextReply('hello');
+  A := MakeAgent;
+  try
+    A.Send('hi', Err);
+    Doc := JsonParse(Requests[0]);
+    try
+      Check(Doc.Find('system').Count = 1,
+        'with one root there is no second system block');
+      Check(Pos('Additional working directories', Requests[0]) = 0,
+        'and nothing in the body mentions them');
+    finally
+      Doc.Free;
+    end;
+  finally
+    A.Free;
+  end;
+
+  Extra := ExcludeTrailingPathDelimiter(SessionDir) + '-lib';
+  ForceDirectories(Extra);
+  Ok := uTools.AddWorkingDir(Extra, Norm, AErr);
+  Check(Ok, 'a working directory is added: ' + AErr);
+
+  ResetScript;
+  SetLength(Replies, 1);
+  Replies[0] := TextReply('hello');
+  A := MakeAgent;
+  try
+    A.Send('hi', Err);
+    Doc := JsonParse(Requests[0]);
+    try
+      Sys := Doc.Find('system');
+      Check(Sys.Count = 2, 'and now there is a second block');
+      Check(Sys.Item(Sys.Count - 1).Find('cache_control') = nil,
+        'still outside the cached prefix, so /add-dir is cheap');
+      Text := Sys.Item(Sys.Count - 1).Str('text');
+      Check(Pos('Additional working directories', Text) > 0,
+        'which names them: ' + Text);
+      Check(Pos(Extra, Text) > 0, 'and gives the directory in full');
+      Check(Pos('full absolute path', Text) > 0,
+        'and says how to name a file in it');
+    finally
+      Doc.Free;
+    end;
+  finally
+    A.Free;
+  end;
+
+  { And the subagent prompt, which is built separately and would otherwise be
+    the one place the roots went unmentioned. }
+  Check(Pos('Additional working directories', uTools.SessionNote) > 0,
+    'SessionNote is the single seam it comes through');
+
+  uTools.ClearWorkingDirs;
+  ResetScript;
+  SetLength(Replies, 1);
+  Replies[0] := TextReply('hello');
+  A := MakeAgent;
+  try
+    A.Send('hi', Err);
+    Doc := JsonParse(Requests[0]);
+    try
+      Check(Doc.Find('system').Count = 1,
+        'removing the root removes the block again');
+    finally
+      Doc.Free;
+    end;
+  finally
+    A.Free;
+  end;
+end;
+
+{ The output style rides in the uncached trailing block, and both halves of
+  that sentence have to hold on EVERY turn.  Asserted against real request
+  bodies because both failure modes are invisible from inside uTools: a style
+  moved into the cached prefix still reads correctly here, and a style emitted
+  only on the first request still passes every SessionNote test. }
+procedure TestStyleReachesEveryTurn;
+var
+  A: TAgent;
+  Err, StyleErr: string;
+  Doc, Sys: TJson;
+  N: Integer;
+begin
+  ResetScript;
+  uTools.RootDir := SessionDir;
+  uTools.ClearDenyRules;
+  uTools.ClearWorkingDirs;
+  uTools.ClearStyles;
+  Check(uTools.SetOutputStyle('explanatory', StyleErr),
+    'a built-in style is set: ' + StyleErr);
+
+  SetLength(Replies, 2);
+  Replies[0] := TextReply('first');
+  Replies[1] := TextReply('second');
+
+  A := MakeAgent;
+  try
+    A.Send('one', Err);
+    A.Send('two', Err);
+    Check(CallCount = 2, 'two turns went out');
+    for N := 0 to 1 do
+    begin
+      Doc := JsonParse(Requests[N]);
+      try
+        Sys := Doc.Find('system');
+        Check(Sys.Count = 2,
+          Format('turn %d carries the trailing system block', [N + 1]));
+        Check(Pos('why it is built that way',
+          Sys.Item(Sys.Count - 1).Str('text')) > 0,
+          '  with the style body in it');
+        { The whole placement ruling in one line: cached, a mid-session
+          /output-style would re-charge the entire prefix. }
+        Check(Sys.Item(Sys.Count - 1).Find('cache_control') = nil,
+          '  and no cache_control on it');
+        Check(Sys.Item(0).Find('cache_control') <> nil,
+          '  while the system prompt block still carries exactly one');
+        Check(Pos('why it is built that way', Sys.Item(0).Str('text')) = 0,
+          '  and the style is not inside the cached prefix');
+      finally
+        Doc.Free;
+      end;
+    end;
+  finally
+    A.Free;
+  end;
+
+  { And back to the default, where the body is what it always was. }
+  uTools.ClearStyles;
+  ResetScript;
+  SetLength(Replies, 1);
+  Replies[0] := TextReply('hello');
+  A := MakeAgent;
+  try
+    A.Send('hi', Err);
+    Doc := JsonParse(Requests[0]);
+    try
+      Check(Doc.Find('system').Count = 1,
+        'with the default style there is no second block at all');
+    finally
+      Doc.Free;
+    end;
+  finally
+    A.Free;
+  end;
+end;
+
+{ Plan mode is told to the model twice: once as a paragraph in the system
+  prompt, so it does not spend a turn walking into the boundary, and once as
+  the refusal when it does anyway.  Both halves are here, plus the shape of
+  the block, which is the thing that has to stay right or every plan-mode turn
+  re-reads the whole cached prefix. }
+procedure TestPlanModeReachesTheModel;
+var
+  A: TAgent;
+  Err: string;
+  Doc, Sys, Msg, C: TJson;
+  Found, I: Integer;
+begin
+  ResetScript;
+  uTools.RootDir := SessionDir;
+  uTools.ClearDenyRules;
+  { Every override on, so a refusal below can only be the boundary. }
+  uTools.AllowAllEdits := True;
+  uTools.BypassMode := True;
+  uTools.PlanMode := True;
+
+  SetLength(Replies, 2);
+  Replies[0] := ToolReply('t1', 'write_file',
+    '{"path":"planned.txt","content":"x"}');
+  Replies[1] := TextReply('Here is what I would do.');
+
+  A := MakeAgent;
+  try
+    A.Send('go', Err);
+    Check(CallCount = 2, 'the turn continues after the plan boundary refuses');
+    Check(not FileExists(IncludeTrailingPathDelimiter(SessionDir) +
+      'planned.txt'), 'and nothing was written');
+
+    Doc := JsonParse(Requests[0]);
+    try
+      Sys := Doc.Find('system');
+      Check(Sys.Count = 2, 'plan mode adds a second system block');
+      { Assert on the LAST block: under an OAuth key the identity block goes
+        first and every index shifts. }
+      Check(Sys.Item(0).Find('cache_control') <> nil,
+        'the first still carries the cache breakpoint');
+      Check(Sys.Item(Sys.Count - 1).Find('cache_control') = nil,
+        'and the mode note deliberately does not, so a toggle is cheap');
+      Check(Pos('plan mode', Sys.Item(Sys.Count - 1).Str('text')) > 0,
+        'and it says so in words the model can act on');
+    finally
+      Doc.Free;
+    end;
+
+    Doc := JsonParse(Requests[1]);
+    try
+      Msg := Doc.Find('messages').Item(2).Find('content');
+      Found := 0;
+      for I := 0 to Msg.Count - 1 do
+        if Msg.Item(I).Str('tool_use_id') = 't1' then Inc(Found);
+      Check(Found = 1, Format('exactly one tool_result for the tool_use (%d)',
+        [Found]));
+      C := Msg.Item(0);
+      Check(C.Bool('is_error'), 'marked as an error result');
+      Check(Pos('plan mode', C.Str('content')) > 0,
+        'and the refusal names the mode: ' + C.Str('content'));
+    finally
+      Doc.Free;
+    end;
+    Check(Prose = 'Here is what I would do.',
+      'and the conversation reaches a normal reply');
+  finally
+    A.Free;
+  end;
+
+  { The other direction, which is the assertion that keeps every existing
+    request-body test honest: with the mode off the body is what it was. }
+  uTools.PlanMode := False;
+  uTools.BypassMode := False;
+  ResetScript;
+  SetLength(Replies, 1);
+  Replies[0] := TextReply('hello');
+  A := MakeAgent;
+  try
+    A.Send('hi', Err);
+    Doc := JsonParse(Requests[0]);
+    try
+      Check(Doc.Find('system').Count = 1,
+        'and out of plan mode there is no second block at all');
+    finally
+      Doc.Free;
+    end;
+  finally
+    A.Free;
+  end;
+  uTools.AllowAllEdits := True;
+end;
+
+{ Print mode has no human, so it must never be the most permissive mode.  The
+  ordering that guarantees it is that the host calls LoadDenyRules before the
+  print-mode halt and LoadPermissions after; this pins the half of it that
+  lives in this unit. }
+procedure TestPrintModeInheritsNoGrants;
+var
+  Base, Appr, Global: string;
+  A: TJson;
+  Out_: string;
+  IsErr: Boolean;
+  Saved: string;
+begin
+  uTools.ClearDenyRules;
+  uTools.ClearBashPrefixes;
+  uTools.ClearTrust;
+  uTools.AllowAllEdits := False;
+  uTools.AllowAllBash := False;
+  uTools.RootDir := SessionDir;
+
+  Saved := SysUtils.GetEnvironmentVariable('LOCALAPPDATA');
+  Base := ExcludeTrailingPathDelimiter(SessionDir) + '-appdata';
+  ForceDirectories(Base);
+  try
+    SetEnvironmentVariable('LOCALAPPDATA', PChar(Base));
+    Appr := uTools.ApprovalsPath;
+    Global := uTools.GlobalDenyPath;
+    ForceDirectories(ExtractFileDir(Appr));
+    ForceDirectories(ExtractFileDir(Global));
+    with TStringList.Create do
+    try
+      Text := '{"allow_bash":true,"bash_programs":["git"],' +
+        '"trusted":{"hooks.json":"deadbeefdeadbeef"},"deny":["tool:fetch"]}';
+      SaveToFile(Appr);
+      Text := '{"deny":["tool:search"]}';
+      SaveToFile(Global);
+    finally
+      Free;
+    end;
+
+    { Exactly the call print mode makes, and nothing else. }
+    uTools.LoadDenyRules(Appr, Global);
+    Check(uTools.DenyRuleCount = 2, 'both files'' deny rules arrive');
+    Check(not uTools.AllowAllBash, 'and allow_bash beside them does not');
+    Check(not uTools.AllowAllEdits, 'nor allow_edits');
+    Check(not uTools.BashPrefixAllowed('git status'),
+      'nor a persisted bash program');
+    Check(uTools.TrustedFingerprint('hooks.json') = '',
+      'nor a trusted fingerprint');
+
+    { With Ask nil - print mode's other half - a denied tool says why, and an
+      ordinary read still works. }
+    A := TJson.NewObj;
+    A.AddStr('url', 'https://example.com/');
+    Out_ := uTools.RunTool('fetch', A, nil, IsErr);
+    A.Free;
+    Check(IsErr and (Pos('refused by deny rule', Out_) > 0),
+      'a denied tool is refused under -p: ' + Out_);
+    A := TJson.NewObj;
+    A.AddStr('pattern', 'nothing-in-particular');
+    Out_ := uTools.RunTool('search', A, nil, IsErr);
+    A.Free;
+    Check(IsErr and (Pos('refused by deny rule', Out_) > 0),
+      'including a tool that is otherwise ungated');
+    WriteSessionFile('plain.txt', 'ordinary');
+    A := TJson.NewObj;
+    A.AddStr('path', 'plain.txt');
+    Out_ := uTools.RunTool('read_file', A, nil, IsErr);
+    A.Free;
+    Check(not IsErr, 'while an ungated, undenied tool still runs');
+  finally
+    SetEnvironmentVariable('LOCALAPPDATA', PChar(Saved));
+    uTools.ClearDenyRules;
+  end;
 end;
 
 { Conversation state has to persist across separate turns. }
@@ -1081,6 +1499,60 @@ begin
   end;
 end;
 
+{ Compaction is pasclaude asking a question of its own, and the user may have
+  an image queued for the question they were about to ask.  If the summarise
+  instruction went through the draining builder it would carry that image into
+  a request the user never sees, and the image would be gone: attached,
+  charged for, and never shown to the model in the context it was meant for.
+  Only a real round trip proves it, because the drain happens before the
+  request goes out and the transcript is replaced after it comes back. }
+procedure TestCompactWithSummaryKeepsPendingImages;
+var
+  A: TAgent;
+  Err: string;
+  Ok: Boolean;
+  Doc, Msgs, Content: TJson;
+begin
+  ResetScript;
+  uTools.RootDir := SessionDir;
+  SetLength(Replies, 3);
+  Replies[0] := TextReply('First answer.');
+  Replies[1] := TextReply('A summary of what we did.');
+  Replies[2] := TextReply('I can see it.');
+
+  A := MakeAgent;
+  try
+    A.Send('a first question', Err);
+    Check(A.AttachImage('image/png', 'cGVuZGluZw==', 12, 8, Err),
+      'an image is queued before compaction: ' + Err);
+
+    Ok := A.CompactWithSummary(Err);
+    Check(Ok, 'the summary still runs with an image pending: ' + Err);
+    Check(A.PendingImages = 1,
+      'and the pending image is NOT spent on the summarise request');
+    Check(Pos('cGVuZGluZw==', A.Transcript) = 0,
+      'nothing put it in the compacted transcript');
+
+    { And it is still there for the message it was meant for. }
+    Ok := A.Send('what is in this picture?', Err);
+    Check(Ok, 'the next turn sends: ' + Err);
+    Check(A.PendingImages = 0, 'which is what finally drains the queue');
+    Doc := JsonParse(Requests[High(Requests)]);
+    try
+      Msgs := Doc.Find('messages');
+      Content := Msgs.Item(Msgs.Count - 1).Find('content');
+      Check(Content.Item(0).Str('type') = 'image',
+        'the image rides the user question, ahead of the prose');
+      Check(Content.Item(0).Find('source').Str('data') = 'cGVuZGluZw==',
+        'with its data intact');
+    finally
+      Doc.Free;
+    end;
+  finally
+    A.Free;
+  end;
+end;
+
 { A summary request that fails must leave the conversation exactly as it
   was - this is the mutation a suite is most likely to miss, because every
   assertion about the failure itself still passes. }
@@ -1242,6 +1714,159 @@ begin
   end;
 end;
 
+
+{ ------------------------------------------------------ credential refresh -- }
+
+{ What the 401 hook hands back, and how often it was asked.  Module-level
+  because TAuthRefreshFn is a plain function variable, the same shape as
+  uHttp.HttpTransport. }
+var
+  RefreshKey: string = '';
+  RefreshCalls: Integer = 0;
+  { When set, every call hands back a DIFFERENT key - two dead credentials
+    alternating, which is the shape an unbounded refresh loop would need. }
+  RefreshVary: Boolean = False;
+
+function FakeRefresh: string;
+begin
+  Inc(RefreshCalls);
+  if RefreshVary then
+    Result := RefreshKey + IntToStr(RefreshCalls)
+  else
+    Result := RefreshKey;
+end;
+
+{ A rejected credential is not a busy server.  401 stays out of Transient(),
+  so the ONLY way a request is ever sent twice for it is the auth hook, and
+  the hook is capped at one use per request.
+
+  Two failures this pins.  First an unbounded refresh loop: two dead sources
+  alternating would, without the cap, produce request after request forever.
+  Second a widened test - if the retry ever fired on any 4xx it would replay
+  a rejected request against a permission error, which is both useless and
+  the wrong thing to do to a 403. }
+procedure TestAuthRefreshOn401;
+
+  { One turn with a scripted 401 on the first call.  Returns how many
+    requests the transport saw. }
+  function RunTurn(const StartKey, NewKey: string; Wire: Boolean;
+    Status, FailFor: Integer): Integer;
+  var
+    A: TAgent;
+    Err: string;
+  begin
+    ResetScript;
+    uTools.RootDir := SessionDir;
+    RefreshKey := NewKey;
+    RefreshCalls := 0;
+    SetLength(Replies, 2);
+    Replies[0] := TextReply('never reached');
+    Replies[1] := TextReply('second time lucky');
+    FailAfter := 0;
+    FailUntil := FailFor;
+    FailStatus := Status;
+    FailBody := '{"type":"error","error":{"type":"authentication_error",' +
+                '"message":"invalid x-api-key"}}';
+    A := TAgent.Create(StartKey, 'm', 'sys');
+    A.OnText := @CapText;
+    A.OnNotice := @CapNotice;
+    if Wire then A.OnAuthRefresh := @FakeRefresh;
+    try
+      A.Send('hello', Err);
+      Result := Length(Requests);
+    finally
+      A.Free;
+      FailAfter := -1;
+      FailUntil := 0;
+      FailStatus := 529;
+      FailBody := '';
+    end;
+  end;
+
+var
+  N: Integer;
+begin
+  N := RunTurn('sk-ant-api03-dead', 'sk-ant-api03-live', True, 401, 1);
+  Check(N = 2, 'a 401 with a different key available is retried exactly once');
+  Check(RefreshCalls = 1, 'and the hook was consulted exactly once');
+  Check(Pos('x-api-key: sk-ant-api03-live', ReqHeaders[1]) > 0,
+    'the second request carries the new credential');
+  Check(Pos('x-ant', Prose) = 0, 'and no key reaches the visible output');
+
+  { The three ways the hook can decline.  Each must leave exactly one
+    request: a retry with the same key would fail identically, and a retry
+    with no key would fail worse. }
+  N := RunTurn('sk-ant-api03-dead', 'sk-ant-api03-dead', True, 401, 1);
+  Check(N = 1, 'a hook returning the same key does not cause a second request');
+  N := RunTurn('sk-ant-api03-dead', '', True, 401, 1);
+  Check(N = 1, 'nor does one returning nothing');
+  N := RunTurn('sk-ant-api03-dead', 'sk-ant-api03-live', False, 401, 1);
+  Check(N = 1, 'nor does an unwired hook');
+  Check(RefreshCalls = 0, 'which is never called at all');
+
+  { Not every 4xx.  A 403 is a permission error and a 400 is a bad request;
+    replaying either against a fresh credential is meaningless. }
+  N := RunTurn('sk-ant-api03-dead', 'sk-ant-api03-live', True, 403, 1);
+  Check(N = 1, 'a 403 is not an authentication failure and is not retried');
+  Check(RefreshCalls = 0, 'and the hook is not even consulted');
+  N := RunTurn('sk-ant-api03-dead', 'sk-ant-api03-live', True, 400, 1);
+  Check(N = 1, 'and neither is a 400');
+  Check(RefreshCalls = 0, 'nor is the hook consulted for one');
+
+  { The bound itself.  Every request 401s and the hook hands back a fresh,
+    equally dead key each time - the exact shape that would loop if the cap
+    were ever lost in a refactor.  Two requests, no more, and the hook asked
+    once. }
+  RefreshVary := True;
+  try
+    N := RunTurn('sk-ant-api03-dead', 'sk-ant-api03-alsodead', True, 401, 99);
+    Check(N = 2, 'endlessly rotating dead credentials still cost two requests');
+    Check(RefreshCalls = 1, 'because the hook is asked once per request');
+  finally
+    RefreshVary := False;
+  end;
+end;
+
+{ The credential must never reach the project tree.  session.json lives in
+  <root>\.pasclaude, where SafePath does not protect it and git might carry
+  it - so a future SaveSession that helpfully recorded the key beside the
+  model, to make /resume "just work", would be putting a secret in a
+  repository. }
+procedure TestSessionCarriesNoCredential;
+const
+  Secret = 'sk-ant-api03-mustnotbesavedanywhere';
+var
+  A: TAgent;
+  Err, Path, Body: string;
+  L: TStringList;
+begin
+  ResetScript;
+  uTools.RootDir := SessionDir;
+  SetLength(Replies, 1);
+  Replies[0] := TextReply('saved');
+  A := TAgent.Create(Secret, 'm', 'sys');
+  A.OnText := @CapText;
+  try
+    A.Send('remember this', Err);
+    Path := IncludeTrailingPathDelimiter(SessionDir) + 'cred-session.json';
+    Check(A.SaveSession(Path, Err), 'the session saves');
+    L := TStringList.Create;
+    try
+      L.LoadFromFile(Path);
+      Body := L.Text;
+    finally
+      L.Free;
+    end;
+    Check(Pos(Secret, Body) = 0,
+      'and the saved file contains no part of the credential');
+    Check(Pos('sk-ant', Body) = 0, 'not even the prefix');
+    Check(Pos(Secret, A.Transcript) = 0,
+      'and neither does the transcript that was written');
+    SysUtils.DeleteFile(Path);
+  finally
+    A.Free;
+  end;
+end;
 { A subscription OAuth token changes how a request authenticates and what
   its system prompt opens with; everything else must stay identical. }
 procedure TestOauthRequestShape;
@@ -1769,6 +2394,212 @@ begin
   end;
 end;
 
+{ The "model" field of a recorded request body. }
+function BodyModel(const Body: string): string;
+var
+  Doc: TJson;
+begin
+  Result := '';
+  Doc := JsonParse(Body);
+  if Doc = nil then Exit;
+  try
+    Result := Doc.Str('model');
+  finally
+    Doc.Free;
+  end;
+end;
+
+{ /cost prints its per-model block only above one row, so a session that
+  routed nowhere must produce exactly one - otherwise the default session's
+  output changes for a feature nobody enabled. }
+procedure TestSingleModelHasOneUsageRow;
+var
+  A: TAgent;
+  Err: string;
+begin
+  ResetScript;
+  uTools.RootDir := SessionDir;
+  SetLength(Replies, 2);
+  Replies[0] := TextReply('one');
+  Replies[1] := TextReply('two');
+
+  A := MakeAgent;
+  try
+    A.Send('hi', Err);
+    A.Send('again', Err);
+    Check(Length(A.UsageByModel) = 1,
+      Format('two turns on one model make exactly one row (%d)',
+        [Length(A.UsageByModel)]));
+    if Length(A.UsageByModel) = 1 then
+    begin
+      Check(A.UsageByModel[0].Model = A.EffectiveModel(mrMain),
+        'filed under the model that was actually sent');
+      Check(A.UsageByModel[0].TokensIn = A.TokensIn,
+        'and holding every input token the scalar total does');
+      Check(A.UsageByModel[0].TokensOut = A.TokensOut, 'and every output one');
+    end;
+  finally
+    A.Free;
+  end;
+end;
+
+{ Routing's primary case: a user who chose a stronger main model gets the
+  cheap one for the read-only investigator, and their own turns are
+  untouched.  The main model is deliberately not the default, or the two
+  would be the same string and the assertion would prove nothing. }
+procedure TestSubagentRoutedModel;
+var
+  A: TAgent;
+  Err, Sonnet: string;
+  Kind: TModelAliasKind;
+begin
+  ResetScript;
+  uTools.RootDir := SessionDir;
+  ResolveModelAlias('sonnet', Sonnet, Kind);
+
+  SetLength(Replies, 3);
+  Replies[0] := ToolReply('t1', 'task', '{"prompt":"look"}');
+  Replies[1] := TextReply('the answer');
+  Replies[2] := TextReply('relaying it');
+
+  A := MakeAgent;
+  try
+    A.Model := 'claude-opus-4-5';
+    A.Send('ask a helper', Err);
+    Check(Length(Requests) = 3, 'three requests were made');
+    if Length(Requests) < 3 then Exit;
+    Check(BodyModel(Requests[0]) = 'claude-opus-4-5',
+      'the parent turn carries the main model (' + BodyModel(Requests[0]) + ')');
+    Check(BodyModel(Requests[1]) = Sonnet,
+      'the subagent turn carries the routed model (' + BodyModel(Requests[1]) + ')');
+    Check(BodyModel(Requests[2]) = 'claude-opus-4-5',
+      'and the parent is back on its own model afterwards');
+
+    { Two rows, and they must account for every token the scalars hold - a
+      subagent whose usage lands in the totals and in no row makes the
+      per-model block under-report exactly what it exists to report. }
+    Check(Length(A.UsageByModel) = 2,
+      Format('usage is filed under two models (%d)', [Length(A.UsageByModel)]));
+    if Length(A.UsageByModel) = 2 then
+    begin
+      Check(A.UsageByModel[0].TokensIn + A.UsageByModel[1].TokensIn = A.TokensIn,
+        'and the rows'' input tokens sum to the total');
+      Check(A.UsageByModel[0].TokensOut + A.UsageByModel[1].TokensOut = A.TokensOut,
+        'and their output tokens');
+    end;
+  finally
+    A.Free;
+  end;
+end;
+
+{ Compaction is the other routed role, and the role field must be restored
+  even when the request fails: without the finally, one failed /compact full
+  strands every later turn on the compaction model. }
+procedure TestCompactionRoutedModel;
+var
+  A: TAgent;
+  Err, Sonnet: string;
+  Kind: TModelAliasKind;
+begin
+  ResetScript;
+  uTools.RootDir := SessionDir;
+  ResolveModelAlias('sonnet', Sonnet, Kind);
+
+  SetLength(Replies, 3);
+  Replies[0] := TextReply('hello there');
+  Replies[1] := TextReply('a summary of it all');
+  Replies[2] := TextReply('carrying on');
+
+  A := MakeAgent;
+  try
+    A.Model := 'claude-opus-4-5';
+    A.Send('hi', Err);
+    Check(A.CompactWithSummary(Err), 'the summary compaction ran: ' + Err);
+    Check(Length(Requests) = 2, 'two requests so far');
+    if Length(Requests) < 2 then Exit;
+    Check(BodyModel(Requests[1]) = Sonnet,
+      'the compaction request carries the compaction route (' +
+      BodyModel(Requests[1]) + ')');
+    A.Send('and now?', Err);
+    Check(BodyModel(Requests[High(Requests)]) = 'claude-opus-4-5',
+      'and the next ordinary turn is back on the main model');
+  finally
+    A.Free;
+  end;
+
+  { The same again, with the compaction made to fail. }
+  ResetScript;
+  SetLength(Replies, 2);
+  Replies[0] := TextReply('hello there');
+  Replies[1] := TextReply('carrying on');
+
+  A := MakeAgent;
+  try
+    A.Model := 'claude-opus-4-5';
+    A.Send('hi', Err);
+    FailAfter := 1;
+    FailUntil := 99;
+    FailStatus := 400;
+    Check(not A.CompactWithSummary(Err), 'a failed compaction reports failure');
+    FailAfter := -1;
+    A.Send('and now?', Err);
+    Check(BodyModel(Requests[High(Requests)]) = 'claude-opus-4-5',
+      'and the session is NOT stranded on the compaction model');
+  finally
+    A.Free;
+  end;
+end;
+
+{ The worst-timed failure in the feature: a model the account cannot use is a
+  404 on the first turn.  When the id came from an alias, the message has to
+  name it - and when it did not, it must not claim one. }
+procedure Test404NamesTheAlias;
+var
+  A: TAgent;
+  Err: string;
+begin
+  ResetScript;
+  uTools.RootDir := SessionDir;
+  SetLength(Replies, 1);
+  Replies[0] := TextReply('unused');
+  FailAfter := 0;
+  FailUntil := 99;
+  FailStatus := 404;
+  FailBody := '{"type":"error","error":{"type":"not_found_error",' +
+              '"message":"model: claude-opus-4-5"}}';
+
+  A := MakeAgent;
+  try
+    A.Model := 'opus';
+    A.Send('hello', Err);
+    Check(Pos('not_found_error', Err) > 0,
+      'the API''s own message survives: ' + Err);
+    Check(Pos('alias "opus"', Err) > 0, 'and the alias that produced the id');
+    Check(Pos('/model', Err) > 0, 'and the command that lists what works');
+  finally
+    A.Free;
+  end;
+
+  ResetScript;
+  SetLength(Replies, 1);
+  Replies[0] := TextReply('unused');
+  FailAfter := 0;
+  FailUntil := 99;
+  FailStatus := 404;
+  FailBody := '{"type":"error","error":{"type":"not_found_error",' +
+              '"message":"model: claude-typo-9"}}';
+  A := MakeAgent;
+  try
+    A.Model := 'claude-typo-9';
+    A.Send('hello', Err);
+    Check(Pos('not_found_error', Err) > 0, 'a typed id still gets the message');
+    Check(Pos('alias', Err) = 0,
+      'and is NOT told it came from an alias it never used: ' + Err);
+  finally
+    A.Free;
+  end;
+end;
+
 { Esc during a subagent must stop both agents.  The host's cancel flag is
   consume-on-read, so this stand-in is too: without the latch the subagent
   eats the abort and the parent carries on as though nothing happened. }
@@ -2248,8 +3079,19 @@ var
   DriverLines: array of string;
   DriverAt: Integer = 0;
 
+var
+  { Set by a resume test to the session file it is watching.  The save has to
+    happen BEFORE the result line - that ordering is the contract a
+    subprocess-per-turn driver relies on to spawn the next process the moment
+    it reads one - and the only honest way to assert it is to stat the file at
+    the instant the result line is emitted. }
+  WatchPath: string = '';
+  FileAtResult: Boolean = False;
+
 procedure CollectLine(const S: string);
 begin
+  if (WatchPath <> '') and (Pos('"type":"result"', S) > 0) then
+    FileAtResult := FileExists(WatchPath);
   SetLength(SdkLines, Length(SdkLines) + 1);
   SdkLines[High(SdkLines)] := S;
 end;
@@ -2361,11 +3203,17 @@ end;
 
 function SdkOptions(F: TSdkFormat; Stream: Boolean): TSdkOptions;
 begin
+  { From the zeroing constructor, so a field added to TSdkOptions later cannot
+    reach SdkRun as stack garbage through this helper. }
+  Result := uSdk.SdkDefaultOptions;
   Result.Format := F;
   Result.StreamInput := Stream;
   Result.SessionId := 'sess-test';
   if Stream then Result.PermissionMode := 'ask'
   else Result.PermissionMode := 'deny';
+  { The name and the channel are two decisions now.  A driver on stdin is a
+    permission answerer, so it is armed exactly when there is one. }
+  Result.AskViaDriver := Stream;
 end;
 
 { One turn with a tool in it, seen entirely through the wire. }
@@ -2779,7 +3627,423 @@ begin
   end;
 end;
 
+{ The use case the feature exists for, both halves: turn one writes a file
+  that was not there, turn two - a different process, so a different agent -
+  continues it. }
+procedure TestSdkResumeRoundTrip;
+var
+  A: TAgent;
+  Err, P, T: string;
+  Code, FirstCount: Integer;
+  Opts: TSdkOptions;
+  Doc: TJson;
 begin
+  ResetScript;
+  ResetSdk;
+  uTools.RootDir := SessionDir;
+  P := IncludeTrailingPathDelimiter(SessionDir) + 'resume-roundtrip.json';
+  if FileExists(P) then DeleteFile(P);
+
+  SetLength(Replies, 1);
+  Replies[0] := TextReply('first answer');
+  Opts := SdkOptions(sfStreamJson, False);
+  Opts.SessionFile := P;
+  Opts.Resume := True;
+
+  WatchPath := P;
+  FileAtResult := False;
+  uSdk.SdkSink := @CollectLine;
+  A := MakeAgent;
+  FirstCount := 0;
+  try
+    Code := uSdk.SdkRun(A, Opts, 'first question', Err);
+    Check(Code = 0, 'a run whose session file does not exist yet starts clean');
+    Doc := JsonParse(SdkNthOf('system', 0));
+    try
+      Check(not Doc.Find('resumed').AsBoolean,
+        'and reports that it resumed nothing');
+      Check(Round(Doc.Num('resumed_messages', -1)) = 0, 'with no messages');
+      Check(Doc.Str('session_file') = P, 'naming the file it will write');
+    finally
+      Doc.Free;
+    end;
+    Check(FileExists(P), 'the turn wrote the session file');
+    { The ordering contract: a driver may spawn the next process the moment it
+      reads the result line, so the file has to be there by then. }
+    Check(FileAtResult,
+      'and it was already on disk when the result line was emitted');
+    FirstCount := A.MessageCount;
+  finally
+    A.Free;
+    WatchPath := '';
+    uSdk.SdkSink := nil;
+  end;
+
+  { A second process: a brand new agent, told to resume the same path. }
+  ResetScript;
+  ResetSdk;
+  SetLength(Replies, 1);
+  Replies[0] := TextReply('second answer');
+  uSdk.SdkSink := @CollectLine;
+  A := MakeAgent;
+  try
+    Code := uSdk.SdkRun(A, Opts, 'second question', Err);
+    Check(Code = 0, 'the continuation run also exits 0');
+    Doc := JsonParse(SdkNthOf('system', 0));
+    try
+      Check(Doc.Find('resumed').AsBoolean, 'and this one says it resumed');
+      Check(Round(Doc.Num('resumed_messages', -1)) = FirstCount,
+        Format('restoring the first run''s message count (%d/%d)',
+          [Round(Doc.Num('resumed_messages', -1)), FirstCount]));
+    finally
+      Doc.Free;
+    end;
+    T := A.Transcript;
+    Check(Pos('first question', T) > 0,
+      'the continued transcript opens with the first run''s question');
+    Check(Pos('second question', T) > Pos('first question', T),
+      'and the new turn comes after it');
+    { The proof it reached the model rather than merely the transcript. }
+    Check(Pos('first question', Requests[0]) > 0,
+      'and the restored history was in the request that was sent');
+  finally
+    A.Free;
+    uSdk.SdkSink := nil;
+  end;
+end;
+
+{ A file that is there and cannot be read stops the run before any turn, in
+  both protocol formats, without overwriting what it could not understand. }
+procedure TestSdkResumeRefusesCorrupt;
+var
+  A: TAgent;
+  Err, P, Original, After_: string;
+  Code: Integer;
+  Opts: TSdkOptions;
+  Doc: TJson;
+  L: TStringList;
+begin
+  ResetScript;
+  ResetSdk;
+  uTools.RootDir := SessionDir;
+  P := IncludeTrailingPathDelimiter(SessionDir) + 'resume-corrupt.json';
+  { A transcript that does not open with a user message: one of
+    ValidTranscript's rules, refused by the load path unchanged. }
+  Original := '{"version":1,"messages":[{"role":"assistant","content":' +
+    '[{"type":"text","text":"x"}]}]}';
+  L := TStringList.Create;
+  try
+    L.Text := Original;
+    L.SaveToFile(P);
+  finally
+    L.Free;
+  end;
+
+  SetLength(Replies, 1);
+  Replies[0] := TextReply('should never be asked for');
+  Opts := SdkOptions(sfStreamJson, False);
+  Opts.SessionFile := P;
+  Opts.Resume := True;
+
+  uSdk.SdkSink := @CollectLine;
+  A := MakeAgent;
+  try
+    Code := uSdk.SdkRun(A, Opts, 'a question', Err);
+    Check(Code = 2, Format('a corrupt resume exits 2, not 1 (%d)', [Code]));
+    Check(SdkTypes = 'system;error;result;',
+      'the frame is still whole: system, then the reason, then result: ' +
+      SdkTypes);
+    Doc := JsonParse(SdkNthOf('error', 0));
+    try
+      Check(Pos(P, Doc.Str('error')) > 0, 'the error line names the file');
+      Check(Pos('user', Doc.Str('error')) > 0,
+        'and carries ValidTranscript''s own reason: ' + Doc.Str('error'));
+    finally
+      Doc.Free;
+    end;
+    Doc := JsonParse(SdkNthOf('result', 0));
+    try
+      Check(Doc.Str('subtype') = 'error', 'the result says error');
+    finally
+      Doc.Free;
+    end;
+    Check(CallCount = 0, 'and no turn was run at all');
+  finally
+    A.Free;
+    uSdk.SdkSink := nil;
+  end;
+
+  { The refused file is still the file.  A run that started fresh would have
+    saved over the evidence on its way out. }
+  L := TStringList.Create;
+  try
+    L.LoadFromFile(P);
+    After_ := Trim(L.Text);
+  finally
+    L.Free;
+  end;
+  Check(After_ = Original,
+    'the unreadable file was not overwritten by a fresh save');
+
+  { json, where the one-line invariant has to survive the refusal. }
+  ResetScript;
+  ResetSdk;
+  SetLength(Replies, 1);
+  Replies[0] := TextReply('should never be asked for');
+  Opts := SdkOptions(sfJson, False);
+  Opts.SessionFile := P;
+  Opts.Resume := True;
+  uSdk.SdkSink := @CollectLine;
+  A := MakeAgent;
+  try
+    Code := uSdk.SdkRun(A, Opts, 'a question', Err);
+    Check(Code = 2, 'json refuses with 2 as well');
+    Check(Length(SdkLines) = 1,
+      Format('emitting exactly one line (%d)', [Length(SdkLines)]));
+    Check(SdkTypes = 'result;', 'and it is the result line: ' + SdkTypes);
+  finally
+    A.Free;
+    uSdk.SdkSink := nil;
+  end;
+end;
+
+{ A save that cannot happen is reported and fails the run, but the turn's own
+  result still says what the turn did. }
+procedure TestSdkSaveFailureReported;
+var
+  A: TAgent;
+  Err, P: string;
+  Code: Integer;
+  Opts: TSdkOptions;
+  Doc: TJson;
+begin
+  ResetScript;
+  ResetSdk;
+  uTools.RootDir := SessionDir;
+  { An existing directory: SaveSession's stream cannot be created on it. }
+  P := IncludeTrailingPathDelimiter(SessionDir) + 'a-directory-not-a-file';
+  ForceDirectories(P);
+
+  SetLength(Replies, 1);
+  Replies[0] := TextReply('the answer survives');
+  Opts := SdkOptions(sfStreamJson, False);
+  Opts.SessionFile := P;
+
+  uSdk.SdkSink := @CollectLine;
+  A := MakeAgent;
+  try
+    Code := uSdk.SdkRun(A, Opts, 'a question', Err);
+    Check(Code = 1, Format('a failed save fails the run (%d)', [Code]));
+    Check(SdkCountOf('error') = 1, 'with one error line');
+    Doc := JsonParse(SdkNthOf('error', 0));
+    try
+      Check(Pos('session not saved', Doc.Str('error')) > 0,
+        'saying the save is what failed: ' + Doc.Str('error'));
+    finally
+      Doc.Free;
+    end;
+    Doc := JsonParse(SdkNthOf('result', 0));
+    try
+      { Not 'error'.  The turn succeeded and the answer is right there; saying
+        otherwise would tell a driver its work was lost when it was not. }
+      Check(Doc.Str('subtype') = 'success',
+        'while the turn itself still reports success: ' + Doc.Str('subtype'));
+      Check(Pos('the answer survives', Doc.Str('result')) > 0,
+        'with the model''s answer intact');
+    finally
+      Doc.Free;
+    end;
+  finally
+    A.Free;
+    uSdk.SdkSink := nil;
+  end;
+end;
+
+{ ------------------------------------------------------------- telemetry -- }
+
+var
+  SawStatus: Integer = -1;
+  SawElapsed: Integer = -1;
+  SawModel: string = '';
+  SawCalls: Integer = 0;
+
+procedure CapRequestDone(StatusCode, ElapsedMs: Integer; const Model: string);
+begin
+  Inc(SawCalls);
+  SawStatus := StatusCode;
+  SawElapsed := ElapsedMs;
+  SawModel := Model;
+end;
+
+procedure BoomRequestDone(StatusCode, ElapsedMs: Integer; const Model: string);
+begin
+  Inc(SawCalls);
+  { A telemetry fault must not be able to fail a turn: the give-up rule is
+    worthless if the recording path itself can raise. }
+  raise Exception.Create('telemetry exploded');
+end;
+
+{ OnRequestDone fires once per request, carrying a status and a non-negative
+  duration and NOTHING that could hold prompt or reply text.  And a recorder
+  that throws is still not allowed to cost the answer. }
+procedure TestRequestDoneSeam;
+var
+  A: TAgent;
+  Err: string;
+begin
+  ResetScript;
+  uTools.RootDir := SessionDir;
+  SetLength(Replies, 1);
+  Replies[0] := TextReply('an answer');
+  SawCalls := 0;
+  SawStatus := -1;
+  SawElapsed := -1;
+  A := MakeAgent;
+  try
+    A.OnRequestDone := @CapRequestDone;
+    Check(A.Send('ask', Err), 'the turn succeeds with a request recorder wired');
+    Check(SawCalls = 1, 'and the recorder fired exactly once');
+    Check(SawStatus = 200, 'with the HTTP status');
+    Check(SawElapsed >= 0, 'and a non-negative duration');
+    Check(SawModel <> '', 'and the model the request actually carried');
+    { The only three things it is given.  A body or an error string here would
+      be the first place completion text could reach a metrics exporter. }
+    Check(Pos('an answer', SawModel) = 0, 'and never the reply text');
+  finally
+    A.Free;
+  end;
+
+  ResetScript;
+  SetLength(Replies, 1);
+  Replies[0] := TextReply('still fine');
+  SawCalls := 0;
+  A := MakeAgent;
+  try
+    A.OnRequestDone := @BoomRequestDone;
+    Check(A.Send('ask', Err), 'a recorder that raises does not fail the turn');
+    Check(SawCalls = 1, 'though it was called');
+  finally
+    A.Free;
+  end;
+end;
+
+{ The central promise, asserted against the transport: a turn with telemetry
+  OFF makes exactly one request - the model call - and a turn with telemetry
+  ON but the collector answering nonsense still completes. }
+procedure TestTelemetryNeverCostsATurn;
+var
+  A: TAgent;
+  Err, FErr: string;
+  C: TTelemConfig;
+  Status: Integer;
+begin
+  ResetScript;
+  uTools.RootDir := SessionDir;
+  SetLength(Replies, 1);
+  Replies[0] := TextReply('off');
+  TelemInit(TelemDefaultConfig);
+  A := MakeAgent;
+  try
+    A.OnRequestDone := @CapRequestDone;
+    Check(A.Send('ask', Err), 'a turn completes with telemetry off');
+    { FakePost is installed for this whole process, so a flush that went out
+      would show up here as a second recorded request. }
+    Check(CallCount = 1, 'and exactly one request was made - the model call');
+    TelemRecordTurn(A.TokensIn, A.TokensOut, A.CacheReadTokens,
+      A.CacheWriteTokens, A.LastRequestModel);
+    Check(not TelemDueForFlush, 'and nothing is ever due while it is off');
+  finally
+    A.Free;
+  end;
+
+  ResetScript;
+  SetLength(Replies, 1);
+  Replies[0] := TextReply('on');
+  C := TelemDefaultConfig;
+  C.Enabled := True;
+  C.Endpoint := 'http://127.0.0.1:4318/v1/metrics';
+  C.IntervalTurns := 1;
+  TelemInit(C);
+  A := MakeAgent;
+  try
+    Check(A.Send('ask', Err), 'a turn completes with telemetry on');
+    TelemRecordTurn(A.TokensIn, A.TokensOut, A.CacheReadTokens,
+      A.CacheWriteTokens, A.LastRequestModel);
+    TelemRecordTurn(A.TokensIn * 2, A.TokensOut * 2, 0, 0, A.LastRequestModel);
+    Check(TelemDueForFlush, 'and the flush comes due');
+    TelemFlush(Status, FErr);
+    ResetScript;
+    SetLength(Replies, 1);
+    Replies[0] := TextReply('and again');
+    Check(A.Send('again', Err), 'the next turn works whatever the flush did');
+  finally
+    A.Free;
+    TelemInit(TelemDefaultConfig);
+  end;
+end;
+
+{ /status reports the agent's live counters, not a private copy that goes
+  stale - and building either report must make no request.  This suite is the
+  only one that can prove the second half: its transport always answers, so a
+  check that quietly sent something would otherwise pass everywhere. }
+procedure TestDiagReadsLiveCountersAndSendsNothing;
+var
+  A: TAgent;
+  Err: string;
+  R: TStatusReport;
+  D: TDiagReport;
+  Before: Integer;
+
+  function ValueOf(const Id: string): string;
+  var
+    I: Integer;
+  begin
+    Result := '';
+    for I := 0 to High(R) do
+      if R[I].Id = Id then Exit(R[I].Value);
+  end;
+
+begin
+  ResetScript;
+  uTools.RootDir := SessionDir;
+  SetLength(Replies, 2);
+  Replies[0] := TextReply('first');
+  Replies[1] := TextReply('second');
+  uDiag.ClearDiagNotes;
+  uDiag.ClearDiagFacts;
+  A := MakeAgent;
+  try
+    Check(A.Send('one', Err), 'first turn');
+    Check(A.Send('two', Err), 'second turn');
+    Before := Length(Requests);
+    R := uDiag.DiagBuildStatus(A);
+    Check(ValueOf('turns') = IntToStr(A.TurnCount),
+      'status reports the agent''s own turn count');
+    Check(ValueOf('tokens_in') = IntToStr(A.TokensIn),
+      'and its input tokens');
+    Check(ValueOf('tokens_out') = IntToStr(A.TokensOut),
+      'and its output tokens');
+    Check(ValueOf('context') = IntToStr(A.ContextTokens),
+      'and the context size of the last request');
+    Check(A.TurnCount = 2, 'and the counters really moved');
+    D := uDiag.DiagBuildDoctor(A, False);
+    Check(Length(D) > 0, 'the doctor builds');
+    { The rule this codebase applies to web search and fetch: nothing goes
+      out because a command was typed. }
+    Check(Length(Requests) = Before,
+      'and neither report produced a single request');
+  finally
+    A.Free;
+    uDiag.ClearDiagNotes;
+    uDiag.ClearDiagFacts;
+  end;
+end;
+
+begin
+  { Hooks are off unless a host says otherwise - see the shipped default in
+    uHooks and TestHooksAreInteractiveOnly in the smoke suite.  This suite
+    stands in for the REPL, which is the one caller that sets it. }
+  uHooks.HooksAllowed := True;
   { Every request in this suite goes to the stand-in rather than the network. }
   SetEnvironmentVariable('USERPROFILE',
     PChar(IncludeTrailingPathDelimiter(SessionDir) + 'nohome'));
@@ -2792,6 +4056,11 @@ begin
   TestRoundLimit;
   TestMidLoopFailure;
   TestDeniedToolContinues;
+  TestDenyProducesToolResult;
+  TestExtraRootsReachTheModel;
+  TestStyleReachesEveryTurn;
+  TestPlanModeReachesTheModel;
+  TestPrintModeInheritsNoGrants;
   TestConversationPersists;
   TestParallelToolCalls;
   TestResumedSessionRunsThroughTheLoop;
@@ -2804,12 +4073,15 @@ begin
   TestRetryHonorsRetryAfter;
   TestRetryDefaultBackoffWithoutHeader;
   TestCompactWithSummary;
+  TestCompactWithSummaryKeepsPendingImages;
   TestCompactWithSummaryFailureRestores;
   TestCompactWithSummaryEmptyRestores;
   TestToolUseStreamingHooks;
   TestContextTokens;
   TestThinkingBudgetInRequest;
   TestOauthRequestShape;
+  TestAuthRefreshOn401;
+  TestSessionCarriesNoCredential;
   TestWebSearchDeclaration;
   TestPauseTurnResumes;
   TestWebSearchRejectionSelfHeals;
@@ -2817,6 +4089,10 @@ begin
   TestSubagent;
   TestSubagentAgentType;
   TestSubagentCost;
+  TestSingleModelHasOneUsageRow;
+  TestSubagentRoutedModel;
+  TestCompactionRoutedModel;
+  Test404NamesTheAlias;
   TestSubagentCancel;
   TestSubagentRoundCap;
   TestMcpTurn;
@@ -2828,6 +4104,12 @@ begin
   TestSdkPermissionDelegation;
   TestSdkJsonSingleLine;
   TestSdkDriverInputHostile;
+  TestSdkResumeRoundTrip;
+  TestSdkResumeRefusesCorrupt;
+  TestSdkSaveFailureReported;
+  TestRequestDoneSeam;
+  TestTelemetryNeverCostsATurn;
+  TestDiagReadsLiveCountersAndSendsNothing;
 
   WriteLn;
   if Fails = 0 then

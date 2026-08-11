@@ -49,6 +49,17 @@ procedure CapResult(const Name, Output: string);
 begin
 end;
 
+{ The status line the user actually sees for a search.  Kept separate from
+  CapResult so the clip test can assert on it without giving every other test
+  in this file a variable it does not use. }
+var
+  LastSearchNote: string = '';
+
+procedure CapSearch(const Name, Output: string);
+begin
+  LastSearchNote := Output;
+end;
+
 { An event as the API frames it: an "event:" line the decoder ignores, then
   the "data:" line that carries the payload. }
 function Ev(const Payload: string): string;
@@ -352,7 +363,8 @@ begin
 end;
 
 { The web search result block, exactly as the API frames it: complete in the
-  content_block_start event, with no deltas to follow. }
+  content_block_start event, with no deltas to follow, and - deliberately -
+  small enough that the clip never touches it. }
 const
   SearchResultBlock =
     '{"type":"web_search_tool_result","tool_use_id":"srvtoolu_01",' +
@@ -426,13 +438,133 @@ begin
         Check(C.Item(0).Find('input').Str('query') = 'free pascal',
           'the accumulated arguments are echoed as parsed input');
         Check(C.Item(1).ToJson = SearchResultBlock,
-          'the result block is echoed byte-for-byte: ' + C.Item(1).ToJson);
+          'a result block under the cap is echoed byte-for-byte: ' +
+          C.Item(1).ToJson);
       finally
         Doc.Free;
       end;
     finally
       A.Free;
     end;
+  end;
+end;
+
+{ One result as the API sends it: a title, a url, a page age, and an opaque
+  blob of page content the server encoded for itself.  The blob is padded to a
+  realistic size because it is the entire cost of a search result - the fields
+  a human would read are a few hundred bytes and are not what makes a verbose
+  search expensive to carry for the rest of a session. }
+function PaddedResult(const Title: string; Pad: Integer): string;
+begin
+  Result := '{"type":"web_search_result","title":' + JsonQuote(Title) +
+    ',"url":"https://example.com/' + Title + '","page_age":"April 1, 2026",' +
+    '"encrypted_content":"' + StringOfChar('A', Pad) + '"}';
+end;
+
+{ Five results of twelve kilobytes each: sixty kilobytes, well past the cap,
+  and the shape a real query with verbose sources produces. }
+function BigSearchStream: string;
+var
+  Body: string;
+  I: Integer;
+begin
+  Body := '';
+  for I := 1 to 5 do
+  begin
+    if Body <> '' then Body := Body + ',';
+    if I = 1 then
+      Body := Body + PaddedResult('Pascal', 12 * 1024)
+    else
+      Body := Body + PaddedResult('R' + IntToStr(I), 12 * 1024);
+  end;
+  Result :=
+    Ev('{"type":"content_block_start","index":0,"content_block":' +
+       '{"type":"server_tool_use","id":"srvtoolu_02","name":"web_search"}}') +
+    Ev('{"type":"content_block_delta","index":0,"delta":' +
+       '{"type":"input_json_delta","partial_json":"{\"query\":\"pascal\"}"}}') +
+    Ev('{"type":"content_block_stop","index":0}') +
+    Ev('{"type":"content_block_start","index":1,"content_block":' +
+       '{"type":"web_search_tool_result","tool_use_id":"srvtoolu_02",' +
+       '"content":[' + Body + ']}}') +
+    Ev('{"type":"message_delta","delta":{"stop_reason":"end_turn"}}');
+end;
+
+{ A search whose result set is echoed on every later request for the rest of
+  the session is the one thing in the transcript that grows without anybody
+  choosing it, so it is clipped at capture.  The clip cuts only at result
+  boundaries: what survives is the object the server sent, byte for byte, and
+  what does not survive is gone whole rather than cut through a brace. }
+procedure TestSearchResultClipped;
+var
+  A: TAgent;
+  Blocks: TPartialBlocks;
+  Stop, Err: string;
+  Ran: Boolean;
+  Doc, C, Res: TJson;
+  Kept: Integer;
+begin
+  LastSearchNote := '';
+  A := TAgent.Create('k', 'm', '');
+  try
+    A.OnToolResult := @CapSearch;
+    Blocks := A.DecodeStream([BigSearchStream], Stop, Err);
+    Check(Length(Blocks) = 2, 'an oversize search reply still decodes to two blocks');
+    if Length(Blocks) <> 2 then Exit;
+    A.ApplyBlocks(Blocks, Ran);
+    Doc := JsonParse(A.Transcript);
+    try
+      Check(Doc <> nil, 'the transcript still parses after a clip');
+      if Doc = nil then Exit;
+      C := Doc.Item(0).Find('content');
+      Check((C <> nil) and (C.Count = 2), 'both blocks survive into the transcript');
+      if (C = nil) or (C.Count <> 2) then Exit;
+
+      Res := C.Item(1).Find('content');
+      Check((Res <> nil) and (Res.Count < 5),
+        Format('a result set over the cap keeps fewer results than arrived (%d)',
+          [Res.Count]));
+      Check(Res.Count >= 1,
+        'and never fewer than one - an empty array would read as a search ' +
+        'that found nothing');
+      Kept := Res.Count;
+      Check(Length(C.Item(1).ToJson) < 2 * MaxSearchResultBytes,
+        Format('the echoed block is bounded by the cap plus the one result ' +
+          'the cap cannot refuse (%d bytes)', [Length(C.Item(1).ToJson)]));
+      Check(Res.Item(0).Str('title') = 'Pascal',
+        'the first result survives the clip untouched');
+      Check(Res.Item(0).Str('type') = 'web_search_result',
+        'every kept result keeps its own shape');
+      Check(Res.Item(0).Str('encrypted_content') = StringOfChar('A', 12 * 1024),
+        'and its opaque content is not shortened either');
+      Check(Pos('dropped', Res.Item(Kept - 1).Str('title')) > 0,
+        'the last kept result says on its face that others were dropped');
+    finally
+      Doc.Free;
+    end;
+    Check(Pos('dropped', LastSearchNote) > 0,
+      'the status line the user sees names the clip: ' + LastSearchNote);
+  finally
+    A.Free;
+  end;
+
+  { An errored search carries an object where the results would be.  There is
+    nothing there to clip and the host has to say error rather than a count. }
+  LastSearchNote := '';
+  A := TAgent.Create('k', 'm', '');
+  try
+    A.OnToolResult := @CapSearch;
+    Blocks := A.DecodeStream([
+      Ev('{"type":"content_block_start","index":0,"content_block":' +
+         '{"type":"web_search_tool_result","tool_use_id":"srvtoolu_03",' +
+         '"content":{"type":"web_search_tool_result_error",' +
+         '"error_code":"max_uses_exceeded"}}}')],
+      Stop, Err);
+    A.ApplyBlocks(Blocks, Ran);
+    Check(Pos('error', LastSearchNote) > 0,
+      'a search that errored still reports as an error and is not clipped: ' +
+      LastSearchNote);
+  finally
+    A.Free;
   end;
 end;
 
@@ -617,6 +749,7 @@ begin
   TestDeniedToolStillAnswers;
   TestPlainReplyEndsTurn;
   TestServerToolBlocks;
+  TestSearchResultClipped;
   TestUnknownBlockWithDeltaDropped;
   TestRequestBody;
   TestAwkwardTextRoundTrips;

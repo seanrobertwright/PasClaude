@@ -13,8 +13,21 @@ interface
 uses SysUtils;
 
 type
+  { The first nine are the original palette and map to the bright ANSI
+    foregrounds, which is all a legacy console can render.  The four after
+    them are the amber theme, and they are the reason this enum grew: a
+    16-colour palette has exactly one amber - clYellow - and a UI built from
+    one amber is a UI with no shading.  These four go out as 24-bit
+    sequences on a VT console and collapse onto clYellow and clGrey where
+    they cannot, which is a duller banner and never a broken one.
+
+    New entries go at the END.  Attr and VtSeq both close with an else, so
+    an unmapped colour is the saved attribute rather than a compile error -
+    an ordering mistake here would be silent. }
   TColor = (clGrey, clWhite, clBright, clCyan, clGreen, clYellow, clRed,
-            clMagenta, clBlue);
+            clMagenta, clBlue,
+            { the amber ramp, lightest first }
+            clAmberLt, clAmber, clAmberDim, clAmberDk);
 
 procedure TermInit;
 procedure TermDone;
@@ -37,6 +50,142 @@ procedure EmitCLn(C: TColor; const S: string = '');
   path; attribute round trip on legacy consoles. }
 procedure EmitLogo(const S: string);
 
+{ ------------------------------------------------------------- the chrome --
+
+  The banner and the prompt block are laid out in columns, and a column is a
+  width.  Everything below exists because Length() is not a width: this
+  program's strings are UTF-8, so '─' is three bytes and one column, and a
+  banner padded by Length() is a banner with a ragged right edge.
+
+  Rows are written as ONE string with inline colour marks rather than as a
+  run of EmitC calls, because a row that is six calls long cannot be measured
+  or padded before it is painted - and measuring is the whole job.  A mark is
+  #1 followed by one letter; #1 cannot occur in text the user or the model
+  produced, so no escaping rule is needed and none is enforced. }
+
+const
+  MkOff      = #1'0';    { back to the terminal's own colour }
+  MkGrey     = #1'g';
+  MkWhite    = #1'w';
+  MkBright   = #1'B';
+  MkCyan     = #1'c';
+  MkGreen    = #1'G';
+  MkYellow   = #1'y';
+  MkRed      = #1'r';
+  MkAmberLt  = #1'L';
+  MkAmber    = #1'A';
+  MkAmberDim = #1'D';
+  MkAmberDk  = #1'K';
+
+{ Columns the string occupies once the marks are removed.  Counts UTF-8
+  characters, not bytes.  Every glyph this program draws is single-width;
+  a wide CJK character would be counted as one and pad short, which is a
+  cosmetic bug in a banner and not worth a character-width table. }
+function UiWidth(const S: string): Integer;
+{ The string with the marks stripped - what a log or a test sees. }
+function UiPlain(const S: string): string;
+{ Padded on the right to exactly W columns (never truncated: use UiFit). }
+function UiPad(const S: string; W: Integer): string;
+{ Truncated to at most W columns, with a trailing ellipsis when it had to
+  cut.  Marks are preserved and never counted, and a cut never lands inside
+  a mark or inside a UTF-8 sequence. }
+function UiFit(const S: string; W: Integer): string;
+{ Centred within W columns. }
+function UiCentre(const S: string; W: Integer): string;
+{ Paints a marked-up string.  Colour marks turn into EmitC runs. }
+procedure UiPaint(const S: string);
+procedure UiPaintLn(const S: string = '');
+{ The same string with the marks turned into VT escapes, for a caller that
+  must paint in ONE write - the prompt block repaints six rows on every
+  keystroke, and six rows of per-run console calls is a prompt that feels
+  like it is thinking.  '' when VT is off, because there is nothing useful
+  to return: the attribute path cannot be expressed as text. }
+function UiVt(const S: string): string;
+
+{ True when the console can be trusted with box-drawing and block glyphs.
+  Tied to VT by default, which every console that has the fonts also has and
+  which the raster-font conhost that would render them as blanks does not. }
+function UiFancy: Boolean;
+
+type
+  { ugAuto follows VT.  The other two override it, which the tests need -
+    a suite that can only ever reach the ASCII branch is a suite that tests
+    half of this - and which a user on a terminal that renders box-drawing
+    badly can be given later without another decision being made here. }
+  TUiGlyphs = (ugAuto, ugAscii, ugUnicode);
+
+procedure UiSetGlyphs(G: TUiGlyphs);
+function UiGlyphs: TUiGlyphs;
+{ Glyph repeated N times.  N below 1 is the empty string, so a caller doing
+  arithmetic on a terminal width cannot produce a negative-length loop. }
+function UiRepeat(const Glyph: string; N: Integer): string;
+{ A horizontal rule of Cells columns. }
+function UiRule(Cells: Integer): string;
+{ A proportional bar: Pct of Cells columns in Fill, the rest in Trough.
+  Pct is clamped to 0..100, and a non-zero percentage always lights at least
+  one cell - a meter that reads 0 at 1% is a meter that lies about the
+  direction things are moving. }
+function UiMeter(Pct, Cells: Integer; Fill, Trough: TColor): string;
+{ 1234 as '1.2k', 1500000 as '1.5M'.  For the status line, where the number
+  is a sense of scale and four significant figures are noise. }
+function UiCount(N: Int64): string;
+
+{ A rounded frame, exactly Width columns wide in every part, so the three
+  pieces line up without the caller doing arithmetic.  The title is set into
+  the top edge, where it reads as a label rather than as a first row.
+
+  UiBoxRow takes one string per column and the width of each; a column is
+  fitted and padded to its width, so a long path shortens instead of pushing
+  the right border off the screen.  For N columns the frame costs
+  3*N + 1 columns of chrome, which is what UiBoxInner works out for the
+  caller. }
+function UiBoxTop(const Title: string; Width: Integer): string;
+function UiBoxBottom(Width: Integer): string;
+function UiBoxRow(const Cells: array of string;
+  const Widths: array of Integer): string;
+{ Columns left for content in a Width-wide box of Columns columns. }
+function UiBoxInner(Width, Columns: Integer): Integer;
+
+{ ---------------------------------------------------------- the statusline --
+
+  What the block under the prompt says.  uTerm is at the bottom of the unit
+  ladder and cannot ask uAgent for a token count or uTools for the permission
+  mode, so the facts are PUSHED here by the REPL before each read rather than
+  pulled from here.  That inversion is not a workaround: it is what keeps the
+  console unit free of the program's state, and it means the composer below
+  is a pure function of a record and can be tested without a console.
+
+  Every field has a "say nothing" value - '' or a negative number - and a
+  field that says nothing takes no space in the output.  A status line is
+  read at a glance or not at all, so a run with no git, no MCP servers and no
+  memory file gets a shorter line, not a line of zeroes and dashes. }
+type
+  TStatusInfo = record
+    Model: string;         { the model or alias in force }
+    Dir: string;           { the working directory, already shortened }
+    Branch: string;        { git branch; '' when the tree is not a repo }
+    CtxTokens: Int64;      { the last measured prompt size }
+    CtxLimit: Int64;       { what it is measured against; 0 hides the meter }
+    TokensIn: Int64;       { the session totals, cache included }
+    TokensOut: Int64;
+    Memories: Integer;     { CLAUDE.md files loaded; -1 hides }
+    Mcps: Integer;         { live MCP servers; -1 hides }
+    Hooks: Integer;        { configured hook entries; -1 hides }
+    Mode: string;          { permission mode word; '' hides the whole line }
+    ModeHot: Boolean;      { paint the mode as a warning, not as a label }
+    Note: string;          { one free line, already marked up; '' hides }
+  end;
+
+{ Clears every field to its "say nothing" value.  Callers build on top of
+  this rather than declaring a record and filling what they remember, so a
+  field added later defaults to hidden instead of to garbage. }
+procedure StatusClear(out S: TStatusInfo);
+{ Installs what the block paints.  Read only while a prompt is on screen. }
+procedure SetStatus(const S: TStatusInfo);
+{ The rows the record renders to, marked up and already fitted to Width.
+  Pure: no console, no module state beyond the palette. }
+function StatusLines(const S: TStatusInfo; Width: Integer): TStringArray;
+
 { ------------------------------------------------------- markdown streaming --
 
   The reply arrives in fragments that can split anywhere - mid-line, mid-**,
@@ -57,8 +206,28 @@ procedure MdFinish;
 function MdMidLine: Boolean;
 
 { Reads one line with basic editing (backspace, Ctrl+U, Ctrl+C).
-  Returns False when the user asks to quit (Ctrl+C on an empty line, or EOF). }
+  Returns False when the user asks to quit (Ctrl+C on an empty line, or EOF).
+
+  This is the PLAIN reader, and it is the one every prompt in the program uses
+  except the REPL: the permission answer, the model picker, the session picker
+  and the rewind picker all read through here.  It consults no binding table
+  and has no modal editor - see the line-editing section below for why that
+  is a safety property and not an oversight. }
 function ReadLineEdit(const Prompt: string; out Line: string): Boolean;
+
+{ Reads one line WITHOUT echoing anything at all - not the characters, not
+  asterisks.  A mask is not free: it publishes the secret's length to anyone
+  looking at the screen or at a terminal recording, and length is most of
+  what an attacker wants to know about a key.  The prompt therefore has to
+  say that typing is not shown, because a terminal that prints nothing looks
+  like a terminal that has hung, and a user who thinks it hung pastes twice.
+
+  False on Esc, on Ctrl+C, and immediately when stdin is not a console - a
+  scripted run has nobody to type, and a reader that blocked there would hang
+  the run forever.  Nothing read here reaches the history: this reader does
+  not call HistoryAdd and does not go through the prompt profile, so no
+  binding table can be pointed at it. }
+function ReadSecretLine(const Prompt: string; out Secret: string): Boolean;
 
 { True when a key is waiting; used to let the user interrupt a stream. }
 function EscPressed: Boolean;
@@ -86,16 +255,108 @@ function TermWidth: Integer;
   history entry is recalled - are separated from the console so they can be
   tested.  ReadLineEdit is then a loop that turns real key events into these
   calls and redraws; everything that could be wrong about the editing itself
-  lives here. }
+  lives here.
+
+  The modal editor and the rebindable keys are both built on that seam rather
+  than inside the key loop, for the same reason: a suite with no way to
+  deliver a keystroke can still drive EditApply, EditNormalKey and DecodeKey
+  directly, so every decision either of them makes is asserted.
+
+  TWO WALLS keep a keys.json away from the permission prompt, and either one
+  alone is sufficient:
+
+    1. The grammar.  A bindable chord must carry ctrl or alt, or be a named
+       non-character key.  The strings 'y', 'a' and 'n' cannot be written in
+       the key-name grammar at all, so no configuration file - mistaken or
+       hostile - can express a rebinding of a permission answer.  Enter, Tab,
+       Escape and Ctrl+C are refused on top of that.
+    2. The scope.  ReadLineCore takes its profile as a required parameter and
+       reads no module state.  Exactly one expression in the program hands it
+       PromptProfile - the argument in ReadPromptLine - and exactly one call
+       site reaches ReadPromptLine, the REPL.  Everything else calls
+       ReadLineEdit, which passes the constant KeysNone, so the permission
+       prompt and the four pickers - /model, /sessions, /rewind and the
+       source chooser inside /login - are structurally unable to see a
+       binding or a vim mode.  The audit is one line:
+
+         grep -n "ReadPromptLine\|PromptProfile\|KeysNone" src/*.pas src/*.lpr
+
+       Expected, and nothing else: ReadPromptLine - one declaration, one body,
+       ONE CALL.  KeysNone - one declaration, one body, one use (in
+       ReadLineEdit) plus KeysDefault building on it.  PromptProfile - one
+       declaration, one body, one setter pair, one read INSIDE THIS UNIT
+       (ReadPromptLine's argument), and reads in the host only to print the
+       table (/keys), to report the mode (/vim) and to save it - none of
+       which can route a profile into a reader.  A second call to
+       ReadPromptLine, or a read of PromptProfile inside ReadLineCore, is the
+       thing this comment exists to make visible in a diff.
+
+  And a third: an action is a TEditKey, so nothing a binding can name
+  submits a line, answers a question, or reaches outside the buffer. }
 type
+  TVimMode = (vmInsert, vmNormal);
+
+  { The eleven original verbs come first and in their original order - a
+    saved profile and the tests both name them by identifier, but ekNewline
+    being last is asserted elsewhere as a canary, so new verbs are APPENDED
+    and never interleaved. }
   TEditKey = (ekChar, ekBackspace, ekDelete, ekLeft, ekRight, ekHome, ekEnd,
-              ekHistPrev, ekHistNext, ekClear, ekNewline);
+              ekHistPrev, ekHistNext, ekClear, ekNewline,
+              { motions }
+              ekWordRight, ekWordLeft, ekWordEnd, ekFirstNonBlank,
+              { deletions }
+              ekDelWordRight, ekDelWordLeft, ekDelWordEnd, ekDelToEnd,
+              ekDelToStart, ekDelLine,
+              { the same six, then insert mode - vim's c operator }
+              ekChangeWordRight, ekChangeWordLeft, ekChangeWordEnd,
+              ekChangeToEnd, ekChangeToStart, ekChangeLine,
+              { mode changes }
+              ekNormalMode, ekInsertHere, ekAppendHere, ekInsertStart,
+              ekAppendEnd,
+              { history of edits, not of commands }
+              ekUndo, ekRedo);
+
+  { One point on the edit timeline.  Only the text and the caret: the mode,
+    the history position and the pending operator are where the user is, not
+    what the line says, and restoring them would be surprising. }
+  TEditUndo = record
+    Text: WideString;
+    Caret: Integer;
+  end;
 
   TEditState = record
     Text: WideString;
     Caret: Integer;        { 0..Length(Text); characters before the cursor }
     HistPos: Integer;      { Length(History) means "the line being typed" }
     Pending: WideString;   { the typed line, stashed while browsing history }
+    { Vim is a property of the profile the line was started with, not a
+      global, so a line read by ReadLineEdit can never be modal. }
+    Vim: Boolean;
+    Mode: TVimMode;
+    PendOp: WideChar;      { 'd' or 'c' awaiting its target, #0 otherwise }
+    Undo: array of TEditUndo;
+    UndoN: Integer;        { entries in use }
+    UndoAt: Integer;       { index of the entry the current state occupies }
+  end;
+
+  { A key event reduced to what a binding may match on: the virtual-key code
+    and the modifier flags.  Deliberately NOT the character the console
+    synthesises - Ctrl+W arrives as VK $57 with the control flag set and also
+    as UnicodeChar #23, and matching on the VK is what makes one rule cover
+    both shapes. }
+  TKeyChord = record
+    VK: Word;
+    Ctrl, Alt, Shift: Boolean;
+  end;
+
+  TBinding = record
+    Chord: TKeyChord;
+    Action: TEditKey;
+  end;
+
+  TKeyProfile = record
+    Vim: Boolean;
+    Binds: array of TBinding;
   end;
 
   { Supplies completion candidates for the token under the caret.  The host
@@ -106,10 +367,164 @@ type
 var
   CompleteProvider: TCompleteProc = nil;
 
-{ Starts an edit with an empty line. }
+  { The line a second Escape submits at the REPL prompt, '' for "do nothing",
+    which is both the default and what every build of this program did before
+    the feature existed.  Pushed down from pasclaude.lpr - uTerm is below
+    uTools and cannot reach a slash command, and inventing a callback that
+    ran a command from inside the editor's own read loop would be worse
+    still: /rewind prompts, and prompting re-enters ReadLineCore while its
+    console mode and its frame are still live.  Reporting the intent as a
+    submitted line means the REPL dispatches it exactly as if it had been
+    typed, through the one path that already handles commands.
+
+    Same one-byte shape and same fail-closed default as uHooks.HooksAllowed,
+    and re-read at the point of use rather than captured, for the same
+    reason. }
+  EscEscCommand: string = '';
+
+const
+  { How long the second Escape has.  Long enough that Escape-Escape is one
+    gesture rather than two, short enough that an Escape now and an Escape
+    after a moment's thought are not read as one - and the whole trigger is
+    already fenced by "the line was ALREADY empty", so the window is the
+    second lock rather than the only one. }
+  EscEscWindowMs = 600;
+
+{ Should this Escape submit EscEscCommand instead of doing what Escape does?
+  Every condition is here rather than inline in the key handler so the rule
+  can be asserted by a test with no console attached, which is the only way
+  anything about ReadLineCore gets tested at all.
+
+  AtPrompt is the REPL's own read and nothing else: the permission question,
+  the model picker, the session picker and the rewind picker all read through
+  ReadLineEdit, and turning Escape into "/rewind" while somebody is being
+  asked which turn to rewind to is a loop and a nonsense.
+
+  LineEmpty means empty when the FIRST Escape was pressed, not after it - so
+  Escape (which clears the line) followed by Escape does nothing new, and the
+  clear keeps the meaning it has always had.
+
+  Vim disqualifies it outright.  A vim user's fingers press Escape twice to be
+  sure they are in normal mode; that is muscle memory older than this program
+  and stealing it would be exactly the breakage this must not cause.  /rewind
+  is still one word away. }
+function EscEscFires(AtPrompt, Armed, LineEmpty, Vim: Boolean;
+  SinceMs: QWord): Boolean;
+
+type
+  { The periodic work a host wants done while this unit is blocked waiting for
+    a key.  A bare procedure and nothing else, because uTerm is below uTools
+    and must never learn that background jobs, spool files or caps exist: the
+    only fact pushed down here is "there is something to do on a clock", and
+    what that something IS stays entirely above. }
+  TIdleProc = procedure;
+
+var
+  { Nil means DO NOTHING, and it does it by not waiting at all - with this
+    unwired, the read in ReadLineCore is byte-for-byte the untimed
+    ReadConsoleInputW this program has always had, because Assigned() gates
+    the entire wait rather than merely skipping the call inside it.
+
+    Same one-word shape and same fail-closed default as uHooks.HooksAllowed
+    and uSdk.SdkProjectContextAllowed, and for the same reason: a wiring
+    mistake costs a feature instead of costing correctness.  RE-READ at the
+    point of use rather than captured when the line started, so a host that
+    wires it late, or clears it mid-run, gets what it asked for and not what
+    was true when the prompt was drawn.  Set from pasclaude.lpr beside
+    CompleteProvider and EscEscCommand, which is where the other two facts
+    this unit is not allowed to know are pushed down. }
+  IdleTick: TIdleProc = nil;
+
+const
+  { How long one wait may block before the loop wakes up to tick.  This is
+    deliberately uTools.SweepTickMs' own number: the prompt now enforces the
+    background spool cap on the same clock as every other tick site, and the
+    prompt ceasing to be the one place where the clock stops is the entire
+    point of the seam.  uTerm cannot say that by referring to the constant -
+    that reference is exactly the upward dependency this design exists to
+    avoid - so the number is repeated here and the reason is written down
+    instead of being inferred from the coincidence. }
+  IdleWaitMs = 250;
+
+  { The shortest gap between two ticks, and it sits BELOW the wait on purpose.
+    GetTickCount64 advances in steps of about 15.6 ms, so a 250 ms wait
+    routinely measures as 234 ms of elapsed clock.  With the gap equal to the
+    wait, roughly half of all timeouts would measure short, skip, and drift
+    the real interval at an idle prompt out towards half a second - the bug
+    would be half-closed and would look closed.  Set under the wait, a wait
+    that timed out is ALWAYS due.
+
+    Which is to say that in the shipped wiring this gate never actually stops
+    a tick, and that is worth writing down rather than leaving to be worked
+    out from two constants.  It had a second job when ReadLineCore ticked on
+    every wake including the ones a keystroke caused - it was what stopped the
+    key path ticking hot, since autorepeat and a pasted block deliver records
+    far faster than 250 ms - and that loop now breaks out to the read before
+    it ticks at all.  The WAIT is the throttle; this is a floor under it, and
+    the floor stays for two reasons.  Lowering IdleWaitMs, which is the
+    obvious thing to reach for the day the prompt has to notice something
+    sooner, would otherwise raise the sweep rate silently along with it.  And
+    IdleTickFires is a pure decision a suite drives with numbers, so the day
+    something does tick on arrival the rule is already here rather than being
+    invented a second time. }
+  IdleTickMs = 200;
+
+{ Should this wakeup run the tick?  Every condition is here rather than inline
+  in the read loop for the same reason EscEscFires' are: no suite can enter
+  ReadLineCore - there is no console under a test runner - so a rule that
+  lives inside that loop is a rule nothing can ever assert.  This one can be
+  called with numbers.
+
+  NowMs is a PARAMETER and not a GetTickCount64 taken inside, which is the
+  whole reason the interval is assertable without a test that sleeps.  Wired
+  is passed in rather than read here so the caller does the Assigned() at the
+  point of use and this stays a pure decision.
+
+  LastMs = 0 means "not yet on this line", and it fires: the same convention
+  uTools.LastSweepTick uses for the same reason - a prompt that has just
+  opened should not have to sit out a gap it never used. }
+function IdleTickFires(Wired: Boolean; LastMs, NowMs: QWord): Boolean;
+
+{ The decision and the call in one place, so whatever advances the clock is
+  whatever ran the tick and the two cannot drift apart.  True when the tick
+  actually ran.  LastMs advances ONLY then: a wakeup inside the gap leaves the
+  clock where it was rather than pushing the next tick further out, which is
+  the difference between a gate and a slow leak. }
+function IdleTickRun(var LastMs: QWord; NowMs: QWord): Boolean;
+
+{ How many RawWrite calls actually painted something.  Exposed for exactly one
+  purpose: the idle tick is contracted to print nothing, and this is what
+  turns that contract from a promise into something the read loop can check
+  after the fact and a test can assert outright.  It counts writes and not
+  bytes - the only question is "did anything reach the screen while I was
+  away", and a counter answers it in one compare.
+
+  It sees only what goes through this unit's own funnel.  A callee that wrote
+  to Output directly would tear the frame and never be noticed; that is a bug
+  in the callee, and this guard should not be described as if it were
+  airtight. }
+function EmitCount: QWord;
+
+{ Starts an edit with an empty line, vim off and an empty undo stack. }
 procedure EditInit(out E: TEditState);
+{ The same, then takes the profile's vim setting.  Every line starts in
+  INSERT mode, so a user who turned vim on and forgot types normally. }
+procedure EditInitProfile(out E: TEditState; const P: TKeyProfile);
 { Applies one key.  Ch matters only for ekChar. }
 procedure EditApply(var E: TEditState; Key: TEditKey; Ch: WideChar);
+{ The vim normal-mode command parser: one printable character in, one verb
+  out.  Returns False when the key was absorbed (an operator waiting for its
+  target) or meaningless (an unbound command character, which is DISCARDED -
+  in normal mode a stray key must never end up in the line).  Pure, so 'd'
+  then 'w' is two calls in a test and no console anywhere. }
+function EditNormalKey(var E: TEditState; Ch: WideChar;
+  out Key: TEditKey): Boolean;
+{ The painted lead: the vim indicator when vim is on, then the prompt on the
+  first buffer line or the continuation marker on any other.  Pure, so the
+  whole composition is asserted without a console - the same reason
+  ModePrompt is a function. }
+function EditLead(const E: TEditState; const Prompt: string;
+  FirstLine: Boolean): string;
 { Completes the token ending at the caret using Candidates.  A single match
   replaces the token outright; several extend it to their common prefix.
   Returns True when the text changed.  Pure, so the whole behaviour is
@@ -137,10 +552,86 @@ const
   { Entries kept on disk.  Enough that Up-arrow reaches last week's build
     command, few enough that the file stays trivial. }
   HistoryMax = 200;
+  { Edit states remembered per line.  A prompt line is not a document; a
+    hundred steps is more than anyone unwinds by hand, and the cap is what
+    stops a pathological paste-and-delete loop from growing without bound. }
+  UndoMax = 100;
+
+{ ------------------------------------------------------------- keybindings --
+
+  Two tables, both closed: chord names and action names.  An unknown entry in
+  either is REPORTED, never ignored - a binding that silently did nothing
+  would be indistinguishable from one this build does not support. }
+
+{ The empty profile: no bindings, vim off.  This is what ReadLineEdit passes,
+  and it is the reason a keys.json cannot reach the permission prompt. }
+function KeysNone: TKeyProfile;
+{ The built-in bindings, which a file overrides entry by entry.  These are
+  the readline verbs the editor has always lacked. }
+function KeysDefault: TKeyProfile;
+{ Parses a keys.json document.  Takes BYTES, never a path: uTerm reads
+  nothing from disk but the history file, and the host is what knows where
+  configuration lives.  Returns False for an unusable document, in which case
+  P is KeysDefault - a broken file must never widen or narrow anything.
+  Notes is every entry that was refused, one line each, for the caller to
+  print; the caller owns and frees it. }
+function KeysParse(const Text: string; out P: TKeyProfile;
+  out Notes: TStringArray): Boolean;
+{ Rewrites Existing with P's vim flag, preserving every other field in place.
+  Read-modify-write rather than a rebuild, because keys.json is hand-authored
+  and /vim save must not reorder or drop what the user wrote. }
+function KeysToJson(const P: TKeyProfile; const Existing: string): string;
+
+function KeyActionName(K: TEditKey): string;
+function KeyActionOf(const Name: string; out K: TEditKey): Boolean;
+function KeyChordName(const C: TKeyChord): string;
+{ Parses '[ctrl+][alt+][shift+]base'.  A bare character is REFUSED with Why
+  naming the missing modifier: that refusal is the wall that keeps y, a and n
+  unbindable no matter what else goes wrong. }
+function KeyChordOf(const Name: string; out C: TKeyChord;
+  out Why: string): Boolean;
+{ Chords the editor owns outright: Ctrl+C, Enter (in every modifier
+  combination), Tab and Escape.  Nothing may take them, because each one is
+  how a user gets out of something. }
+function KeyChordReserved(const C: TKeyChord): Boolean;
+
+{ Pure key-event to verb decision, matched on VK and modifiers alone.  False
+  when no binding matches, leaving the caller's fixed handling in charge. }
+function DecodeKey(const P: TKeyProfile; const E: TEditState; VK: Word;
+  Ctrl, Alt, Shift: Boolean; Ch: WideChar; out Key: TEditKey): Boolean;
+
+{ The one install seam.  PromptProfile is read in exactly one expression in
+  the program - ReadPromptLine's argument - and a grep is the audit. }
+procedure SetPromptProfile(const P: TKeyProfile);
+procedure SetPromptVim(Enabled: Boolean);
+function PromptProfile: TKeyProfile;
+
+{ The REPL's reader, and the ONLY caller of the profile.  Everything else in
+  the program keeps ReadLineEdit, whose signature and behaviour are unchanged
+  by any of this.  This is also the only reader that draws the framed block
+  described above; on a console that refused VT it is the plain line, and
+  nothing above this comment changes. }
+function ReadPromptLine(const Prompt: string; out Line: string): Boolean;
+
+{ The visual rows the framed prompt breaks Text into at InnerW columns, and
+  where in them the caret sits.  Rows come back as UTF-8, without the lead
+  or the frame - this is the wrapping alone.
+
+  Exposed for the same reason the editor's own decisions are: a wrap that
+  loses a character, or a caret that lands one row from where the user's eye
+  is, is invisible in review and obvious in use, and neither can be argued
+  about against a console.  Row and column are both zero-based. }
+function PromptRows(const Text: WideString; InnerW, Caret: Integer;
+  out CaretRow, CaretCol: Integer): TStringArray;
 
 implementation
 
-uses Windows, Classes;
+{ uJson is the bottom of the unit ladder and depends on nothing, so using it
+  here breaks no rule - but it is the first thing beyond the RTL that uTerm
+  has needed, and the reason is narrow: keys.json is JSON, and a second
+  parser in this program would be a liability.  KeysParse takes a string, so
+  uTerm still opens no file but the history. }
+uses Windows, Classes, uJson;
 
 var
   HOut: HANDLE = 0;
@@ -178,6 +669,14 @@ begin
     clRed:     Result := #27'[91m';
     clMagenta: Result := #27'[95m';
     clBlue:    Result := #27'[94m';
+    { The amber ramp.  Truecolor, because the whole point of these four is
+      the distance between them and a palette that has one yellow cannot
+      express it.  A terminal that advertises VT but only has 256 colours
+      quantises these itself, and lands somewhere in the same family. }
+    clAmberLt:  Result := #27'[38;2;255;203;139m';   { highlights }
+    clAmber:    Result := #27'[38;2;255;169;64m';    { the accent }
+    clAmberDim: Result := #27'[38;2;191;122;38m';    { borders }
+    clAmberDk:  Result := #27'[38;2;122;80;34m';     { rules, meter troughs }
   else
     Result := '';
   end;
@@ -222,6 +721,14 @@ begin
     clRed:     Result := FOREGROUND_RED or FOREGROUND_INTENSITY;
     clMagenta: Result := FOREGROUND_RED or FOREGROUND_BLUE or FOREGROUND_INTENSITY;
     clBlue:    Result := FOREGROUND_BLUE or FOREGROUND_INTENSITY;
+    { Sixteen colours have one amber between them, so the ramp collapses:
+      the two bright ends onto intense yellow, the two dark ones onto the
+      dim pair that reads as "structure, not text".  The banner loses its
+      shading and keeps its shape. }
+    clAmberLt, clAmber:
+      Result := FOREGROUND_RED or FOREGROUND_GREEN or FOREGROUND_INTENSITY;
+    clAmberDim: Result := FOREGROUND_RED or FOREGROUND_GREEN;
+    clAmberDk:  Result := FOREGROUND_INTENSITY;
   else
     Result := SavedAttr;
   end;
@@ -274,6 +781,18 @@ begin
   if Result < 20 then Result := 20;
 end;
 
+var
+  { Every byte this unit puts on the screen passes through RawWrite, so one
+    counter here is the whole program's "did anything paint".  Counted after
+    the empty-string exit below, because a write of nothing did not paint and
+    the read loop's frame repair must not fire on one. }
+  EmitSeq: QWord = 0;
+
+function EmitCount: QWord;
+begin
+  Result := EmitSeq;
+end;
+
 { WriteConsoleW takes UTF-16, so text is converted rather than written as raw
   bytes; that keeps output correct even if the codepage switch was refused.
   It fails outright on a redirected handle, in which case the UTF-8 bytes go
@@ -284,6 +803,10 @@ var
   Written: DWORD;
 begin
   if S = '' then Exit;
+  { Bumped whether the console call or the stream fallback below does the
+    work: both of them painted, and the counter's consumer only asks whether
+    the screen changed under it. }
+  Inc(EmitSeq);
   if HOut <> 0 then
   begin
     W := UTF8Decode(S);
@@ -340,6 +863,473 @@ begin
     RawWrite(S);
     if HOut <> 0 then SetConsoleTextAttribute(HOut, SavedAttr);
   end;
+end;
+
+{ ------------------------------------------------------------- the chrome -- }
+
+var
+  GlyphMode: TUiGlyphs = ugAuto;
+
+procedure UiSetGlyphs(G: TUiGlyphs);
+begin
+  GlyphMode := G;
+end;
+
+function UiGlyphs: TUiGlyphs;
+begin
+  Result := GlyphMode;
+end;
+
+function UiFancy: Boolean;
+begin
+  case GlyphMode of
+    ugAscii:   Result := False;
+    ugUnicode: Result := True;
+  else
+    Result := VtActive;
+  end;
+end;
+
+{ A byte starts a character unless it is a UTF-8 continuation byte, which is
+  the whole of the width rule for the single-width text this draws. }
+function IsLead(B: Byte): Boolean;
+begin
+  Result := (B and $C0) <> $80;
+end;
+
+function UiWidth(const S: string): Integer;
+var
+  I: Integer;
+begin
+  Result := 0;
+  I := 1;
+  while I <= Length(S) do
+  begin
+    if S[I] = #1 then
+    begin
+      { A mark is two bytes and zero columns.  A trailing #1 with nothing
+        after it is a caller's bug; it is skipped rather than counted, so a
+        truncated row cannot make the padding negative. }
+      Inc(I, 2);
+      Continue;
+    end;
+    if IsLead(Byte(S[I])) then Inc(Result);
+    Inc(I);
+  end;
+end;
+
+function UiPlain(const S: string): string;
+var
+  I: Integer;
+begin
+  Result := '';
+  I := 1;
+  while I <= Length(S) do
+  begin
+    if S[I] = #1 then
+    begin
+      Inc(I, 2);
+      Continue;
+    end;
+    Result := Result + S[I];
+    Inc(I);
+  end;
+end;
+
+function UiRepeat(const Glyph: string; N: Integer): string;
+var
+  I: Integer;
+begin
+  Result := '';
+  for I := 1 to N do Result := Result + Glyph;
+end;
+
+function UiPad(const S: string; W: Integer): string;
+begin
+  Result := S + UiRepeat(' ', W - UiWidth(S));
+end;
+
+function UiFit(const S: string; W: Integer): string;
+var
+  I, Col: Integer;
+begin
+  if W <= 0 then Exit('');
+  if UiWidth(S) <= W then Exit(S);
+  { One column is given back to the ellipsis, so a fitted string is at most
+    W wide including the mark that it was cut. }
+  Result := '';
+  Col := 0;
+  I := 1;
+  while I <= Length(S) do
+  begin
+    if S[I] = #1 then
+    begin
+      { Marks are copied through without costing a column: a truncated row
+        that dropped its colour marks would leak the last colour onto
+        everything painted after it. }
+      Result := Result + Copy(S, I, 2);
+      Inc(I, 2);
+      Continue;
+    end;
+    if IsLead(Byte(S[I])) then
+    begin
+      if Col >= W - 1 then Break;
+      Inc(Col);
+    end;
+    Result := Result + S[I];
+    Inc(I);
+  end;
+  if UiFancy then Result := Result + #$E2#$80#$A6 else Result := Result + '.';
+end;
+
+function UiCentre(const S: string; W: Integer): string;
+var
+  Left: Integer;
+begin
+  Left := (W - UiWidth(S)) div 2;
+  if Left < 0 then Left := 0;
+  Result := UiRepeat(' ', Left) + S;
+end;
+
+type
+  { What WalkMarks hands each run to. }
+  TMarkSink = procedure(const Run: string; Col: TColor; Coloured: Boolean);
+
+function MarkColor(C: Char; out Col: TColor): Boolean;
+begin
+  Result := True;
+  case C of
+    'g': Col := clGrey;
+    'w': Col := clWhite;
+    'B': Col := clBright;
+    'c': Col := clCyan;
+    'G': Col := clGreen;
+    'y': Col := clYellow;
+    'r': Col := clRed;
+    'L': Col := clAmberLt;
+    'A': Col := clAmber;
+    'D': Col := clAmberDim;
+    'K': Col := clAmberDk;
+  else
+    Col := clWhite;
+    Result := False;    { '0', and anything unknown, means "no colour" }
+  end;
+end;
+
+{ The one walk over the marks, shared by both painters.  Each run is handed
+  to Run with the colour in force, or with Coloured false where the string
+  asked for the terminal's own foreground. }
+procedure WalkMarks(const S: string; Sink: TMarkSink);
+var
+  I, Start: Integer;
+  Col: TColor;
+  Coloured: Boolean;
+
+  procedure FlushRun(Upto: Integer);
+  begin
+    if Upto < Start then Exit;
+    if Upto = Start - 1 then Exit;
+    Sink(Copy(S, Start, Upto - Start + 1), Col, Coloured);
+  end;
+
+begin
+  Coloured := False;
+  Col := clWhite;
+  Start := 1;
+  I := 1;
+  while I <= Length(S) do
+  begin
+    if S[I] = #1 then
+    begin
+      FlushRun(I - 1);
+      if I + 1 <= Length(S) then
+        Coloured := MarkColor(S[I + 1], Col)
+      else
+        Coloured := False;
+      Inc(I, 2);
+      Start := I;
+      Continue;
+    end;
+    Inc(I);
+  end;
+  FlushRun(Length(S));
+end;
+
+var
+  { WalkMarks hands its runs to a closure-free callback, so the two painters
+    each keep one module-level accumulator.  Neither is re-entrant, and
+    neither needs to be: both are called from the one thread that owns the
+    console. }
+  VtBuf: string = '';
+
+procedure VtSink(const Run: string; Col: TColor; Coloured: Boolean);
+begin
+  if Coloured then VtBuf := VtBuf + VtSeq(Col) + Run + VtReset
+  else VtBuf := VtBuf + Run;
+end;
+
+procedure PaintSink(const Run: string; Col: TColor; Coloured: Boolean);
+begin
+  if Coloured then EmitC(Col, Run) else Emit(Run);
+end;
+
+function UiVt(const S: string): string;
+begin
+  if not VtActive then Exit('');
+  VtBuf := '';
+  WalkMarks(S, @VtSink);
+  Result := VtBuf;
+  VtBuf := '';
+end;
+
+procedure UiPaint(const S: string);
+begin
+  { One write on a VT console, a call per run on a legacy one - where the
+    colour IS a call and there is no way around it. }
+  if VtActive then
+    RawWrite(UiVt(S))
+  else
+    WalkMarks(S, @PaintSink);
+end;
+
+procedure UiPaintLn(const S: string);
+begin
+  UiPaint(S);
+  EmitLn;
+end;
+
+function UiRule(Cells: Integer): string;
+begin
+  if UiFancy then
+    Result := UiRepeat(#$E2#$94#$80, Cells)     { U+2500 }
+  else
+    Result := UiRepeat('-', Cells);
+end;
+
+function UiMeter(Pct, Cells: Integer; Fill, Trough: TColor): string;
+var
+  Lit: Integer;
+  Block: string;
+  FillMark, TroughMark: string;
+
+  function MarkOf(C: TColor): string;
+  begin
+    case C of
+      clGrey:     Result := MkGrey;
+      clWhite:    Result := MkWhite;
+      clBright:   Result := MkBright;
+      clCyan:     Result := MkCyan;
+      clGreen:    Result := MkGreen;
+      clYellow:   Result := MkYellow;
+      clRed:      Result := MkRed;
+      clAmberLt:  Result := MkAmberLt;
+      clAmber:    Result := MkAmber;
+      clAmberDim: Result := MkAmberDim;
+      clAmberDk:  Result := MkAmberDk;
+    else
+      Result := MkOff;
+    end;
+  end;
+
+begin
+  if Cells < 1 then Exit('');
+  if Pct < 0 then Pct := 0;
+  if Pct > 100 then Pct := 100;
+  Lit := (Pct * Cells) div 100;
+  { A percentage that has moved off zero lights a cell.  The rounding this
+    breaks is worth less than the signal: the first thing a user wants from
+    a context meter is to see it start. }
+  if (Lit = 0) and (Pct > 0) then Lit := 1;
+  if Lit > Cells then Lit := Cells;
+  if UiFancy then Block := #$E2#$96#$88 else Block := '=';   { U+2588 }
+  FillMark := MarkOf(Fill);
+  TroughMark := MarkOf(Trough);
+  Result := FillMark + UiRepeat(Block, Lit) +
+            TroughMark + UiRepeat(Block, Cells - Lit) + MkOff;
+end;
+
+function UiCount(N: Int64): string;
+begin
+  if N < 0 then Exit('0');
+  if N < 1000 then Exit(IntToStr(N));
+  if N < 1000000 then
+    Exit(Format('%.1fk', [N / 1000]));
+  Result := Format('%.1fM', [N / 1000000]);
+end;
+
+{ The four rounded corners and the two bars, or ASCII where the console
+  cannot be trusted with them.  Kept together so the fallback set is
+  obviously complete rather than six scattered ifs. }
+function GlyphTL: string; begin if UiFancy then Result := #$E2#$95#$AD else Result := '.'; end;
+function GlyphTR: string; begin if UiFancy then Result := #$E2#$95#$AE else Result := '.'; end;
+function GlyphBL: string; begin if UiFancy then Result := #$E2#$95#$B0 else Result := '`'; end;
+function GlyphBR: string; begin if UiFancy then Result := #$E2#$95#$AF else Result := #39;  end;
+function GlyphV: string;  begin if UiFancy then Result := #$E2#$94#$82 else Result := '|'; end;
+
+function UiBoxInner(Width, Columns: Integer): Integer;
+begin
+  { Two border bars, one separator per extra column, and a space on each
+    side of every column. }
+  Result := Width - (3 * Columns + 1);
+  if Result < 0 then Result := 0;
+end;
+
+function UiBoxTop(const Title: string; Width: Integer): string;
+var
+  Rest: Integer;
+begin
+  if Title = '' then
+  begin
+    Result := MkAmberDim + GlyphTL + UiRule(Width - 2) + GlyphTR + MkOff;
+    Exit;
+  end;
+  Rest := Width - 5 - UiWidth(Title);
+  if Rest < 0 then Rest := 0;
+  Result := MkAmberDim + GlyphTL + UiRule(1) + ' ' +
+            Title + MkAmberDim + ' ' + UiRule(Rest) + GlyphTR + MkOff;
+end;
+
+function UiBoxBottom(Width: Integer): string;
+begin
+  Result := MkAmberDim + GlyphBL + UiRule(Width - 2) + GlyphBR + MkOff;
+end;
+
+function UiBoxRow(const Cells: array of string;
+  const Widths: array of Integer): string;
+var
+  I, W: Integer;
+begin
+  Result := MkAmberDim + GlyphV + MkOff + ' ';
+  for I := 0 to High(Cells) do
+  begin
+    if I > 0 then Result := Result + MkAmberDim + GlyphV + MkOff + ' ';
+    if I <= High(Widths) then W := Widths[I] else W := 0;
+    Result := Result + UiPad(UiFit(Cells[I], W), W) + ' ';
+  end;
+  Result := Result + MkAmberDim + GlyphV + MkOff;
+end;
+
+{ ---------------------------------------------------------- the statusline -- }
+
+var
+  Status: TStatusInfo;
+
+procedure StatusClear(out S: TStatusInfo);
+begin
+  S.Model := '';
+  S.Dir := '';
+  S.Branch := '';
+  S.CtxTokens := 0;
+  S.CtxLimit := 0;
+  S.TokensIn := 0;
+  S.TokensOut := 0;
+  S.Memories := -1;
+  S.Mcps := -1;
+  S.Hooks := -1;
+  S.Mode := '';
+  S.ModeHot := False;
+  S.Note := '';
+end;
+
+procedure SetStatus(const S: TStatusInfo);
+begin
+  Status := S;
+end;
+
+{ 'thing' or 'things', so a line can say "1 hook" without saying "1 hooks". }
+function Plural(N: Integer; const One, Many: string): string;
+begin
+  if N = 1 then Result := IntToStr(N) + ' ' + One
+  else Result := IntToStr(N) + ' ' + Many;
+end;
+
+function StatusLines(const S: TStatusInfo; Width: Integer): TStringArray;
+var
+  Row, Sep, Facts: string;
+  Pct: Integer;
+
+  procedure Add(const Line: string);
+  begin
+    if Trim(UiPlain(Line)) = '' then Exit;
+    SetLength(Result, Length(Result) + 1);
+    Result[High(Result)] := UiFit(Line, Width);
+  end;
+
+begin
+  Result := nil;
+  if Width < 12 then Exit;
+  if UiFancy then Sep := MkAmberDk + ' ' + #$E2#$94#$82 + ' ' else Sep := MkAmberDk + ' | ';
+
+  { Line one: who is answering and where.  The two facts a user checks
+    before typing, and the two that are wrong most expensively. }
+  Row := '';
+  if S.Model <> '' then Row := MkCyan + '[' + S.Model + ']';
+  if S.Dir <> '' then
+  begin
+    if Row <> '' then Row := Row + Sep;
+    Row := Row + MkAmberLt + S.Dir;
+  end;
+  if S.Branch <> '' then
+    Row := Row + MkGrey + ' git:(' + MkAmber + S.Branch + MkGrey + ')';
+  Add(Row + MkOff);
+
+  { Line two: the meters.  Context first, because it is the one that ends
+    the session when it fills. }
+  Row := '';
+  if S.CtxLimit > 0 then
+  begin
+    Pct := Round((S.CtxTokens * 100) / S.CtxLimit);
+    Row := MkGrey + 'Context ' +
+           UiMeter(Pct, 12, clAmber, clAmberDk) + ' ' +
+           MkAmberLt + IntToStr(Pct) + '%' +
+           MkGrey + ' (' + UiCount(S.CtxTokens) + ')';
+  end;
+  if (S.TokensIn > 0) or (S.TokensOut > 0) then
+  begin
+    if Row <> '' then Row := Row + Sep;
+    Row := Row + MkGrey + 'Session ' + MkAmberLt + UiCount(S.TokensIn) +
+           MkGrey + ' in ' + MkAmberLt + UiCount(S.TokensOut) + MkGrey + ' out';
+  end;
+  Add(Row + MkOff);
+
+  { Line three: what was loaded.  Nothing here changes during a session, so
+    it is the line a reader stops noticing - which is why it is last of the
+    three and why a zero is omitted rather than shown. }
+  Facts := '';
+  if S.Memories > 0 then Facts := Plural(S.Memories, 'CLAUDE.md', 'CLAUDE.md');
+  if S.Mcps > 0 then
+  begin
+    if Facts <> '' then Facts := Facts + Sep + MkGrey;
+    Facts := Facts + Plural(S.Mcps, 'MCP', 'MCPs');
+  end;
+  if S.Hooks > 0 then
+  begin
+    if Facts <> '' then Facts := Facts + Sep + MkGrey;
+    Facts := Facts + Plural(S.Hooks, 'hook', 'hooks');
+  end;
+  if Facts <> '' then Add(MkGrey + Facts + MkOff);
+
+  { The mode, last and loudest.  It is the line that says what will happen
+    without being asked, so it is the one that must survive a narrow
+    terminal - hence last, where nothing pushes it off.
+
+    The caller sets Mode to '' for the ordinary ask-me state.  An indicator
+    that is always on is not an indicator, and the prompt has always taken
+    that view; the status line takes it too. }
+  if S.Mode <> '' then
+  begin
+    if S.ModeHot then
+    begin
+      if UiFancy then Row := MkRed + #$E2#$96#$B8#$E2#$96#$B8 + ' '
+      else Row := MkRed + '>> ';
+      Row := Row + S.Mode + MkGrey + '  (/mode to change)';
+    end
+    else
+      Row := MkAmberDim + S.Mode + MkGrey + '  (/mode to change)';
+    Add(Row + MkOff);
+  end;
+
+  if S.Note <> '' then Add(S.Note + MkOff);
 end;
 
 { ------------------------------------------------------- markdown streaming -- }
@@ -622,6 +1612,22 @@ begin
   E.Caret := 0;
   E.HistPos := Length(History);
   E.Pending := '';
+  E.Vim := False;
+  E.Mode := vmInsert;
+  E.PendOp := #0;
+  SetLength(E.Undo, 0);
+  E.UndoN := 0;
+  E.UndoAt := 0;
+end;
+
+procedure EditInitProfile(out E: TEditState; const P: TKeyProfile);
+begin
+  EditInit(E);
+  { Insert mode every time, deliberately.  A prompt that came back in normal
+    mode would eat the first word of anyone who had forgotten vim was on, and
+    unlike a file there is nothing on screen to make the mode obvious before
+    the first keystroke. }
+  E.Vim := P.Vim;
 end;
 
 function TokenAtCaret(const E: TEditState; out AtLineStart: Boolean): string;
@@ -678,10 +1684,222 @@ begin
   Result := True;
 end;
 
+{ ----------------------------------------------------------- word motions --
+
+  One rule, defined once, used by every w/b/e verb and by Ctrl+W.  A word is
+  a run of letters, digits and underscore, or a run of punctuation; blanks
+  separate them.  Anything above #127 counts as a word character rather than
+  punctuation: a path with an accent or a line of CJK would otherwise
+  fragment into one "word" per character, which is worse than wrong - it is
+  slow to recover from. }
+type
+  TWordClass = (wcBlank, wcWord, wcPunct);
+
+function ClassOf(C: WideChar): TWordClass;
+begin
+  if (C = ' ') or (C = #9) or (C = #10) or (C = #13) then
+    Result := wcBlank
+  else if ((C >= 'A') and (C <= 'Z')) or ((C >= 'a') and (C <= 'z')) or
+          ((C >= '0') and (C <= '9')) or (C = '_') or (C > #127) then
+    Result := wcWord
+  else
+    Result := wcPunct;
+end;
+
+{ All four take and return 0-based caret positions (the number of characters
+  before the cursor), which is what TEditState.Caret holds; the strings
+  themselves are 1-based, hence the +1 on every index. }
+
+function WordFwd(const W: WideString; P: Integer): Integer;
+var
+  C: TWordClass;
+begin
+  Result := P;
+  if Result >= Length(W) then Exit(Length(W));
+  C := ClassOf(W[Result + 1]);
+  if C <> wcBlank then
+    while (Result < Length(W)) and (ClassOf(W[Result + 1]) = C) do Inc(Result);
+  while (Result < Length(W)) and (ClassOf(W[Result + 1]) = wcBlank) do Inc(Result);
+end;
+
+function WordBack(const W: WideString; P: Integer): Integer;
+var
+  C: TWordClass;
+begin
+  Result := P;
+  while (Result > 0) and (ClassOf(W[Result]) = wcBlank) do Dec(Result);
+  if Result = 0 then Exit(0);
+  C := ClassOf(W[Result]);
+  while (Result > 0) and (ClassOf(W[Result]) = C) do Dec(Result);
+end;
+
+{ The position of the LAST character of the next word, not the one after it -
+  that is what makes 'e' distinct from 'w', and getting it wrong by one is
+  the first thing a vim user notices. }
+function WordEndFwd(const W: WideString; P: Integer): Integer;
+begin
+  Result := P + 1;
+  if Result >= Length(W) then
+  begin
+    { The last character of an EMPTY line is 0, not -1.  The two clamps at the
+      bottom of this function never run on this path, so the arithmetic has to
+      be right here: a caret of -1 escapes into VimClamp and Redraw, both of
+      which index W[Caret + 1] and so read W[0] - a nil dereference on an empty
+      WideString, and a process death that skips TermDone and leaves the
+      console in raw mode. }
+    Result := Length(W) - 1;
+    if Result < 0 then Result := 0;
+    Exit;
+  end;
+  while (Result < Length(W)) and (ClassOf(W[Result + 1]) = wcBlank) do Inc(Result);
+  while (Result < Length(W) - 1) and
+        (ClassOf(W[Result + 2]) = ClassOf(W[Result + 1])) do Inc(Result);
+  if Result > Length(W) - 1 then Result := Length(W) - 1;
+  if Result < 0 then Result := 0;
+end;
+
+{ The newline-bounded run the caret sits in - the same span Redraw paints, so
+  0, ^ and $ mean what the user can see rather than what the whole buffer
+  happens to contain after a paste. }
+function SegStart(const W: WideString; P: Integer): Integer;
+var
+  I: Integer;
+begin
+  Result := 0;
+  for I := P downto 1 do
+    if W[I] = #10 then Exit(I);
+end;
+
+function SegEnd(const W: WideString; P: Integer): Integer;
+var
+  I, From: Integer;
+begin
+  Result := Length(W);
+  { The scan starts at P + 1, so a caret of -1 would index W[0] - outside a
+    WideString, and a nil dereference when the string is empty.  Callers are
+    supposed to hand over a caret in range; this clamp is the belt to that
+    braces, because the cost of being wrong here is the whole process. }
+  From := P + 1;
+  if From < 1 then From := 1;
+  for I := From to Length(W) do
+    if W[I] = #10 then Exit(I - 1);
+end;
+
+function FirstNonBlank(const W: WideString; P: Integer): Integer;
+var
+  E: Integer;
+begin
+  Result := SegStart(W, P);
+  E := SegEnd(W, P);
+  while (Result < E) and (ClassOf(W[Result + 1]) = wcBlank) do Inc(Result);
+end;
+
+{ In normal mode the caret sits ON a character, not between two, which is
+  what keeps i and a distinct, makes x delete under the cursor, and makes
+  Esc's step left correct.  One clamp, applied after every normal-mode verb. }
+procedure VimClamp(var E: TEditState);
+var
+  S, F: Integer;
+begin
+  if not (E.Vim and (E.Mode = vmNormal)) then Exit;
+  S := SegStart(E.Text, E.Caret);
+  F := SegEnd(E.Text, E.Caret);
+  if E.Caret > F - 1 then E.Caret := F - 1;
+  if E.Caret < S then E.Caret := S;
+  if E.Caret < 0 then E.Caret := 0;
+end;
+
+{ ------------------------------------------------------------------ undo --
+
+  The array is a timeline of states and UndoAt is where the current state
+  sits on it.  E itself is the live copy, so it is written back into
+  Undo[UndoAt] before anything moves - that resynchronisation is what lets a
+  whole insert session (which pushes nothing per character) collapse into the
+  single step a vim user expects. }
+
+procedure UndoSync(var E: TEditState);
+begin
+  if E.UndoN = 0 then
+  begin
+    if Length(E.Undo) < 1 then SetLength(E.Undo, 8);
+    E.UndoAt := 0;
+    E.UndoN := 1;
+  end;
+  E.Undo[E.UndoAt].Text := E.Text;
+  E.Undo[E.UndoAt].Caret := E.Caret;
+end;
+
+procedure UndoPush(var E: TEditState);
+var
+  I: Integer;
+begin
+  UndoSync(E);
+  { A fresh edit discards whatever redo tail was there: the timeline forks
+    and the abandoned branch is not worth the confusion of keeping. }
+  Inc(E.UndoAt);
+  E.UndoN := E.UndoAt + 1;
+  if Length(E.Undo) < E.UndoN then SetLength(E.Undo, E.UndoN + 8);
+  E.Undo[E.UndoAt] := E.Undo[E.UndoAt - 1];
+  if E.UndoN > UndoMax then
+  begin
+    for I := 1 to E.UndoN - 1 do E.Undo[I - 1] := E.Undo[I];
+    Dec(E.UndoAt);
+    Dec(E.UndoN);
+    E.Undo[E.UndoN].Text := '';
+  end;
+end;
+
+procedure UndoStep(var E: TEditState; Delta: Integer);
+var
+  T: Integer;
+begin
+  UndoSync(E);
+  T := E.UndoAt + Delta;
+  if (T < 0) or (T >= E.UndoN) then Exit;
+  E.UndoAt := T;
+  E.Text := E.Undo[T].Text;
+  E.Caret := E.Undo[T].Caret;
+end;
+
+{ Which verbs are worth a step of their own.  Not ekChar: per-character undo
+  is the complaint every vim user has about editors that do it.  Single
+  deletes earn one only in normal mode, where they are x rather than the
+  Delete key held down. }
+function UndoWorthy(const E: TEditState; Key: TEditKey): Boolean;
+begin
+  case Key of
+    ekClear, ekDelWordRight, ekDelWordLeft, ekDelWordEnd, ekDelToEnd,
+    ekDelToStart, ekDelLine, ekChangeWordRight, ekChangeWordLeft,
+    ekChangeWordEnd, ekChangeToEnd, ekChangeToStart, ekChangeLine,
+    ekInsertHere, ekAppendHere, ekInsertStart, ekAppendEnd:
+      Result := True;
+    ekDelete, ekBackspace:
+      Result := E.Vim and (E.Mode = vmNormal);
+  else
+    Result := False;
+  end;
+end;
+
+{ Removes [A, B) and parks the caret at A.  Every delete and change verb is
+  this plus a span, which is why they cannot disagree about the caret. }
+procedure CutSpan(var E: TEditState; A, B: Integer);
+begin
+  if A < 0 then A := 0;
+  if B > Length(E.Text) then B := Length(E.Text);
+  if B <= A then
+  begin
+    E.Caret := A;
+    Exit;
+  end;
+  Delete(E.Text, A + 1, B - A);
+  E.Caret := A;
+end;
+
 procedure EditApply(var E: TEditState; Key: TEditKey; Ch: WideChar);
 var
   Target: Integer;
 begin
+  if UndoWorthy(E, Key) then UndoPush(E);
   case Key of
     ekChar:
       begin
@@ -704,9 +1922,13 @@ begin
     ekRight:
       if E.Caret < Length(E.Text) then Inc(E.Caret);
     ekHome:
-      E.Caret := 0;
+      { With vim on, 0 and Ctrl+A mean the start of the line the user can
+        see; without it, the historical whole-buffer behaviour is kept
+        exactly, because four other prompts depend on it. }
+      if E.Vim then E.Caret := SegStart(E.Text, E.Caret) else E.Caret := 0;
     ekEnd:
-      E.Caret := Length(E.Text);
+      if E.Vim then E.Caret := SegEnd(E.Text, E.Caret)
+               else E.Caret := Length(E.Text);
     ekClear:
       begin
         E.Text := '';
@@ -721,8 +1943,8 @@ begin
         Inc(E.Caret);
       end;
     ekHistPrev, ekHistNext:
+      if Length(History) > 0 then
       begin
-        if Length(History) = 0 then Exit;
         { The half-typed line is stashed on the way out so that browsing up
           and back down returns it rather than losing it. }
         if E.HistPos = Length(History) then E.Pending := E.Text;
@@ -730,15 +1952,596 @@ begin
                             else Target := E.HistPos + 1;
         if Target < 0 then Target := 0;
         if Target > Length(History) then Target := Length(History);
-        if Target = E.HistPos then Exit;
-        E.HistPos := Target;
-        if E.HistPos = Length(History) then
-          E.Text := E.Pending
-        else
-          E.Text := UTF8Decode(History[E.HistPos]);
-        E.Caret := Length(E.Text);
+        if Target <> E.HistPos then
+        begin
+          E.HistPos := Target;
+          if E.HistPos = Length(History) then
+            E.Text := E.Pending
+          else
+            E.Text := UTF8Decode(History[E.HistPos]);
+          E.Caret := Length(E.Text);
+        end;
       end;
+
+    { ---- motions.  These move the caret and nothing else. ---- }
+    ekWordRight:     E.Caret := WordFwd(E.Text, E.Caret);
+    ekWordLeft:      E.Caret := WordBack(E.Text, E.Caret);
+    ekWordEnd:       E.Caret := WordEndFwd(E.Text, E.Caret);
+    ekFirstNonBlank: E.Caret := FirstNonBlank(E.Text, E.Caret);
+
+    { ---- deletions.  Each is the span its matching motion covers. ---- }
+    ekDelWordRight, ekChangeWordRight:
+      CutSpan(E, E.Caret, WordFwd(E.Text, E.Caret));
+    ekDelWordLeft, ekChangeWordLeft:
+      CutSpan(E, WordBack(E.Text, E.Caret), E.Caret);
+    ekDelWordEnd, ekChangeWordEnd:
+      CutSpan(E, E.Caret, WordEndFwd(E.Text, E.Caret) + 1);
+    ekDelToEnd, ekChangeToEnd:
+      CutSpan(E, E.Caret, SegEnd(E.Text, E.Caret));
+    ekDelToStart, ekChangeToStart:
+      CutSpan(E, SegStart(E.Text, E.Caret), E.Caret);
+    ekDelLine, ekChangeLine:
+      CutSpan(E, SegStart(E.Text, E.Caret), SegEnd(E.Text, E.Caret));
+
+    { ---- mode changes ---- }
+    ekNormalMode:
+      begin
+        E.Mode := vmNormal;
+        E.PendOp := #0;
+        { Leaving insert steps left, because the caret was after the last
+          character typed and normal mode sits on one. }
+        if E.Caret > SegStart(E.Text, E.Caret) then Dec(E.Caret);
+      end;
+    ekInsertHere:
+      E.Mode := vmInsert;
+    ekAppendHere:
+      begin
+        E.Mode := vmInsert;
+        if E.Caret < Length(E.Text) then Inc(E.Caret);
+      end;
+    ekInsertStart:
+      begin
+        E.Mode := vmInsert;
+        E.Caret := FirstNonBlank(E.Text, E.Caret);
+      end;
+    ekAppendEnd:
+      begin
+        E.Mode := vmInsert;
+        E.Caret := SegEnd(E.Text, E.Caret);
+      end;
+
+    ekUndo: UndoStep(E, -1);
+    ekRedo: UndoStep(E, 1);
   end;
+
+  { The change verbs are their deletion plus insert mode; sharing the arm
+    above means the two can never disagree about what was removed. }
+  case Key of
+    ekChangeWordRight, ekChangeWordLeft, ekChangeWordEnd, ekChangeToEnd,
+    ekChangeToStart, ekChangeLine:
+      E.Mode := vmInsert;
+  end;
+
+  VimClamp(E);
+end;
+
+{ ---------------------------------------------------- vim normal mode -----
+
+  What is here: two modes, the motions h l w b e 0 ^ $, j/k as history, the
+  entries i a I A, the edits x D C S dd cc dw db de d0 d$ cw cb ce c0 c$, and
+  undo/redo.
+
+  What is deliberately NOT here: visual mode, registers, yank and put (dw
+  therefore deletes into nothing - there is nowhere to put it), counts (3dw),
+  the . repeat, marks, macros, : commands, / and ? search, text objects
+  (ciw, di"), r R s, o O, gg G and %.  A prompt is one line: there is no
+  buffer to write, no next line for o to open, and j/k are worth far more as
+  history than as line motion.  What one line does NOT remove is the need for
+  undo, for w/b/e over a long path, and for 0/^/$ - a pasted block puts
+  newlines in the buffer, so those three are defined against the segment the
+  screen is actually showing. }
+function EditNormalKey(var E: TEditState; Ch: WideChar;
+  out Key: TEditKey): Boolean;
+var
+  Op: WideChar;
+begin
+  Key := ekChar;
+  Result := False;
+
+  if E.PendOp <> #0 then
+  begin
+    Op := E.PendOp;
+    { Cleared whatever happens next: an operator that survived an invalid
+      target would fire on the following keystroke, which is the kind of bug
+      that deletes a word the user was only trying to move over. }
+    E.PendOp := #0;
+    if Op = 'd' then
+      case Ch of
+        'w': Key := ekDelWordRight;
+        'b': Key := ekDelWordLeft;
+        'e': Key := ekDelWordEnd;
+        '0': Key := ekDelToStart;
+        '$': Key := ekDelToEnd;
+        'd': Key := ekDelLine;
+      else
+        Exit(False);
+      end
+    else
+      case Ch of
+        { cw is ce in vim - it changes to the end of the word rather than to
+          the start of the next, and every vim user has that in their
+          fingers.  Matching the editor rather than the symmetry. }
+        'w', 'e': Key := ekChangeWordEnd;
+        'b': Key := ekChangeWordLeft;
+        '0': Key := ekChangeToStart;
+        '$': Key := ekChangeToEnd;
+        'c': Key := ekChangeLine;
+      else
+        Exit(False);
+      end;
+    Exit(True);
+  end;
+
+  case Ch of
+    'h': Key := ekLeft;
+    'l': Key := ekRight;
+    'w': Key := ekWordRight;
+    'b': Key := ekWordLeft;
+    'e': Key := ekWordEnd;
+    '0': Key := ekHome;
+    '^': Key := ekFirstNonBlank;
+    '$': Key := ekEnd;
+    { The one-line adaptation: there is no line below to move to, and
+      up/down on a prompt has meant history since the first version. }
+    'j': Key := ekHistNext;
+    'k': Key := ekHistPrev;
+    'x': Key := ekDelete;
+    'D': Key := ekDelToEnd;
+    'C': Key := ekChangeToEnd;
+    'S': Key := ekChangeLine;
+    'i': Key := ekInsertHere;
+    'a': Key := ekAppendHere;
+    'I': Key := ekInsertStart;
+    'A': Key := ekAppendEnd;
+    'u': Key := ekUndo;
+    #18: Key := ekRedo;          { Ctrl+R }
+    'd', 'c':
+      begin
+        E.PendOp := Ch;
+        Exit(False);
+      end;
+  else
+    { An unbound command character is thrown away.  Inserting it instead
+      would be the worst of both worlds: the user is in normal mode, so the
+      character was never meant as text. }
+    Exit(False);
+  end;
+  Result := True;
+end;
+
+{ ------------------------------------------------------------ keybindings -- }
+
+{ VK_OEM_4 is the '[' key on a US layout, wanted only so that Ctrl+[ can mean
+  Escape the way it does in a terminal.  It is layout-dependent, which is
+  also why no other punctuation is nameable: a binding that silently meant a
+  different physical key on a German keyboard is worse than no binding. }
+const
+  VK_OEM_4_ = 219;
+
+type
+  TKeyName = record
+    Name: string;
+    VK: Word;
+  end;
+  TActionName = record
+    Name: string;
+    Key: TEditKey;
+  end;
+
+const
+  KeyNames: array[0..12] of TKeyName = (
+    (Name: 'left';      VK: VK_LEFT),
+    (Name: 'right';     VK: VK_RIGHT),
+    (Name: 'up';        VK: VK_UP),
+    (Name: 'down';      VK: VK_DOWN),
+    (Name: 'home';      VK: VK_HOME),
+    (Name: 'end';       VK: VK_END),
+    (Name: 'backspace'; VK: VK_BACK),
+    (Name: 'delete';    VK: VK_DELETE),
+    (Name: 'pageup';    VK: VK_PRIOR),
+    (Name: 'pagedown';  VK: VK_NEXT),
+    (Name: '[';         VK: VK_OEM_4_),
+    { The last three are nameable only so the parser can recognise them and
+      then refuse them by name; none can ever be bound. }
+    (Name: 'enter';     VK: VK_RETURN),
+    (Name: 'tab';       VK: VK_TAB));
+
+  { The closed action set.  ekChar is absent on purpose: it is the only verb
+    that needs a character, and a binding that could produce text is a
+    binding that could type an answer to a question. }
+  ActionNames: array[0..30] of TActionName = (
+    (Name: 'left';              Key: ekLeft),
+    (Name: 'right';             Key: ekRight),
+    (Name: 'home';              Key: ekHome),
+    (Name: 'end';               Key: ekEnd),
+    (Name: 'backspace';         Key: ekBackspace),
+    (Name: 'delete';            Key: ekDelete),
+    (Name: 'history-prev';      Key: ekHistPrev),
+    (Name: 'history-next';      Key: ekHistNext),
+    (Name: 'clear-line';        Key: ekClear),
+    (Name: 'newline';           Key: ekNewline),
+    (Name: 'word-right';        Key: ekWordRight),
+    (Name: 'word-left';         Key: ekWordLeft),
+    (Name: 'word-end';          Key: ekWordEnd),
+    (Name: 'first-non-blank';   Key: ekFirstNonBlank),
+    (Name: 'delete-word-right'; Key: ekDelWordRight),
+    (Name: 'delete-word-left';  Key: ekDelWordLeft),
+    (Name: 'delete-word-end';   Key: ekDelWordEnd),
+    (Name: 'delete-to-end';     Key: ekDelToEnd),
+    (Name: 'delete-to-start';   Key: ekDelToStart),
+    (Name: 'delete-line';       Key: ekDelLine),
+    (Name: 'change-word-right'; Key: ekChangeWordRight),
+    (Name: 'change-word-left';  Key: ekChangeWordLeft),
+    (Name: 'change-word-end';   Key: ekChangeWordEnd),
+    (Name: 'change-to-end';     Key: ekChangeToEnd),
+    (Name: 'change-to-start';   Key: ekChangeToStart),
+    (Name: 'change-line';       Key: ekChangeLine),
+    (Name: 'normal-mode';       Key: ekNormalMode),
+    (Name: 'insert-here';       Key: ekInsertHere),
+    (Name: 'append-here';       Key: ekAppendHere),
+    (Name: 'insert-start';      Key: ekInsertStart),
+    (Name: 'append-end';        Key: ekAppendEnd));
+
+function KeyActionName(K: TEditKey): string;
+var
+  I: Integer;
+begin
+  for I := 0 to High(ActionNames) do
+    if ActionNames[I].Key = K then Exit(ActionNames[I].Name);
+  { Undo and redo are bindable but sit outside the table because they are
+    named twice over - once here, once as vim's u and Ctrl+R. }
+  case K of
+    ekUndo: Result := 'undo';
+    ekRedo: Result := 'redo';
+  else
+    Result := '';
+  end;
+end;
+
+function KeyActionOf(const Name: string; out K: TEditKey): Boolean;
+var
+  I: Integer;
+  N: string;
+begin
+  K := ekChar;
+  N := LowerCase(Trim(Name));
+  if N = 'undo' then begin K := ekUndo; Exit(True); end;
+  if N = 'redo' then begin K := ekRedo; Exit(True); end;
+  for I := 0 to High(ActionNames) do
+    if ActionNames[I].Name = N then
+    begin
+      K := ActionNames[I].Key;
+      Exit(True);
+    end;
+  Result := False;
+end;
+
+function KeyChordName(const C: TKeyChord): string;
+var
+  I: Integer;
+begin
+  Result := '';
+  if C.Ctrl  then Result := Result + 'ctrl+';
+  if C.Alt   then Result := Result + 'alt+';
+  if C.Shift then Result := Result + 'shift+';
+  if C.VK = VK_ESCAPE then Exit(Result + 'escape');
+  for I := 0 to High(KeyNames) do
+    if KeyNames[I].VK = C.VK then Exit(Result + KeyNames[I].Name);
+  if ((C.VK >= Ord('A')) and (C.VK <= Ord('Z'))) or
+     ((C.VK >= Ord('0')) and (C.VK <= Ord('9'))) then
+    Result := Result + LowerCase(Chr(C.VK))
+  else
+    Result := Result + Format('vk%d', [C.VK]);
+end;
+
+function KeyChordOf(const Name: string; out C: TKeyChord;
+  out Why: string): Boolean;
+var
+  N: string;
+  I: Integer;
+begin
+  C.VK := 0;
+  C.Ctrl := False;
+  C.Alt := False;
+  C.Shift := False;
+  Why := '';
+  N := LowerCase(Trim(Name));
+
+  { Modifier prefixes, in any order, each at most once. }
+  while True do
+  begin
+    if Copy(N, 1, 5) = 'ctrl+' then
+    begin
+      if C.Ctrl then begin Why := 'ctrl given twice'; Exit(False); end;
+      C.Ctrl := True;
+      Delete(N, 1, 5);
+    end
+    else if Copy(N, 1, 4) = 'alt+' then
+    begin
+      if C.Alt then begin Why := 'alt given twice'; Exit(False); end;
+      C.Alt := True;
+      Delete(N, 1, 4);
+    end
+    else if Copy(N, 1, 6) = 'shift+' then
+    begin
+      if C.Shift then begin Why := 'shift given twice'; Exit(False); end;
+      C.Shift := True;
+      Delete(N, 1, 6);
+    end
+    else
+      Break;
+  end;
+
+  if N = '' then
+  begin
+    Why := 'no key after the modifiers';
+    Exit(False);
+  end;
+
+  if N = 'escape' then
+  begin
+    C.VK := VK_ESCAPE;
+    Exit(True);
+  end;
+  for I := 0 to High(KeyNames) do
+    if KeyNames[I].Name = N then
+    begin
+      C.VK := KeyNames[I].VK;
+      Exit(True);
+    end;
+
+  { A single letter or digit - and THIS is the wall.  Without a modifier it
+    is refused outright, which is why no file can name y, a or n, and why a
+    keys.json cannot touch the permission prompt even if every other guard
+    in this unit were wired away. }
+  if (Length(N) = 1) and
+     (((N[1] >= 'a') and (N[1] <= 'z')) or ((N[1] >= '0') and (N[1] <= '9'))) then
+  begin
+    if not (C.Ctrl or C.Alt) then
+    begin
+      Why := 'a plain key cannot be bound; write ctrl+' + N + ' or alt+' + N;
+      Exit(False);
+    end;
+    C.VK := Ord(UpCase(N[1]));
+    Exit(True);
+  end;
+
+  Why := 'unknown key name';
+  Result := False;
+end;
+
+function KeyChordReserved(const C: TKeyChord): Boolean;
+begin
+  { Enter in every modifier combination (submit, and Ctrl/Alt+Enter for a
+    line break), Tab (completion), Escape (clear, or normal mode) and Ctrl+C
+    (quit).  Each one is how a user gets out of something, and a rebound exit
+    is a trap. }
+  Result := (C.VK = VK_RETURN) or (C.VK = VK_TAB) or (C.VK = VK_ESCAPE) or
+            ((C.VK = Ord('C')) and C.Ctrl);
+end;
+
+function KeysNone: TKeyProfile;
+begin
+  Result.Vim := False;
+  SetLength(Result.Binds, 0);
+end;
+
+procedure BindSet(var P: TKeyProfile; const C: TKeyChord; K: TEditKey);
+var
+  I, N: Integer;
+begin
+  for I := 0 to High(P.Binds) do
+    if (P.Binds[I].Chord.VK = C.VK) and (P.Binds[I].Chord.Ctrl = C.Ctrl) and
+       (P.Binds[I].Chord.Alt = C.Alt) and (P.Binds[I].Chord.Shift = C.Shift) then
+    begin
+      P.Binds[I].Action := K;
+      Exit;
+    end;
+  N := Length(P.Binds);
+  SetLength(P.Binds, N + 1);
+  P.Binds[N].Chord := C;
+  P.Binds[N].Action := K;
+end;
+
+procedure BindDrop(var P: TKeyProfile; const C: TKeyChord);
+var
+  I, J: Integer;
+begin
+  for I := 0 to High(P.Binds) do
+    if (P.Binds[I].Chord.VK = C.VK) and (P.Binds[I].Chord.Ctrl = C.Ctrl) and
+       (P.Binds[I].Chord.Alt = C.Alt) and (P.Binds[I].Chord.Shift = C.Shift) then
+    begin
+      for J := I to High(P.Binds) - 1 do P.Binds[J] := P.Binds[J + 1];
+      SetLength(P.Binds, Length(P.Binds) - 1);
+      Exit;
+    end;
+end;
+
+procedure BindName(var P: TKeyProfile; const Chord, Action: string);
+var
+  C: TKeyChord;
+  K: TEditKey;
+  Why: string;
+begin
+  { The defaults go through the same grammar as a file's entries, so a
+    default that could not be written in keys.json cannot exist. }
+  if not KeyChordOf(Chord, C, Why) then Exit;
+  if not KeyActionOf(Action, K) then Exit;
+  BindSet(P, C, K);
+end;
+
+function KeysDefault: TKeyProfile;
+begin
+  Result := KeysNone;
+  { The readline verbs the editor has always been missing.  Ctrl+W and Ctrl+K
+    are what a shell user reaches for; Alt+B and Alt+F are the word motions;
+    Ctrl+Z is undo, which now has something to undo. }
+  BindName(Result, 'ctrl+w', 'delete-word-left');
+  BindName(Result, 'ctrl+k', 'delete-to-end');
+  BindName(Result, 'alt+b',  'word-left');
+  BindName(Result, 'alt+f',  'word-right');
+  BindName(Result, 'ctrl+z', 'undo');
+end;
+
+function DecodeKey(const P: TKeyProfile; const E: TEditState; VK: Word;
+  Ctrl, Alt, Shift: Boolean; Ch: WideChar; out Key: TEditKey): Boolean;
+var
+  I: Integer;
+begin
+  Key := ekChar;
+  { E and Ch are not consulted: a binding must mean the same thing whatever
+    the console synthesised into UnicodeChar and whatever mode the editor is
+    in, or the same physical key would do two things.  They are in the
+    signature because the suite drives this exactly as the loop does. }
+  for I := 0 to High(P.Binds) do
+    if (P.Binds[I].Chord.VK = VK) and (P.Binds[I].Chord.Ctrl = Ctrl) and
+       (P.Binds[I].Chord.Alt = Alt) and (P.Binds[I].Chord.Shift = Shift) then
+    begin
+      Key := P.Binds[I].Action;
+      Exit(True);
+    end;
+  Result := False;
+end;
+
+procedure NoteAdd(var Notes: TStringArray; const S: string);
+var
+  N: Integer;
+begin
+  N := Length(Notes);
+  SetLength(Notes, N + 1);
+  Notes[N] := S;
+end;
+
+function KeysParse(const Text: string; out P: TKeyProfile;
+  out Notes: TStringArray): Boolean;
+var
+  Root, B, V: TJson;
+  I: Integer;
+  C: TKeyChord;
+  K: TEditKey;
+  Name, Act, Why: string;
+begin
+  P := KeysDefault;
+  Notes := nil;
+  Result := False;
+
+  if Trim(Text) = '' then
+  begin
+    NoteAdd(Notes, 'keys.json is empty; using the built-in bindings');
+    Exit;
+  end;
+  Root := JsonParse(Text);
+  if Root = nil then
+  begin
+    NoteAdd(Notes, 'keys.json is not valid JSON; using the built-in bindings');
+    Exit;
+  end;
+  try
+    if Root.Kind <> jkObj then
+    begin
+      NoteAdd(Notes, 'keys.json must be a JSON object; using the built-in bindings');
+      Exit;
+    end;
+    P.Vim := Root.Bool('vim', False);
+    B := Root.Find('bindings');
+    if (B <> nil) and (B.Kind <> jkObj) then
+      NoteAdd(Notes, '"bindings" must be an object; ignored')
+    else if B <> nil then
+      for I := 0 to B.Count - 1 do
+      begin
+        Name := B.Key(I);
+        V := B.Item(I);
+        if V.Kind <> jkStr then
+        begin
+          NoteAdd(Notes, Name + ': the action must be a string');
+          Continue;
+        end;
+        Act := LowerCase(Trim(V.AsString));
+        if not KeyChordOf(Name, C, Why) then
+        begin
+          NoteAdd(Notes, Name + ': ' + Why);
+          Continue;
+        end;
+        if KeyChordReserved(C) then
+        begin
+          NoteAdd(Notes, Name + ' cannot be rebound; the editor owns it');
+          Continue;
+        end;
+        { An explicit unbind, so a user can take back a default without
+          having to know what else the key might mean. }
+        if Act = 'none' then
+        begin
+          BindDrop(P, C);
+          Continue;
+        end;
+        if not KeyActionOf(Act, K) then
+        begin
+          NoteAdd(Notes, Name + ': unknown action "' + Act + '"');
+          Continue;
+        end;
+        BindSet(P, C, K);
+      end;
+    Result := True;
+  finally
+    Root.Free;
+  end;
+end;
+
+function KeysToJson(const P: TKeyProfile; const Existing: string): string;
+var
+  Root: TJson;
+  I: Integer;
+begin
+  Root := nil;
+  if Trim(Existing) <> '' then Root := JsonParse(Existing);
+  if (Root <> nil) and (Root.Kind <> jkObj) then FreeAndNil(Root);
+  if Root = nil then Root := TJson.NewObj;
+  try
+    { Only the vim field is written.  The bindings in memory came from this
+      file and rewriting them would reformat a document the user hand-wrote,
+      for no gain; SetAt keeps the key where it already was so a diff of the
+      file shows one changed value. }
+    I := Root.IndexOf('vim');
+    if I >= 0 then
+      Root.SetAt(I, TJson.NewBool(P.Vim))
+    else
+      Root.AddBool('vim', P.Vim);
+    Result := Root.ToJsonPretty + sLineBreak;
+  finally
+    Root.Free;
+  end;
+end;
+
+{ The install seam.  Written by SetPromptProfile/SetPromptVim, read in
+  exactly one expression in the whole program: the argument ReadPromptLine
+  passes to ReadLineCore.  If a second read ever appears, the wall described
+  at the top of this unit's line-editing section is gone. }
+var
+  PromptProfileVar: TKeyProfile;
+
+procedure SetPromptProfile(const P: TKeyProfile);
+begin
+  PromptProfileVar := P;
+end;
+
+procedure SetPromptVim(Enabled: Boolean);
+begin
+  PromptProfileVar.Vim := Enabled;
+end;
+
+function PromptProfile: TKeyProfile;
+begin
+  Result := PromptProfileVar;
 end;
 
 { Redraws the edited line in place.  The whole line is rewritten rather than
@@ -750,49 +2553,397 @@ end;
   console cannot re-edit rows it has already scrolled past, so what is drawn
   is the line containing the caret, with a continuation marker instead of the
   prompt when it is not the first. }
-procedure Redraw(const Prompt: string; const W: WideString; Caret: Integer;
+{ The mode tag.  Both states are shown, unlike the permission mode where only
+  the unusual one is: with vim on there is no safe default state, because
+  every printable key means something different in each. }
+function EditVimTag(const E: TEditState): string;
+begin
+  if not E.Vim then Exit('');
+  if E.Mode = vmNormal then Result := '[N] ' else Result := '[I] ';
+end;
+
+function EditLead(const E: TEditState; const Prompt: string;
+  FirstLine: Boolean): string;
+begin
+  Result := EditVimTag(E);
+  if FirstLine then Result := Result + Prompt else Result := Result + '... ';
+end;
+
+procedure Redraw(const Prompt: string; const E: TEditState;
   var PrevLen: Integer);
 var
   I: Integer;
   LineStart, LineEnd: Integer;
-  Seg: WideString;
-  Lead: string;
-  RelCaret: Integer;
+  Seg, W: WideString;
+  Lead, Tag: string;
+  RelCaret, Painted: Integer;
 begin
+  W := E.Text;
   { The segment between the newlines around the caret. }
   LineStart := 1;
-  for I := Caret downto 1 do
+  for I := E.Caret downto 1 do
     if W[I] = #10 then
     begin
       LineStart := I + 1;
       Break;
     end;
   LineEnd := Length(W);
-  for I := Caret + 1 to Length(W) do
+  for I := E.Caret + 1 to Length(W) do
     if W[I] = #10 then
     begin
       LineEnd := I - 1;
       Break;
     end;
   Seg := Copy(W, LineStart, LineEnd - LineStart + 1);
-  RelCaret := Caret - LineStart + 1;
-  if LineStart = 1 then Lead := Prompt else Lead := '... ';
+  RelCaret := E.Caret - LineStart + 1;
+  Tag := EditVimTag(E);
+  Lead := EditLead(E, Prompt, LineStart = 1);
 
-  { Back to column zero, then over the prompt. }
+  { PrevLen is the TOTAL painted width, lead included, not the length of the
+    text.  It has to be: the mode tag appears and disappears mid-line, and a
+    four-character indicator that vanished while the erase loop measured only
+    the text would leave '[N] ' hanging off the end of the line. }
+  Painted := Length(Lead) + Length(Seg);
+
+  { Back to column zero, then over the lead. }
   Emit(#13);
-  EmitC(clCyan, Lead);
+  if Tag <> '' then
+    if E.Mode = vmNormal then EmitC(clYellow, Tag) else EmitC(clGrey, Tag);
+  EmitC(clCyan, Copy(Lead, Length(Tag) + 1, MaxInt));
   Emit(UTF8Encode(Seg));
   { Erase whatever the previous, longer line left on screen. }
-  for I := Length(Seg) to PrevLen - 1 do
+  for I := Painted to PrevLen - 1 do
     Emit(' ');
   Emit(#13);
-  EmitC(clCyan, Lead);
+  if Tag <> '' then
+    if E.Mode = vmNormal then EmitC(clYellow, Tag) else EmitC(clGrey, Tag);
+  EmitC(clCyan, Copy(Lead, Length(Tag) + 1, MaxInt));
   if RelCaret > 0 then
     Emit(UTF8Encode(Copy(Seg, 1, RelCaret)));
-  PrevLen := Length(Seg);
+  PrevLen := Painted;
 end;
 
-function ReadLineEdit(const Prompt: string; out Line: string): Boolean;
+{ ------------------------------------------------------- the prompt block --
+
+  Redraw above paints one line and stays on it.  The REPL's prompt is a
+  block: a rule, the text, a rule, and the status lines under it.  That means
+  painting rows BELOW the caret and then going back up to it, which is a
+  thing only VT escapes can do - so this path exists alongside the one above
+  rather than replacing it, and a console that refused VT keeps the single
+  line it has always had.
+
+  The block is for the REPL and nothing else.  A permission question inside a
+  status frame is a permission question nobody reads, so ReadLineEdit - which
+  is what every other prompt in the program calls - never takes this path. }
+
+type
+  { A visual row of the input text: a span of the wide string, 1-based.
+    Spans rather than copies, so the caret can be located by arithmetic
+    instead of by re-searching the text. }
+  TWrapSpan = record
+    Start, Len: Integer;
+  end;
+  TWrapSpans = array of TWrapSpan;
+
+  TBlockState = record
+    Rows: Integer;       { rows painted last time, so a shrink can be erased }
+    CaretRow: Integer;   { where the cursor was left, counted from row 0 }
+  end;
+
+{ Breaks the text into visual rows of at most InnerW columns.  Hard newlines
+  always break; beyond that the break is at the last space that fits, and at
+  InnerW itself when a single word is longer than the row.  Always returns at
+  least one span, possibly empty, because a block with no rows has nowhere to
+  put the caret. }
+function WrapText(const W: WideString; InnerW: Integer): TWrapSpans;
+var
+  LineStart, I, SegEndIx, Look: Integer;
+
+  procedure Emit_(A, L: Integer);
+  begin
+    if L < 0 then L := 0;
+    SetLength(Result, Length(Result) + 1);
+    Result[High(Result)].Start := A;
+    Result[High(Result)].Len := L;
+  end;
+
+begin
+  Result := nil;
+  if InnerW < 1 then InnerW := 1;
+  LineStart := 1;
+  I := 1;
+  while I <= Length(W) + 1 do
+  begin
+    if (I = Length(W) + 1) or (W[I] = #10) then
+    begin
+      { One logical line: LineStart .. I-1.  Wrapped into as many rows as
+        it needs, and into one empty row when it is empty - a blank line the
+        user typed is a blank line they should see. }
+      SegEndIx := I - 1;
+      while SegEndIx - LineStart + 1 > InnerW do
+      begin
+        { The row can hold LineStart .. LineStart+InnerW-1, so the character
+          at LineStart+InnerW is the first that does not fit.  Walking back
+          from there finds the space to break at - and that space is itself a
+          legal break, because it is dropped rather than shown. }
+        Look := LineStart + InnerW;
+        while (Look > LineStart) and (W[Look] <> ' ') do Dec(Look);
+        if Look > LineStart then
+        begin
+          Emit_(LineStart, Look - LineStart);
+          LineStart := Look + 1;
+        end
+        else
+        begin
+          { A word longer than the row is cut at the margin.  Refusing to
+            break it would either overflow the frame or loop forever, and
+            the loop is the worse of the two. }
+          Emit_(LineStart, InnerW);
+          LineStart := LineStart + InnerW;
+        end;
+      end;
+      Emit_(LineStart, SegEndIx - LineStart + 1);
+      LineStart := I + 1;
+    end;
+    Inc(I);
+  end;
+  if Length(Result) = 0 then Emit_(1, 0);
+end;
+
+{ Which row the caret sits on and how far into it.  The caret is an index
+  BETWEEN characters (0 = before the first), so a caret at a row's end and
+  one at the next row's start are the same position; the earlier row wins,
+  which is what a user who just typed the last character expects to see. }
+procedure CaretAt(const Spans: TWrapSpans; Caret: Integer;
+  out Row, Col: Integer);
+var
+  I: Integer;
+begin
+  for I := 0 to High(Spans) do
+    if Caret <= Spans[I].Start + Spans[I].Len - 1 then
+    begin
+      Row := I;
+      Col := Caret - Spans[I].Start + 1;
+      if Col < 0 then Col := 0;
+      Exit;
+    end;
+  Row := High(Spans);
+  if Row < 0 then Row := 0;
+  Col := 0;
+  if Length(Spans) > 0 then Col := Spans[Row].Len;
+end;
+
+function PromptRows(const Text: WideString; InnerW, Caret: Integer;
+  out CaretRow, CaretCol: Integer): TStringArray;
+var
+  Spans: TWrapSpans;
+  I: Integer;
+begin
+  Result := nil;
+  Spans := WrapText(Text, InnerW);
+  CaretAt(Spans, Caret, CaretRow, CaretCol);
+  SetLength(Result, Length(Spans));
+  for I := 0 to High(Spans) do
+    Result[I] := UTF8Encode(Copy(Text, Spans[I].Start, Spans[I].Len));
+end;
+
+{ The rows the block paints, marked up and fitted.  Pure but for TermWidth
+  and the installed status record, which is what makes the layout arguable
+  in a test without a console. }
+function BlockRows(const E: TEditState; Width: Integer;
+  out CaretRow, CaretCol: Integer): TStringArray;
+var
+  Body: TStringArray;
+  Lead, Cont, Tag: string;
+  InnerW, I, LeadW: Integer;
+  Stat: TStringArray;
+
+  procedure Add(const S: string);
+  begin
+    SetLength(Result, Length(Result) + 1);
+    Result[High(Result)] := S;
+  end;
+
+begin
+  Result := nil;
+  if UiFancy then Lead := MkAmber + #$E2#$9D#$AF + ' ' else Lead := MkAmber + '> ';
+  LeadW := 2;
+  Cont := '  ';
+
+  { The vim tag, in front of the prompt mark exactly as it is on the single
+    line.  It cannot be dropped here and left to the status line: with vim on
+    there is no safe default state, because every printable key means
+    something different in each mode - which is why this is the one indicator
+    shown in BOTH its states rather than only the unusual one.
+
+    It costs nothing in reflow because both tags are four columns wide, so
+    the text column does not move when the mode changes.  A tag of some other
+    width would shift the whole block sideways on every Esc. }
+  if E.Vim then
+  begin
+    if E.Mode = vmNormal then Tag := MkYellow + '[N] ' else Tag := MkGrey + '[I] ';
+    Lead := Tag + Lead;
+    Cont := '    ' + Cont;
+    LeadW := LeadW + 4;
+  end;
+
+  InnerW := Width - LeadW;
+  if InnerW < 8 then InnerW := 8;
+
+  Body := PromptRows(E.Text, InnerW, E.Caret, CaretRow, CaretCol);
+
+  { Row 0 is the rule above the text, so the caret row reported to the
+    painter is one further down than the text row, and the column is one
+    lead further along. }
+  Add(MkAmberDk + UiRule(Width) + MkOff);
+  Inc(CaretRow);
+  CaretCol := CaretCol + LeadW;
+
+  for I := 0 to High(Body) do
+    { The text carries no colour mark at all, so it arrives in the terminal's
+      own foreground.  Anything else would fight whatever theme the user
+      chose for the window they type into. }
+    if I = 0 then
+      Add(Lead + MkOff + Body[I])
+    else
+      Add(Cont + Body[I]);
+
+  Add(MkAmberDk + UiRule(Width) + MkOff);
+  Stat := StatusLines(Status, Width);
+  for I := 0 to High(Stat) do Add(Stat[I]);
+end;
+
+{ Where the cursor sits, so the first paint can tell whether the row it is
+  about to take over already has something on it.  False when the console
+  will not say, which is treated as "not at the start" - one spare blank
+  line is a cheaper mistake than an erased line of output. }
+function CursorAtLineStart: Boolean;
+var
+  Info: CONSOLE_SCREEN_BUFFER_INFO;
+begin
+  Result := False;
+  if (HOut <> 0) and GetConsoleScreenBufferInfo(HOut, Info) then
+    Result := Info.dwCursorPosition.X = 0;
+end;
+
+{ Paints the block, leaving the cursor in the text where the caret is.
+  Every move is relative - up N, down N - never absolute, so a paint that
+  scrolled the window is still correct: the block scrolled with it. }
+procedure BlockDraw(const E: TEditState; var St: TBlockState);
+var
+  Rows: TStringArray;
+  Width, CaretRow, CaretCol, Total, I: Integer;
+  Buf: string;
+begin
+  Width := TermWidth - 1;      { one column spare, or the last cell wraps }
+  if Width < 12 then Width := 12;
+  Rows := BlockRows(E, Width, CaretRow, CaretCol);
+
+  { The whole repaint is assembled and written ONCE.  Six rows painted run by
+    run is thirty console calls per keystroke, which the user experiences as
+    a prompt that stutters while they type - and a terminal handed the update
+    in pieces has thirty chances to show a half-drawn frame. }
+  Buf := '';
+
+  { The first paint claims rows it does not own yet, and it claims them by
+    erasing them - so it has to start on a row that is genuinely free.  The
+    blank line after that is not decoration: the block is a frame, and a
+    frame flush against the last line of a reply reads as part of it. }
+  if St.Rows = 0 then
+  begin
+    if not CursorAtLineStart then Buf := sLineBreak;
+    Buf := Buf + sLineBreak;
+  end;
+
+  { Back to the top of the block from wherever the caret was left. }
+  if St.CaretRow > 0 then Buf := Buf + #27'[' + IntToStr(St.CaretRow) + 'A';
+  Buf := Buf + #13;
+
+  { A block that shrank still has the old rows on screen, so the paint runs
+    to whichever count is larger and blanks the difference. }
+  Total := Length(Rows);
+  if St.Rows > Total then Total := St.Rows;
+  for I := 0 to Total - 1 do
+  begin
+    if I > 0 then Buf := Buf + sLineBreak;
+    Buf := Buf + #27'[2K';
+    if I <= High(Rows) then Buf := Buf + UiVt(UiFit(Rows[I], Width));
+  end;
+
+  { Down at the last row now; back up to the caret's row and along to it. }
+  if Total - 1 > CaretRow then
+    Buf := Buf + #27'[' + IntToStr(Total - 1 - CaretRow) + 'A';
+  Buf := Buf + #13;
+  if CaretCol > 0 then Buf := Buf + #27'[' + IntToStr(CaretCol) + 'C';
+
+  Emit(Buf);
+  St.Rows := Length(Rows);
+  St.CaretRow := CaretRow;
+end;
+
+{ Takes the block off the screen and leaves the cursor at column zero of the
+  row it started on, ready for whatever the REPL prints next. }
+procedure BlockErase(var St: TBlockState);
+var
+  I: Integer;
+  Buf: string;
+begin
+  if St.Rows = 0 then Exit;
+  Buf := '';
+  if St.CaretRow > 0 then Buf := #27'[' + IntToStr(St.CaretRow) + 'A';
+  Buf := Buf + #13;
+  for I := 0 to St.Rows - 1 do
+  begin
+    if I > 0 then Buf := Buf + sLineBreak;
+    Buf := Buf + #27'[2K';
+  end;
+  if St.Rows > 1 then Buf := Buf + #27'[' + IntToStr(St.Rows - 1) + 'A';
+  Emit(Buf + #13);
+  St.Rows := 0;
+  St.CaretRow := 0;
+end;
+
+function EscEscFires(AtPrompt, Armed, LineEmpty, Vim: Boolean;
+  SinceMs: QWord): Boolean;
+begin
+  { EscEscCommand read HERE, at the point of use, so a host that wires it late
+    or clears it mid-run gets what it asked for rather than what was true when
+    the line started. }
+  Result := AtPrompt and Armed and LineEmpty and (not Vim) and
+            (EscEscCommand <> '') and (SinceMs <= EscEscWindowMs);
+end;
+
+function IdleTickFires(Wired: Boolean; LastMs, NowMs: QWord): Boolean;
+begin
+  { NowMs > LastMs guards the subtraction rather than the logic: these are
+    unsigned, and two wakeups landing inside one 15.6 ms clock step give
+    NowMs = LastMs, which would otherwise be a fine comparison and is written
+    out here only so a reader does not have to work out that it cannot wrap. }
+  Result := Wired and ((LastMs = 0) or
+            ((NowMs > LastMs) and (NowMs - LastMs >= IdleTickMs)));
+end;
+
+function IdleTickRun(var LastMs: QWord; NowMs: QWord): Boolean;
+begin
+  { Assigned() read HERE, at the point of use, and not captured when the line
+    started - the same rule EscEscCommand and uHooks.HooksAllowed are held to,
+    and it matters more here because a prompt can stay open for minutes. }
+  Result := IdleTickFires(Assigned(IdleTick), LastMs, NowMs);
+  if not Result then Exit;
+  LastMs := NowMs;
+  IdleTick();
+end;
+
+{ The one console key loop, taking its profile as a REQUIRED PARAMETER and
+  reading no module state.  That is the structural half of the wall: the two
+  wrappers below are the only things that supply a profile, and the one that
+  every prompt in the program already calls supplies the empty one.
+
+  Block asks for the framed multi-row prompt.  It is honoured only where it
+  can be: a console with no VT, or a redirected stdin, falls back to the
+  single line, and the caller cannot tell the difference except by looking. }
+function ReadLineCore(const Prompt: string; const P: TKeyProfile;
+  Block: Boolean; out Line: string): Boolean;
 var
   Rec: INPUT_RECORD;
   NRead: DWORD = 0;
@@ -804,20 +2955,139 @@ var
   Token: string;
   AtStart: Boolean;
   Cands: TStringArray;
+  Ctrl, Alt, Shift: Boolean;
+  Bound: TEditKey;
+  Blk: TBlockState;
+  Framed: Boolean;
+  { True when there is a real console to block on, which is the only case the
+    bounded wait is entered in.  Split out of the Framed decision below
+    because the two questions had been one line and are not the same
+    question: the frame additionally needs VT, and the wait must NOT be
+    entered off a pipe, where a handle's signalled state means something else
+    entirely and waiting on it would be a guess. }
+  Waiting: Boolean;
+  Waited: DWORD;
+  { When the last idle tick ran, on this line and no other.  A local beside
+    EscTick, and for the same reason: the state dies with the line, so a
+    prompt that opened after a long reply ticks immediately rather than
+    inheriting a clock from a prompt three screens ago. }
+  LastIdle: QWord;
+  { The double-Escape latch.  Armed only by an Escape that arrived on an
+    already-empty line at the REPL prompt with vim off; EscTick is when.
+    Both are locals, so the state dies with the line and an Escape left
+    hanging from a previous prompt can never arm anything. }
+  EscArmed: Boolean;
+  EscPrev: Boolean;
+  EscTick: QWord;
+  EscEmpty: Boolean;
 
   { Applies a key and repaints.  Every editing key goes through here, so the
     console and the state cannot drift apart. }
   procedure Apply(Key: TEditKey; C: WideChar);
   begin
     EditApply(E, Key, C);
-    Redraw(Prompt, E.Text, E.Caret, PrevLen);
+    if Framed then BlockDraw(E, Blk) else Redraw(Prompt, E, PrevLen);
+  end;
+
+  { A repaint with no state change - after an absorbed vim operator, or a
+    completion that changed nothing.  Same split as Apply. }
+  procedure Repaint;
+  begin
+    if Framed then BlockDraw(E, Blk) else Redraw(Prompt, E, PrevLen);
+  end;
+
+  { The block comes down and the submitted text goes into the scrollback as
+    an ordinary line, which is where the user will look for it three screens
+    later.  Without this the frame would scroll away carrying the question
+    with it, and the transcript would be a column of answers. }
+  procedure CloseBlock;
+  var
+    Mark: string;
+  begin
+    BlockErase(Blk);
+    if UiFancy then Mark := #$E2#$9D#$AF + ' ' else Mark := '> ';
+    EmitC(clAmberDim, Mark);
+    EmitCLn(clWhite, UTF8Encode(E.Text));
+  end;
+
+  { One wakeup's worth of periodic work, run between two console reads.
+
+    The block is NOT taken down around the tick, and that is the decision
+    here rather than an oversight.  The obvious reading of "the frame must not
+    flicker" is BlockErase -> tick -> BlockDraw, and it is wrong for this
+    callee: the tick the host wires prints nothing at all, so bracketing would
+    blank and repaint the prompt four times a second while nobody is typing.
+    A prompt that blinks at an empty room is a worse bug than an unbounded
+    spool, which is precisely the trade this must not get backwards.
+
+    The silence is CHECKED rather than trusted, because a contract nobody
+    verifies is a comment.  If the callee did write, the frame on screen has
+    already been written over - there is nothing left to erase, and erasing
+    would eat the output instead.  The recovery is therefore to claim fresh
+    rows BELOW the damage: zeroing St.Rows is exactly what BlockDraw treats as
+    a first paint, blank line and CursorAtLineStart check included, so the
+    wreckage scrolls away as ordinary output like any other line the REPL
+    prints between two prompts.  On the unframed path the same repair is one
+    newline and a Redraw, which is what every other "something else printed"
+    site in this file already does.
+
+    Cost in the shipped configuration: one QWord read and one compare per
+    tick, and the repair branch is unreachable by construction.  That is the
+    intent - the assertion is the product, not the recovery. }
+  procedure Wake;
+  var
+    Seq: QWord;
+  begin
+    Seq := EmitCount;
+    if not IdleTickRun(LastIdle, GetTickCount64) then Exit;
+    if EmitCount = Seq then Exit;
+    if Framed then
+    begin
+      Blk.Rows := 0;
+      Blk.CaretRow := 0;
+      BlockDraw(E, Blk);
+    end
+    else
+    begin
+      if not CursorAtLineStart then EmitLn;
+      PrevLen := 0;
+      Redraw(Prompt, E, PrevLen);
+    end;
   end;
 
 begin
   Line := '';
   PrevLen := 0;
-  EditInit(E);
-  EmitC(clCyan, Prompt);
+  EscArmed := False;
+  EscPrev := False;
+  EscTick := 0;
+  LastIdle := 0;
+  EditInitProfile(E, P);
+  { The frame needs VT for the cursor moves and a real console to read from;
+    without either, the caller silently gets the line editor this program has
+    always had.  Deciding it once here means no key handler has to ask.
+
+    Split in two without changing a value: Framed is Block and VtActive and
+    Waiting exactly as it was, and StdinIsConsole is now asked once instead of
+    once per entry to two different questions. }
+  Waiting := (HIn <> 0) and StdinIsConsole;
+  Framed := Block and VtActive and Waiting;
+  Blk.Rows := 0;
+  Blk.CaretRow := 0;
+  if Framed then
+    BlockDraw(E, Blk)
+  else
+  begin
+    { The tag is part of the lead from the first keystroke, so the width the
+      erase loop measures against is right even before the first Redraw. }
+    if E.Vim then
+    begin
+      EmitC(clGrey, EditVimTag(E));
+      PrevLen := Length(EditVimTag(E));
+    end;
+    EmitC(clCyan, Prompt);
+    PrevLen := PrevLen + Length(Prompt);
+  end;
 
   { Raw mode: cooked mode would swallow the per-key handling this editor
     needs, and ENABLE_PROCESSED_INPUT would route Ctrl+C to the control
@@ -831,6 +3101,70 @@ begin
   end;
   try
     repeat
+      { The bounded wait that closes the prompt-idle window, sitting in FRONT
+        of the read below rather than replacing it.  There is no timeout form
+        of ReadConsoleInput, so wait-then-read is the only mechanism available
+        - and it is also the right one, because the console input handle is a
+        synchronisation object that Windows signals the instant a record
+        lands.  A keystroke therefore costs one WaitForSingleObject on an
+        already-signalled handle and one GetTickCount64, and no latency: the
+        wait returns immediately rather than at the end of an interval, which
+        is what rules out the obvious PeekConsoleInput-plus-Sleep shape.  That
+        one would add the sleep to every keystroke, burn a wake whether or not
+        anything was pending, and hand the paste burst at VK_RETURN below a
+        second way to be wrong.
+
+        Nothing can steal the record between the wait and the read.
+        ReadLineCore is the only reader of HIn on the only thread while this
+        loop is live - EscPressed drains HIn too, but only from the streaming
+        path, which by definition is not running while a prompt is open.
+
+        ONLY WAIT_TIMEOUT is special.  WAIT_OBJECT_0, WAIT_ABANDONED and
+        WAIT_FAILED all break out and fall into the read that has always been
+        here, so every failure mode of the wait degrades to the loop this
+        program shipped before it existed.  A handle that somehow never
+        signalled would spin at 4 Hz rather than hang, which is the direction
+        to fail in.
+
+        Wake runs ONLY on the timeout, and the Break is ahead of it, and that
+        order is the second version of these four lines.  The first ran Wake
+        after every return, gated by IdleTickMs, on the argument that ticking
+        only on the timeout is starved exactly when it matters: autorepeat and
+        a pasted block deliver records faster than 250 ms, so the wait never
+        expires and the tick never runs at the very moment a job is producing
+        output.  That argument is real and it is still true of this code - it
+        is simply worth less than what it cost.
+
+        What it cost was a keystroke.  The tick is TickBackgroundJobs, which
+        sweeps, and a sweep that finds a job over the spool cap terminates it
+        and then waits JobKillWaitMs - two seconds - for the process to die,
+        ONCE PER JOB, up to the eight a session may have.  With Wake ahead of
+        the Break that ran between a character landing in the console input
+        buffer and this loop reading it, so a user typing into a session with
+        several capped jobs could watch the prompt freeze for up to sixteen
+        seconds with nothing echoed.  The character was never lost - the input
+        buffer holds records while we are away - but "never lost" was the
+        weaker half of the promise this whole change was made under, and the
+        other half was that a keystroke is never DELAYED by the wait either.
+        Now nothing at all happens between a record arriving and the read of
+        it: the wait returns, the Break fires, and the code below is the code
+        this program has always had.
+
+        The starvation the old order bought off is what we pay instead, and it
+        is bounded by the burst rather than by the job: while records keep
+        arriving inside 250 ms of each other no tick runs, and the first pause
+        of a quarter second runs one.  A paste and an autorepeat both end, and
+        the cap is re-checked the moment they do.  Set against what this
+        replaced - a prompt that ticked NEVER, however long it was left open -
+        the hole is a fraction of the one that was here a round ago, and it is
+        the only shape of it that cannot make the editor stutter. }
+      if Waiting then
+        while Assigned(IdleTick) do
+        begin
+          Waited := WaitForSingleObject(HIn, IdleWaitMs);
+          if Waited <> WAIT_TIMEOUT then Break;
+          Wake;
+        end;
       if (HIn = 0) or not ReadConsoleInputW(HIn, Rec, 1, NRead) or (NRead = 0) then
       begin
         { Not a console (piped input): fall back to a plain read. }
@@ -842,15 +3176,47 @@ begin
         Continue;
 
       Ch := WideChar(Rec.Event.KeyEvent.UnicodeChar);
+      Ctrl := (Rec.Event.KeyEvent.dwControlKeyState and
+               (LEFT_CTRL_PRESSED or RIGHT_CTRL_PRESSED)) <> 0;
+      Alt := (Rec.Event.KeyEvent.dwControlKeyState and
+              (LEFT_ALT_PRESSED or RIGHT_ALT_PRESSED)) <> 0;
+      Shift := (Rec.Event.KeyEvent.dwControlKeyState and SHIFT_PRESSED) <> 0;
+
+      { A modifier pressed on its own is not a key event this loop has any
+        other use for - Ch is #0, the case below has no arm for these codes,
+        and Ctrl/Alt/Shift reach the handlers that care through
+        dwControlKeyState rather than as records of their own.  It is skipped
+        HERE, above the latch, for the one reason the latch cares about:
+        ReadConsoleInputW delivers a Shift press as a KEY_EVENT with
+        bKeyDown set, so it does reach this point, and disarming on it broke
+        the double-Escape pair for anyone who reached for a modifier inside the
+        600 ms window.  The comment below used to promise that holding Shift
+        was safe while nothing in the code made it so; this is the line that
+        makes the promise true rather than the line that deleted it. }
+      case Rec.Event.KeyEvent.wVirtualKeyCode of
+        VK_SHIFT, VK_CONTROL, VK_MENU, VK_LWIN, VK_RWIN,
+        VK_CAPITAL, VK_NUMLOCK, VK_SCROLL: Continue;
+      end;
+
+      { The double-Escape latch survives exactly one key event: this one.  Any
+        key at all breaks the pair, so a character typed and rubbed out inside
+        the window cannot leave an Escape from before it still armed - and the
+        Escape branch below re-arms from EscPrev, which is why disarming here
+        unconditionally is safe.  Key-up records, non-key records and the bare
+        modifiers just above all Continue before reaching this line, so holding
+        Shift does not break the pair. }
+      EscPrev := EscArmed;
+      EscArmed := False;
+
       case Rec.Event.KeyEvent.wVirtualKeyCode of
         VK_RETURN:
           begin
             { Enter with Ctrl or Alt held inserts a line break instead of
               submitting, which is how a multi-line prompt is written by
-              hand.  A pasted block does the same implicitly below. }
-            if (Rec.Event.KeyEvent.dwControlKeyState and
-                (LEFT_CTRL_PRESSED or RIGHT_CTRL_PRESSED or
-                 LEFT_ALT_PRESSED or RIGHT_ALT_PRESSED)) <> 0 then
+              hand.  A pasted block does the same implicitly below.  Both
+              shapes are reserved: Enter submits from either vim mode, so a
+              paste arriving in normal mode still cannot fire a request. }
+            if Ctrl or Alt then
             begin
               Apply(ekNewline, #0);
               Continue;
@@ -865,7 +3231,7 @@ begin
               Apply(ekNewline, #0);
               Continue;
             end;
-            EmitLn;
+            if Framed then CloseBlock else EmitLn;
             Line := UTF8Encode(E.Text);
             HistoryAdd(Line);
             Exit(True);
@@ -876,11 +3242,35 @@ begin
             begin
               Token := TokenAtCaret(E, AtStart);
               Cands := CompleteProvider(Token, AtStart);
-              if CompleteToken(E, Cands) then
-                Redraw(Prompt, E.Text, E.Caret, PrevLen);
+              if CompleteToken(E, Cands) then Repaint;
             end;
             Continue;
           end;
+      end;
+
+      { Ctrl+C before anything a binding could see.  It is in the reserved
+        set as well, so this is belt and braces on purpose. }
+      if (Ch = #3) or ((Rec.Event.KeyEvent.wVirtualKeyCode = Ord('C')) and Ctrl) then
+      begin
+        { Erased rather than closed: nothing was submitted, so nothing
+          belongs in the scrollback. }
+        if Framed then BlockErase(Blk);
+        EmitLn;
+        Exit(False);
+      end;
+
+      { The binding table, consulted here and nowhere else in the program.
+        Matching is on the virtual key and the modifier flags, never on the
+        control character the console synthesised, so one rule covers both
+        shapes Ctrl arrives in. }
+      if DecodeKey(P, E, Rec.Event.KeyEvent.wVirtualKeyCode,
+                   Ctrl, Alt, Shift, Ch, Bound) then
+      begin
+        Apply(Bound, #0);
+        Continue;
+      end;
+
+      case Rec.Event.KeyEvent.wVirtualKeyCode of
         VK_BACK:   begin Apply(ekBackspace, #0); Continue; end;
         VK_DELETE: begin Apply(ekDelete, #0);    Continue; end;
         VK_LEFT:   begin Apply(ekLeft, #0);      Continue; end;
@@ -889,33 +3279,205 @@ begin
         VK_END:    begin Apply(ekEnd, #0);       Continue; end;
         VK_UP:     begin Apply(ekHistPrev, #0);  Continue; end;
         VK_DOWN:   begin Apply(ekHistNext, #0);  Continue; end;
-        VK_ESCAPE: begin Apply(ekClear, #0);     Continue; end;
+        VK_ESCAPE:
+          begin
+            { Measured BEFORE anything is applied: "already empty" is a fact
+              about the line as the user pressed the key, and reading it after
+              ekClear had run would make every Escape look like it arrived on
+              an empty line. }
+            EscEmpty := Length(E.Text) = 0;
+            if EscEscFires(Block, EscPrev, EscEmpty, E.Vim,
+                           GetTickCount64 - EscTick) then
+            begin
+              { Submitted exactly as though it had been typed and entered, so
+                the REPL's one command path handles it and nothing here knows
+                what the word means.  Put in the line first and repainted, so
+                the scrollback shows WHY the next thing on screen happened -
+                a rewind list appearing under a blank prompt would read as the
+                program doing something of its own accord.
+
+                Deliberately not HistoryAdd: the user pressed Escape twice,
+                they did not type this, and up-arrow should still reach the
+                last thing they did type. }
+              E.Text := UTF8Decode(EscEscCommand);
+              E.Caret := Length(E.Text);
+              Repaint;
+              if Framed then CloseBlock else EmitLn;
+              Line := EscEscCommand;
+              Exit(True);
+            end;
+            { Armed for the next Escape only under the conditions that could
+              ever fire - the test is repeated rather than trusted to
+              EscEscFires, because arming on a line that had text in it is how
+              "Escape clears, Escape again rewinds" would sneak back in. }
+            EscArmed := Block and EscEmpty and (not E.Vim);
+            EscTick := GetTickCount64;
+            { With vim on, Escape leaves insert mode - which costs the
+              clear-the-line meaning it has always had.  Ctrl+U still clears,
+              and /vim says so when it turns the mode on. }
+            if E.Vim then Apply(ekNormalMode, #0) else Apply(ekClear, #0);
+            Continue;
+          end;
+        VK_OEM_4_:
+          { Ctrl+[ is Escape in a terminal, and a vim user's fingers know it.
+            Layout-dependent, so its failure is a missing convenience. }
+          if Ctrl and E.Vim then
+          begin
+            Apply(ekNormalMode, #0);
+            Continue;
+          end;
       end;
 
-      if Ch = #3 then          { Ctrl+C }
-      begin
-        EmitLn;
-        Exit(False);
-      end;
+      { Ctrl+R arrives as a control character, below the printable range the
+        normal-mode parser sees, so redo is wired here rather than there. }
+      if (Ch = #18) and E.Vim then begin Apply(ekRedo, #0); Continue; end;
       if Ch = #21 then begin Apply(ekClear, #0); Continue; end;  { Ctrl+U }
       if Ch = #1  then begin Apply(ekHome, #0);  Continue; end;  { Ctrl+A }
       if Ch = #5  then begin Apply(ekEnd, #0);   Continue; end;  { Ctrl+E }
       if Ch >= #32 then
       begin
+        { In normal mode a printable key is a command, never text. }
+        if E.Vim and (E.Mode = vmNormal) then
+        begin
+          if EditNormalKey(E, Ch, Bound) then
+            Apply(Bound, #0)
+          else
+            { An absorbed operator or a discarded key still repaints: the
+              caret may have moved nowhere but the tag must stay honest. }
+            Repaint;
+          Continue;
+        end;
         EditApply(E, ekChar, Ch);
         { Appending at the end is the common case and needs no redraw, which
-          keeps ordinary typing free of flicker. }
-        if E.Caret = Length(E.Text) then
+          keeps ordinary typing free of flicker.  PrevLen is total painted
+          width, so this is an increment, not the text length - which also
+          fixes the multi-line case, where the two were never the same.
+
+          The framed path cannot take that shortcut: a character can push the
+          text onto a new row, which moves the rules and the status lines
+          under it, so the block is repainted whole every time. }
+        if Framed then
+          BlockDraw(E, Blk)
+        else if E.Caret = Length(E.Text) then
         begin
           Emit(UTF8Encode(WideString(Ch)));
-          PrevLen := Length(E.Text);
+          Inc(PrevLen);
         end
         else
-          Redraw(Prompt, E.Text, E.Caret, PrevLen);
+          Redraw(Prompt, E, PrevLen);
       end;
     until False;
   finally
     if HIn <> 0 then SetConsoleMode(HIn, Mode);
+  end;
+end;
+
+function ReadLineEdit(const Prompt: string; out Line: string): Boolean;
+begin
+  { KeysNone, always.  This is the reader the permission prompt, the model
+    picker, the session picker and the rewind picker use, and it is the
+    reader anyone adding a sixth prompt will reach for because it is the one
+    that already exists under the obvious name.
+
+    False for the frame, always, and for the same reason: these prompts ask a
+    question whose answer matters, and a question wrapped in a status bar is
+    a question that gets skimmed.
+
+    These prompts DO tick, because the tick is in ReadLineCore and is
+    deliberately not gated on Block the way EscEscFires is gated on AtPrompt.
+    That gate exists because /rewind MEANS something different inside the
+    rewind picker; a tick means nothing at all, only "time passed, do the
+    periodic thing".  The permission question is where the user sits longest -
+    reading a diff, thinking, often with a job already running - so making it
+    the one remaining place where the clock stops would rebuild the bug one
+    prompt over. }
+  Result := ReadLineCore(Prompt, KeysNone, False, Line);
+end;
+
+function ReadPromptLine(const Prompt: string; out Line: string): Boolean;
+begin
+  { THE one read of PromptProfile in the program, and the one framed prompt. }
+  Result := ReadLineCore(Prompt, PromptProfile, True, Line);
+end;
+
+function ReadSecretLine(const Prompt: string; out Secret: string): Boolean;
+var
+  Mode: DWORD;
+  Rec: INPUT_RECORD;
+  NRead: DWORD = 0;
+  Ch: WideChar;
+  Ctrl: Boolean;
+  W: WideString;
+begin
+  Secret := '';
+  Result := False;
+  { The one console read in this unit that still blocks with no timeout, and
+    it is left that way on purpose rather than by omission.  This is a third
+    loop with its own console-mode handling, reached only from /login, and
+    duplicating the wait and the tick here would be diff spent on a window
+    measured in the seconds a user takes to paste a key.  Named as a residual
+    in FEATURES-NOT-YET.md instead of being quietly left out; the fix is the
+    same three lines if it ever matters. }
+  { Refused rather than attempted off a pipe.  ReadLineCore falls back to
+    ReadLn there; this must not, because the fallback would echo the secret
+    into whatever is reading the console's output and because a -p run has
+    nobody to answer. }
+  if not StdinIsConsole then Exit;
+  EmitC(clCyan, Prompt);
+  GetConsoleMode(HIn, Mode);
+  { Raw, for the same reason the editor is: cooked mode would echo. }
+  SetConsoleMode(HIn, 0);
+  try
+    W := '';
+    repeat
+      if not ReadConsoleInputW(HIn, Rec, 1, NRead) or (NRead = 0) then Exit;
+      if (Rec.EventType <> KEY_EVENT) or not Rec.Event.KeyEvent.bKeyDown then
+        Continue;
+      Ctrl := (Rec.Event.KeyEvent.dwControlKeyState and
+               (LEFT_CTRL_PRESSED or RIGHT_CTRL_PRESSED)) <> 0;
+      case Rec.Event.KeyEvent.wVirtualKeyCode of
+        VK_RETURN:
+          begin
+            Emit(#10);
+            Secret := UTF8Encode(W);
+            Exit(True);
+          end;
+        VK_ESCAPE:
+          begin
+            Emit(#10);
+            Exit(False);
+          end;
+        VK_BACK:
+          begin
+            if Length(W) > 0 then SetLength(W, Length(W) - 1);
+            Continue;
+          end;
+      end;
+      Ch := WideChar(Rec.Event.KeyEvent.UnicodeChar);
+      { Ctrl+C quits, Ctrl+U clears - the two the plain editor also honours,
+        so muscle memory does not produce a key with a stray control
+        character wedged into it. }
+      if Ctrl and ((Ch = #3) or (Ch = 'c') or (Ch = 'C')) then
+      begin
+        Emit(#10);
+        Exit(False);
+      end;
+      if Ctrl and ((Ch = #21) or (Ch = 'u') or (Ch = 'U')) then
+      begin
+        W := '';
+        Continue;
+      end;
+      { Everything below space is a control code, and a key never contains
+        one; dropping them here is also what keeps a bracketed-paste burst
+        from wedging escape sequences into the middle of the value. }
+      if Ch < ' ' then Continue;
+      W := W + Ch;
+      { Deliberately no Emit.  This is the whole point of the reader. }
+    until False;
+  finally
+    { Restored even on Esc, on Ctrl+C and on an exception, or a cancelled
+      /login would leave the console in raw mode for the rest of the run. }
+    SetConsoleMode(HIn, Mode);
   end;
 end;
 

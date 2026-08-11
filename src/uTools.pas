@@ -1,9 +1,22 @@
 { uTools - the tools the model is allowed to call, and the permission gate.
 
   Every tool that changes the machine (write, edit, bash) asks the user first,
-  unless the session has been put in accept-all mode.  Reads are free.  Paths
-  are resolved against the session root and refused when they escape it, so a
-  confused model cannot walk into C:\Windows by accident. }
+  unless a standing approval covers it or the session has been put in
+  accept-edits or bypass mode.  Reads are free.  Paths are resolved against
+  the session root and refused when they escape it, so a confused model cannot
+  walk into C:\Windows by accident.
+
+  Two boundaries sit ABOVE the gate rather than inside it, in RunTool, where
+  no answer and no standing grant is consulted: the subagent read-only list,
+  and plan mode.  A boundary refuses; only the gate can allow.  Everything
+  the gate can conclude is narrowed further by the deny rules, which no mode
+  and no answer can lift.
+
+  A mode comes from exactly three places - a keystroke, this process's command
+  line, or the user's own earlier "always" in the out-of-tree approvals file.
+  The gate never reads the project directory for any of it: a repository that
+  could ship the file answering its own permission questions is the hole the
+  whole design exists to close. }
 unit uTools;
 
 {$mode objfpc}{$H+}
@@ -15,6 +28,19 @@ uses SysUtils, uJson, uDiff;
 type
   { Answer to a permission prompt. }
   TPermission = (pmAsk, pmAllowOnce, pmAllowAlways, pmDeny);
+
+  { What the session is doing about permission, as one word for the user.
+    The prefix is pmode rather than pm because pm is TPermission's, and two
+    enumerations sharing a prefix in one unit is how a value ends up in the
+    wrong case arm with no diagnostic at all.
+
+    This is a DISPLAY type, not the state: there is no mode variable.  Plan is
+    a boundary and bypass is a gate setting, so collapsing them onto one scale
+    would have to claim one is stronger than the other, and plan must beat
+    bypass - "let me look around first" has to be available inside a yolo
+    session.  CurrentPermMode derives the word from the state that already
+    exists; SetPermMode is the only writer. }
+  TPermMode = (pmodePlan, pmodeAsk, pmodeAcceptEdits, pmodeBypass);
 
   { Supplied by the host so this unit does not depend on the console. }
   TAskProc = function(const Title, Detail: string): TPermission;
@@ -79,7 +105,32 @@ type
   end;
   TPluginInfoArray = array of TPluginInfo;
 
+  { One output style, as the listing shows it.  TSkillSource is reused rather
+    than duplicated with one extra value: a built-in has no directory and no
+    precedence, so it is a flag beside the source and not a fourth member of
+    it - an enum member meaning "not from anywhere" would have to be handled
+    at every site that maps a source to a path. }
+  TStyleInfo = record
+    Name: string;
+    Description: string;
+    Path: string;          { '' for a built-in }
+    Plugin: string;        { '' unless Source = ssPlugin }
+    { '' when the file parsed.  A style that failed is listed with its reason
+      rather than dropped, for the reason the skill catalogue gives: omitted
+      is the state in which nobody can find out why it never applied. }
+    Err: string;
+    Source: TSkillSource;
+    Builtin: Boolean;
+  end;
+  TStyleInfoArray = array of TStyleInfo;
+
 var
+  { Cap on any single tool result.  A var rather than a const because
+    settings.json may move it, within a range uSettings clamps before anything
+    assigns here - this unit does the capping, not the deciding.  Read at use
+    time and never cached, so a /config reload takes effect on the next tool
+    call rather than the next launch. }
+  MaxOutBytes: Integer = 30 * 1024;
   { Session root; every path argument is resolved relative to it. }
   RootDir: string = '';
   { Set once the user picks "always" for a tool class. }
@@ -91,6 +142,25 @@ var
     command line instead, which is the same reasoning that makes an "always"
     for bash approve a program rather than a command line. }
   AllowAllMcp: Boolean = False;
+  { The two mode variables.  Both are session-scoped and neither is ever
+    written to or read from a file, by design: a mode is a statement about
+    what is being done right now, and a standing file meaning "and every
+    future session" is a wider grant than the word implied.  Neither can be
+    set from the project directory - not by a hook, a skill, a plugin, an
+    MCP server, .mcp.json or CLAUDE.md - because the only writer is
+    SetPermMode and its only callers are the host's slash commands and its
+    command-line parser.
+
+    PlanMode is enforced in RunTool, beside the subagent read-only boundary
+    and far above the gate, so it beats BypassMode, a class allow-all, a
+    persisted bash prefix and a PreToolUse hook's allow without any of them
+    needing to know it exists. }
+  PlanMode: Boolean = False;
+  { BypassMode is one line at the top of Permit and PermitBash.  It sets none
+    of the four flags above, which is what makes "yolo never persists" a
+    property of the variable rather than of the host remembering to skip a
+    save. }
+  BypassMode: Boolean = False;
   { Filled in by uAgent's initialization.  Nil means this build cannot run a
     subagent at all: the task tool is then not advertised and, if the model
     names it anyway, it reports a plain error.  Deny-by-default applied to a
@@ -111,6 +181,10 @@ const
   SkillsDirName    = 'skills';
   PluginsDirName   = 'plugins';
   CommandsDirName  = 'commands';
+  { A flat <name>.md per style, like commands and agents rather than like
+    skills: a style is one document with nothing beside it, so a directory
+    per name would be an empty directory per name. }
+  StylesDirName    = 'styles';
   { Plugin enablement.  Deliberately NOT in permissions.json: that file only
     ever widens on load, which would make "/plugins disable" a lie the moment
     the session restarted.  This one is authoritative in both directions. }
@@ -131,6 +205,22 @@ const
   { Plugins are directories the user copied in on purpose; sixteen is already
     more than a project will have, and the scan runs at every launch. }
   MaxPlugins        = 16;
+
+  { An output style is a document somebody wrote by hand; 64 KB of it is
+    already more than a description of how to write prose can need, and this
+    is only how much of the file is looked at at all. }
+  MaxStyleBytes     = 64 * 1024;
+  { How much of it reaches the system prompt, and therefore what it costs
+    EVERY turn: the style rides in the uncached trailing block, so unlike the
+    skill catalogue this is a recurring charge rather than a one-off.  2 KB is
+    roughly three hundred words - ample for "how the user wants replies
+    written" - and halving it halves the standing cost.  Applied with Utf8Cut,
+    never Copy, and the command reports when it bit. }
+  MaxStyleNoteBytes = 2 * 1024;
+  { The style that emits nothing at all.  Reserved, like the other built-ins,
+    so a file can never mean something different from the name the listing
+    shows. }
+  DefaultStyleName  = 'default';
 
   { The server-side web search tool's type string.  Anthropic versions these
     by date; older models take the basic 'web_search_20250305' instead.
@@ -188,6 +278,21 @@ const
     configuration, it is something else wearing the name. }
   McpMaxConfigBytes = 1024 * 1024;
 
+  { The user's own copy, in %USERPROFILE%\.pasclaude\ - and note the missing
+    dot.  The project's file is dot-prefixed because ecosystem convention puts
+    it at a repository root, where a leading dot is how a config file says it
+    is not source.  Inside .pasclaude\ the dot buys nothing at all: the
+    directory already says what the file is, and the layout already names it. }
+  UserMcpFileName = 'mcp.json';
+
+  { The leaf directory a stderr spool goes in, and the extension it carries.
+    Named once because there are now TWO of these directories - the project's
+    <root>\.pasclaude\mcp\ and the user's %LOCALAPPDATA%\pasclaude\mcp\ - and
+    two literals for one concept is how a rename ends up half-done: /mcp would
+    keep printing the word the builder stopped using. }
+  UserMcpSpoolDirName = 'mcp';
+  McpSpoolExt         = '.err';
+
 { The tool list, as the API expects it under "tools". }
 function ToolsSchema: TJson;
 
@@ -233,6 +338,60 @@ function RunTool(const Name: string; Input: TJson; Ask: TAskProc;
   invisible to every test that goes through a tool. }
 function Permit(const Name, Detail: string; Ask: TAskProc): Boolean;
 
+{ The bash gate, which is a different predicate: an "always" there records a
+  program rather than a class.  Exposed for the same reason as Permit - the
+  two of them together are the whole answer to "can this be overridden", and
+  a test that only went through RunTool could not tell which line refused. }
+function PermitBash(const Cmd, Detail: string; Ask: TAskProc): Boolean;
+
+{ ---- permission modes ----
+  Three sources may change a mode and there are no others: a keystroke at the
+  REPL prompt, an argument on this process's command line, and the
+  allow_edits key in the out-of-tree approvals file, which is written only by
+  the user's own earlier "always" answers.  Nothing in or under the project
+  directory is one of them.  There is deliberately no exit_plan_mode tool: a
+  tool that lets the model leave plan mode is a tool that lets the model grant
+  itself write access. }
+
+{ The only writer of PlanMode and BypassMode.  pmodeAsk is the off switch the
+  program has never had - it clears all four class blankets so the word "ask"
+  on screen means you will be asked. }
+procedure SetPermMode(M: TPermMode);
+{ Derived, never stored.  Plan beats bypass beats accept-edits beats ask. }
+function CurrentPermMode: TPermMode;
+function PermModeName(M: TPermMode): string;
+{ Parses a --permission-mode or /mode argument.  Rejects 'bypass': the
+  dangerous mode keeps its dangerous spelling and has one, on the command
+  line and at the prompt alike. }
+function PermModeParse(const S: string; out M: TPermMode): Boolean;
+{ The plan-mode paragraph for the system prompt, '' in every other mode.
+  SessionNote is what actually reaches the request; this is separate so the
+  text can be asserted on without reconstructing the whole note. }
+function PermModeNote: string;
+{ The plan-mode allowlist: what the model may still call while planning. }
+function IsPlanTool(const Name: string): Boolean;
+{ The tool_result a refused call gets, so the model learns the mode by being
+  told as well as by walking into it. }
+function PlanRefusal(const Name: string): string;
+{ Whether M can be entered by a -p run, given whether a stream-json driver is
+  attached.  A pure function so the rule is testable without a process. }
+function PermModeReachableUnderPrint(M: TPermMode; HasDriver: Boolean): Boolean;
+{ The standing grants no mode word names - the bash, fetch and MCP class
+  flags, the approved bash programs and the trusted MCP servers.  '' when
+  there are none, which is what lets the host show a mode line only when
+  there is something to say. }
+function PermGrantSummary: string;
+{ The mode as one word for the input prompt, with a '+' when PermGrantSummary
+  has something the word does not cover.  Text, not console - the host adds
+  the '> ' - and here rather than there because "does the user know what mode
+  they are in" is the failure this feature exists to prevent, and a host-only
+  string is one no suite can assert on. }
+function PermModeIndicator: string;
+{ The banner line, or '' when there is nothing worth saying.  Non-empty for a
+  grant loaded from the approvals file as well as for one typed this session:
+  the loaded case is the state that has always existed and never been shown. }
+function PermModeBanner: string;
+
 { A one-line description used in the transcript and in permission prompts. }
 function DescribeTool(const Name: string; Input: TJson): string;
 
@@ -256,6 +415,164 @@ function IsValidUtf8(const S: string): Boolean;
   @file mentions face the same guard as tool calls. }
 function ResolveInRoot(const P: string; out Full: string; out Err: string): Boolean;
 
+{ ---- additional working directories ----
+  One resolution base, several acceptance tests.  A path argument is resolved
+  against the PRIMARY root exactly as it always was; the resolved absolute
+  path is then accepted if it lies inside any root.  Nothing a relative path
+  meant yesterday changes when a directory is added, which is what makes the
+  widening auditable: --add-dir can only make previously-refused ABSOLUTE
+  paths succeed, never silently re-point src\main.pas at another tree.
+
+  Index 0 is the primary root - NormalizeRoot - and everything that is state
+  rather than workspace binds to it and to nothing else: the session file,
+  the history, the approvals key, snapshots, the jobs spool, plugins.json,
+  hooks.json, skills, agents, custom commands, .mcp.json, the MCP cache and
+  bash's working directory.  An added root therefore contributes no code and
+  no configuration; it grants file access and that alone.  Generalising any
+  of those call sites to scan every root would turn --add-dir into a way to
+  make an arbitrary directory execute code, which is a strictly larger grant
+  than the one the user typed.
+
+  Roots come from the user and from nowhere else: --add-dir on argv and
+  /add-dir typed at the prompt.  There is no tool, no config key and no
+  approvals key, so a repository cannot ship the file that widens its own
+  guard, and nothing is inherited by a later session. }
+const
+  { A bound on a loop that runs on the hottest guard in the program.  Eight is
+    generous for the real use - a project plus a couple of libraries - and an
+    unbounded list here would be an unbounded loop on every path a tool
+    names. }
+  MaxWorkingDirs = 8;
+
+{ How many roots there are, primary included; RootAt(0) is always the primary
+  and is never removed or reordered. }
+function RootCount: Integer;
+function RootAt(Index: Integer): string;
+{ The added ones only, in order, for display. }
+function WorkingDirs: TStringArray;
+
+{ True when Cand is Root or sits under it.  The whole escape rule, written
+  once: with N roots there would otherwise be N chances to reintroduce the
+  classic prefix bug that lets C:\proj-sibling pass for C:\proj. }
+function WithinRoot(const Cand, Root: string): Boolean;
+{ Which root contains Full, primary first; -1 when none does. }
+function RootIndexOf(const Full: string): Integer;
+
+{ Adds a working directory.  Norm is the normalised absolute path the host
+  must echo, so the user sees what was actually granted rather than what they
+  typed.  Refuses a volume or share root, a missing path, a file, a duplicate
+  and anything already covered by an existing root; a directory that is a
+  PARENT of existing extras is accepted and swallows them, which Err reports
+  as a note with Result True. }
+function AddWorkingDir(const Dir: string; out Norm, Err: string): Boolean;
+{ Takes an index (as printed) or a path.  Index 0 is refused: the primary root
+  is the session's identity, not part of the grant. }
+function RemoveWorkingDir(const Dir: string; out Err: string): Boolean;
+procedure ClearWorkingDirs;          { test seam, and TSdkSession.Create }
+
+{ Per-root ignore rules.  The two-argument IsIgnored keeps its meaning - the
+  primary root - so every existing caller and test is unchanged. }
+function IsIgnoredIn(RootIndex: Integer; const RelPath: string;
+  IsDir: Boolean): Boolean;
+
+{ ---- deny rules ----
+  The one kind of permission state that only ever narrows.  A rule is one
+  string, "kind:pattern", and there are exactly three kinds because there are
+  exactly three choke points every route to the thing has to pass:
+
+    tool:<name-glob>   tool:bash  tool:fetch  tool:mcp__github__*
+    bash:<prog-glob>   bash:rm    bash:del
+    path:<glob>        path:.env  path:**/*.pem  path:/secrets/**
+
+  tool: and bash: are read at the top of RunTool, above the PreToolUse fire;
+  path: is read inside SafePath, where every path-taking tool, @-mention and
+  @import already funnels.  Neither point is reachable past an approval: a
+  deny beats /yolo, a persisted "always", accept-edits and a hook's allow,
+  because all of those are consulted further down.
+
+  Three limits, stated here because a deny rule the user misreads as wider
+  than it is is worse than no rule at all:
+
+  1. bash: is a NAME FILTER, not a guarantee.  It reads the first token of
+     every cmd.exe segment, so "git status && rm -rf x" is caught where the
+     approval prefix table gives up - but it cannot follow %VAR% expansion,
+     a for loop, a renamed copy or a .cmd wrapper that calls the program.
+     tool:bash is the airtight form.
+  2. path: protects pasclaude's file tools, not the shell.  "type .env" run
+     through bash never touches SafePath.  Denying a path from the shell
+     needs tool:bash or a bash: rule.
+  3. Hardlinks evade path:.  Canonicalisation resolves junctions, 8.3 names
+     and case, but a second name for the same bytes is a different path by
+     every API Windows offers.  Making one needs the shell, which is gated
+     separately.
+
+  fetch:<host> is deliberately not offered: WinHTTP follows redirects and
+  uHttp sets no redirect policy, so a host rule would match the URL the model
+  typed and not the host that answered.  tool:fetch is the honest version. }
+type
+  TDenyRule = record
+    Text: string;      { verbatim, as written in the file - what a message names }
+    Kind: string;      { 'tool' | 'bash' | 'path' }
+    Pattern: string;   { lowercased, '/' separators }
+    Source: string;    { the file it came from, so /deny can say which line to delete }
+    Err: string;       { '' when in force; otherwise why it is not }
+  end;
+  TDenyRuleArray = array of TDenyRule;
+
+const
+  { A bound on the hottest guard in the program.  Past it a rule is kept and
+    reported with a reason rather than dropped, because a rule that vanishes
+    silently is the failure this whole feature exists to avoid. }
+  MaxDenyRules = 256;
+
+{ Every rule, in force or not, in the order it was loaded. }
+function  DenyRules: TDenyRuleArray;
+{ How many are actually in force.  Bad ones are not counted, only reported. }
+function  DenyRuleCount: Integer;
+function  DenyRulesInForce: Boolean;
+{ True when at least one path: rule is in force.  Separate because it is what
+  buys the early exit in DenyPathReason: with no path rule, a SafePath call
+  opens no handles and pays one boolean. }
+function  DenyPathRulesInForce: Boolean;
+{ The text of every rule that could not be parsed, for the startup warning. }
+function  BadDenyRules: TStringArray;
+procedure AddDenyRule(const Text, Source: string);
+procedure ClearDenyRules;                                   { test seam }
+{ Reads ONLY the "deny" array of each file.  It must never grow to read a
+  grant key: the host calls it before print mode halts, which is the whole
+  reason a -p run inherits deny rules and no approvals. }
+procedure LoadDenyRules(const RootApprovals, Global: string);
+{ %LOCALAPPDATA%\pasclaude\deny.json - global, every root.  '' when there is
+  no home to put it in, which means the same as an empty file. }
+function  GlobalDenyPath: string;
+{ The global file's rules as written, and the write-back.  /deny add and
+  /deny remove are the only widening operation in the feature and they go
+  through here, so the JSON stays in this unit with the rest of it. }
+function  GlobalDenyList: TStringArray;
+function  SaveGlobalDenyList(const A: TStringArray; out Err: string): Boolean;
+
+{ Each returns '' for "not denied", otherwise the exact sentence the user and
+  the model both read: refused by deny rule "path:.env" (<file>). }
+function  DenyToolReason(const Name: string): string;
+function  DenyBashReason(const Cmd: string): string;
+function  DenyPathReason(const Full: string): string;
+{ The walkers' cheaper cousin: no canonicalisation, because FindFirst already
+  produced a long name under an already-resolved root. }
+function  DenyWalkReason(const RelPath, BaseName: string): string;
+{ 8.3 names expanded, junctions followed, case as the filesystem holds it.
+  Public so the tests can assert the resolution directly rather than through
+  a refusal, which would not distinguish "canonicalises" from "expands". }
+function  CanonicalPath(const P: string): string;
+
+{ The trailing, uncached system-prompt block: everything the model has to be
+  told about how this session is set up that is not part of its identity.
+  '' with default settings, and BuildRequest then emits no second block at
+  all, so an ordinary session's request body is unchanged and so is its
+  prompt cache.  Deny contributes one sentence and deliberately not the
+  patterns - naming .env in the prompt advertises a target.  Permission modes
+  and additional working directories are the other two contributors. }
+function  SessionNote: string;
+
 { Loads the root .gitignore, if any.  Called once at startup and after /clear
   of the cache would make no sense - the file rarely changes mid-session. }
 procedure LoadIgnoreRules;
@@ -266,8 +583,49 @@ function IsIgnored(const RelPath: string; IsDir: Boolean): Boolean;
 
 { Runs a command in the session root and returns its combined output, for the
   host's own use (git context at startup).  Same machinery as the bash tool,
-  without the permission gate - the host is not the model. }
+  without the permission gate - the host is not the model.  Sandboxed=False,
+  for the reason written above the implementation. }
 function RunShellQuiet(const Cmd: string; out ExitCode: Integer): string;
+
+{ ---- program resolution ----
+  The absolute path of a program on PATH, honouring PATHEXT.  The CURRENT
+  DIRECTORY IS NEVER SEARCHED, and neither is any working root.
+
+  The reason is measured, not theoretical.  RunShell composes
+  "<ComSpec>" /C <Cmd> with the working directory at the session root, and
+  cmd.exe resolves the current directory BEFORE PATH.  A CreateProcess probe
+  in a directory containing git.cmd, with NoDefaultCurrentDirectoryInExePath
+  unset (the Windows default), ran that git.cmd for the command
+  "git rev-parse --abbrev-ref HEAD".  uSdk.SdkGitContext issues exactly that
+  at startup, so cloning a repository that ships git.cmd and opening
+  pasclaude in it is arbitrary code execution before the user types
+  anything.  Composing through here is what closes it.
+
+  A PATH entry that IS a working root - a repository that put itself on PATH
+  - is skipped for the same reason: it would reintroduce the hazard through
+  the front door.
+
+  ProgramCommand returns '"<abs>" <Args>', or '' when the program does not
+  resolve.  '' contributes nothing to a caller, exactly as a directory that
+  is not a repository already does; it is never composed as a bare name. }
+function ResolveProgram(const Name: string; out FullPath: string): Boolean;
+function ProgramCommand(const Name, Args: string): string;
+
+{ The foreground shell itself.  Public because the output contract - exit
+  code, interleaved stderr, nothing truncated, the tail after exit - is the
+  thing most easily broken by a change to the drain loop, and a test that had
+  to go through the tool arm and the permission gate to reach it could not say
+  which part was wrong.  Output is returned raw; the caller repairs the OEM
+  codepage. }
+function RunShell(const Cmd, WorkDir: string; Sandboxed: Boolean;
+  out ExitCode: Integer): string;
+
+{ The foreground deadline, in milliseconds.  A variable rather than a constant
+  only so a test can wind it down: the path it guards needs a command that
+  genuinely never finishes, and the alternative to a seam is two minutes of
+  wall clock in a suite.  Nothing in the shipped program assigns it. }
+var
+  ShellTimeoutMs: Integer = 120000;
 
 { The leading program name of a shell command - the part an "always" answer
   reasonably covers.  Exposed for the tests. }
@@ -376,6 +734,82 @@ procedure ClearSkills;                { test seam }
 function SkillsDirProject: string;
 function SkillsDirUser: string;
 
+{ ------------------------------------------------------------ output style -- }
+
+{ An output style is one markdown file in the SKILL.md shape, parsed by the
+  same ParseSkillFrontmatter - a second reader of the same file shape would be
+  a second set of failure modes for it.  It says how the user wants replies
+  written and nothing else: there is no frontmatter key that maps to a
+  setting, and the body is read by exactly one string concatenation, in
+  StyleNote.  That absence of a consumer is the whole of the enforcement, and
+  it is stated here because it is the only honest way to put it. }
+function StylesDirProject: string;
+function StylesDirUser: string;
+{ Project, then each enabled plugin alphabetically, then the user's own home
+  directory.  '' when no file answers to the name; a built-in name never
+  reaches here at all. }
+function ResolveStyleFile(const Name: string): string;
+{ Built-ins first, then files: project, then enabled plugins, then user, with
+  the nearer source winning and broken files listed with their reason. }
+function StyleCatalogue: TStyleInfoArray;
+procedure RefreshStyles;              { /output-style is the rescan }
+procedure ClearStyles;                { test seam, mirrors ClearSkills }
+
+function OutputStyleName: string;     { DefaultStyleName when none is set }
+function OutputStylePath: string;     { '' for a built-in }
+{ 'builtin', 'project', 'user' or 'plugin:<name>' - persisted alongside the
+  name so a project file appearing later cannot inherit the consent the user
+  gave to a user file of the same name. }
+function OutputStyleSource: string;
+{ Resolves, reads, parses and caches the body.  False with Err set leaves the
+  current style untouched, so a typo never silently clears one. }
+function SetOutputStyle(const Name: string; out Err: string): Boolean;
+{ The paragraph SessionNote prepends: '' for the default style, otherwise the
+  fence line plus the capped body.  Exposed so a test can assert the text
+  without making a request.
+
+  Not a plain accessor: it reads the file behind the body and compares a
+  fingerprint of its bytes, and re-parses it if that moved - see StyleRecheck.
+  A built-in style has no file and never reaches the disk from here. }
+function StyleNote: string;
+{ True when the body hit MaxStyleNoteBytes.  Reported by /output-style rather
+  than silently swallowed: what the model was actually handed is the thing the
+  user needs to be able to see. }
+function StyleNoteTruncated: Boolean;
+{ What LoadPermissions had to say about the persisted style: '' when it
+  applied cleanly, otherwise a line for the host to print in yellow.  A module
+  var rather than an out parameter because uTools may not print and
+  LoadPermissions is called from three places that do not all care. }
+function StyleStartupNote: string;
+{ Cleared by a caller that has already overruled the persisted name, so the
+  user is not told about a fallback that never happened. }
+procedure ClearStyleStartupNote;
+{ What the last on-the-fly re-read had to say, read-and-cleared: '' when
+  nothing went wrong, otherwise one line for the host to print in yellow.  It
+  fires when the style file has changed on disk and the new contents cannot be
+  used - deleted, unreadable, broken frontmatter, renamed inside its own
+  header.  The style that WAS working is kept in that case, which is why this
+  has to be said out loud: a session whose style file has quietly become
+  rubbish is still writing in the old voice, and the user needs to know their
+  edit did not take before they conclude the feature is broken.
+
+  Read-and-clear rather than a plain getter, because the caller is a REPL loop
+  that runs before every prompt and a note that stayed set would be printed
+  once per keystroke round.  The fingerprint is updated even when the re-read
+  fails, so a file that stays broken is reported once and then left alone. }
+function TakeStyleReloadNote: string;
+{ How many times the change check has gone to ask about the style file, for
+  the life of the process.  A test seam, admitted as one, and it exists
+  because the promise it pins - a built-in style has no file and never reaches
+  the disk - was until now only assertable as an ABSENCE of a complaint, which
+  is what let a Check that could not fail sit in the suite for a round.
+  Counted at the TOP of FingerprintStyleFile, before that routine's own
+  empty-path exit, so the guard in StyleRecheck is what the number measures:
+  delete that guard and the count rises.  Never reset, not even by
+  ClearStyles - every assertion on it is a delta, so no test has to restore it
+  and none can be broken by another test having run first. }
+function StyleFileProbes: Int64;
+
 function PluginsDir: string;
 function InstalledPlugins: TPluginInfoArray;
 function PluginEnabled(const Name: string): Boolean;
@@ -413,6 +847,36 @@ function ValidSkillFileName(const Name: string): Boolean;
 
   Each job also owns a Win32 job object with kill-on-close, so the whole
   process tree dies with pasclaude even when pasclaude dies badly. }
+
+var
+  { A runaway job writing to disk forever is the failure mode a spool file
+    has that a pipe does not.  Sixteen megabytes is generous for anything
+    worth reading and small enough to notice.
+
+    Test seam: a var rather than a const, in the style of MaxOutBytes above,
+    so a suite can lower it and watch a job get stopped without writing
+    sixteen megabytes to the user's disk to do it.  The value and what it
+    means are unchanged; only who can read and set it changed. }
+  MaxSpoolBytes: Int64 = 16 * 1024 * 1024;
+
+{ Re-checks the spool cap, cheaply and on a clock rather than on the model's
+  behaviour.  Wired to four places the program reaches under its own steam:
+  the top of every executed tool call, every network chunk of a streaming
+  reply, the top of the REPL loop before each prompt is drawn, and - since the
+  prompt-idle window was closed - each wakeup of the bounded wait in front of
+  uTerm's console read, which is to say every quarter second the user spends
+  sitting at a prompt or reading a permission question.  Between them they
+  cover the three gaps the cap used to fall through: a turn of pure thinking
+  with no tool call in it, a turn where the model calls nothing further after
+  starting the job, and the long silence while a human thinks.  The prompt is
+  no longer the one place where this clock stops.
+
+  This is the bound; it is not a guarantee, and the comment on SweepTickMs
+  spells out the difference.  It sweeps only: a caller that needs a job's
+  output, or needs finished jobs forgotten, must still call PollBackgroundJob
+  or StartBackgroundJob, which do their own unthrottled sweep because a poll
+  has to report the state as of now. }
+procedure TickBackgroundJobs;
 
 { Starts Cmd detached and returns its job id.  False, with Err set, when the
   table is full, the command is blank, or Windows refused to start it. }
@@ -458,6 +922,44 @@ function RestoreFilesSince(TurnNo: Integer; out Notes: string): Integer;
 procedure ClearSnapshots;
 { Test seam: how many snapshots are held. }
 function SnapshotCount: Integer;
+{ The file as it stood BEFORE this session first touched it - the OLDEST
+  snapshot for Full, not the newest.  A read-only view over the same array
+  /rewind uses, so it adds no state and nothing to clear.
+
+  Oldest rather than newest is the whole point: a file rewritten in turns 2
+  and 5 has two snapshots, and the answer to "what has this session done to
+  it" is the turn-2 one.  Returning the newest would report a multi-turn
+  rewrite as whatever the last edit happened to change.
+
+  False means no snapshot exists - the file was never written this session,
+  or it was larger than MaxReadBytes when SnapshotFile looked at it and was
+  skipped, the same limit /rewind already documents.  SnapshotSkippedOversize
+  below is how a caller tells those two apart instead of guessing between
+  them out loud.  Existed=False with a True result is the distinct third
+  answer: this session CREATED the file, so its baseline is genuinely
+  empty. }
+function SessionBaseline(const Full: string;
+  out Text: string; out Existed: Boolean): Boolean;
+
+{ The snapshot cap, in bytes, so a caller that has to EXPLAIN a missing
+  baseline can name the real number instead of re-typing "400 KB" into
+  prose and drifting when the constant moves.  It exists for that one
+  reason: nothing outside this unit gets to change what is snapshotted. }
+function SnapshotLimitBytes: Integer;
+
+{ True when SnapshotFile looked at Full this session and put it down again
+  because it was over SnapshotLimitBytes.  This is the third answer
+  SessionBaseline structurally cannot give: False from that function means
+  "never written" and "written, but too big to hold" at the same time, and
+  those two want different sentences - one says the session has not touched
+  the file, the other says the file is too large and names the limit.
+
+  Recorded where the skip HAPPENS rather than deduced afterwards from the
+  file's size right now, which was the shorter version and is wrong in a way
+  that reads as confident: a file that was 500 KB when this session first
+  touched it and is 3 KB now would be told, flatly, that it was never
+  written. }
+function SnapshotSkippedOversize(const Full: string): Boolean;
 
 { Where the standing approvals for the current RootDir live, and deliberately
   NOT inside it.  The file answers "may this project's code run", so a copy of
@@ -477,6 +979,12 @@ function SnapshotCount: Integer;
   There is no migration of an existing in-project file.  Importing one would
   be importing exactly the bytes this function exists to distrust. }
 function ApprovalsPath: string;
+
+{ The filename-safe name this session's out-of-tree state is filed under, from
+  the PRIMARY root only.  ApprovalsPath is built from it, and so is the host's
+  sandbox scratch, so the two cannot drift into disagreeing about which
+  session they belong to. }
+function SessionKey: string;
 
 { Loads standing approvals from Path: the tool-class "always" answers and
   the approved bash programs, so an "a" gives once survives restarts.  A
@@ -532,16 +1040,119 @@ function TakeHookAllow: Boolean;
   line has no matching fingerprint and is asked about by name. }
 function McpConfigPath: string;
 
-{ Replaces the server table with what Path declares.  False when there is
-  nothing usable; Err is set only for a real problem, so a missing file is a
-  quiet False.  ${VAR} and ${VAR:-default} are expanded before the command
-  line is hashed, so what the fingerprint covers is what will actually run. }
+{ %USERPROFILE%\.pasclaude\mcp.json - the user's own servers, which apply to
+  every project they open.  '' when %USERPROFILE% is unset, which is not an
+  error: it means there are none. }
+function UserMcpConfigPath: string;
+
+{ Where a USER-scope server's discovery cache goes:
+  <LOCALAPPDATA|USERPROFILE>\pasclaude\mcp-cache.json, the GlobalDenyPath and
+  ApprovalsPath shape.  Deliberately NOT the project's
+  .pasclaude\mcp-cache.json, and not only on tidiness grounds.  McpLoadCache
+  gates on Approved and a user server is approved by construction, so a
+  repository that shipped a cache entry keyed on a guessed name@hash would
+  inject its own tool names and descriptions into every request under the
+  user's own trusted server name.  '' when neither variable is set, which
+  means no cache at all: those servers connect at every launch, which is slow
+  and never unsafe. }
+function UserMcpCachePath: string;
+
+{ Where a USER-scope server's stderr spool goes:
+  <LOCALAPPDATA|USERPROFILE>\pasclaude\mcp\<name>-<SessionKey>.err.  Read this
+  beside UserMcpCachePath, because it is the same jump for a related reason: a
+  server that follows the user between projects should not leave its
+  diagnostics scattered one-per-repository, and it certainly should not write
+  them INTO whatever repository the user happened to open today.
+
+  %LOCALAPPDATA% and not the %USERPROFILE% its mcp.json lives in, which will
+  read as a mistake until you have the rule: %USERPROFILE% is hand-authored
+  configuration a person has to be able to find and edit, %LOCALAPPDATA% is
+  state THIS PROGRAM writes, keyed by session.  The rule is written out at
+  pasclaude.lpr's KeysPath and again in README's layout section.  mcp.json is
+  the first kind, a spool is the second, and the discovery cache six lines up
+  made exactly this jump for exactly this reason.
+
+  '' when neither variable is set - there is no home, so there is no spool.
+  Never a fallback into the project: that is ApprovalsPath's argument, and it
+  applies here for a plainer reason too, since a path inside the project is the
+  thing this function exists to stop writing.  Trailing PathDelim. }
+function UserMcpSpoolDir: string;
+
+{ UserMcpSpoolDir plus this server's file name, or '' when there is no home.
+  Asking creates nothing: only a spawn creates the directory it writes into. }
+function UserMcpSpoolPath(const Name: string): string;
+
+{ The spool this session actually handed that server, whichever scope it came
+  from; '' for a name nobody configured.  Exposed for McpServerApproved's
+  reason - so a suite can assert the WIRING took and not merely that a path
+  builder exists, which is the half of this that has been wrong before. }
+function McpServerErrLog(const Name: string): string;
+
+{ Replaces the server table with what Path declares.  This is the PROJECT
+  loader and the host does not call it - LoadMcpConfigAll is what startup
+  wants, and a wiring mistake that calls this one instead simply loses the
+  user's servers, which is the direction a mistake should fail in.
+
+  It keeps this exact shape - one file, ClearMcpServers first - because
+  uDiag.pas documents that behaviour as the reason /doctor does not re-read
+  configuration, and eight test call sites across three suites drive it.
+  False when there is nothing usable; Err is set only for a real problem, so a
+  missing file is a quiet False.  ${VAR} and ${VAR:-default} are expanded
+  before the command line is hashed, so what the fingerprint covers is what
+  will actually run. }
 function LoadMcpConfig(const Path: string; out Err: string): Boolean;
 
-{ The spawn gate.  Asks once per server whose fingerprint is not already
-  recorded; a nil Ask denies everything and spawns nothing, which is what
-  makes print mode structurally unable to be the thing that first runs a
-  repository's code. }
+{ Both scopes, in the order that is the rule: the user's file first, then the
+  project's.  See MergeMcpConfig for why the order decides a name collision. }
+function LoadMcpConfigAll(out Err: string): Boolean;
+
+{ The USER's file and nothing else, for a run with nobody at the keyboard.
+
+  This exists because -p used to read neither file and that was one decision
+  answering two different questions.  The argument that kept MCP out of print
+  mode is about the PROJECT's file: a scripted run must not be the thing that
+  first executes a repository's code, because the spawn prompt is how a person
+  decides whether to trust a program the project chose, and there is nobody
+  there to answer it.  Every word of that still holds and .mcp.json is still
+  unread under -p.  None of it is true of %USERPROFILE%\.pasclaude\mcp.json,
+  which names programs the USER chose and which McpApproveAll already approves
+  without asking anything, in the REPL, today.  Refusing to load it under -p
+  was not a smaller grant; it was the same grant withheld from the one caller
+  that could not object.
+
+  What does NOT change: the per-CALL gate in McpRun.  A plain -p run has a nil
+  Ask and therefore denies every MCP call, exactly as it denies every other
+  gated tool - so the tools are declared and refused, and the run says so.
+  What makes the feature worth having is the driver: --input-format stream-json
+  answers permission_request lines, so an embedding program can allow the calls
+  it wants, and --dangerously-skip-permissions is the blunt other way.
+
+  ClearMcpServers first, like LoadMcpConfigAll, so calling either one after the
+  other is defined rather than additive. }
+function LoadMcpConfigUser(out Err: string): Boolean;
+
+{ 'user' | 'project' for a configured server; '' when the name is unknown. }
+function McpServerScope(const Name: string): string;
+{ Whether the spawn gate has been answered for this server.  Exposed so a
+  suite can assert that a user-scope server needs nobody to answer it. }
+function McpServerApproved(const Name: string): Boolean;
+
+{ The spawn gate.  Asks once per PROJECT server whose fingerprint is not
+  already recorded; a nil Ask denies every one of those and spawns none of
+  them, which is what makes print mode structurally unable to be the thing that
+  first runs a REPOSITORY's code.
+
+  READ THE SECOND HALF BEFORE RELYING ON THE FIRST.  A user-scope server is
+  approved outright, in both loops, and is never routed past the nil-Ask branch
+  at all - see the long note in the body for why that asymmetry is the whole
+  point of the feature.  So "a nil Ask spawns nothing" is NOT true of this
+  function any more, and this call is not on its own the guard that keeps an
+  unattended entry point from starting the programs in
+  %USERPROFILE%\.pasclaude\mcp.json.  What keeps the shipped host honest there
+  is that print mode halts above the call site.  An embedder that wired a nil
+  Ask on the strength of the first paragraph alone would run every one of the
+  user's servers with nobody watching, which is why the correction is written
+  here rather than left to whoever next reads the body. }
 procedure McpApproveAll(Ask: TAskProc; Notice: TMcpNoticeProc);
 
 { Connects the approved servers that have no cached tool list and returns how
@@ -555,7 +1166,7 @@ function McpRun(const Name: string; Input: TJson; Ask: TAskProc;
   out IsError: Boolean): string;
 
 { One line per configured server for /mcp, tab-separated:
-  name, status, tools, skipped, command, note.  Same shape as
+  name, status, tools, skipped, command, note, scope.  Same shape as
   BackgroundJobList, and for the same reason: a program started on the user's
   behalf has to be visible without asking the model about it. }
 function McpServerList: TStringArray;
@@ -611,7 +1222,7 @@ procedure AllowMcpServer(const ToolName: string);
 
 implementation
 
-uses Classes, Process, Windows, uHttp, uRegex, uNotebook, uMcp, uHooks;
+uses Classes, Windows, uHttp, uRegex, uNotebook, uMcp, uHooks, uSandbox;
 
 const
   MaxReadBytes = 400 * 1024;   { keeps a stray huge file out of the context }
@@ -627,7 +1238,6 @@ const
     are summarised away - what reaches the model is the cells, not the
     base64 that makes the file big. }
   MaxNotebookBytes = 8 * 1024 * 1024;
-  MaxOutBytes  = 30 * 1024;    { cap on any single tool result }
   { A fetched page larger than this is cut; the model gets the front, which
     is where documents put what they are about. }
   MaxFetchBytes = 200 * 1024;
@@ -635,125 +1245,12 @@ const
     short enough that a big one does not scroll the question off screen. }
   PreviewLines = 40;
 
-{ ------------------------------------------------------------ path safety -- }
-
-function NormalizeRoot: string;
-begin
-  if RootDir = '' then
-    RootDir := GetCurrentDir;
-  Result := ExcludeTrailingPathDelimiter(ExpandFileName(RootDir));
-end;
-
-{ Resolves P under the session root.  Fails when the result would sit outside
-  the root, which is the only place this program is allowed to touch. }
-function SafePath(const P: string; out Full: string; out Err: string): Boolean;
-var
-  Root, Cand: string;
-begin
-  Err := '';
-  Root := NormalizeRoot;
-  if P = '' then
-  begin
-    Err := 'path is required';
-    Exit(False);
-  end;
-  if (Length(P) >= 2) and (P[2] = ':') then
-    Cand := ExpandFileName(P)
-  else if (Length(P) >= 1) and (P[1] in ['\', '/']) then
-    Cand := ExpandFileName(Root + P)
-  else
-    Cand := ExpandFileName(IncludeTrailingPathDelimiter(Root) + P);
-  Cand := ExcludeTrailingPathDelimiter(Cand);
-
-  if (CompareText(Cand, Root) <> 0) and
-     (CompareText(Copy(Cand, 1, Length(Root) + 1), Root + PathDelim) <> 0) then
-  begin
-    Err := Format('path escapes the session root (%s): %s', [Root, P]);
-    Exit(False);
-  end;
-
-  { pasclaude's own state is off limits.  The session file is the conversation
-    itself: letting the model read it wastes the context on a copy of what it
-    already has, and letting it write there would let a tool call rewrite the
-    history of the very turn that is running. }
-  if (CompareText(Copy(Cand, Length(Root) + 2, Length(StateDirName)),
-                  StateDirName) = 0) and
-     ((Length(Cand) = Length(Root) + 1 + Length(StateDirName)) or
-      (Cand[Length(Root) + 2 + Length(StateDirName)] = PathDelim)) then
-  begin
-    Err := StateDirName + ' holds pasclaude''s own session state and is not accessible';
-    Exit(False);
-  end;
-
-  Full := Cand;
-  Result := True;
-end;
-
-function ResolveInRoot(const P: string; out Full: string; out Err: string): Boolean;
-begin
-  Result := SafePath(P, Full, Err);
-end;
-
-{ -------------------------------------------------------------- .gitignore -- }
-
-{ A deliberately partial reading of the format: comments, blank lines,
-  dir-only rules (trailing /), anchored rules (leading /), and * within a
-  segment.  Negation (!) is honoured for whole rules.  The full spec has
-  corner cases (** spans, character classes) that build tools need and a
-  listing filter does not; anything unmatched is simply shown, which errs on
-  the side of the model seeing more rather than less. }
-type
-  TIgnoreRule = record
-    Pattern: string;      { lowercased, / separators }
-    DirOnly: Boolean;
-    Anchored: Boolean;
-    Negated: Boolean;
-  end;
-
-var
-  IgnoreRules: array of TIgnoreRule;
-
-procedure LoadIgnoreRules;
-var
-  L: TStringList;
-  I, N: Integer;
-  S: string;
-  R: TIgnoreRule;
-begin
-  SetLength(IgnoreRules, 0);
-  if not FileExists(IncludeTrailingPathDelimiter(NormalizeRoot) + '.gitignore') then
-    Exit;
-  L := TStringList.Create;
-  try
-    try
-      L.LoadFromFile(IncludeTrailingPathDelimiter(NormalizeRoot) + '.gitignore');
-    except
-      Exit;   { an unreadable .gitignore just means nothing is filtered }
-    end;
-    N := 0;
-    for I := 0 to L.Count - 1 do
-    begin
-      S := Trim(L[I]);
-      if (S = '') or (S[1] = '#') then Continue;
-      R.Negated := S[1] = '!';
-      if R.Negated then Delete(S, 1, 1);
-      R.DirOnly := (S <> '') and (S[Length(S)] = '/');
-      if R.DirOnly then SetLength(S, Length(S) - 1);
-      R.Anchored := (S <> '') and (S[1] = '/');
-      if R.Anchored then Delete(S, 1, 1);
-      if S = '' then Continue;
-      R.Pattern := LowerCase(StringReplace(S, '\', '/', [rfReplaceAll]));
-      SetLength(IgnoreRules, N + 1);
-      IgnoreRules[N] := R;
-      Inc(N);
-    end;
-  finally
-    L.Free;
-  end;
-end;
+{ ---------------------------------------------------------- glob matching -- }
 
 { Matches Pattern against one path segment or segment run, with * spanning
-  anything except a separator. }
+  anything except a separator.  It sits here, above the path guard, rather
+  than beside the .gitignore reader that was its first caller: the deny rules
+  match with it too and the guard runs before either. }
 function SegMatch(const Pattern, S: string): Boolean;
 var
   P, T: Integer;
@@ -794,7 +1291,871 @@ begin
   Result := P > Length(Pattern);
 end;
 
-function IsIgnored(const RelPath: string; IsDir: Boolean): Boolean;
+{ ------------------------------------------------------------ path safety -- }
+
+{ Up here, ahead of the deny rules, because they need the root to say what a
+  path looks like relative to the project - and the guard that reads them is
+  the next thing below. }
+function NormalizeRoot: string;
+begin
+  if RootDir = '' then
+    RootDir := GetCurrentDir;
+  Result := ExcludeTrailingPathDelimiter(ExpandFileName(RootDir));
+end;
+
+var
+  { The added roots, normalised and carrying no trailing delimiter.  Never
+    persisted and never read from a file - see the interface comment. }
+  ExtraRoots: array of string;
+
+{ The escape comparison, and the only copy of it in the program.  Root +
+  PathDelim rather than Root is what refuses C:\proj-sibling\leak.txt against
+  C:\proj; the first disjunct is what still admits the root itself.  Anyone
+  asking "is this path inside that directory" calls this - nobody writes a
+  prefix compare, because the prefix compare is the bug. }
+function WithinRoot(const Cand, Root: string): Boolean;
+begin
+  Result := (CompareText(Cand, Root) = 0) or
+            (CompareText(Copy(Cand, 1, Length(Root) + 1), Root + PathDelim) = 0);
+end;
+
+function RootCount: Integer;
+begin
+  Result := 1 + Length(ExtraRoots);
+end;
+
+function RootAt(Index: Integer): string;
+begin
+  if Index <= 0 then
+    Result := NormalizeRoot
+  else if Index <= Length(ExtraRoots) then
+    Result := ExtraRoots[Index - 1]
+  else
+    Result := '';
+end;
+
+function WorkingDirs: TStringArray;
+var
+  I: Integer;
+begin
+  SetLength(Result, Length(ExtraRoots));
+  for I := 0 to High(ExtraRoots) do Result[I] := ExtraRoots[I];
+end;
+
+function RootIndexOf(const Full: string): Integer;
+var
+  I: Integer;
+begin
+  { Primary first, so a nested added root can never take a path away from the
+    root that owns the session state. }
+  for I := 0 to RootCount - 1 do
+    if WithinRoot(Full, RootAt(I)) then Exit(I);
+  Result := -1;
+end;
+
+{ Today's state-directory check with the root as a parameter.  The slice at
+  Length(Root)+2 is the byte after "Root\", so it is correct only because a
+  root carries no trailing delimiter - which NormalizeRoot guarantees for the
+  primary and AddWorkingDir enforces for every other.  The terminator test is
+  what stops .pasclaudex being caught by it. }
+function InStateDirOf(const Cand, Root: string): Boolean;
+begin
+  Result :=
+    (CompareText(Copy(Cand, Length(Root) + 2, Length(StateDirName)),
+                 StateDirName) = 0) and
+    ((Length(Cand) = Length(Root) + 1 + Length(StateDirName)) or
+     (Cand[Length(Root) + 2 + Length(StateDirName)] = PathDelim));
+end;
+
+{ ------------------------------------------------------------- deny rules -- }
+
+{ FPC 3.2.2's Windows unit declares neither of these, and both are ordinary
+  kernel32 exports.  GetFinalPathNameByHandleW is what follows a junction and
+  expands an 8.3 name; GetLongPathNameW is the fallback for the one reachable
+  failure of the handle route - a file another process holds with share-mode
+  zero - because a deny rule that stops applying while somebody has the file
+  open in an editor is exactly the silent miss this feature exists to avoid. }
+const
+  FILE_FLAG_BACKUP_SEMANTICS = $02000000;
+
+function GetFinalPathNameByHandleW(H: THandle; Buf: PWideChar;
+  Cch, Flags: DWORD): DWORD; stdcall; external 'kernel32'
+  name 'GetFinalPathNameByHandleW';
+function GetLongPathNameW(Src, Buf: PWideChar; Cch: DWORD): DWORD; stdcall;
+  external 'kernel32' name 'GetLongPathNameW';
+
+var
+  DenyList: array of TDenyRule;
+  { Counted rather than recomputed: DenyPathReason runs on every path a tool
+    names, and with no path rule at all it must not open a handle or even
+    walk the list. }
+  DenyInForce: Integer = 0;
+  DenyPathInForce: Integer = 0;
+
+function DenyRules: TDenyRuleArray;
+begin
+  Result := DenyList;
+end;
+
+function DenyRuleCount: Integer;
+begin
+  Result := DenyInForce;
+end;
+
+function DenyRulesInForce: Boolean;
+begin
+  Result := DenyInForce > 0;
+end;
+
+function DenyPathRulesInForce: Boolean;
+begin
+  Result := DenyPathInForce > 0;
+end;
+
+function BadDenyRules: TStringArray;
+var
+  I, N: Integer;
+begin
+  SetLength(Result, 0);
+  N := 0;
+  for I := 0 to High(DenyList) do
+    if DenyList[I].Err <> '' then
+    begin
+      SetLength(Result, N + 1);
+      Result[N] := DenyList[I].Text;
+      Inc(N);
+    end;
+end;
+
+{ Splits "kind:pattern".  An unrecognised rule is kept with its reason rather
+  than dropped: a user who wrote read:.env believing it protected something
+  has to be told it does not, and a rule that vanished on load would leave
+  nothing to tell them with. }
+procedure ParseDenyRule(var R: TDenyRule);
+var
+  C: Integer;
+begin
+  R.Kind := '';
+  R.Pattern := '';
+  R.Err := '';
+  C := Pos(':', R.Text);
+  if C = 0 then
+  begin
+    R.Err := 'expected kind:pattern (tool:, bash: or path:)';
+    Exit;
+  end;
+  R.Kind := LowerCase(Trim(Copy(R.Text, 1, C - 1)));
+  R.Pattern := LowerCase(Trim(Copy(R.Text, C + 1, MaxInt)));
+  if (R.Kind <> 'tool') and (R.Kind <> 'bash') and (R.Kind <> 'path') then
+  begin
+    R.Err := 'unknown rule kind "' + R.Kind + '" (use tool:, bash: or path:)';
+    Exit;
+  end;
+  if R.Pattern = '' then
+  begin
+    R.Err := 'no pattern after ' + R.Kind + ':';
+    Exit;
+  end;
+  { One spelling of a path from here on, so the matcher never has to know
+    which separator the user happened to type. }
+  if R.Kind = 'path' then
+    R.Pattern := StringReplace(R.Pattern, '\', '/', [rfReplaceAll]);
+end;
+
+procedure AddDenyRule(const Text, Source: string);
+var
+  R: TDenyRule;
+  I: Integer;
+begin
+  R.Text := Trim(Text);
+  if R.Text = '' then Exit;
+  { The same rule from both files is one rule; the first source named is the
+    one /deny points at, which is the one that would still apply. }
+  for I := 0 to High(DenyList) do
+    if DenyList[I].Text = R.Text then Exit;
+  R.Source := Source;
+  ParseDenyRule(R);
+  if (R.Err = '') and (DenyInForce >= MaxDenyRules) then
+    R.Err := Format('more than %d deny rules; this one is not in force',
+      [MaxDenyRules]);
+  SetLength(DenyList, Length(DenyList) + 1);
+  DenyList[High(DenyList)] := R;
+  if R.Err = '' then
+  begin
+    Inc(DenyInForce);
+    if R.Kind = 'path' then Inc(DenyPathInForce);
+  end;
+end;
+
+procedure ClearDenyRules;
+begin
+  SetLength(DenyList, 0);
+  DenyInForce := 0;
+  DenyPathInForce := 0;
+end;
+
+{ The path matcher, with the gitignore intuition the ignore reader already
+  half-implements: ** spans separators, * does not, and ? matches one
+  character that is not a separator.  "a/**/b" also matches "a/b", because a
+  pattern that needed an intervening directory would surprise everyone who
+  has ever written one. }
+function PathGlobMatch(const Pattern, S: string): Boolean;
+
+  function M(P, T: Integer): Boolean;
+  begin
+    while True do
+    begin
+      if P > Length(Pattern) then Exit(T > Length(S));
+      if (Pattern[P] = '*') and (P < Length(Pattern)) and
+         (Pattern[P + 1] = '*') then
+      begin
+        Inc(P, 2);
+        if (P <= Length(Pattern)) and (Pattern[P] = '/') then
+        begin
+          if M(P + 1, T) then Exit(True);   { ** swallowed nothing }
+          Inc(P);                           { ...or the separator too }
+        end;
+        if P > Length(Pattern) then Exit(True);
+        while T <= Length(S) + 1 do
+        begin
+          if M(P, T) then Exit(True);
+          Inc(T);
+        end;
+        Exit(False);
+      end
+      else if Pattern[P] = '*' then
+      begin
+        Inc(P);
+        if P > Length(Pattern) then
+          Exit(Pos('/', Copy(S, T, MaxInt)) = 0);
+        while T <= Length(S) + 1 do
+        begin
+          if M(P, T) then Exit(True);
+          if (T <= Length(S)) and (S[T] = '/') then Exit(False);
+          Inc(T);
+        end;
+        Exit(False);
+      end
+      else if (T <= Length(S)) and
+              ((Pattern[P] = S[T]) or
+               ((Pattern[P] = '?') and (S[T] <> '/'))) then
+      begin
+        Inc(P);
+        Inc(T);
+      end
+      else
+        Exit(False);
+    end;
+  end;
+
+begin
+  Result := M(1, 1);
+end;
+
+{ A pattern with no separator in it is a name rule and matches the base name
+  at any depth - path:.env catches src\.env without anybody having to think
+  about where they are.  A pattern with one is a whole-path rule, anchored to
+  whatever it is being matched against; a leading / is allowed and means the
+  same thing, because that is what a user who writes /secrets/** expects and
+  the alternative - a floating pattern that matches a\secrets\x too - is the
+  unpredictable reading. }
+function PathPatternHits(const Pattern, Slashed, Base: string): Boolean;
+var
+  Pat: string;
+begin
+  if Pos('/', Pattern) = 0 then
+    Exit(SegMatch(Pattern, Base));
+  Pat := Pattern;
+  if (Pat <> '') and (Pat[1] = '/') then Delete(Pat, 1, 1);
+  Result := PathGlobMatch(Pat, Slashed);
+end;
+
+{ The long, junction-free, filesystem-cased spelling of P, or the best
+  approximation of it that Windows will give up.  Conversions go through
+  UnicodeString because both APIs are wide-only; a path outside the system
+  codepage survives no worse here than it does through FindFirst, which is
+  the standard the rest of this unit already sets. }
+function ResolvedForm(const P: string): string;
+var
+  W, Out_: UnicodeString;
+  H: THandle;
+  N: DWORD;
+begin
+  Result := '';
+  W := UnicodeString(P);
+  SetLength(Out_, 1024);
+  H := CreateFileW(PWideChar(W), 0, FILE_SHARE_READ or FILE_SHARE_WRITE or
+    FILE_SHARE_DELETE, nil, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, 0);
+  if H <> INVALID_HANDLE_VALUE then
+  begin
+    N := GetFinalPathNameByHandleW(H, PWideChar(Out_), Length(Out_), 0);
+    CloseHandle(H);
+    if (N > 0) and (N < DWORD(Length(Out_))) then
+    begin
+      SetLength(Out_, N);
+      Result := string(Out_);
+      { The API answers in \\?\ form, which nothing else in this program
+        spells that way. }
+      if Copy(Result, 1, 8) = '\\?\UNC\' then
+        Result := '\\' + Copy(Result, 9, MaxInt)
+      else if Copy(Result, 1, 4) = '\\?\' then
+        Result := Copy(Result, 5, MaxInt);
+      Exit;
+    end;
+    SetLength(Out_, 1024);
+  end;
+  { No handle - the file may be held exclusively, or gone.  This expands 8.3
+    names without opening anything, but it does not follow junctions; a
+    name rule (path:.env) still catches what a whole-path rule would miss. }
+  N := GetLongPathNameW(PWideChar(W), PWideChar(Out_), Length(Out_));
+  if (N > 0) and (N < DWORD(Length(Out_))) then
+  begin
+    SetLength(Out_, N);
+    Result := string(Out_);
+  end;
+end;
+
+function CanonicalPath(const P: string): string;
+var
+  Head, Tail, Fixed, Parent: string;
+begin
+  Result := ExpandFileName(P);
+  Head := ExcludeTrailingPathDelimiter(Result);
+  Tail := '';
+  { Up the tree until something exists.  write_file names files that are not
+    there yet, and a rule about a directory has to cover them: the resolved
+    ancestor plus the literal tail is the only honest answer. }
+  while Head <> '' do
+  begin
+    Fixed := ResolvedForm(Head);
+    if Fixed <> '' then
+      Exit(ExcludeTrailingPathDelimiter(Fixed) + Tail);
+    Parent := ExcludeTrailingPathDelimiter(ExtractFileDir(Head));
+    if (Parent = '') or (Parent = Head) then Break;
+    Tail := PathDelim + ExtractFileName(Head) + Tail;
+    Head := Parent;
+  end;
+end;
+
+function DenyReasonText(const R: TDenyRule): string;
+begin
+  Result := Format('refused by deny rule "%s"', [R.Text]);
+  if R.Source <> '' then
+    Result := Result + ' (' + R.Source + ')';
+end;
+
+{ Both spellings of one absolute path, lowercased with / separators: the
+  whole thing, and the part under the root that contains it when one does.  A
+  rule written the way a user thinks about their project - path:src/**.pas -
+  has to match the same file a rule written absolutely does.
+
+  The relative form is measured against the WINNING root, not the primary one.
+  The list_dir and search walkers hand DenyWalkReason a name relative to the
+  tree they are walking, so an anchored rule already hides matching files in an
+  added working directory; measuring here against the primary only would leave
+  RelForm empty for those files and let an absolute read_file or write_file
+  through - a file invisible to the model and fully readable by name, which is
+  the "looks enforced and is not" failure the walker half exists to prevent. }
+procedure PathForms(const Full: string; out Slashed, RelForm, Base: string);
+var
+  I: Integer;
+  Root: string;
+begin
+  Slashed := LowerCase(StringReplace(Full, '\', '/', [rfReplaceAll]));
+  Base := LowerCase(ExtractFileName(ExcludeTrailingPathDelimiter(Full)));
+  RelForm := '';
+  { Primary first, the same order RootIndexOf and SafePath use, so a nested
+    added root cannot change what a path is relative to. }
+  for I := 0 to RootCount - 1 do
+  begin
+    Root := LowerCase(StringReplace(
+      ExcludeTrailingPathDelimiter(RootAt(I)), '\', '/', [rfReplaceAll]));
+    if (Root <> '') and (Copy(Slashed, 1, Length(Root) + 1) = Root + '/') then
+    begin
+      RelForm := Copy(Slashed, Length(Root) + 2, MaxInt);
+      Exit;
+    end;
+  end;
+end;
+
+function DenyPathReason(const Full: string): string;
+var
+  I: Integer;
+  Slashed, RelForm, Base, CSlashed, CRel, CBase: string;
+  Canon: string;
+begin
+  Result := '';
+  { The early exit that keeps the guard free for everyone who has no path
+    rule: no list walk, no handle, one integer test. }
+  if DenyPathInForce = 0 then Exit;
+  PathForms(Full, Slashed, RelForm, Base);
+  { Canonicalisation can only ever ADD matches.  Both forms are tested and
+    either one denies, so a rule can never stop applying because Windows
+    reported a path in an unexpected spelling. }
+  Canon := CanonicalPath(Full);
+  PathForms(Canon, CSlashed, CRel, CBase);
+  for I := 0 to High(DenyList) do
+    if (DenyList[I].Err = '') and (DenyList[I].Kind = 'path') then
+      if PathPatternHits(DenyList[I].Pattern, Slashed, Base) or
+         ((RelForm <> '') and
+          PathPatternHits(DenyList[I].Pattern, RelForm, Base)) or
+         PathPatternHits(DenyList[I].Pattern, CSlashed, CBase) or
+         ((CRel <> '') and
+          PathPatternHits(DenyList[I].Pattern, CRel, CBase)) then
+        Exit(DenyReasonText(DenyList[I]));
+end;
+
+function DenyWalkReason(const RelPath, BaseName: string): string;
+var
+  I: Integer;
+  Slashed, Base: string;
+begin
+  Result := '';
+  if DenyPathInForce = 0 then Exit;
+  Slashed := LowerCase(StringReplace(RelPath, '\', '/', [rfReplaceAll]));
+  Base := LowerCase(BaseName);
+  for I := 0 to High(DenyList) do
+    if (DenyList[I].Err = '') and (DenyList[I].Kind = 'path') then
+      if PathPatternHits(DenyList[I].Pattern, Slashed, Base) then
+        Exit(DenyReasonText(DenyList[I]));
+end;
+
+function DenyToolReason(const Name: string): string;
+var
+  I: Integer;
+  N: string;
+begin
+  Result := '';
+  if DenyInForce = 0 then Exit;
+  N := LowerCase(Trim(Name));
+  if N = '' then Exit;
+  for I := 0 to High(DenyList) do
+    if (DenyList[I].Err = '') and (DenyList[I].Kind = 'tool') then
+      if SegMatch(DenyList[I].Pattern, N) then
+        Exit(DenyReasonText(DenyList[I]));
+end;
+
+{ The first token of one cmd.exe segment, with the decoration a program name
+  can carry taken off: quotes, a directory, the .exe.  "C:\bin\rm.exe" and rm
+  are the same program and an "always" answer already reads them that way. }
+function SegmentProgram(const S: string): string;
+var
+  I: Integer;
+  Tok: string;
+begin
+  Result := '';
+  I := 1;
+  while (I <= Length(S)) and (S[I] in [' ', #9]) do Inc(I);
+  Tok := '';
+  if (I <= Length(S)) and (S[I] = '"') then
+  begin
+    Inc(I);
+    while (I <= Length(S)) and (S[I] <> '"') do
+    begin
+      Tok := Tok + S[I];
+      Inc(I);
+    end;
+  end
+  else
+    while (I <= Length(S)) and not (S[I] in [' ', #9]) do
+    begin
+      Tok := Tok + S[I];
+      Inc(I);
+    end;
+  if Tok = '' then Exit;
+  Tok := ExtractFileName(Tok);
+  if LowerCase(ExtractFileExt(Tok)) = '.exe' then
+    SetLength(Tok, Length(Tok) - 4);
+  Result := LowerCase(Tok);
+end;
+
+function DenyBashReason(const Cmd: string): string;
+var
+  I, J, Start: Integer;
+  Prog: string;
+  InQuote: Boolean;
+  Heads: TStringArray;
+  N: Integer;
+begin
+  Result := '';
+  if DenyInForce = 0 then Exit;
+
+  { Every segment cmd.exe would run, not just the first: the approval prefix
+    table gives up on a chained command and returns '', which is right for
+    granting and useless for refusing.  A separator wearing a ^ is not a
+    separator; a ^ inside a token is left alone, so r^m reads as the program
+    r^m and is NOT caught.  That gap is real and documented - closing it
+    means writing a cmd.exe parser, and half of one would be worse. }
+  SetLength(Heads, 0);
+  N := 0;
+  Start := 1;
+  InQuote := False;
+  I := 1;
+  while I <= Length(Cmd) do
+  begin
+    if Cmd[I] = '^' then
+    begin
+      Inc(I, 2);
+      Continue;
+    end;
+    if Cmd[I] = '"' then InQuote := not InQuote
+    else if (not InQuote) and (Cmd[I] in ['&', '|', ';', '(', ')', #10, #13]) then
+    begin
+      SetLength(Heads, N + 1);
+      Heads[N] := Copy(Cmd, Start, I - Start);
+      Inc(N);
+      Start := I + 1;
+    end;
+    Inc(I);
+  end;
+  SetLength(Heads, N + 1);
+  Heads[N] := Copy(Cmd, Start, MaxInt);
+
+  for J := 0 to High(Heads) do
+  begin
+    Prog := SegmentProgram(Heads[J]);
+    if Prog = '' then Continue;
+    for I := 0 to High(DenyList) do
+      if (DenyList[I].Err = '') and (DenyList[I].Kind = 'bash') then
+        if SegMatch(DenyList[I].Pattern, Prog) then
+          Exit(DenyReasonText(DenyList[I]));
+  end;
+end;
+
+function GlobalDenyPath: string;
+var
+  Home: string;
+begin
+  Result := '';
+  { SysUtils. qualified for the same reason ApprovalsPath does it: the
+    Windows unit has a raw API of the same name in scope. }
+  Home := Trim(SysUtils.GetEnvironmentVariable('LOCALAPPDATA'));
+  if Home = '' then
+    Home := Trim(SysUtils.GetEnvironmentVariable('USERPROFILE'));
+  if Home = '' then Exit;
+  Result := IncludeTrailingPathDelimiter(Home) + 'pasclaude' + PathDelim +
+    'deny.json';
+end;
+
+{ Reads the "deny" array out of one file.  Anything else in the file is not
+  looked at - see the note on LoadDenyRules. }
+function ReadDenyArray(const Path: string): TStringArray;
+var
+  F: TFileStream;
+  Text: string;
+  Root, Arr: TJson;
+  I: Integer;
+begin
+  SetLength(Result, 0);
+  if (Path = '') or not FileExists(Path) then Exit;
+  try
+    F := TFileStream.Create(Path, fmOpenRead or fmShareDenyNone);
+    try
+      SetLength(Text, F.Size);
+      if F.Size > 0 then F.ReadBuffer(Text[1], F.Size);
+    finally
+      F.Free;
+    end;
+  except
+    Exit;
+  end;
+  Root := JsonParse(Text);
+  if Root = nil then Exit;
+  try
+    Arr := Root.Find('deny');
+    if (Arr = nil) or (Arr.Kind <> jkArr) then Exit;
+    SetLength(Result, Arr.Count);
+    for I := 0 to Arr.Count - 1 do
+      Result[I] := Arr.Item(I).AsString;
+  finally
+    Root.Free;
+  end;
+end;
+
+var
+  { The per-root file's deny array exactly as it was read, so SavePermissions
+    can put it back byte for byte.  Without this a rule somebody added by hand
+    is erased the moment the session exits, which is the opposite of what a
+    hand-editable file promises - and it is a silent loss, not a compile
+    error, which is why TestDenyRoundTrip exists. }
+  RootDenyRaw: TStringArray;
+
+procedure LoadDenyRules(const RootApprovals, Global: string);
+var
+  A: TStringArray;
+  I: Integer;
+begin
+  A := ReadDenyArray(Global);
+  for I := 0 to High(A) do
+    AddDenyRule(A[I], Global);
+  RootDenyRaw := ReadDenyArray(RootApprovals);
+  for I := 0 to High(RootDenyRaw) do
+    AddDenyRule(RootDenyRaw[I], RootApprovals);
+end;
+
+function GlobalDenyList: TStringArray;
+begin
+  Result := ReadDenyArray(GlobalDenyPath);
+end;
+
+function SaveGlobalDenyList(const A: TStringArray; out Err: string): Boolean;
+var
+  Root, Arr: TJson;
+  Text, Path: string;
+  F: TFileStream;
+  I: Integer;
+begin
+  Err := '';
+  Path := GlobalDenyPath;
+  if Path = '' then
+  begin
+    Err := 'no LOCALAPPDATA or USERPROFILE to keep deny.json in';
+    Exit(False);
+  end;
+  Root := TJson.NewObj;
+  try
+    Arr := TJson.NewArr;
+    for I := 0 to High(A) do
+      Arr.Push(TJson.NewStr(A[I]));
+    Root.Add('deny', Arr);
+    Text := Root.ToJson;
+  finally
+    Root.Free;
+  end;
+  Result := False;
+  try
+    ForceDirectories(ExtractFileDir(Path));
+    F := TFileStream.Create(Path, fmCreate);
+    try
+      if Text <> '' then F.WriteBuffer(Text[1], Length(Text));
+    finally
+      F.Free;
+    end;
+    Result := True;
+  except
+    on E: Exception do Err := E.Message;
+  end;
+end;
+
+function SessionNote: string;
+var
+  I: Integer;
+begin
+  { Fixed order: the output style, then the plan paragraph, then the
+    additional-working-directories block, then the deny sentence - so a
+    session with several of them on reads the same way every turn.
+
+    The style goes FIRST because it is the only text in this block that a file
+    chose rather than pasclaude's own state, and the deny sentence stays
+    PERMANENTLY LAST because it is the one line here describing a refusal
+    nothing can override.  Anything added to this block later inserts between
+    the roots block and the deny sentence; nothing appends after it, or the
+    unbypassable rule loses the recency position to a paragraph out of a
+    repository.
+
+    The whole block is deliberately outside cache breakpoint #1, which is why
+    every one of these may flip mid-session for a few dozen tokens instead of
+    a re-read of the entire cached prefix. }
+  Result := StyleNote + PermModeNote;
+  { Emitted only when there is more than one root, so an ordinary session's
+    request body - and therefore its prompt cache - is byte-identical to what
+    it was before this feature existed. }
+  if RootCount > 1 then
+  begin
+    Result := Result + 'Additional working directories (same rules as the ' +
+      'session root):'#10;
+    for I := 1 to RootCount - 1 do
+      Result := Result + '  ' + RootAt(I) + #10;
+    Result := Result +
+      'Tool paths are relative to the session root. A file in an additional ' +
+      'directory must be given as its full absolute path.'#10;
+  end;
+  { The patterns are deliberately absent: the model needs to know a refusal is
+    policy, or it burns turns retrying, and it does not need a list of what to
+    try.  The permission mode below plan is absent for the same class of
+    reason - a model told it is in bypass has been told nothing it can use. }
+  if DenyRulesInForce then
+    Result := Result +
+      'Some tools and paths are refused by deny rules; a refusal names the ' +
+      'rule. Do not attempt to work around one.'#10;
+end;
+
+{ Resolves P under the session root.  Fails when the result would sit outside
+  every root, which are the only places this program is allowed to touch. }
+function SafePath(const P: string; out Full: string; out Err: string): Boolean;
+var
+  Root, Cand, Reason, List: string;
+  I, Hit: Integer;
+begin
+  { Cleared first, so a caller that ignores the Boolean gets nothing usable
+    rather than a stale path from the last call. }
+  Full := '';
+  Err := '';
+  Root := NormalizeRoot;
+  if P = '' then
+  begin
+    Err := 'path is required';
+    Exit(False);
+  end;
+  { The identical three-way classification, and against the PRIMARY root only.
+    There is exactly one resolution base however many roots there are: a bare
+    relative path means the same file after --add-dir that it meant before,
+    and a file in an added directory is named by its full absolute path.  A
+    search order over the roots would make read_file('config.json') mean
+    different files depending on what had been added, which is an ambiguity
+    an attacker chooses and a user cannot see. }
+  if (Length(P) >= 2) and (P[2] = ':') then
+    Cand := ExpandFileName(P)
+  else if (Length(P) >= 1) and (P[1] in ['\', '/']) then
+    Cand := ExpandFileName(Root + P)
+  else
+    Cand := ExpandFileName(IncludeTrailingPathDelimiter(Root) + P);
+  Cand := ExcludeTrailingPathDelimiter(Cand);
+
+  { Deny is the fallthrough, not a branch: matching no root cannot pass,
+    however the loop is later edited. }
+  Hit := -1;
+  for I := 0 to RootCount - 1 do
+    if WithinRoot(Cand, RootAt(I)) then
+    begin
+      Hit := I;
+      Break;
+    end;
+  if Hit < 0 then
+  begin
+    Err := Format('path escapes the session root (%s): %s', [Root, P]);
+    if RootCount > 1 then
+    begin
+      List := '';
+      for I := 1 to RootCount - 1 do
+      begin
+        if List <> '' then List := List + ', ';
+        List := List + RootAt(I);
+      end;
+      Err := Err + ', or any added directory: ' + List;
+    end;
+    Exit(False);
+  end;
+
+  { pasclaude's own state is off limits.  The session file is the conversation
+    itself: letting the model read it wastes the context on a copy of what it
+    already has, and letting it write there would let a tool call rewrite the
+    history of the very turn that is running.
+
+    Refused at the top level of EVERY root, added ones included.  That
+    directory is not ours in an added root - but if it is ever somebody's
+    primary root it holds that session's transcript, and the list_dir and
+    search walkers already skip the name in any tree at any depth.  A
+    SafePath that disagreed with the walkers would be the inconsistency; a
+    uniform rule is the one a reader can verify. }
+  if InStateDirOf(Cand, RootAt(Hit)) then
+  begin
+    Err := StateDirName + ' holds pasclaude''s own session state and is not accessible';
+    Exit(False);
+  end;
+
+  { The path deny rules, on the resolved candidate and nowhere else.  This is
+    the only place in the program that turns a path argument into an absolute
+    path, so ..\ tricks, 8.3 names and junctions are unwound exactly once, and
+    read_file, write_file, edit_file, notebook_edit, list_dir, the change
+    preview, @-mentions and the SDK's @import all arrive here - a path-taking
+    tool added later cannot forget the rule.  The refusal rides out on Err,
+    which every one of those callers already turns into a tool_result. }
+  Reason := DenyPathReason(Cand);
+  if Reason <> '' then
+  begin
+    Err := Reason;
+    Exit(False);
+  end;
+
+  Full := Cand;
+  Result := True;
+end;
+
+function ResolveInRoot(const P: string; out Full: string; out Err: string): Boolean;
+begin
+  Result := SafePath(P, Full, Err);
+end;
+
+{ -------------------------------------------------------------- .gitignore -- }
+
+{ A deliberately partial reading of the format: comments, blank lines,
+  dir-only rules (trailing /), anchored rules (leading /), and * within a
+  segment.  Negation (!) is honoured for whole rules.  The full spec has
+  corner cases (** spans, character classes) that build tools need and a
+  listing filter does not; anything unmatched is simply shown, which errs on
+  the side of the model seeing more rather than less. }
+type
+  TIgnoreRule = record
+    Pattern: string;      { lowercased, / separators }
+    DirOnly: Boolean;
+    Anchored: Boolean;
+    Negated: Boolean;
+  end;
+
+  TIgnoreRuleArray = array of TIgnoreRule;
+
+var
+  { One rule set per root, parallel to the root list.  A .gitignore is
+    anchored to the tree it sits in, so applying the primary's "/src" to
+    another root would hide the wrong files - and applying an added root's
+    rules to the project would hide files the user came here to change. }
+  IgnoreSets: array of TIgnoreRuleArray;
+
+{ Reads one root's .gitignore.  Nothing is an error: an absent or unreadable
+  file simply means that tree is unfiltered. }
+function LoadIgnoreSet(const Root: string): TIgnoreRuleArray;
+var
+  L: TStringList;
+  I, N: Integer;
+  S: string;
+  R: TIgnoreRule;
+begin
+  Result := nil;
+  if not FileExists(IncludeTrailingPathDelimiter(Root) + '.gitignore') then
+    Exit;
+  L := TStringList.Create;
+  try
+    try
+      L.LoadFromFile(IncludeTrailingPathDelimiter(Root) + '.gitignore');
+    except
+      Exit;   { an unreadable .gitignore just means nothing is filtered }
+    end;
+    N := 0;
+    for I := 0 to L.Count - 1 do
+    begin
+      S := Trim(L[I]);
+      if (S = '') or (S[1] = '#') then Continue;
+      R.Negated := S[1] = '!';
+      if R.Negated then Delete(S, 1, 1);
+      R.DirOnly := (S <> '') and (S[Length(S)] = '/');
+      if R.DirOnly then SetLength(S, Length(S) - 1);
+      R.Anchored := (S <> '') and (S[1] = '/');
+      if R.Anchored then Delete(S, 1, 1);
+      if S = '' then Continue;
+      R.Pattern := LowerCase(StringReplace(S, '\', '/', [rfReplaceAll]));
+      SetLength(Result, N + 1);
+      Result[N] := R;
+      Inc(N);
+    end;
+  finally
+    L.Free;
+  end;
+end;
+
+procedure LoadIgnoreRules;
+var
+  I: Integer;
+begin
+  { Signature unchanged, meaning widened: every root, because a root added
+    mid-session has a .gitignore too and calling this is how it gets read. }
+  SetLength(IgnoreSets, RootCount);
+  for I := 0 to RootCount - 1 do
+    IgnoreSets[I] := LoadIgnoreSet(RootAt(I));
+end;
+
+function IsIgnoredIn(RootIndex: Integer; const RelPath: string;
+  IsDir: Boolean): Boolean;
 var
   I, J: Integer;
   Path, Seg: string;
@@ -802,8 +2163,11 @@ var
   Segs: array of string;
   NSeg: Integer;
   Hit: Boolean;
+  IgnoreRules: TIgnoreRuleArray;
 begin
   Result := False;
+  if (RootIndex < 0) or (RootIndex > High(IgnoreSets)) then Exit;
+  IgnoreRules := IgnoreSets[RootIndex];
   if Length(IgnoreRules) = 0 then Exit;
   Path := LowerCase(StringReplace(RelPath, '\', '/', [rfReplaceAll]));
 
@@ -852,6 +2216,193 @@ begin
     if Hit then
       Result := not Rule.Negated;
   end;
+end;
+
+{ The public two-argument form keeps its old meaning exactly: a path relative
+  to the primary root, against the primary root's rules.  Every existing
+  caller and test therefore reads unchanged. }
+function IsIgnored(const RelPath: string; IsDir: Boolean): Boolean;
+begin
+  Result := IsIgnoredIn(0, RelPath, IsDir);
+end;
+
+{ ------------------------------------------- the working-directory set -- }
+
+{ A directory argument, resolved by SafePath's own three-way rule and stripped
+  of any trailing delimiter.  Written once and shared by add and remove
+  because the two must agree on what a typed path names: a remove that
+  normalised differently from the add could not find what it was given. }
+function NormalizeDirArg(const Dir: string): string;
+begin
+  if (Length(Dir) >= 2) and (Dir[2] = ':') then
+    Result := ExpandFileName(Dir)
+  else if (Length(Dir) >= 2) and (Dir[1] in ['\', '/']) and
+          (Dir[2] in ['\', '/']) then
+    { A UNC name expands to itself; ExpandFileName would not improve it. }
+    Result := Dir
+  else if (Length(Dir) >= 1) and (Dir[1] in ['\', '/']) then
+    Result := ExpandFileName(NormalizeRoot + Dir)
+  else
+    Result := ExpandFileName(IncludeTrailingPathDelimiter(NormalizeRoot) + Dir);
+  Result := ExcludeTrailingPathDelimiter(Result);
+end;
+
+{ The one rule for turning what a user typed into a root, shared by argv, the
+  slash command, the SDK and the suites - the same reason ValidExtensionName
+  is public.  Err carries a refusal when Result is False and a note about
+  what was swallowed when it is True. }
+function AddWorkingDir(const Dir: string; out Norm, Err: string): Boolean;
+var
+  Cand, Swallowed: string;
+  I, N: Integer;
+  Kept: array of string;
+begin
+  Norm := '';
+  Err := '';
+  Result := False;
+  if Trim(Dir) = '' then
+  begin
+    Err := 'a directory is required';
+    Exit;
+  end;
+  { Relative to the primary root, like every other path this program is
+    handed, and stripped of any trailing delimiter: InStateDirOf's slice
+    arithmetic is correct only for a root that carries none, so storing
+    'D:\lib\' would silently admit .pasclaude in that tree. }
+  Cand := NormalizeDirArg(Dir);
+  { A bare volume or share root grants the machine.  Honestly a fat-finger
+    guard rather than a security boundary - C:\Users is still accepted and is
+    nearly as wide - but it stops the guard degenerating to nothing by typo. }
+  if (Length(Cand) <= 2) and (Pos(':', Cand) > 0) then
+  begin
+    Err := 'a whole drive cannot be a working directory: ' + Cand;
+    Exit;
+  end;
+  if (Copy(Cand, 1, 2) = '\\') and
+     (Pos('\', Copy(Cand, 3, MaxInt)) = 0) then
+  begin
+    Err := 'a whole share cannot be a working directory: ' + Cand;
+    Exit;
+  end;
+  { A typo that silently grants nothing and becomes reachable later, when
+    somebody happens to create the directory, is the worst of the failures
+    available here. }
+  if FileExists(Cand) and not DirectoryExists(Cand) then
+  begin
+    Err := 'not a directory: ' + Cand;
+    Exit;
+  end;
+  if not DirectoryExists(Cand) then
+  begin
+    Err := 'no such directory: ' + Cand;
+    Exit;
+  end;
+  for I := 0 to RootCount - 1 do
+    if CompareText(Cand, RootAt(I)) = 0 then
+    begin
+      Err := 'already a working directory: ' + Cand;
+      Exit;
+    end
+    else if WithinRoot(Cand, RootAt(I)) then
+    begin
+      Err := 'already covered by ' + RootAt(I) + ': ' + Cand;
+      Exit;
+    end;
+
+  { A parent of existing extras is accepted and swallows them, so the list
+    says what it means; index 0 is never dropped, because the primary root is
+    the session's identity rather than part of the grant. }
+  Swallowed := '';
+  SetLength(Kept, 0);
+  N := 0;
+  for I := 0 to High(ExtraRoots) do
+    if WithinRoot(ExtraRoots[I], Cand) then
+    begin
+      if Swallowed <> '' then Swallowed := Swallowed + ', ';
+      Swallowed := Swallowed + ExtraRoots[I];
+    end
+    else
+    begin
+      SetLength(Kept, N + 1);
+      Kept[N] := ExtraRoots[I];
+      Inc(N);
+    end;
+
+  if N + 1 > MaxWorkingDirs then
+  begin
+    Err := Format('at most %d additional working directories', [MaxWorkingDirs]);
+    Exit;
+  end;
+
+  SetLength(ExtraRoots, N + 1);
+  for I := 0 to N - 1 do ExtraRoots[I] := Kept[I];
+  ExtraRoots[N] := Cand;
+  { A new root has its own .gitignore, and this is the only place that can
+    know it just arrived. }
+  LoadIgnoreRules;
+  Norm := Cand;
+  if Swallowed <> '' then
+    Err := 'it contains, and replaces, ' + Swallowed;
+  Result := True;
+end;
+
+function RemoveWorkingDir(const Dir: string; out Err: string): Boolean;
+var
+  I, J, Idx, Code: Integer;
+  Cand: string;
+begin
+  Err := '';
+  Result := False;
+  Idx := -1;
+  Val(Trim(Dir), Idx, Code);
+  if Code <> 0 then Idx := -1;
+  if Code = 0 then
+  begin
+    if Idx = 0 then
+    begin
+      { The primary root is where the session, the history and the approvals
+        key live.  Removing it would not narrow anything; it would just make
+        the program unable to find its own state. }
+      Err := 'the session root cannot be removed';
+      Exit;
+    end;
+    if (Idx < 1) or (Idx > Length(ExtraRoots)) then
+    begin
+      Err := 'no working directory numbered ' + Trim(Dir);
+      Exit;
+    end;
+  end
+  else
+  begin
+    Cand := NormalizeDirArg(Dir);
+    if CompareText(Cand, NormalizeRoot) = 0 then
+    begin
+      Err := 'the session root cannot be removed';
+      Exit;
+    end;
+    for I := 0 to High(ExtraRoots) do
+      if CompareText(ExtraRoots[I], Cand) = 0 then
+      begin
+        Idx := I + 1;
+        Break;
+      end;
+    if Idx < 1 then
+    begin
+      Err := 'not a working directory: ' + Cand;
+      Exit;
+    end;
+  end;
+  for J := Idx - 1 to High(ExtraRoots) - 1 do
+    ExtraRoots[J] := ExtraRoots[J + 1];
+  SetLength(ExtraRoots, Length(ExtraRoots) - 1);
+  LoadIgnoreRules;
+  Result := True;
+end;
+
+procedure ClearWorkingDirs;
+begin
+  SetLength(ExtraRoots, 0);
+  LoadIgnoreRules;
 end;
 
 function Clip(const S: string): string;
@@ -1031,6 +2582,7 @@ end;
 function ListDir(const Full: string; MaxDepth: Integer): string;
 var
   RootPrefix: string;
+  RootIdx: Integer;
 
   procedure Walk(const Dir, Prefix: string; Depth: Integer);
   var
@@ -1050,16 +2602,22 @@ var
           RelName := Copy(IncludeTrailingPathDelimiter(Dir) + R.Name,
             Length(RootPrefix) + 1, MaxInt);
           { .git and build output would flood the listing with noise. }
+          { And a denied path is not announced either.  SafePath stops the
+            model naming it; this stops the listing telling it there is
+            something there to name - the same two mechanisms the state
+            directory needs, for the same reason. }
           if (R.Attr and faDirectory) <> 0 then
           begin
             if (R.Name = '.git') or (R.Name = 'node_modules') or
                (CompareText(R.Name, StateDirName) = 0) then Continue;
-            if IsIgnored(RelName, True) then Continue;
+            if IsIgnoredIn(RootIdx, RelName, True) then Continue;
+            if DenyWalkReason(RelName, R.Name) <> '' then Continue;
             Dirs.Add(R.Name);
           end
           else
           begin
-            if IsIgnored(RelName, False) then Continue;
+            if IsIgnoredIn(RootIdx, RelName, False) then Continue;
+            if DenyWalkReason(RelName, R.Name) <> '' then Continue;
             Files.Add(Format('%s (%d bytes)', [R.Name, R.Size]));
           end;
         until FindNext(R) <> 0;
@@ -1083,7 +2641,12 @@ var
 
 begin
   Result := Rel(Full) + '\'#10;
-  RootPrefix := IncludeTrailingPathDelimiter(NormalizeRoot);
+  { The containing root, not the primary: the relative name a rule is matched
+    against has to be relative to the tree the rule came from, and an added
+    root's listing is labelled by Rel with its absolute path anyway. }
+  RootIdx := RootIndexOf(Full);
+  if RootIdx < 0 then RootIdx := 0;
+  RootPrefix := IncludeTrailingPathDelimiter(RootAt(RootIdx));
   Walk(Full, '  ', 0);
 end;
 
@@ -1094,15 +2657,18 @@ end;
   literally - "Result :=", "array[0]", "foo.bar" - and a "looks like a regex"
   heuristic would silently reinterpret them with no error anyone could see.
   Err is non-empty only when the pattern would not compile; the caller turns
-  that into a tool error. }
+  that into a tool error.
+
+  Hits and Truncated are in/out because one search may now walk several roots,
+  and the 200-hit and step budgets are budgets for the CALL: a hostile pattern
+  must not get its allowance again for every directory the user added. }
 function GrepTree(const Root, Pattern, Glob: string;
   UseRegex, CaseSensitive: Boolean; MaxDepth: Integer;
-  out Err: string): string;
+  var Hits: Integer; var Truncated: Boolean; out Err: string): string;
 var
-  Hits: Integer;
   RootPrefix, Needle: string;
   Rx: TRegex;
-  Truncated: Boolean;
+  RootIdx: Integer;
 
   { The match decision for one line.  A budget exhaustion is not a miss: it
     means the answer is unknown, so it stops the walk and is reported. }
@@ -1167,12 +2733,18 @@ var
             the context every turn with a copy of itself. }
           if (R.Name = '.git') or (R.Name = 'node_modules') or
              (CompareText(R.Name, StateDirName) = 0) then Continue;
-          if IsIgnored(RelName, True) then Continue;
+          if IsIgnoredIn(RootIdx, RelName, True) then Continue;
+          { A denied directory is not descended into and a denied file is not
+            read.  Without this half, search would happily print a line out of
+            the very file SafePath refuses to open - the single most damaging
+            way a path rule could look enforced and not be. }
+          if DenyWalkReason(RelName, R.Name) <> '' then Continue;
           Walk(IncludeTrailingPathDelimiter(Dir) + R.Name, Depth + 1);
         end
         else if Matches(R.Name) and (R.Size < MaxReadBytes) then
         begin
-          if IsIgnored(RelName, False) then Continue;
+          if IsIgnoredIn(RootIdx, RelName, False) then Continue;
+          if DenyWalkReason(RelName, R.Name) <> '' then Continue;
           if not LoadFileText(IncludeTrailingPathDelimiter(Dir) + R.Name, LText, LErr) then
             Continue;
           { A hit goes straight into a JSON request body, where one bad byte
@@ -1219,21 +2791,49 @@ var
 begin
   Result := '';
   Err := '';
-  Hits := 0;
-  Truncated := False;
   Rx := nil;
   if CaseSensitive then Needle := Pattern else Needle := LowerCase(Pattern);
   if UseRegex and not TRegex.Compile(Pattern, CaseSensitive, Rx, Err) then
     Exit('');
+  RootIdx := RootIndexOf(Root);
+  if RootIdx < 0 then RootIdx := 0;
+  RootPrefix := IncludeTrailingPathDelimiter(RootAt(RootIdx));
   try
     { One budget for the whole call rather than one per line, so a hostile
       pattern cannot spend its allowance again on every file in the tree. }
     if Rx <> nil then Rx.Budget := DefaultRegexBudget;
-    RootPrefix := IncludeTrailingPathDelimiter(NormalizeRoot);
     Walk(Root, 0);
   finally
     Rx.Free;
   end;
+end;
+
+{ The search tool's whole answer.  With no path it walks every root, primary
+  first, under one shared budget - so the project's own hits are the ones that
+  survive truncation when a large library has been added. }
+function SearchRoots(const Where, Pattern, Glob: string;
+  UseRegex, CaseSensitive: Boolean; MaxDepth: Integer;
+  out Err: string): string;
+var
+  I, Hits: Integer;
+  Truncated: Boolean;
+begin
+  Result := '';
+  Err := '';
+  Hits := 0;
+  Truncated := False;
+  if Where <> '' then
+    Result := GrepTree(Where, Pattern, Glob, UseRegex, CaseSensitive,
+      MaxDepth, Hits, Truncated, Err)
+  else
+    for I := 0 to RootCount - 1 do
+    begin
+      Result := Result + GrepTree(RootAt(I), Pattern, Glob, UseRegex,
+        CaseSensitive, MaxDepth, Hits, Truncated, Err);
+      if Err <> '' then Exit('');
+      if (Hits >= 200) or Truncated then Break;
+    end;
+  if Err <> '' then Exit('');
   { Partial hits are still worth having, so this is a note rather than an
     error - but the model has to be told the answer is incomplete. }
   if Truncated then
@@ -1245,69 +2845,254 @@ end;
 { -------------------------------------------------------------------- bash -- }
 
 { Runs Cmd through cmd.exe and returns its combined output.  A hard timeout
-  keeps a hung command from freezing the session. }
-function RunShell(const Cmd, WorkDir: string; out ExitCode: Integer): string;
+  keeps a hung command from freezing the session.
+
+  Raw CreateProcess through uSandbox rather than TProcess, which cannot be
+  given a job object - and a foreground command was the one child of this
+  program that had none, so a timed-out command's kill reached cmd.exe and
+  orphaned everything cmd.exe had started.  The byte contract is unchanged:
+  stderr is merged into stdout in arrival order, output is returned raw for
+  the caller to repair out of the OEM codepage, and the pipe is drained again
+  after the process exits so the tail is never lost.
+
+  Sandboxed is a parameter rather than a read of the level inside, because the
+  sandbox is a property of WHO asked for the command.  This program's own
+  introspection is not the model's command and must not be confined; see
+  RunShellQuiet. }
+function RunShell(const Cmd, WorkDir: string; Sandboxed: Boolean;
+  out ExitCode: Integer): string;
 var
-  P: TProcess;
+  SA: SECURITY_ATTRIBUTES;
+  SI: STARTUPINFOA;
+  PI: PROCESS_INFORMATION;
+  hRead, hWrite, hNul, hJob: THandle;
   Buf: array[0..4095] of Byte;
-  N: LongInt;
+  N, Avail: DWORD;
   Deadline: QWord;
-  S: string;
+  S, CmdLine, ComSpec, Env: string;
+  Code: DWORD;
+  Saved: TSandboxLevel;
+  InJob, Alive: Boolean;
+
+  { Everything the pipe has right now, and nothing more.  PeekNamedPipe first
+    is mandatory: ReadFile on an empty pipe whose write end is still open
+    blocks forever, which on this thread means the session stops. }
+  procedure Drain;
+  begin
+    repeat
+      Avail := 0;
+      if not PeekNamedPipe(hRead, nil, 0, nil, @Avail, nil) then Exit;
+      if Avail = 0 then Exit;
+      N := 0;
+      if not ReadFile(hRead, Buf[0], SizeOf(Buf), N, nil) then Exit;
+      if N = 0 then Exit;
+      SetString(S, PAnsiChar(@Buf[0]), N);
+      Result := Result + S;
+    until False;
+  end;
+
 begin
   Result := '';
   ExitCode := -1;
-  P := TProcess.Create(nil);
+
+  FillChar(SA, SizeOf(SA), 0);
+  SA.nLength := SizeOf(SA);
+  SA.bInheritHandle := True;
+  hRead := 0;
+  hWrite := 0;
+  if not CreatePipe(hRead, hWrite, @SA, 0) then
+  begin
+    Result := 'failed to start: ' + SysErrorMessage(GetLastError);
+    Exit;
+  end;
+  { Mandatory, not hygiene, and the same rule uMcp documents: without it the
+    child inherits a duplicate of our read end, so the pipe never reports EOF
+    and the drain loop below can never tell empty from finished. }
+  SetHandleInformation(hRead, HANDLE_FLAG_INHERIT, 0);
+  { NUL for stdin, matching background bash: a command that reads stdin gets
+    an instant EOF instead of waiting forever for a keyboard nobody is at. }
+  hNul := CreateFile('NUL', GENERIC_READ, FILE_SHARE_READ or FILE_SHARE_WRITE,
+    @SA, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
+
+  ComSpec := SysUtils.GetEnvironmentVariable('ComSpec');
+  if ComSpec = '' then ComSpec := 'cmd.exe';
+  CmdLine := '"' + ComSpec + '" /C ' + Cmd;
+
+  FillChar(SI, SizeOf(SI), 0);
+  SI.cb := SizeOf(SI);
+  SI.dwFlags := STARTF_USESTDHANDLES;
+  SI.hStdInput := hNul;
+  SI.hStdOutput := hWrite;
+  { Both ends of the child's output on one handle, which is what makes the two
+    streams interleave in the order they were written rather than arriving as
+    two blocks - the same thing poStderrToOutPut bought. }
+  SI.hStdError := hWrite;
+
+  { An unsandboxed caller is served by forcing the level off for the duration,
+    so there is exactly one spawn and one place that decides what a child
+    gets.  Saving and restoring rather than branching keeps the job object,
+    the env block and the token consistent with each other. }
+  Saved := uSandbox.SandboxLevel;
+  if not Sandboxed then uSandbox.SandboxLevel := slOff;
   try
-    P.Executable := SysUtils.GetEnvironmentVariable('ComSpec');
-    if P.Executable = '' then P.Executable := 'cmd.exe';
-    P.Parameters.Add('/C');
-    P.Parameters.Add(Cmd);
-    P.CurrentDirectory := WorkDir;
-    P.Options := [poUsePipes, poStderrToOutPut, poNoConsole];
-    try
-      P.Execute;
-    except
-      on E: Exception do
-      begin
-        Result := 'failed to start: ' + E.Message;
-        Exit;
-      end;
+    hJob := SandboxNewJob;
+    Env := SandboxEnvBlock;
+    if not SandboxSpawn(CmdLine, WorkDir, Env, 0, SI, PI, hJob, InJob) then
+    begin
+      Result := 'failed to start: ' + SysErrorMessage(GetLastError);
+      CloseHandle(hRead);
+      CloseHandle(hWrite);
+      if hNul <> INVALID_HANDLE_VALUE then CloseHandle(hNul);
+      if hJob <> 0 then CloseHandle(hJob);
+      Exit;
     end;
-    Deadline := GetTickCount64 + 120000;
+
+    { After the spawn, never before: closing the write end first would leave
+      the child writing into a pipe with no reader.  Ours must go, though, or
+      the read end never sees EOF. }
+    CloseHandle(hWrite);
+    if hNul <> INVALID_HANDLE_VALUE then CloseHandle(hNul);
+    CloseHandle(PI.hThread);
+
+    Deadline := GetTickCount64 + QWord(ShellTimeoutMs);
     repeat
-      while P.Output.NumBytesAvailable > 0 do
-      begin
-        N := P.Output.Read(Buf[0], SizeOf(Buf));
-        if N <= 0 then Break;
-        SetString(S, PAnsiChar(@Buf[0]), N);
-        Result := Result + S;
-      end;
-      if not P.Running then Break;
+      { The order is load-bearing and is the whole of the no-lost-bytes
+        argument.  Asking whether it has exited BEFORE draining means the
+        drain that follows an observed exit cannot miss anything, since a
+        process that has already gone writes nothing more.  Drained first and
+        asked afterwards, the bytes written between the two would be lost -
+        which is a race, so it would show up as a tail that goes missing on a
+        busy machine perhaps one run in a hundred, and never in a test. }
+      Alive := WaitForSingleObject(PI.hProcess, 0) <> WAIT_OBJECT_0;
+      Drain;
+      if not Alive then Break;
       if GetTickCount64 > Deadline then
       begin
-        P.Terminate(1);
-        Result := Result + #10'[timed out after 120s]';
+        { The job, not the process.  TProcess could only ever terminate
+          cmd.exe, which left the build it had started running and holding
+          this pipe; killing the job takes the tree. }
+        if hJob <> 0 then
+          SandboxTerminateJob(hJob, 1)
+        else
+          TerminateProcess(PI.hProcess, 1);
+        WaitForSingleObject(PI.hProcess, 2000);
+        Result := Result + #10 +
+          Format('[timed out after %ds]', [ShellTimeoutMs div 1000]);
         Break;
       end;
       Sleep(20);
     until False;
-    { Drain whatever landed in the pipe after the process exited. }
-    while P.Output.NumBytesAvailable > 0 do
-    begin
-      N := P.Output.Read(Buf[0], SizeOf(Buf));
-      if N <= 0 then Break;
-      SetString(S, PAnsiChar(@Buf[0]), N);
-      Result := Result + S;
-    end;
-    ExitCode := P.ExitStatus;
+
+    { And once more after the kill path, which breaks out without having
+      drained since the exit was observed.  On the ordinary path the loop has
+      already read everything and this finds an empty pipe. }
+    Drain;
+
+    Code := 0;
+    if GetExitCodeProcess(PI.hProcess, Code) then ExitCode := Integer(Code);
+    CloseHandle(PI.hProcess);
+    CloseHandle(hRead);
+    { Closed last: KILL_ON_JOB_CLOSE reaps anything the command left behind.
+      That is a real behaviour change - a foreground "start /b server.exe"
+      used to outlive the tool call and now does not - and it is the right
+      one, because run_in_background is what outliving a call is for. }
+    if hJob <> 0 then CloseHandle(hJob);
   finally
-    P.Free;
+    uSandbox.SandboxLevel := Saved;
   end;
 end;
 
+{ ------------------------------------------------- program resolution ----- }
+
+{ Splits a semicolon list, dropping empties and surrounding quotes.  PATH
+  entries are quoted surprisingly often on real machines. }
+function SplitPathList(const S: string): TStringArray;
+var
+  I, Start: Integer;
+  Part: string;
+begin
+  Result := nil;
+  Start := 1;
+  for I := 1 to Length(S) + 1 do
+    if (I > Length(S)) or (S[I] = ';') then
+    begin
+      Part := Trim(Copy(S, Start, I - Start));
+      Start := I + 1;
+      if (Length(Part) >= 2) and (Part[1] = '"') and
+         (Part[Length(Part)] = '"') then
+        Part := Copy(Part, 2, Length(Part) - 2);
+      if Part = '' then Continue;
+      SetLength(Result, Length(Result) + 1);
+      Result[High(Result)] := Part;
+    end;
+end;
+
+function ResolveProgram(const Name: string; out FullPath: string): Boolean;
+var
+  Dirs, Exts: TStringArray;
+  I, J, K: Integer;
+  Dir, Cand, ExtList: string;
+  Bad: Boolean;
+begin
+  FullPath := '';
+  Result := False;
+  { A NAME only.  Anything with a separator, a drive colon, a quote or a
+    control byte is not something this function will look up: the caller
+    would be asking for a path, and a path is exactly what must not come
+    from anywhere but PATH here. }
+  if (Name = '') or (Length(Name) > 64) then Exit;
+  for I := 1 to Length(Name) do
+    if not (Name[I] in ['A'..'Z', 'a'..'z', '0'..'9', '.', '_', '-']) then Exit;
+
+  { SysUtils. qualified: the Windows unit exports a raw API of the same name
+    that shadows it and returns a DWORD. }
+  Dirs := SplitPathList(SysUtils.GetEnvironmentVariable('PATH'));
+  ExtList := SysUtils.GetEnvironmentVariable('PATHEXT');
+  if Trim(ExtList) = '' then ExtList := '.COM;.EXE;.BAT;.CMD';
+  Exts := SplitPathList(ExtList);
+
+  for I := 0 to High(Dirs) do
+  begin
+    Dir := Dirs[I];
+    { Absolute only: a relative PATH entry resolves against the current
+      directory, which is the thing this function exists to not consult. }
+    if not ((Length(Dir) >= 3) and (Dir[2] = ':') and
+            ((Dir[3] = '\') or (Dir[3] = '/'))) and
+       not ((Length(Dir) >= 2) and (Dir[1] = '\') and (Dir[2] = '\')) then
+      Continue;
+    Dir := ExcludeTrailingPathDelimiter(Dir);
+    Bad := False;
+    for K := 0 to RootCount - 1 do
+      if WithinRoot(Dir, RootAt(K)) then Bad := True;
+    if Bad then Continue;
+    for J := 0 to High(Exts) do
+    begin
+      Cand := Dir + PathDelim + Name + Exts[J];
+      if FileExists(Cand) then
+      begin
+        FullPath := Cand;
+        Exit(True);
+      end;
+    end;
+  end;
+end;
+
+function ProgramCommand(const Name, Args: string): string;
+var
+  Full: string;
+begin
+  if not ResolveProgram(Name, Full) then Exit('');
+  Result := '"' + Full + '"';
+  if Args <> '' then Result := Result + ' ' + Args;
+end;
+
+{ pasclaude's own "git status" and "git rev-parse", never the model's command,
+  so Sandboxed is False: at low integrity git would fail writing its index
+  lock in a tree nobody has labelled, and the program would appear to have
+  forgotten how to read its own repository. }
 function RunShellQuiet(const Cmd: string; out ExitCode: Integer): string;
 begin
-  Result := RunShell(Cmd, NormalizeRoot, ExitCode);
+  Result := RunShell(Cmd, NormalizeRoot, False, ExitCode);
   if not IsValidUtf8(Result) then
     Result := OemToUtf8(Result);
 end;
@@ -1331,57 +3116,32 @@ const
     offset advances by what was returned, so what is not returned now comes
     back next time rather than vanishing. }
   MaxPollBytes = 24 * 1024;
-  { A runaway job writing to disk forever is the failure mode a spool file
-    has that a pipe does not.  Sixteen megabytes is generous for anything
-    worth reading and small enough to notice. }
-  MaxSpoolBytes = 16 * 1024 * 1024;
+  { MaxSpoolBytes lives in the interface now, beside the functions it bounds,
+    so a suite can lower it rather than having to produce sixteen megabytes to
+    reach it.  Its justification went up there with it.
+
+    How often a tick may actually re-stat the spools.  A quarter of a second
+    is the shortest interval worth re-opening eight files at: below it the
+    check starts to be measurable during a fast stream, where it fires once
+    per network chunk, and above it the overshoot grows for nothing.
+
+    What this buys, stated honestly, because it is not "the cap is now
+    enforced".  Nothing here can stop a child writing between two ticks - the
+    child is a separate process with its own handle and pasclaude is not in
+    its write path at all.  The real guarantee is MaxSpoolBytes plus whatever
+    one tick's worth of writing is, which for a child streaming into a warm
+    page cache is tens of megabytes rather than zero.  What changed is the
+    clock: enforcement used to depend on the model choosing to call another
+    tool, and now it depends on a quarter of a second passing. }
+  SweepTickMs = 250;
   JobKillWaitMs = 2000;
   JobsDirName = 'jobs';
 
-{ FPC 3.2.2's Windows unit does not declare the job-object API at all, so the
-  four entry points and the two records it needs are declared here.  These are
-  the documented kernel32 exports, nothing exotic; TJobExtendedLimits is 144
-  bytes on x64, which SetInformationJobObject validates on every call and a
-  probe confirmed before this was written. }
-const
-  JobObjectExtendedLimitInformation = 9;
-  JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = $2000;
-
-type
-  TJobBasicLimits = record
-    PerProcessUserTimeLimit: Int64;
-    PerJobUserTimeLimit: Int64;
-    LimitFlags: DWORD;
-    MinimumWorkingSetSize: SIZE_T;
-    MaximumWorkingSetSize: SIZE_T;
-    ActiveProcessLimit: DWORD;
-    Affinity: ULONG_PTR;
-    PriorityClass: DWORD;
-    SchedulingClass: DWORD;
-  end;
-
-  TJobIoCounters = record
-    ReadOperationCount, WriteOperationCount, OtherOperationCount: QWord;
-    ReadTransferCount, WriteTransferCount, OtherTransferCount: QWord;
-  end;
-
-  TJobExtendedLimits = record
-    BasicLimitInformation: TJobBasicLimits;
-    IoInfo: TJobIoCounters;
-    ProcessMemoryLimit: SIZE_T;
-    JobMemoryLimit: SIZE_T;
-    PeakProcessMemoryUsed: SIZE_T;
-    PeakJobMemoryUsed: SIZE_T;
-  end;
-
-function CreateJobObjectA(Attr: Pointer; Name: PAnsiChar): THandle; stdcall;
-  external 'kernel32' name 'CreateJobObjectA';
-function SetInformationJobObject(J: THandle; Cls: Integer; Info: Pointer;
-  Len: DWORD): BOOL; stdcall; external 'kernel32' name 'SetInformationJobObject';
-function AssignProcessToJobObject(J, P: THandle): BOOL; stdcall;
-  external 'kernel32' name 'AssignProcessToJobObject';
-function TerminateJobObject(J: THandle; Code: UINT): BOOL; stdcall;
-  external 'kernel32' name 'TerminateJobObject';
+{ The job-object record and its four kernel32 imports used to be declared here
+  and, verbatim, in uHooks and uMcp - three copies, because the ladder forbids
+  the other two from importing this unit.  They now live in uSandbox, which is
+  a leaf below all three and is therefore the only place they could ever have
+  been shared. }
 
 type
   TBackgroundJob = record
@@ -1396,6 +3156,10 @@ type
 var
   Jobs: array of TBackgroundJob;
   JobSeq: Integer = 0;
+  { When the last tick actually swept.  Zero means "never", which GetTickCount64
+    is never equal to in practice, so the first tick after a launch always
+    runs. }
+  LastSweepTick: QWord = 0;
 
 { The spool directory.  This deliberately bypasses SafePath: the state
   directory is exactly where that guard refuses to let the model go, and
@@ -1466,7 +3230,7 @@ begin
     if WaitForSingleObject(J.Proc, 0) <> WAIT_OBJECT_0 then
     begin
       if J.Job <> 0 then
-        TerminateJobObject(J.Job, 1)
+        SandboxTerminateJob(J.Job, 1)
       else
         TerminateProcess(J.Proc, 1);
       WaitForSingleObject(J.Proc, JobKillWaitMs);
@@ -1487,6 +3251,25 @@ begin
   J.Note := '';
 end;
 
+{ The spool cap as a sentence a user can act on.  Integer megabyte division was
+  what stood in the kill note, and it was fine while MaxSpoolBytes was a const:
+  publishing it as a settable var made every value below a megabyte reachable,
+  and 512 KB rendered as "produced more than 0 MB and was stopped" - a line
+  saying a job was killed for producing nothing.  The implementer of the seam
+  worked around it by raising the suite's cap to exactly one megabyte, which
+  hides the sentence without fixing it.  Three ranges and nothing cleverer:
+  this number appears in one string, and a job stopped for writing too much is
+  not the moment to introduce rounding the reader has to think about. }
+function CapText(Bytes: Int64): string;
+begin
+  if Bytes >= 1024 * 1024 then
+    Result := IntToStr(Bytes div (1024 * 1024)) + ' MB'
+  else if Bytes >= 1024 then
+    Result := IntToStr(Bytes div 1024) + ' KB'
+  else
+    Result := IntToStr(Bytes) + ' bytes';
+end;
+
 { Refreshes exit state, and stops anything that has written more than the
   spool cap.  Purge additionally drops jobs whose output has been read to the
   end after exiting - only StartBackgroundJob asks for that, because a poll
@@ -1501,13 +3284,13 @@ begin
     if JobAlive(Jobs[I]) and (SpoolSize(Jobs[I].Spool) > MaxSpoolBytes) then
     begin
       if Jobs[I].Job <> 0 then
-        TerminateJobObject(Jobs[I].Job, 1)
+        SandboxTerminateJob(Jobs[I].Job, 1)
       else
         TerminateProcess(Jobs[I].Proc, 1);
       WaitForSingleObject(Jobs[I].Proc, JobKillWaitMs);
       Jobs[I].Killed := True;
-      Jobs[I].Note := Format('[%s produced more than %d MB and was stopped]',
-        [Jobs[I].Id, MaxSpoolBytes div (1024 * 1024)]);
+      Jobs[I].Note := Format('[%s produced more than %s and was stopped]',
+        [Jobs[I].Id, CapText(MaxSpoolBytes)]);
       JobAlive(Jobs[I]);
     end;
   end;
@@ -1524,15 +3307,73 @@ begin
   SetLength(Jobs, N);
 end;
 
+{ The cap on a clock rather than on the model's goodwill.  Four callers reach
+  this and each covers something the others do not: RunToolInner catches the
+  ordinary case of a session that keeps working, uAgent.StreamChunk catches a
+  long reply that calls no tool at all, the top of the REPL loop catches the
+  moment before the program blocks on the keyboard, and uTerm's idle wait
+  catches the block itself.
+
+  That fourth caller reverses an argument that stood here, and it is rewritten
+  rather than deleted because a comment that quietly stops contradicting a
+  decision is how the decision gets made twice.  What this paragraph used to
+  say was that the prompt-idle window was documented rather than closed, on
+  the grounds that closing it meant giving uTerm's single input loop a
+  periodic wakeup - a change to the most delicate loop in the program - in
+  order to bound some disk inside .pasclaude\jobs that ClearJobs and this
+  unit's finalization already delete.  The cost estimate turned out to be
+  wrong in the direction that matters: it is a WaitForSingleObject in front of
+  the read that was already there, plus a procedure variable defaulting nil,
+  and the key-handling half of that loop is untouched.  uTerm still calls
+  nothing upward - the tick is PUSHED DOWN as uTerm.IdleTick from
+  pasclaude.lpr, exactly as CompleteProvider and EscEscCommand are - and a
+  host that wires nothing gets the loop this program has always had.  What
+  remains true from the old wording is the modesty: this bounds the window, it
+  does not make the cap a guarantee, and SweepTickMs' own comment still spells
+  out the difference.
+
+  The early exit is the whole reason this is safe to call from a hot loop: the
+  overwhelmingly common case is no background jobs at all, and that case costs
+  one integer compare.  It is what makes four wakeups a second at an idle
+  prompt free.
+
+  Never SweepJobs(True).  A purge from a tick could forget a finished job in
+  the gap between the model being told about it and the model reading it,
+  which is the exact hazard SweepJobs' own comment argues against;
+  StartBackgroundJob stays the only caller entitled to ask for a purge.
+
+  The idle wait adds a SECOND reason, and it is a new constraint on a function
+  nobody previously thought was constrained, so it is written where an edit to
+  SweepJobs will hit it.  A tick can now fire from a PERMISSION PROMPT, and a
+  permission prompt is itself nested inside a uTools call: RunToolInner is on
+  the stack, above it Ask, and the prompt reads through uTerm.ReadLineEdit.
+  That makes the tick re-entrant with respect to this unit.  It is safe today
+  for a reason worth naming rather than rediscovering - SweepJobs(False) never
+  calls FreeJob and never SetLengths the Jobs array, so an index a nested
+  caller is holding across the prompt survives it untouched.  A purge does
+  both, and would invalidate that index while the user was reading a diff.
+  Whoever teaches SweepJobs(False) to resize the array breaks this, silently,
+  and this sentence is the only thing that will tell them. }
+procedure TickBackgroundJobs;
+var
+  Now_: QWord;
+begin
+  if Length(Jobs) = 0 then Exit;
+  Now_ := GetTickCount64;
+  if (LastSweepTick <> 0) and (Now_ - LastSweepTick < SweepTickMs) then Exit;
+  LastSweepTick := Now_;
+  SweepJobs(False);
+end;
+
 function StartBackgroundJob(const Cmd: string; out Id: string; out Err: string): Boolean;
 var
-  Info: TJobExtendedLimits;
   SA: SECURITY_ATTRIBUTES;
   SI: STARTUPINFOA;
   PI: PROCESS_INFORMATION;
   hJob, hSpool, hNul: THandle;
   CmdLine, Spool, ComSpec: string;
   J: TBackgroundJob;
+  InJob: Boolean;
 begin
   Result := False;
   Id := '';
@@ -1553,22 +3394,18 @@ begin
   Inc(JobSeq);
   Spool := JobsDir + 'bg' + IntToStr(JobSeq) + '.out';
 
-  hJob := CreateJobObjectA(nil, nil);
-  if hJob <> 0 then
-  begin
-    FillChar(Info, SizeOf(Info), 0);
-    Info.BasicLimitInformation.LimitFlags := JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-    if not SetInformationJobObject(hJob, JobObjectExtendedLimitInformation,
-             @Info, SizeOf(Info)) then
-    begin
-      CloseHandle(hJob);
-      hJob := 0;
-    end;
-  end;
+  hJob := SandboxNewJob;
 
   { The child inherits a handle onto the spool and onto NUL.  NUL for stdin
     matters as much as the spool does: a command that reads stdin gets an
-    instant EOF instead of waiting forever for a keyboard nobody is at. }
+    instant EOF instead of waiting forever for a keyboard nobody is at.
+
+    Both handles survive the integrity drop: a probe confirmed that a handle
+    this medium-integrity process opened is still writable by a low-integrity
+    child that inherited it.  The asymmetry is a bonus rather than a cost -
+    the low child can write its own spool through the handle it was given and
+    cannot re-open that path by name, so it cannot go back and rewrite what it
+    already said. }
   FillChar(SA, SizeOf(SA), 0);
   SA.nLength := SizeOf(SA);
   SA.bInheritHandle := True;
@@ -1594,9 +3431,6 @@ begin
     foreground is a trap nobody could explain afterwards.  The line reaching
     cmd.exe here is character-identical to RunShell's. }
   CmdLine := '"' + ComSpec + '" /C ' + Cmd;
-  { CreateProcessA may write into lpCommandLine, so it must not be sharing a
-    string with anybody. }
-  UniqueString(CmdLine);
   FillChar(SI, SizeOf(SI), 0);
   SI.cb := SizeOf(SI);
   SI.dwFlags := STARTF_USESTDHANDLES;
@@ -1605,8 +3439,8 @@ begin
   SI.hStdError := hSpool;
   FillChar(PI, SizeOf(PI), 0);
 
-  if not CreateProcess(nil, PChar(CmdLine), nil, nil, True, CREATE_NO_WINDOW,
-           nil, PChar(NormalizeRoot), SI, PI) then
+  if not SandboxSpawn(CmdLine, NormalizeRoot, SandboxEnvBlock, 0, SI, PI,
+           hJob, InJob) then
   begin
     Err := 'could not start: ' + SysErrorMessage(GetLastError);
     CloseHandle(hSpool);
@@ -1629,12 +3463,12 @@ begin
   J.Job := hJob;
   J.Started := GetTickCount64;
   J.ExitCode := -1;
-  { Assignment is after the spawn, so a grandchild started in the microseconds
-    before it escapes the job.  cmd.exe has to parse its command line first,
-    so the window is tiny - but it is real, and a stray that escapes survives
-    kill_bash.  When assignment fails outright the kill reaches cmd.exe only,
-    which the status line says out loud rather than pretending otherwise. }
-  J.Tree := (hJob <> 0) and AssignProcessToJobObject(hJob, PI.hProcess);
+  { The child is created suspended, assigned, and only then resumed, so the
+    race this used to document - a grandchild started while cmd.exe parsed its
+    command line, escaping the job and surviving kill_bash - is closed.  When
+    assignment fails outright the kill still reaches cmd.exe only, which the
+    status line says out loud rather than pretending otherwise. }
+  J.Tree := InJob;
   if (hJob <> 0) and not J.Tree then
     J.Note := Format('[%s could not be put in a job object; stopping it may ' +
       'leave programs it started running]', [J.Id]);
@@ -1758,7 +3592,7 @@ begin
   if WaitForSingleObject(Jobs[I].Proc, 0) <> WAIT_OBJECT_0 then
   begin
     if Jobs[I].Job <> 0 then
-      TerminateJobObject(Jobs[I].Job, 1)
+      SandboxTerminateJob(Jobs[I].Job, 1)
     else
       TerminateProcess(Jobs[I].Proc, 1);
     WaitForSingleObject(Jobs[I].Proc, JobKillWaitMs);
@@ -1832,8 +3666,12 @@ begin
     FreeJob(Jobs[I]);
   SetLength(Jobs, 0);
   { Ids restart, because nothing that could still name an old one survives a
-    clear: the transcript holding them has been thrown away too. }
+    clear: the transcript holding them has been thrown away too.  The tick
+    clock restarts for the same reason and for one of its own: a suite that
+    clears the table and immediately starts a job must not find its first tick
+    throttled out by a sweep that happened before any of this existed. }
   JobSeq := 0;
+  LastSweepTick := 0;
 end;
 
 { ---------------------------------------------------------- bash prefixes -- }
@@ -2059,23 +3897,24 @@ begin
   end;
 end;
 
-function ApprovalsPath: string;
+{ The name this session's out-of-tree state is filed under.  The leaf is
+  decoration - it is what makes the directory readable by a human deleting an
+  entry - so anything that is not plainly a filename character is dropped
+  rather than escaped.  The hash of the whole path, case-folded because
+  Windows paths are, is what actually distinguishes two roots.
+
+  Factored out of ApprovalsPath because the sandbox scratch needs the same
+  key.  Sharing the function rather than the convention is what stops the two
+  stores drifting into disagreeing about which session they belong to - and it
+  binds both to the PRIMARY root, which is deliberate: an added working
+  directory contributes no key, or adding a directory would become a way to
+  import another session's approvals. }
+function SessionKey: string;
 var
-  Home, Root, Leaf: string;
+  Root, Leaf: string;
   I: Integer;
 begin
-  Result := '';
-  { SysUtils. qualified deliberately: the Windows unit's raw API of the same
-    name is in scope here and shadows it. }
-  Home := Trim(SysUtils.GetEnvironmentVariable('LOCALAPPDATA'));
-  if Home = '' then
-    Home := Trim(SysUtils.GetEnvironmentVariable('USERPROFILE'));
-  if Home = '' then Exit;
   Root := NormalizeRoot;
-  { The leaf is decoration - it is what makes the directory readable by a human
-    deleting an entry - so anything that is not plainly a filename character is
-    dropped rather than escaped.  The hash of the whole path, case-folded
-    because Windows paths are, is what actually distinguishes two roots. }
   Leaf := '';
   for I := 1 to Length(ExtractFileName(Root)) do
     if ExtractFileName(Root)[I] in ['a'..'z', 'A'..'Z', '0'..'9', '-', '_'] then
@@ -2084,10 +3923,23 @@ begin
       if Length(Leaf) >= 32 then Break;
     end;
   if Leaf = '' then Leaf := 'root';
+  Result := Leaf + '-' +
+    LowerCase(IntToHex(Fnv1a(UpperCase(Root), QWord($CBF29CE484222325)), 16));
+end;
+
+function ApprovalsPath: string;
+var
+  Home: string;
+begin
+  Result := '';
+  { SysUtils. qualified deliberately: the Windows unit's raw API of the same
+    name is in scope here and shadows it. }
+  Home := Trim(SysUtils.GetEnvironmentVariable('LOCALAPPDATA'));
+  if Home = '' then
+    Home := Trim(SysUtils.GetEnvironmentVariable('USERPROFILE'));
+  if Home = '' then Exit;
   Result := IncludeTrailingPathDelimiter(Home) + 'pasclaude' + PathDelim +
-    'approvals' + PathDelim + Leaf + '-' +
-    LowerCase(IntToHex(Fnv1a(UpperCase(Root), QWord($CBF29CE484222325)), 16)) +
-    '.json';
+    'approvals' + PathDelim + SessionKey + '.json';
 end;
 
 type
@@ -2180,6 +4032,10 @@ end;
   same shape uAgent uses to fill SubagentRunner.  Doing it this way rather
   than mirroring RootDir into a second variable means a test that moves the
   root moves the hooks with it and cannot forget. }
+{ NormalizeRoot, deliberately: an added working directory contributes no
+  code and no configuration.  --add-dir grants file access to a directory and
+  nothing else, so generalising this to scan every root would turn it into a
+  way to make an arbitrary directory execute what it ships. }
 function HookRoot: string;
 begin
   Result := NormalizeRoot;
@@ -2305,6 +4161,10 @@ begin
   Result := True;
 end;
 
+{ NormalizeRoot, deliberately: an added working directory contributes no
+  code and no configuration.  --add-dir grants file access to a directory and
+  nothing else, so generalising this to scan every root would turn it into a
+  way to make an arbitrary directory execute what it ships. }
 function SkillsDirProject: string;
 begin
   Result := IncludeTrailingPathDelimiter(NormalizeRoot) + StateDirName +
@@ -3113,6 +4973,637 @@ begin
   Result := ResolveExtensionFile(AgentsDirName, Name);
 end;
 
+{ ----------------------------------------------------------- output style -- }
+
+{ Compiled in rather than shipped as files, for two reasons.  A bare checkout
+  has no .pasclaude\styles\, and a feature that demonstrates nothing until the
+  user writes a file is a mechanism rather than a feature.  And a built-in on
+  disk could be edited into something that no longer matches the name the
+  listing shows, which is the same failure the reserved-name refusal below
+  exists to prevent. }
+const
+  BuiltinStyleCount = 3;
+  BuiltinStyleNames: array[0..BuiltinStyleCount - 1] of string =
+    (DefaultStyleName, 'explanatory', 'learning');
+  BuiltinStyleDescs: array[0..BuiltinStyleCount - 1] of string = (
+    'Ordinary replies. Adds nothing to the system prompt.',
+    'Explain the code as you change it.',
+    'Leave one real step for the user to write.');
+  BuiltinStyleBodies: array[0..BuiltinStyleCount - 1] of string = (
+    '',
+    'Explain the codebase as you work. When you touch something ' +
+    'non-obvious, say in a sentence or two why it is built that way and ' +
+    'what the other way would have broken. Explain the code actually in ' +
+    'front of you, not the general topic. Keep the explanation shorter ' +
+    'than the work.',
+    'Do the work, but leave one piece of it for the user. Choose the ' +
+    'smallest step that carries the real decision, stop before it, mark it ' +
+    'TODO(you): with what it has to do and what it must not break, and hand ' +
+    'it back. Do not then write it yourself in the same reply.');
+
+var
+  { The selected style.  The body is cached here rather than parsed per
+    request, and it is kept honest by StyleRecheck, which fingerprints the
+    file on the way through StyleNote and re-parses only when that moved.
+
+    FINGERPRINT AND RE-PARSE ON CHANGE, not re-parse every time, and the
+    choice is worth its paragraph.  StyleNote is called from SessionNote,
+    which is called while a request body is being built, which happens on
+    every single turn: parsing unconditionally would put a UTF-8 repair and a
+    frontmatter parse on the request path, and - worse than the cost - it
+    would put the PARSE FAILURE there too, so a half-saved file caught
+    mid-write by an editor would decide the style for a request already in
+    flight.  Gating on the fingerprint keeps that whole class of failure off
+    the turn, and in the ordinary case where nothing changed the cached note
+    is returned byte-identical, which is what the prompt cache upstream
+    depends on.
+
+    THE FINGERPRINT IS THE FILE'S BYTES, and it used not to be.  What stood
+    here was FindFirst's stamp compared beside the size, which on Windows is a
+    DOS timestamp with two-second granularity: an edit landing inside one tick
+    that left the file exactly the same length was invisible, and the escape
+    hatch was re-running /output-style <name>.  A real last-write time -
+    GetFileAttributesExW into WIN32_FILE_ATTRIBUTE_DATA, a 100-nanosecond
+    FILETIME - was the obvious replacement and is not enough.  NTFS stores
+    100ns ticks but nothing writes 100ns values into them: the file system
+    stamps a write from the cached system time, whose tick is about 15
+    milliseconds, so two saves inside one tick get byte-identical last-write
+    times.  That turns a documented miss into a flaky one, which is worse, and
+    it means a Windows API import into a unit that has none.  The bytes are
+    the only thing that cannot be identical while the content differs, so the
+    check hashes them: FNV-1a 64 over the whole file, beside the size the
+    directory already reports.
+
+    What that costs, honestly, because it revises an argument this project
+    made in prose: one bounded open of a file capped at MaxStyleBytes - 64 KB
+    - once per turn, on the path that is about to make an HTTPS request.  The
+    read is back on the request path; the PARSE is not, and the parse was
+    always the half that mattered, because a read either works or returns
+    False while a parse can decide a style from a file caught mid-save. }
+  StyleName: string = DefaultStyleName;
+  StylePath: string = '';
+  StyleSource: string = 'builtin';
+  StyleBody: string = '';
+  StyleNote_: string = '';
+  StyleNoteWasCut: Boolean = False;
+  StyleStartupNote_: string = '';
+  { The size the directory reports for the file StyleBody was read from, and
+    FNV-1a 64 over its bytes.  Size -1 means "there was no file there", which
+    is both the state before any file style is set and the state after one is
+    deleted - the two are distinguished by StylePath, which is '' only for a
+    built-in.  Hash 0 means "a file is there and its bytes could not be got";
+    an EMPTY file hashes to the offset basis and never to 0, so the marker is
+    unambiguous, and a locked file therefore reports itself once and then
+    compares equal until the lock lifts. }
+  StyleSize: Int64 = -1;
+  StyleHash: QWord = 0;
+  StyleReloadNote_: string = '';
+  { Deliberately outside every reset below - see StyleFileProbes. }
+  StyleProbes_: Int64 = 0;
+
+  StyleCache: TStyleInfoArray;
+  StyleCacheValid: Boolean = False;
+
+function BuiltinStyleIndex(const Name: string): Integer;
+var
+  I: Integer;
+begin
+  Result := -1;
+  for I := 0 to BuiltinStyleCount - 1 do
+    if CompareText(BuiltinStyleNames[I], Trim(Name)) = 0 then Exit(I);
+end;
+
+function StylesDirProject: string;
+begin
+  Result := IncludeTrailingPathDelimiter(NormalizeRoot) + StateDirName +
+    PathDelim + StylesDirName + PathDelim;
+end;
+
+{ The user's own home directory, exactly as SkillsDirUser reads it and for a
+  stronger reason: how somebody wants their replies written is a property of
+  the person, not of the repository they happen to have open. }
+function StylesDirUser: string;
+var
+  Home: string;
+begin
+  Result := '';
+  Home := Trim(SysUtils.GetEnvironmentVariable('USERPROFILE'));
+  if Home = '' then Exit;
+  Result := IncludeTrailingPathDelimiter(Home) + StateDirName + PathDelim +
+    StylesDirName + PathDelim;
+end;
+
+function ResolveStyleFile(const Name: string): string;
+var
+  P: string;
+begin
+  { Project and the enabled plugins come free from the resolver commands and
+    agents already use; only the user-directory fallback is new here. }
+  Result := ResolveExtensionFile(StylesDirName, Name);
+  if Result <> '' then Exit;
+  if not ValidExtensionName(Trim(Name)) then Exit;
+  P := StylesDirUser;
+  if P = '' then Exit;
+  P := P + Trim(Name) + '.md';
+  if FileExists(P) then Result := P;
+end;
+
+function StyleIndex(const Arr: TStyleInfoArray; const N: string): Integer;
+var
+  I: Integer;
+begin
+  Result := -1;
+  for I := 0 to High(Arr) do
+    if CompareText(Arr[I].Name, N) = 0 then Exit(I);
+end;
+
+{ Every *.md under Dir that is not already catalogued.  Glob rather than
+  FindFirst on '*', so '.' and '..' cannot arrive as style names the way
+  ScanSkillDir has to guard against. }
+procedure ScanStyleDir(const Dir: string; Source: TSkillSource;
+  const Plugin: string; var Arr: TStyleInfoArray);
+var
+  R: TSearchRec;
+  L: TStringList;
+  I: Integer;
+  Info: TStyleInfo;
+  Base, Text, Note, StName, StDesc, StBody, StErr: string;
+begin
+  if (Dir = '') or not DirectoryExists(Dir) then Exit;
+  L := TStringList.Create;
+  try
+    if FindFirst(Dir + '*.md', faAnyFile, R) = 0 then
+    begin
+      repeat
+        if (R.Attr and faDirectory) <> 0 then Continue;
+        Base := ChangeFileExt(R.Name, '');
+        if not ValidExtensionName(Base) then Continue;
+        L.Add(Base);
+      until FindNext(R) <> 0;
+      SysUtils.FindClose(R);
+    end;
+    L.Sort;
+
+    for I := 0 to L.Count - 1 do
+    begin
+      { Nearer wins, same rule as the skill catalogue: the first source to
+        offer a name keeps it. }
+      if StyleIndex(Arr, L[I]) >= 0 then Continue;
+
+      Info.Name := L[I];
+      Info.Path := Dir + L[I] + '.md';
+      Info.Source := Source;
+      Info.Plugin := Plugin;
+      Info.Builtin := False;
+      Info.Description := '';
+      Info.Err := '';
+
+      { A file cannot take a built-in name.  Listed with the clash rather
+        than hidden, because the alternative states are both worse: hidden
+        and the user never learns why their file does nothing, or applied and
+        the listing advertises one thing while the loader uses another. }
+      if BuiltinStyleIndex(L[I]) >= 0 then
+        Info.Err := L[I] + ' is a built-in style; rename the file'
+      else if not LoadFileLimited(Info.Path, MaxStyleBytes, Text, Note) then
+        Info.Err := 'cannot read: ' + Note
+      else
+      begin
+        if not IsValidUtf8(Text) then Text := OemToUtf8(Text);
+        if not ParseSkillFrontmatter(Text, StName, StDesc, StBody, StErr) then
+          { The parser's wording is about a skill, so the listing says which
+            file it is talking about rather than leaving the user to guess. }
+          Info.Err := StErr
+        else if (Trim(StName) <> '') and
+                (CompareText(Trim(StName), Info.Name) <> 0) then
+          Info.Err := Format('name: %s does not match the file %s',
+            [Trim(StName), Info.Name + '.md'])
+        else
+          Info.Description := Utf8Cut(Trim(StDesc), MaxSkillDescBytes);
+      end;
+
+      SetLength(Arr, Length(Arr) + 1);
+      Arr[High(Arr)] := Info;
+    end;
+  finally
+    L.Free;
+  end;
+end;
+
+procedure SortStyles(var Arr: TStyleInfoArray; First: Integer);
+var
+  I, J: Integer;
+  T: TStyleInfo;
+begin
+  for I := First + 1 to High(Arr) do
+  begin
+    T := Arr[I];
+    J := I - 1;
+    while (J >= First) and (CompareText(Arr[J].Name, T.Name) > 0) do
+    begin
+      Arr[J + 1] := Arr[J];
+      Dec(J);
+    end;
+    Arr[J + 1] := T;
+  end;
+end;
+
+function StyleCatalogue: TStyleInfoArray;
+var
+  I: Integer;
+begin
+  if not StyleCacheValid then
+  begin
+    SetLength(StyleCache, BuiltinStyleCount);
+    for I := 0 to BuiltinStyleCount - 1 do
+    begin
+      StyleCache[I].Name := BuiltinStyleNames[I];
+      StyleCache[I].Description := BuiltinStyleDescs[I];
+      StyleCache[I].Path := '';
+      StyleCache[I].Plugin := '';
+      StyleCache[I].Err := '';
+      StyleCache[I].Source := ssUser;
+      StyleCache[I].Builtin := True;
+    end;
+    ScanStyleDir(StylesDirProject, ssProject, '', StyleCache);
+    for I := 0 to High(EnabledPlugins) do
+      ScanStyleDir(PluginsDir + EnabledPlugins[I] + PathDelim +
+        StylesDirName + PathDelim, ssPlugin, EnabledPlugins[I], StyleCache);
+    ScanStyleDir(StylesDirUser, ssUser, '', StyleCache);
+    { Built-ins keep the head of the list and files are sorted below them:
+      the three names that always work should not be scattered through a
+      project's own. }
+    SortStyles(StyleCache, BuiltinStyleCount);
+    StyleCacheValid := True;
+  end;
+  Result := StyleCache;
+end;
+
+procedure RefreshStyles;
+begin
+  StyleCacheValid := False;
+  SetLength(StyleCache, 0);
+end;
+
+procedure ClearStyles;
+begin
+  RefreshStyles;
+  StyleName := DefaultStyleName;
+  StylePath := '';
+  StyleSource := 'builtin';
+  StyleBody := '';
+  StyleNote_ := '';
+  StyleNoteWasCut := False;
+  StyleStartupNote_ := '';
+  StyleSize := -1;
+  StyleHash := 0;
+  StyleReloadNote_ := '';
+  { StyleProbes_ is NOT cleared here.  It is monotonic for the life of the
+    process precisely so that every assertion on it is a delta between two
+    reads a test made itself, which means no test has to restore it in a
+    finally and no test can be poisoned by another having run first. }
+end;
+
+function OutputStyleName: string;
+begin
+  Result := StyleName;
+end;
+
+function OutputStylePath: string;
+begin
+  Result := StylePath;
+end;
+
+function OutputStyleSource: string;
+begin
+  Result := StyleSource;
+end;
+
+{ Defined below, beside the read it shares with SetStyleChecked; declared here
+  because StyleNote is the one caller and StyleNote has to stay where the rest
+  of the accessors are. }
+procedure StyleRecheck; forward;
+
+function StyleNote: string;
+begin
+  { The only place the edited-file check hangs off, and deliberately the
+    narrowest one: this is the function whose result actually reaches a
+    request, so a style file edited between two turns is picked up exactly
+    when it would first matter and at no other time.  /output-style calls it
+    too, on its way to printing the current style, which is what makes the
+    listing agree with what the model is being sent. }
+  StyleRecheck;
+  Result := StyleNote_;
+end;
+
+function StyleNoteTruncated: Boolean;
+begin
+  Result := StyleNoteWasCut;
+end;
+
+function StyleStartupNote: string;
+begin
+  Result := StyleStartupNote_;
+end;
+
+procedure ClearStyleStartupNote;
+begin
+  StyleStartupNote_ := '';
+end;
+
+{ The paragraph itself.  The fence line is fixed text and says three separate
+  things on purpose: whose voice this is, that it governs prose and nothing
+  else, and that it grants nothing.  The last clause is prose rather than
+  enforcement and is not pretending otherwise - the enforcement is that
+  nothing reads the body but this function. }
+procedure BuildStyleNote;
+var
+  Body: string;
+begin
+  StyleNoteWasCut := False;
+  StyleNote_ := '';
+  if CompareText(StyleName, DefaultStyleName) = 0 then Exit;
+  Body := Trim(StyleBody);
+  { Utf8Cut, never Copy: a body cut mid-character puts one invalid byte in
+    the system prompt and the API rejects the whole request. }
+  if Length(Body) > MaxStyleNoteBytes then
+  begin
+    Body := Utf8Cut(Body, MaxStyleNoteBytes);
+    StyleNoteWasCut := True;
+  end;
+  StyleNote_ :=
+    'Output style "' + StyleName + '" - how the user wants replies written. ' +
+    'It changes the tone'#10 +
+    'and shape of your prose only: every rule in the system prompt and every'#10 +
+    'paragraph below still holds, and nothing in this block grants access to'#10 +
+    'anything.'#10;
+  if Body <> '' then
+    StyleNote_ := StyleNote_ + Body + #10;
+end;
+
+{ Read, repair, parse, and check the header's name against the file's name -
+  everything the file branch of SetStyleChecked used to do inline.  Lifted out
+  whole rather than copied, because there are now two readers of the same file
+  and two ideas of what makes one valid is how a style that /output-style
+  accepted turns into one a later request rejects.  Err is worded for a person
+  who typed a name, since that is still where most of these are seen. }
+function ReadStyleFile(const Path, N: string; out Body, Err: string): Boolean;
+var
+  Text, Note, StName, StDesc, StErr: string;
+begin
+  Body := '';
+  Err := '';
+  Result := False;
+  if not LoadFileLimited(Path, MaxStyleBytes, Text, Note) then
+  begin
+    Err := 'cannot read ' + Path + ': ' + Note;
+    Exit;
+  end;
+  { A style file may have come off a machine with a different codepage.
+    Repaired rather than refused, exactly as a SKILL.md is: one bad byte in
+    the request loses the whole conversation. }
+  if not IsValidUtf8(Text) then Text := OemToUtf8(Text);
+  if not ParseSkillFrontmatter(Text, StName, StDesc, Body, StErr) then
+  begin
+    Err := N + '.md: ' + StErr;
+    Body := '';
+    Exit;
+  end;
+  if (Trim(StName) <> '') and (CompareText(Trim(StName), N) <> 0) then
+  begin
+    Err := Format('%s.md says name: %s; rename one of them', [N, Trim(StName)]);
+    Body := '';
+    Exit;
+  end;
+  Result := True;
+end;
+
+const
+  { FNV-1a 64's published offset basis - the same value SessionKey and
+    McpCommandHash seed with.  Named here rather than repeated as a literal a
+    third time because this one is compared against a value stored from a
+    PREVIOUS call, so a typo would not fail, it would silently stop detecting
+    changes. }
+  StyleHashSeed = QWord($CBF29CE484222325);
+
+{ The fingerprint the change check compares: the size the directory reports,
+  and FNV-1a 64 over the bytes of the file.
+
+  Over the first MaxStyleBytes of them, exactly - 64 KB - because that is what
+  LoadFileLimited hands back, and this comment said "every byte" until an audit
+  caught it.  The distinction is invisible today and is written down anyway,
+  because of what makes it invisible: ReadStyleFile truncates at the SAME cap,
+  so a body cannot depend on a byte this hash never saw, and a change out past
+  65536 that also moved the length is caught by Size sitting beside the hash.
+  That is a coupling between two functions and not a property of either.  Raise
+  the cap in ReadStyleFile alone and a style file whose only edit is past 64 KB,
+  at unchanged length, stops being noticed - silently, with three documents
+  claiming it cannot happen.  Whoever raises one raises both.
+
+  Size -1 for "nothing is there",
+  which covers both a built-in (Path = '') and a file that has been deleted
+  since it was read - the caller tells those two apart by StylePath and needs
+  to, because only one of them is worth complaining about.
+
+  FindFirst is still here and still first, for the one thing a hash cannot
+  say: whether there is a file at all.  A deleted style file is worth a line
+  saying so; a file that is present but will not open is worth a different
+  one.  R.Time is not read any more - it was the two-second DOS stamp the old
+  check turned on, and the hash below is what it turns on now.
+
+  Hash 0 for a file that would not open, deliberately: it is a value the
+  content path cannot produce, since Fnv1a of the empty string is the offset
+  basis.  So a file held open by an editor moves the fingerprint once, gets
+  its complaint once, and compares equal every turn after until it becomes
+  readable again - at which point the hash moves back and the body is
+  re-read, silently, even though not one byte of it changed. }
+procedure FingerprintStyleFile(const Path: string; out Size: Int64;
+  out Hash: QWord);
+var
+  R: TSearchRec;
+  Text, Note: string;
+begin
+  { Counted before the empty-path exit below - see StyleFileProbes.  This is
+    the only line in the unit whose placement is chosen for a test, and it is
+    the placement that makes the caller's guard a testable line rather than an
+    unreachable one: if StyleRecheck stopped short-circuiting on a built-in,
+    the number would move and a Check in the smoke suite would fail. }
+  Inc(StyleProbes_);
+  Size := -1;
+  Hash := 0;
+  if Path = '' then Exit;
+  if FindFirst(Path, faAnyFile, R) <> 0 then Exit;
+  Size := R.Size;
+  SysUtils.FindClose(R);
+  if LoadFileLimited(Path, MaxStyleBytes, Text, Note) then
+    Hash := Fnv1a(Text, StyleHashSeed);
+end;
+
+function StyleFileProbes: Int64;
+begin
+  Result := StyleProbes_;
+end;
+
+{ Has the file behind the cached body changed, and if so can the new one be
+  used?  Called from StyleNote, so once per request at most.
+
+  What it deliberately does NOT do is re-resolve the name.  StylePath was
+  chosen once, by SetStyleChecked, against the project/plugin/user precedence
+  and against the source the user consented to; re-walking that here would let
+  a file dropped into a NEARER directory mid-session take over a style the
+  user picked from their own home directory, which is precisely the
+  substitution OutputStyleSource exists to prevent.  This re-reads the file
+  that was already agreed to and nothing else.
+
+  A failed re-read keeps the body that was working.  Emptying the style
+  because somebody saved a broken frontmatter would change the voice of every
+  reply from that moment on, in a way nothing on screen would explain - and
+  the old body is still exactly what the user asked for the last time the file
+  was readable.  The fingerprint is updated even on failure so the complaint
+  is made once rather than once per turn.
+
+  On a turn where something DID change the file is read twice - once here for
+  the hash, once inside ReadStyleFile to parse it - and that is deliberate.
+  ReadStyleFile stays the single definition of what a valid style file is, and
+  threading the already-read text into it would fork that definition in two to
+  save an open of a 64 KB file on the rare turn.  The window between the two
+  reads is self-correcting: a file rewritten inside it stores the hash of a
+  version that was not parsed, so the next turn sees a mismatch and converges. }
+procedure StyleRecheck;
+var
+  NewSize: Int64;
+  NewHash: QWord;
+  NewBody, Err: string;
+begin
+  { A built-in has no file, and this is the line that keeps it off the disk
+    entirely: default, explanatory and learning must not start reading
+    anything merely because file-backed styles learned to reload.  It is now
+    an assertable line rather than defence in depth - StyleFileProbes counts
+    entries to FingerprintStyleFile above that routine's own empty-path exit,
+    so deleting this Exit makes a Check in the smoke suite fail. }
+  if StylePath = '' then Exit;
+  FingerprintStyleFile(StylePath, NewSize, NewHash);
+  if (NewSize = StyleSize) and (NewHash = StyleHash) then Exit;
+  StyleSize := NewSize;
+  StyleHash := NewHash;
+  if NewSize < 0 then
+  begin
+    StyleReloadNote_ := 'output style ' + StyleName + ': ' + StylePath +
+      ' is gone; keeping the text it had';
+    Exit;
+  end;
+  if not ReadStyleFile(StylePath, StyleName, NewBody, Err) then
+  begin
+    StyleReloadNote_ := 'output style ' + StyleName + ': ' + Err +
+      '; keeping the text that was working';
+    Exit;
+  end;
+  { Silent on success, and that is the intended shape: the point of the
+    feature is that an edited file simply applies, and a line of chrome after
+    every save would make the ordinary case the noisy one. }
+  StyleBody := NewBody;
+  BuildStyleNote;
+end;
+
+function TakeStyleReloadNote: string;
+begin
+  Result := StyleReloadNote_;
+  StyleReloadNote_ := '';
+end;
+
+{ Want = '' means any source is acceptable, which is what a user typing the
+  name means.  A non-empty Want is the persisted-source check: the user
+  consented to a style from one place, and a file that appeared since in a
+  nearer place is not the thing they consented to. }
+function SetStyleChecked(const Name, Want: string; out Err: string): Boolean;
+var
+  N, Path, Src, StBody: string;
+  B, I: Integer;
+  NewSize: Int64;
+  NewHash: QWord;
+begin
+  Err := '';
+  Result := False;
+  N := Trim(Name);
+  if N = '' then N := DefaultStyleName;
+
+  NewSize := -1;
+  NewHash := 0;
+  B := BuiltinStyleIndex(N);
+  if B >= 0 then
+  begin
+    Path := '';
+    Src := 'builtin';
+    StBody := BuiltinStyleBodies[B];
+    N := BuiltinStyleNames[B];
+  end
+  else
+  begin
+    if not ValidExtensionName(N) then
+    begin
+      Err := 'not a style name: ' + N;
+      Exit;
+    end;
+    Path := ResolveStyleFile(N);
+    if Path = '' then
+    begin
+      Err := 'no style called ' + N;
+      Exit;
+    end;
+    { Fingerprinted BEFORE the read, never after: a file rewritten in the
+      window between the two would otherwise be recorded under the NEWER
+      fingerprint with the older body cached.  Under the old timestamp that
+      wedged the check permanently - a stamp cannot go backwards, so the
+      newer-stamp-older-body pairing never resolved.  Under a hash it merely
+      could not resolve on this turn, since the stored hash would be of a
+      version we did not parse and the next turn's read would differ from it
+      and converge; fingerprinting first makes even that impossible, at a cost
+      of at most one redundant re-read. }
+    FingerprintStyleFile(Path, NewSize, NewHash);
+    if not ReadStyleFile(Path, N, StBody, Err) then Exit;
+    { Which source actually answered.  Compared by path rather than re-walked,
+      so the label can never disagree with the file that was read. }
+    Src := 'user';
+    if (StylesDirProject <> '') and
+       (CompareText(Copy(Path, 1, Length(StylesDirProject)),
+                    StylesDirProject) = 0) then
+      Src := 'project'
+    else
+      for I := 0 to High(EnabledPlugins) do
+        if CompareText(Copy(Path, 1, Length(PluginsDir + EnabledPlugins[I])),
+                       PluginsDir + EnabledPlugins[I]) = 0 then
+        begin
+          Src := 'plugin:' + EnabledPlugins[I];
+          Break;
+        end;
+  end;
+
+  if (Want <> '') and (CompareText(Want, Src) <> 0) then
+  begin
+    Err := Format('%s now resolves to %s, not %s', [N, Src, Want]);
+    Exit;
+  end;
+
+  StyleName := N;
+  StylePath := Path;
+  StyleSource := Src;
+  StyleBody := StBody;
+  { Both, and both from the branch above: a built-in leaves them at -1/0,
+    which StyleRecheck never looks at because StylePath is ''.  A pending
+    complaint about the PREVIOUS style file goes too - the user has just
+    chosen a different style and a yellow line about the old one would be
+    answering a question they stopped asking. }
+  StyleSize := NewSize;
+  StyleHash := NewHash;
+  StyleReloadNote_ := '';
+  BuildStyleNote;
+  Result := True;
+end;
+
+function SetOutputStyle(const Name: string; out Err: string): Boolean;
+begin
+  Result := SetStyleChecked(Name, '', Err);
+end;
+
 { -------------------------------------------------------------- subagents -- }
 
 var
@@ -3147,6 +5638,46 @@ begin
   Result := (Name = 'read_file') or (Name = 'list_dir') or (Name = 'search');
 end;
 
+{ The plan-mode allowlist, in the same shape and for the same reason: a
+  reviewer verifies "nothing here changes anything" by reading one line.
+
+  An allowlist rather than a list of the mutating tools, because the tool set
+  is open - mcp__* names are arbitrary third-party verbs and the dynamic tool
+  source registry means new ones arrive at runtime.  A denylist would let an
+  MCP tool called create_issue straight through the moment somebody
+  configured the server; this refuses it without anybody having to think
+  about it, and refuses next year's tool by default too.
+
+  bash is refused whole.  Nothing here can tell "git status" from "del /s",
+  and a plan mode that ran shell commands it guessed were harmless would be
+  making exactly the judgement it exists to defer to the user.
+
+  fetch stays on the list because investigation needs it, and it changes
+  nothing locally - but it is an https request, so it is an observable
+  external side effect.  It still goes through Permit, so plan mode can never
+  make anything more permissive than the mode underneath it; anyone
+  uncomfortable with the exfiltration channel deletes one name here and loses
+  nothing structural.
+
+  A strict superset of IsSubagentTool, so the two boundaries compose as an
+  intersection: a subagent in plan mode has exactly the subagent's three. }
+function IsPlanTool(const Name: string): Boolean;
+begin
+  { fetch is deliberately absent.  Everything else here reads what is already
+    on this machine, which is what makes plan mode safe to enter without being
+    asked anything; an outbound HTTPS request is a side effect the user cannot
+    see and the one channel by which everything the model just read can leave.
+    A mode whose promise is "look, do not touch" cannot hold that promise and
+    also POST the tree to a URL.  Investigation that genuinely needs the
+    network is what leaving plan mode is for. }
+  Result := IsSubagentTool(Name) or (Name = 'todo_write') or
+    (Name = 'skill') or (Name = 'task') or (Name = 'bash_output');
+end;
+
+{ NormalizeRoot, deliberately: an added working directory contributes no
+  code and no configuration.  --add-dir grants file access to a directory and
+  nothing else, so generalising this to scan every root would turn it into a
+  way to make an arbitrary directory execute what it ships. }
 function AgentsDir: string;
 begin
   Result := IncludeTrailingPathDelimiter(NormalizeRoot) + StateDirName +
@@ -3286,6 +5817,13 @@ type
 
 var
   Snapshots: array of TSnapshot;
+  { The paths SnapshotFile declined for size, and nothing else about them.
+    Deliberately NOT a member of TSnapshot with an empty Text: a record in
+    the Snapshots array claiming Existed with no bytes is exactly what
+    RestoreFilesSince would write back, so /rewind would truncate a 400 KB
+    file to nothing.  A separate append-only list cannot do that, because
+    nothing reads it but the sentence that explains a missing baseline. }
+  Oversize: array of string;
   CurrentTurn: Integer = 0;
 
 procedure BeginTurn(TurnNo: Integer);
@@ -3296,6 +5834,11 @@ end;
 procedure ClearSnapshots;
 begin
   SetLength(Snapshots, 0);
+  { The record of what was skipped dies with the records of what was kept.
+    It only ever existed to explain the absence of a snapshot, so once the
+    snapshots are gone it explains nothing, and /clear and the suites need
+    nothing new to reset it. }
+  SetLength(Oversize, 0);
 end;
 
 function SnapshotCount: Integer;
@@ -3303,11 +5846,40 @@ begin
   Result := Length(Snapshots);
 end;
 
+function SnapshotLimitBytes: Integer;
+begin
+  Result := MaxReadBytes;
+end;
+
+{ CompareText, not a byte comparison, and for the same reason SessionBaseline
+  gives above: the three places that decide whether two paths are "the same
+  file" must agree, or a file would be skipped under one spelling and looked
+  up under another. }
+procedure NoteOversize(const Full: string);
+var
+  I: Integer;
+begin
+  for I := 0 to High(Oversize) do
+    if CompareText(Oversize[I], Full) = 0 then Exit;
+  SetLength(Oversize, Length(Oversize) + 1);
+  Oversize[High(Oversize)] := Full;
+end;
+
+function SnapshotSkippedOversize(const Full: string): Boolean;
+var
+  I: Integer;
+begin
+  Result := False;
+  for I := 0 to High(Oversize) do
+    if CompareText(Oversize[I], Full) = 0 then Exit(True);
+end;
+
 { Captures Full's state before its first change this turn.  Later changes in
   the same turn keep the first snapshot: rewinding lands at the turn start,
   not midway through it.  Snapshot bytes live in memory; a 400 KB cap keeps
   a huge generated file from bloating the process, at the cost of that file
-  not being rewindable - noted at restore time. }
+  not being rewindable - noted at restore time, and recorded in Oversize so
+  the caller explaining a missing baseline can name the reason. }
 procedure SnapshotFile(const Full: string);
 var
   I: Integer;
@@ -3329,7 +5901,16 @@ begin
     try
       F := TFileStream.Create(Full, fmOpenRead or fmShareDenyNone);
       try
-        if F.Size > MaxReadBytes then Exit;   { too big to hold; not rewindable }
+        if F.Size > MaxReadBytes then
+        begin
+          { Too big to hold; not rewindable - and now said so out loud.  The
+            note goes HERE and at no other Exit in this procedure: the
+            except path below is a file that could not be read at all, which
+            is a different fact, and reporting it as oversized would tell a
+            user a locked 2 KB file was over the cap. }
+          NoteOversize(Full);
+          Exit;
+        end;
         SetLength(S.Text, F.Size);
         if F.Size > 0 then F.ReadBuffer(S.Text[1], F.Size);
       finally
@@ -3341,6 +5922,29 @@ begin
   end;
   SetLength(Snapshots, Length(Snapshots) + 1);
   Snapshots[High(Snapshots)] := S;
+end;
+
+function SessionBaseline(const Full: string;
+  out Text: string; out Existed: Boolean): Boolean;
+var
+  I, Best: Integer;
+begin
+  Text := '';
+  Existed := False;
+  Best := -1;
+  { CompareText, matching SnapshotFile's own comparison: the two must agree
+    about what "the same file" means or a baseline would be found for a path
+    that never got one. }
+  for I := 0 to High(Snapshots) do
+    if CompareText(Snapshots[I].Full, Full) = 0 then
+      if (Best < 0) or (Snapshots[I].Turn < Snapshots[Best].Turn) then
+        Best := I;
+  Result := Best >= 0;
+  if Result then
+  begin
+    Text := Snapshots[Best].Text;
+    Existed := Snapshots[Best].Existed;
+  end;
 end;
 
 function RestoreFilesSince(TurnNo: Integer; out Notes: string): Integer;
@@ -3356,6 +5960,17 @@ begin
   for I := High(Snapshots) downto 0 do
   begin
     if Snapshots[I].Turn < TurnNo then Continue;
+    { A rewind writes a copy taken before the rule existed.  A rule added
+      mid-session must not be undone by restoring over the path it covers, so
+      the snapshot is skipped and said out loud - a file silently left alone
+      by a rewind reads as a broken rewind. }
+    Err := DenyPathReason(Snapshots[I].Full);
+    if Err <> '' then
+    begin
+      Notes := Notes + 'left alone ' + Rel(Snapshots[I].Full) + ': ' +
+        Err + #10;
+      Continue;
+    end;
     if Snapshots[I].Existed then
     begin
       if SaveFileText(Snapshots[I].Full, Snapshots[I].Text, Err) then
@@ -3396,7 +6011,8 @@ end;
 { ------------------------------------------------- permission persistence -- }
 
 { The file is JSON: {"allow_edits":bool,"allow_bash":bool,"allow_fetch":bool,
-  "bash_programs":["git","build",...],"trusted":{"mcp:github":"3f9a1c04..."}}.
+  "bash_programs":["git","build",...],"trusted":{"mcp:github":"3f9a1c04..."},
+  "deny":["bash:rm"],"sandbox":"low"}.
   Path is ApprovalsPath, which is outside the project: every key here answers
   "what may this project do", so a copy the project itself supplies would be
   the project answering for the user.  Deliberately not the transcript format
@@ -3407,7 +6023,50 @@ end;
   file can mean.
 
   AllowAllMcp is deliberately absent: it is set only by /yolo, and /yolo is
-  never saved at all. }
+  never saved at all.  PlanMode and BypassMode are absent for the same
+  reason and for a stronger one - a mode says what is being done right now,
+  and a file that quietly meant "and every future session" would be a wider
+  grant than the word the user typed.
+
+  allow_edits is now also what "/mode ask" writes false, and that works
+  precisely because of the only-widen rule above: the load can turn the flag
+  on from a true key but has nothing that turns it on from a false or absent
+  one, so a false written here is a durable off switch rather than a silence.
+  This is why SavePermissions must keep writing the flag's actual value.
+
+  One more key, "deny":["bash:rm",...], and it is the first with the opposite
+  polarity - it can only narrow.  It is read by LoadDenyRules, not here, and
+  for a reason worth stating: LoadDenyRules runs before print mode halts, so a
+  -p run inherits every deny rule and no grant at all.  Two readers of one
+  file, and only one of them may ever run early.  SavePermissions writes the
+  array back verbatim, including a line it could not parse, because the file
+  is hand-edited and a rule silently erased on exit is worse than one that
+  never worked.
+
+  And one more, "sandbox":"low", which is the third polarity: it can only
+  raise.  Every other key in this file is about what may be ALLOWED, so the
+  safe direction for a stale file is to grant less; the sandbox is about what
+  is FORBIDDEN, so the safe direction there is to forbid more.  Hence 'low'
+  loads and 'off' does not exist - it is never written and never read, which
+  is what makes it impossible for anything on disk to be the reason the
+  sandbox is not running.
+
+  And a fourth polarity, "output_style":"explanatory" with
+  "output_style_source":"user": neither widening nor narrowing, it selects
+  prose.  It is here rather than in the project because a repository that
+  could pick its own text for the system prompt has not been asked anything -
+  the same reason the trust store is here - and it is a name rather than a
+  body because the file must stay small enough to hand-edit.  An unresolvable
+  name, or one that now resolves somewhere other than the recorded source,
+  loads as the default with a note.  Nothing in either key can grant anything:
+  see StyleNote, whose one caller is a string concatenation.
+
+  Additional working directories are deliberately NOT stored here either, and
+  the only-widen rule is again the reason: a persisted root would be a grant
+  no later session could revoke by any means the file offers, and a clone
+  that shipped one would have widened the path guard by existing.  A root
+  comes from argv or from a typed /add-dir, lasts the session, and is
+  re-stated next time. }
 procedure LoadPermissions(const Path: string);
 var
   F: TFileStream;
@@ -3445,6 +6104,37 @@ begin
     if (Progs <> nil) and (Progs.Kind = jkObj) then
       for I := 0 to Progs.Count - 1 do
         RecordTrust(Progs.Key(I), Progs.Item(I).AsString);
+    { "sandbox", and it raises only.  The mirror image of the only-widen rule
+      above, pointing the other way because the sandbox is a restriction
+      rather than a grant: 'low' can turn confinement on, and no value here
+      can ever turn it off - 'off' is never written and, as the comparison
+      shows, never read.  So a stale file, a corrupt one or a hostile one can
+      never be the reason the sandbox is not running.  A non-string, a null or
+      an array all read as '' and change nothing. }
+    if (Root.Str('sandbox') = 'low') and
+       (uSandbox.SandboxLevel < slLow) then
+      uSandbox.SandboxLevel := slLow;
+    { "output_style", and it is the fourth polarity: it neither widens nor
+      narrows anything, it selects prose.  Nothing reads the body but one
+      concatenation in StyleNote and no frontmatter key maps to a setting, so
+      the failure modes worth guarding are about honesty rather than about
+      grants: a name that no longer resolves loads as the default with a note,
+      never as an error - aborting here would take the deny array and the
+      sandbox level down with it.
+
+      The source is persisted beside the name and checked, because the name
+      alone is not what the user consented to.  A user typing "explanatory"
+      when it resolved to their own home directory has not agreed to a
+      styles\explanatory.md the project created afterwards, and project wins
+      the precedence.  A mismatch falls back to the default and says so. }
+    StyleStartupNote_ := '';
+    Progs := Root.Find('output_style');
+    if (Progs <> nil) and (Trim(Progs.AsString) <> '') and
+       (CompareText(Trim(Progs.AsString), DefaultStyleName) <> 0) then
+      if not SetStyleChecked(Trim(Progs.AsString),
+           Trim(Root.Str('output_style_source')), StyleStartupNote_) then
+        StyleStartupNote_ := 'output style: ' + StyleStartupNote_ +
+          '; using ' + DefaultStyleName;
   finally
     Root.Free;
   end;
@@ -3470,6 +6160,28 @@ begin
     for I := 0 to High(Trusted) do
       Progs.AddStr(Trusted[I].Key, Trusted[I].Fingerprint);
     Root.Add('trusted', Progs);
+    { Verbatim from what was loaded, unparseable lines included.  This unit
+      never adds to this array - /deny writes the global file - so writing
+      back exactly what was read is the whole contract. }
+    Progs := TJson.NewArr;
+    for I := 0 to High(RootDenyRaw) do
+      Progs.Push(TJson.NewStr(RootDenyRaw[I]));
+    Root.Add('deny', Progs);
+    { Written only for 'low', never for 'off' and never for the default.  A
+      file that could say off would be a file that could switch the sandbox
+      off, which is the one thing this key must not be able to do. }
+    if uSandbox.SandboxLevel = slLow then
+      Root.AddStr('sandbox', 'low');
+    { Absent for the default style, so a user who never types the command
+      keeps the file they had.  The name and not the text: the file is
+      hand-editable state and a style body pasted into it would be neither
+      readable nor answerable to the question "where did this come from",
+      which the recorded source and the startup line do answer. }
+    if CompareText(StyleName, DefaultStyleName) <> 0 then
+    begin
+      Root.AddStr('output_style', StyleName);
+      Root.AddStr('output_style_source', StyleSource);
+    end;
     Text := Root.ToJson;
   finally
     Root.Free;
@@ -3582,6 +6294,8 @@ begin
   P.Add('pattern', StrProp('Text to find. A case-insensitive substring ' +
     'unless regex is true.'));
   P.Add('glob', StrProp('Optional filename filter, e.g. ".pas" or "test".'));
+  P.Add('path', StrProp('Optional directory to search, instead of every ' +
+    'working directory.'));
   P.Add('regex', BoolProp('Treat pattern as a regular expression: . * + ? ' +
     'repeat counts, [a-z], \d \w \s \b ^ $ | and (groups). ASCII byte ' +
     'semantics; no backreferences or lookaround.'));
@@ -3594,8 +6308,10 @@ begin
       'Default 8.');
   end;
   Result.Push(MakeTool('search',
-    'Search file contents under the session root. Returns path:line: text. ' +
-    'Set regex for pattern syntax.',
+    'Search file contents under the session root, and under any additional ' +
+    'working directory. Returns path:line: text; a result outside the ' +
+    'session root is shown as an absolute path and must be given back as ' +
+    'one. Set regex for pattern syntax.',
     P, ['pattern']));
 
   { The cut is made here rather than by filtering afterwards so a subagent is
@@ -3999,14 +6715,210 @@ begin
   Result := True;
 end;
 
+{ ---------------------------------------------------- permission modes -- }
+
+{ Accept-edits IS AllowAllEdits.  Not a new variable beside it: that flag
+  already means "the edits class is pre-approved", already persists and
+  already has the pmAllowAlways widening path, and around sixty places set it
+  directly to suppress prompts.  What it lacked was a name, an off switch and
+  an indicator, and those three things are the whole of this feature.  A
+  parallel mode boolean would create a state where the mode says ask and the
+  flag says allow, with no way for the user to tell which one the gate
+  believed. }
+procedure SetPermMode(M: TPermMode);
+begin
+  case M of
+    { Everything else untouched, so leaving plan mode returns the session to
+      the gate state it had rather than to a state the mode invented. }
+    pmodePlan: PlanMode := True;
+    pmodeAsk:
+      begin
+        PlanMode := False;
+        BypassMode := False;
+        { "Ask" on screen has to mean you will be asked, so the four class
+          blankets go.  Deliberately NOT the bash prefix table or the trust
+          store: those are narrow grants that each named the thing they
+          covered - a program, a server - and revoking them is not what the
+          user asked for.  /mode reports their counts instead. }
+        AllowAllEdits := False;
+        AllowAllBash := False;
+        AllowAllFetch := False;
+        AllowAllMcp := False;
+      end;
+    pmodeAcceptEdits:
+      begin
+        PlanMode := False;
+        BypassMode := False;
+        AllowAllBash := False;
+        AllowAllFetch := False;
+        AllowAllMcp := False;
+        AllowAllEdits := True;
+      end;
+    pmodeBypass:
+      begin
+        { Plan is cleared because bypass is a deliberate answer to "stop
+          asking", and a session that stayed in plan would refuse everything
+          while claiming to approve everything. }
+        PlanMode := False;
+        { Note what this does NOT do: it sets none of the four
+          persisted-shaped flags.  Bypass therefore touches zero persisted
+          state, and "yolo never persists" stops depending on the host
+          remembering to skip the save at shutdown - that suppression stays,
+          as a second line. }
+        BypassMode := True;
+      end;
+  end;
+end;
+
+function CurrentPermMode: TPermMode;
+begin
+  { Plan first: it is a boundary and it beats bypass. }
+  if PlanMode then Result := pmodePlan
+  else if BypassMode then Result := pmodeBypass
+  else if AllowAllEdits then Result := pmodeAcceptEdits
+  else Result := pmodeAsk;
+end;
+
+function PermModeName(M: TPermMode): string;
+begin
+  case M of
+    pmodePlan: Result := 'plan';
+    pmodeAcceptEdits: Result := 'accept-edits';
+    pmodeBypass: Result := 'bypass';
+  else
+    Result := 'ask';
+  end;
+end;
+
+function PermModeParse(const S: string; out M: TPermMode): Boolean;
+var
+  N: string;
+begin
+  M := pmodeAsk;
+  N := LowerCase(Trim(S));
+  Result := True;
+  if N = 'ask' then M := pmodeAsk
+  else if N = 'plan' then M := pmodePlan
+  else if N = 'accept-edits' then M := pmodeAcceptEdits
+  { 'bypass' and 'yolo' are refused here rather than accepted quietly.  The
+    mode is reachable, but only by typing --dangerously-skip-permissions or
+    /yolo: a mild spelling for the dangerous mode is how it gets into a
+    script somebody skim-read. }
+  else Result := False;
+end;
+
+function PermModeNote: string;
+begin
+  Result := '';
+  if not PlanMode then Exit;
+  Result :=
+    'This session is in plan mode. Investigate as much as you like: '#10 +
+    'read_file, list_dir, search, task and bash_output all work, '#10 +
+    'and todo_write is there for your own notes. Every call that would '#10 +
+    'change anything, or reach off this machine, is refused while plan '#10 +
+    'mode is on - write_file, edit_file, notebook_edit, bash, kill_bash, '#10 +
+    'fetch, and every tool an MCP '#10 +
+    'server contributed. Do not retry a refused call and do not ask to be '#10 +
+    'let out mid-turn: only the user can leave plan mode. End your turn by '#10 +
+    'saying what you would do and why, and stop there.'#10;
+end;
+
+function PlanRefusal(const Name: string): string;
+begin
+  { One ASCII sentence naming the mode, the reason and the way out, because a
+    refusal the model cannot act on costs a turn of retries. }
+  Result := 'plan mode: nothing may change yet. Say what you would do and ' +
+    'stop; only the user leaves plan mode (/mode). Refused: ' + Name;
+end;
+
+function PermModeReachableUnderPrint(M: TPermMode; HasDriver: Boolean): Boolean;
+begin
+  case M of
+    { The default, and it denies everything gated: -p leaves Ask nil. }
+    pmodeAsk: Result := True;
+    { Strictly stricter than the default. }
+    pmodePlan: Result := True;
+    { "Stop asking me" presupposes a me.  With a stream-json driver on stdin
+      there is one; without, the honest spelling of "no human, do it anyway"
+      is the dangerous flag, and silently downgrading to ask would leave a
+      script believing it had asked for something it did not get. }
+    pmodeAcceptEdits: Result := HasDriver;
+    { Reachable, and the single largest weakening in this round: it is the
+      only thing here a CI system can use.  It costs the literal string
+      --dangerously-skip-permissions and a warning on stderr. }
+    pmodeBypass: Result := True;
+  else
+    Result := False;
+  end;
+end;
+
+function PermGrantSummary: string;
+var
+  I, Progs, Trust: Integer;
+begin
+  { Everything a mode word does not cover.  AllowAllEdits is absent on
+    purpose: it IS the accept-edits word, so naming it here would make the
+    prompt read "accept-edits+" forever and the suffix would stop meaning
+    anything. }
+  Result := '';
+  if AllowAllBash then Result := Result + ', bash';
+  if AllowAllFetch then Result := Result + ', fetch';
+  if AllowAllMcp then Result := Result + ', mcp tools';
+  Progs := Length(BashPrefixes);
+  if Progs > 0 then
+    Result := Result + Format(', %d approved bash program(s)', [Progs]);
+  Trust := 0;
+  for I := 0 to High(Trusted) do
+    if Copy(Trusted[I].Key, 1, 9) = 'mcp-call:' then Inc(Trust);
+  if Trust > 0 then
+    Result := Result + Format(', %d trusted mcp server(s)', [Trust]);
+  if Result <> '' then Delete(Result, 1, 2);
+end;
+
+function PermModeIndicator: string;
+begin
+  Result := PermModeName(CurrentPermMode);
+  { A pointer to /mode, not information: no suffix can render every
+    combination of standing grants, and one that tried would be read as
+    complete.  It says only "the word understates this". }
+  if PermGrantSummary <> '' then Result := Result + '+';
+end;
+
+function PermModeBanner: string;
+begin
+  Result := '';
+  if (CurrentPermMode = pmodeAsk) and (PermGrantSummary = '') then Exit;
+  Result := 'mode: ' + PermModeName(CurrentPermMode);
+  if PermGrantSummary <> '' then
+    Result := Result + ' (also standing: ' + PermGrantSummary + ')';
+  Result := Result + '  -  /mode ask to be asked again';
+end;
+
 function Permit(const Name, Detail: string; Ask: TAskProc): Boolean;
 var
   IsBash, IsFetch, IsMcp: Boolean;
   A: TPermission;
 begin
+  { [DENY] first, before anything can short-circuit past it.  RunTool already
+    refused this call, so nothing reaches here - the line exists so a reader
+    of the predicate sees deny-first without having to trust the caller, and
+    so a fifth entry point added later cannot be talked into a yes.  Any new
+    gate opens with this line and PermitBash's pair of them; that is a
+    copy-paste rule on purpose, not a memory test. }
+  if DenyToolReason(Name) <> '' then Exit(False);
+
   IsBash := Name = 'bash';
   IsFetch := Name = 'fetch';
   IsMcp := Copy(Name, 1, Length(McpNamePrefix)) = McpNamePrefix;
+
+  { The one line in this function that is not about a class, which is why it
+    is not down among them.  Set only by /yolo or by
+    --dangerously-skip-permissions, and BELOW the deny line above, which is
+    the cheapest available proof that no mode reaches around a deny rule: the
+    two decisions are not even in the same paragraph.  Plan mode is not
+    checked here at all - it was enforced in RunTool before this function was
+    reached, which is exactly why it beats this line. }
+  if BypassMode then Exit(True);
 
   if IsBash and AllowAllBash then Exit(True);
   if IsFetch and AllowAllFetch then Exit(True);
@@ -4056,12 +6968,33 @@ end;
 { The bash gate.  "Always" for a shell command approves its program, not
   every future command: the user who said always to "git status" meant git,
   and quietly extending that to "del /s" is how trust gets spent.  /yolo
-  still approves everything through AllowAllBash. }
+  still approves everything through AllowAllBash.
+
+  uSandbox.SandboxLevel is NOT read here, and must never be - not to reach a
+  decision, and not even to decorate Detail.  A sandboxed command faces this
+  function in the identical order with the identical question.  The reason is
+  a measurement rather than a principle: a probe ran "dir %USERPROFILE%",
+  "type .gitconfig" and an HTTPS request under low integrity and all three
+  exited 0, so a confined command can still read every credential on the
+  machine and send it anywhere.  A boundary that stops writes and stops
+  nothing else cannot buy an approval discount, and a level shown at approval
+  time would only invite "it's sandboxed, so yes". }
 function PermitBash(const Cmd, Detail: string; Ask: TAskProc): Boolean;
 var
   A: TPermission;
   P: string;
 begin
+  { [DENY], the pair of them, commented with the line at the top of Permit.
+    The program name is an argument here rather than a tool name, so it needs
+    its own read - above AllowAllBash and above the prefix table, which is
+    what makes a deny rule beat both /yolo and a persisted "always". }
+  if DenyToolReason('bash') <> '' then Exit(False);
+  if DenyBashReason(Cmd) <> '' then Exit(False);
+
+  { Below the deny pair and above everything else, commented with the same
+    line in Permit. }
+  if BypassMode then Exit(True);
+
   if AllowAllBash then Exit(True);
   if BashPrefixAllowed(Cmd) then Exit(True);
   if Ask = nil then Exit(False);
@@ -4163,8 +7096,12 @@ var
 begin
   Detail := DescribeTool(Name, Input);
   { The diff is only built when someone is actually going to be asked, since
-    reading and diffing the file is pure waste under /yolo. }
-  if Assigned(Ask) and not (AllowAllEdits or ((Name = 'bash') and AllowAllBash)) then
+    reading and diffing the file is pure waste under /yolo.  Bypass needs its
+    own term now that it no longer sets AllowAllEdits: without it, the mode
+    whose whole point is not asking would be the one paying for a diff nobody
+    will read. }
+  if Assigned(Ask) and not BypassMode and
+     not (AllowAllEdits or ((Name = 'bash') and AllowAllBash)) then
   begin
     Preview := ChangePreview(Name, Input);
     if Preview <> '' then
@@ -4186,12 +7123,24 @@ type
     Decl: string;   { the validated declaration, as text }
   end;
 
+  { Which file named the program.  It decides three things and nothing else:
+    whether the spawn prompt is asked, which cache file the tool list goes to,
+    and who wins a name collision. }
+  TMcpScope = (msProject, msUser);
+
   TMcpServerRec = record
     Name, Command, Hash, WorkDir, Transport: string;
     Note, LastErr, ErrLog: string;
+    { The HTTP half.  Http is the discriminator and the other two are only
+      meaningful under it; Command still carries the URL as its display string,
+      so every panel, cache key and notice that already reads Command to say
+      what a server IS keeps working without a branch. }
+    Http: Boolean;
+    Url, Headers: string;
     EnvPairs: array of string;
     TimeoutMs: Integer;
     Status: TMcpStatus;
+    Scope: TMcpScope;
     Approved: Boolean;
     Conn: Integer;
     Skipped: Integer;
@@ -4205,6 +7154,10 @@ var
     than describe the configuration. }
   McpBudgetDropped: Integer = 0;
 
+{ NormalizeRoot, deliberately: an added working directory contributes no
+  code and no configuration.  --add-dir grants file access to a directory and
+  nothing else, so generalising this to scan every root would turn it into a
+  way to make an arbitrary directory execute what it ships. }
 function McpConfigPath: string;
 begin
   Result := IncludeTrailingPathDelimiter(NormalizeRoot) + '.mcp.json';
@@ -4218,13 +7171,71 @@ end;
 function McpDir: string;
 begin
   Result := IncludeTrailingPathDelimiter(NormalizeRoot) + StateDirName +
-    PathDelim + 'mcp' + PathDelim;
+    PathDelim + UserMcpSpoolDirName + PathDelim;
 end;
 
 function McpCachePath: string;
 begin
   Result := IncludeTrailingPathDelimiter(NormalizeRoot) + StateDirName +
     PathDelim + 'mcp-cache.json';
+end;
+
+function UserMcpConfigPath: string;
+var
+  Home: string;
+begin
+  Result := '';
+  { SysUtils. qualified for the same reason ApprovalsPath and SkillsDirUser do
+    it: the Windows unit has a raw API of this name in scope here. }
+  Home := Trim(SysUtils.GetEnvironmentVariable('USERPROFILE'));
+  if Home = '' then Exit;
+  Result := IncludeTrailingPathDelimiter(Home) + StateDirName + PathDelim +
+    UserMcpFileName;
+end;
+
+{ Out of the project on purpose, and the argument is ApprovalsPath's: user-scope
+  state kept in a project directory is a file the project can write, and this
+  one is read back as tool declarations for a server that is approved by
+  construction. }
+function UserMcpCachePath: string;
+var
+  Home: string;
+begin
+  Result := '';
+  Home := Trim(SysUtils.GetEnvironmentVariable('LOCALAPPDATA'));
+  if Home = '' then
+    Home := Trim(SysUtils.GetEnvironmentVariable('USERPROFILE'));
+  if Home = '' then Exit;
+  Result := IncludeTrailingPathDelimiter(Home) + 'pasclaude' + PathDelim +
+    'mcp-cache.json';
+end;
+
+{ Deliberately line-for-line UserMcpCachePath above, down to the LOCALAPPDATA
+  first and the bare 'pasclaude' literal - the same spelling GlobalDenyPath and
+  ApprovalsPath use, rather than a fourth word for one directory.  The long
+  argument for the home it picks is in the interface. }
+function UserMcpSpoolDir: string;
+var
+  Home: string;
+begin
+  Result := '';
+  Home := Trim(SysUtils.GetEnvironmentVariable('LOCALAPPDATA'));
+  if Home = '' then
+    Home := Trim(SysUtils.GetEnvironmentVariable('USERPROFILE'));
+  if Home = '' then Exit;
+  Result := IncludeTrailingPathDelimiter(Home) + 'pasclaude' + PathDelim +
+    UserMcpSpoolDirName + PathDelim;
+end;
+
+function UserMcpSpoolPath(const Name: string): string;
+begin
+  Result := UserMcpSpoolDir;
+  if Result = '' then Exit;
+  { Name leads and the session key trails, which is the whole reason for the
+    ordering: one listing of this directory groups every project's copy of your
+    server together, and grouping by server is the question the user was asking
+    when they went looking for the file at all. }
+  Result := Result + Name + '-' + SessionKey + McpSpoolExt;
 end;
 
 function McpFind(const Name: string): Integer;
@@ -4259,18 +7270,66 @@ begin
   Result := Length(McpServers[I].Tools);
 end;
 
+function McpScopeName(S: TMcpScope): string;
+begin
+  if S = msUser then Result := 'user' else Result := 'project';
+end;
+
+function McpServerScope(const Name: string): string;
+var
+  I: Integer;
+begin
+  I := McpFind(Name);
+  if I < 0 then Exit('');
+  Result := McpScopeName(McpServers[I].Scope);
+end;
+
+function McpServerApproved(const Name: string): Boolean;
+var
+  I: Integer;
+begin
+  I := McpFind(Name);
+  if I < 0 then Exit(False);
+  Result := McpServers[I].Approved;
+end;
+
+function McpServerErrLog(const Name: string): string;
+var
+  I: Integer;
+begin
+  I := McpFind(Name);
+  if I < 0 then Exit('');
+  Result := McpServers[I].ErrLog;
+end;
+
 function McpStatusWord(S: TMcpStatus): string;
 begin
   case S of
     mcPending:     Result := 'pending approval';
     mcDenied:      Result := 'denied';
-    mcUnsupported: Result := 'unsupported transport (stdio only)';
+    mcUnsupported: Result := 'unsupported';
     mcCached:      Result := 'cached, connects on first use';
     mcConnected:   Result := 'connected';
     mcDead:        Result := 'dead';
   else
     Result := 'failed to start';
   end;
+end;
+
+{ Every sentence in this unit that says "stderr: " follows it with this, never
+  with ErrLog itself.  A spool path is now allowed to be '', and three format
+  strings that would each have rendered "stderr: )" - a sentence that stops
+  dead exactly where the answer was meant to be - are three places a reader
+  would conclude the program had lost track of its own file.  Sited beside
+  McpStatusWord rather than beside McpServerList, its notional home, only
+  because two of the three callers are McpRun and Pascal wants it declared
+  first. }
+function McpErrLogWord(const P: string): string;
+begin
+  if P = '' then
+    Result := 'discarded, no LOCALAPPDATA or USERPROFILE to keep it in'
+  else
+    Result := P;
 end;
 
 procedure ClearMcpServers;
@@ -4581,27 +7640,33 @@ begin
   S := S + Reason;
 end;
 
-function LoadMcpConfig(const Path: string; out Err: string): Boolean;
+{ One file into the shared table, without clearing it.  Label_ is what every
+  sentence in Err names itself by: ExtractFileName for the project's file and
+  the FULL PATH for the user's, so 'mcp.json' and '.mcp.json' are never
+  confusable in a line somebody has to act on.  Once two files write into one
+  Err string, a complaint that does not name its file is a complaint nobody can
+  fix - and NoteReason's own dedupe would otherwise swallow the second file's
+  identical wording and leave the user looking in the wrong place. }
+function MergeMcpConfig(const Path, Label_: string; Scope: TMcpScope;
+  var Err: string): Integer;
 var
   F: TFileStream;
-  Text, Name, Cmd, PErr: string;
+  Text, Name, Cmd, PErr, HdrName, HdrVal: string;
   Root, Servers, S, A, E: TJson;
-  I, J: Integer;
+  I, J, Held: Integer;
   Args: array of string;
   Rec: TMcpServerRec;
 begin
-  Err := '';
-  Result := False;
-  ClearMcpServers;
-  if not FileExists(Path) then Exit;
+  Result := 0;
+  if (Path = '') or not FileExists(Path) then Exit;
   Text := '';
   try
     F := TFileStream.Create(Path, fmOpenRead or fmShareDenyNone);
     try
       if F.Size > McpMaxConfigBytes then
       begin
-        Err := Format('%s is %d bytes; that is not a configuration',
-          [ExtractFileName(Path), F.Size]);
+        NoteReason(Err, Format('%s is %d bytes; that is not a configuration',
+          [Label_, F.Size]));
         Exit;
       end;
       SetLength(Text, F.Size);
@@ -4612,7 +7677,7 @@ begin
   except
     on Ex: Exception do
     begin
-      Err := 'cannot read ' + ExtractFileName(Path) + ': ' + Ex.Message;
+      NoteReason(Err, 'cannot read ' + Label_ + ': ' + Ex.Message);
       Exit;
     end;
   end;
@@ -4620,14 +7685,14 @@ begin
   Root := JsonParse(Text, PErr);
   if Root = nil then
   begin
-    Err := ExtractFileName(Path) + ' is not valid JSON: ' + PErr;
+    NoteReason(Err, Label_ + ' is not valid JSON: ' + PErr);
     Exit;
   end;
   try
     Servers := Root.Find('mcpServers');
     if (Servers = nil) or (Servers.Kind <> jkObj) then
     begin
-      Err := ExtractFileName(Path) + ' has no mcpServers object';
+      NoteReason(Err, Label_ + ' has no mcpServers object');
       Exit;
     end;
     for I := 0 to Servers.Count - 1 do
@@ -4636,49 +7701,202 @@ begin
       S := Servers.Item(I);
       if not ValidServerName(Name) then
       begin
-        NoteReason(Err, 'refused a server whose name is not a bare name');
+        NoteReason(Err, Label_ + ': refused a server whose name is not a bare name');
         Continue;
       end;
-      if McpFind(Name) >= 0 then
+      Held := McpFind(Name);
+      if Held >= 0 then
       begin
-        NoteReason(Err, 'refused a duplicate server name');
+        { The user wins, and this is the one place in the program where the
+          nearer-wins rule that resolves skills, styles, commands and agents is
+          deliberately inverted.  Those four resolve INERT TEXT; this one
+          resolves A PROGRAM TO SPAWN.  Under project-wins a repository could
+          name its server 'github', displace the user's, and inherit the
+          model's whole session habit of calling mcp__github__* - and the fresh
+          spawn prompt is no defence, because the question it asks ("may this
+          run") is not the question that went wrong ("whose program is this").
+          The refusal is named rather than silent so the collision is something
+          the user can act on. }
+        if (McpServers[Held].Scope = msUser) and (Scope = msProject) then
+          NoteReason(Err, Label_ + ': refused "' + Name + '" - a server in ' +
+            'your own ' + UserMcpFileName + ' already has that name')
+        else
+          NoteReason(Err, Label_ + ': refused a duplicate server name');
         Continue;
       end;
       if (S = nil) or (S.Kind <> jkObj) then
       begin
-        NoteReason(Err, 'refused a server entry that is not an object');
+        NoteReason(Err, Label_ + ': refused a server entry that is not an object');
         Continue;
       end;
 
+      Rec.Scope := Scope;
       Rec.Name := Name;
       Rec.Note := '';
       Rec.LastErr := '';
       Rec.Hash := '';
       Rec.WorkDir := NormalizeRoot;
-      Rec.ErrLog := McpDir + Name + '.err';
+      { Scope decides where the stderr goes, and the three levels that make the
+        path unambiguous are all here.
+
+        SCOPE picks the root.  A user server is the user's and follows them
+        between projects, so its spool follows too, out to
+        %LOCALAPPDATA%\pasclaude\mcp\ - which also stops it writing diagnostics
+        into whatever repository the user happened to open today.  A project
+        server was chosen by the repository and its spool stays in the
+        repository's own .pasclaude\mcp\, deliberately unmoved: that is where
+        that project's state already lives, and moving it would key one more
+        thing on the session for no argument at all.  The two roots also mean a
+        project 'github' and a user 'github' can never name one file, even
+        though only one of them can be live at a time - MergeMcpConfig above
+        refuses the collision.
+
+        THE NAME is the leaf, and it is a bare name by then: ValidServerName
+        has already refused anything path-bearing.  It has NOT refused every
+        character Windows dislikes in a filename, so a server called a*b builds
+        a path CreateFile will fail on - the same hole project scope has always
+        had, now reachable from a file in the user's own home.  The name filter
+        is the guard and it is narrower than the filesystem's.
+
+        THE SESSION KEY distinguishes two PROJECTS running the same user
+        server, and it is not tidiness.  uMcp opens this file CREATE_ALWAYS, so
+        one shared file would mean whichever project started second truncating
+        the first mid-write, with the two children then scribbling over each
+        other at independent file offsets - a corruption bug traded for a
+        placement one.
+
+        Projects and not sessions, and the name is the trap: SessionKey is a
+        pure function of the primary root (the leaf plus a hash of the
+        normalised path) with no pid, clock or per-process part in it, so two
+        pasclaude windows open on the SAME directory compute the same leaf and
+        DO still share one spool, second truncating first.  This comment used
+        to claim that case was designed out.  It is not, it never was, and it
+        is not a regression either - the in-project path it replaced collided
+        in exactly the same way - but a key that fixes one collision must not
+        be described as fixing both.  Adding the pid would fix it and is
+        refused for a reason: the file's whole value is that it is still there
+        after the server died and you went looking for what it said, and a
+        name nobody can predict is a file nobody finds.
+
+        '' when there is no home at all.  McpSpawn routes an empty path to NUL:
+        the stderr is discarded and the server starts normally.  Never a
+        fallback into the project, which would restore precisely the thing this
+        branch exists to stop. }
+      if Scope = msUser then Rec.ErrLog := UserMcpSpoolPath(Name)
+      else Rec.ErrLog := McpDir + Name + McpSpoolExt;
       Rec.Status := mcPending;
       Rec.Approved := False;
       Rec.Conn := -1;
       Rec.Skipped := 0;
       SetLength(Rec.Tools, 0);
       SetLength(Rec.EnvPairs, 0);
+      { Rec is one local reused for every entry in the file, so a field added
+        to it has to be cleared HERE or it carries over.  Http carrying over is
+        not a cosmetic bug: the entry after a url server would be sent down the
+        HTTP connect path with no url, and the first version of this shipped
+        exactly that - every stdio server in the suite failed to connect,
+        because a local record's Boolean starts as whatever was on the stack. }
+      Rec.Http := False;
+      Rec.Url := '';
+      Rec.Headers := '';
       Rec.TimeoutMs := Round(S.Num('timeoutMs', uMcp.McpCallMs));
       if Rec.TimeoutMs < 1000 then Rec.TimeoutMs := 1000;
       if Rec.TimeoutMs > 600000 then Rec.TimeoutMs := 600000;
 
       Rec.Transport := LowerCase(Trim(S.Str('type')));
       if Rec.Transport = '' then Rec.Transport := 'stdio';
-      { Listed, never silently dropped.  A user who wrote an http entry and
-        saw nothing at all would conclude the feature is broken rather than
-        that this build does not speak that transport. }
+
+      { A url entry.  Two answers, and which one you get depends entirely on
+        WHOSE FILE IT IS - the same asymmetry the spawn prompt already draws,
+        pushed to its conclusion for a transport where the risk is larger.
+
+        USER SCOPE: a real server.  You named a host, and a host you named is
+        no more of a grant than a program you named; McpApproveAll already
+        approves your own servers without a question, and the per-call gate is
+        untouched.
+
+        PROJECT SCOPE: refused by name, and this is the one place a project
+        entry is refused where the stdio equivalent would merely have prompted.
+        The reason is that the prompt cannot carry the question.  For a
+        program, the prompt shows a command line and "may this repository run
+        this" is answerable by looking at it.  For a URL, the thing being
+        granted is that every argument the model passes to that tool - file
+        contents, paths, whatever it read on your machine - is posted to a host
+        the REPOSITORY chose, and no prompt showing a URL asks that question in
+        a form anybody can weigh.  A stdio server from a project can at least
+        be read before it runs; a remote one cannot be read at all.
+        Deliberately not softened to a loopback exception either: 127.0.0.1 in
+        a repository's .mcp.json is a port on YOUR machine that the repository
+        picked, and "it is only local" is exactly the sentence that makes that
+        sound safe. }
       if (S.Find('url') <> nil) or (Rec.Transport <> 'stdio') then
       begin
-        Rec.Status := mcUnsupported;
-        Rec.Command := Trim(S.Str('url'));
+        Rec.Url := Trim(McpExpandVars(S.Str('url')));
+        Rec.Command := Rec.Url;
         if Rec.Command = '' then Rec.Command := Trim(S.Str('command'));
-        Rec.Note := 'this build speaks stdio only';
+
+        if Scope <> msUser then
+        begin
+          Rec.Status := mcUnsupported;
+          Rec.Note := 'a url server may only be declared in your own ' +
+            'mcp.json, never a project''s';
+          SetLength(McpServers, Length(McpServers) + 1);
+          McpServers[High(McpServers)] := Rec;
+          Inc(Result);
+          Continue;
+        end;
+
+        if (Rec.Transport <> 'stdio') and (Rec.Transport <> 'http') and
+           (Rec.Transport <> 'streamable-http') then
+        begin
+          Rec.Status := mcUnsupported;
+          Rec.Note := 'unsupported transport "' + Rec.Transport +
+            '"; this build speaks stdio and streamable http';
+          SetLength(McpServers, Length(McpServers) + 1);
+          McpServers[High(McpServers)] := Rec;
+          Inc(Result);
+          Continue;
+        end;
+
+        if Rec.Url = '' then
+        begin
+          NoteReason(Err, Label_ + ': refused an http server with no url');
+          Continue;
+        end;
+
+        { Headers, expanded like everything else so ${TOKEN} works, and
+          composed into the CRLF block uMcp passes through verbatim.  A name or
+          a value carrying CR or LF is dropped rather than cut: a header value
+          with a newline in it is header injection, and this is the one place
+          a file the user wrote meets a request this program composes. }
+        E := S.Find('headers');
+        if (E <> nil) and (E.Kind = jkObj) then
+          for J := 0 to E.Count - 1 do
+          begin
+            HdrName := Trim(E.Key(J));
+            HdrVal := Trim(McpExpandVars(E.Item(J).AsString));
+            if (HdrName = '') or (Pos(#13, HdrName) > 0) or
+               (Pos(#10, HdrName) > 0) or (Pos(':', HdrName) > 0) or
+               (Pos(#13, HdrVal) > 0) or (Pos(#10, HdrVal) > 0) then
+            begin
+              NoteReason(Err, Label_ + ': dropped a header that cannot be ' +
+                'sent (' + HdrName + ')');
+              Continue;
+            end;
+            if Rec.Headers <> '' then Rec.Headers := Rec.Headers + #13#10;
+            Rec.Headers := Rec.Headers + HdrName + ': ' + HdrVal;
+          end;
+
+        Rec.Http := True;
+        { No hash, and that is not an omission.  A fingerprint exists so an
+          "always" can be revoked when the thing it covered changes, and a
+          user-scope server is never prompted for in the first place - so there
+          is nothing for a hash to protect.  A project-scope url never reaches
+          here to need one. }
+        Rec.Hash := '';
         SetLength(McpServers, Length(McpServers) + 1);
         McpServers[High(McpServers)] := Rec;
+        Inc(Result);
         Continue;
       end;
 
@@ -4688,7 +7906,7 @@ begin
       Cmd := Trim(McpExpandVars(S.Str('command')));
       if Cmd = '' then
       begin
-        NoteReason(Err, 'refused a server with no command');
+        NoteReason(Err, Label_ + ': refused a server with no command');
         Continue;
       end;
 
@@ -4720,24 +7938,65 @@ begin
 
       SetLength(McpServers, Length(McpServers) + 1);
       McpServers[High(McpServers)] := Rec;
+      Inc(Result);
     end;
   finally
     Root.Free;
   end;
+end;
+
+function LoadMcpConfig(const Path: string; out Err: string): Boolean;
+begin
+  Err := '';
+  ClearMcpServers;
+  MergeMcpConfig(Path, ExtractFileName(Path), msProject, Err);
+  Result := Length(McpServers) > 0;
+end;
+
+{ The host's loader.  User first, project second, and the order IS the rule:
+  MergeMcpConfig refuses an incoming name a user server already holds, so
+  whichever file is read first is the one that keeps its names.  Reading the
+  project first would make that refusal point the other way and hand a
+  repository the ability to take over a name the model has been calling all
+  session. }
+function LoadMcpConfigAll(out Err: string): Boolean;
+begin
+  Err := '';
+  ClearMcpServers;
+  MergeMcpConfig(UserMcpConfigPath, UserMcpConfigPath, msUser, Err);
+  MergeMcpConfig(McpConfigPath, ExtractFileName(McpConfigPath), msProject, Err);
+  Result := Length(McpServers) > 0;
+end;
+
+{ Line for line LoadMcpConfigAll above without its second MergeMcpConfig, and
+  written that way on purpose rather than as a scope parameter on the existing
+  function: the two callers are answering different questions and a Boolean
+  argument would put the print-mode decision inside a function whose header
+  explains the interactive one.  The header on the declaration is where the
+  argument lives. }
+function LoadMcpConfigUser(out Err: string): Boolean;
+begin
+  Err := '';
+  ClearMcpServers;
+  MergeMcpConfig(UserMcpConfigPath, UserMcpConfigPath, msUser, Err);
   Result := Length(McpServers) > 0;
 end;
 
 { ---- the discovery cache ---- }
 
-procedure McpLoadCache;
+{ One cache file for one scope.  Split because a user-scope server's tool list
+  is user-scope state and the project directory is exactly where ApprovalsPath
+  already refuses to keep state of that kind - here it is also the difference
+  between a repository being unable to describe the user's servers and being
+  able to name their tools under a name the user trusts. }
+procedure McpLoadCacheFrom(const Path: string; Scope: TMcpScope);
 var
   F: TFileStream;
-  Text, Path: string;
+  Text: string;
   Root, Arr, It: TJson;
   I, J, K: Integer;
 begin
-  Path := McpCachePath;
-  if not FileExists(Path) then Exit;
+  if (Path = '') or not FileExists(Path) then Exit;
   Text := '';
   try
     F := TFileStream.Create(Path, fmOpenRead or fmShareDenyNone);
@@ -4757,6 +8016,7 @@ begin
     if Root.Kind <> jkObj then Exit;
     for I := 0 to High(McpServers) do
     begin
+      if McpServers[I].Scope <> Scope then Continue;
       if McpServers[I].Hash = '' then Continue;
       { Approval first, and not merely as an optimisation.  The cache is a
         file in the project directory, so a repository can ship one whose
@@ -4785,17 +8045,35 @@ begin
   end;
 end;
 
-procedure McpSaveCache;
+procedure McpLoadCache;
+begin
+  McpLoadCacheFrom(McpCachePath, msProject);
+  McpLoadCacheFrom(UserMcpCachePath, msUser);
+end;
+
+procedure McpSaveCacheTo(const Path: string; Scope: TMcpScope);
 var
   Root, Arr, It: TJson;
   Text: string;
   F: TFileStream;
-  I, J: Integer;
+  I, J, Seen: Integer;
 begin
+  if Path = '' then Exit;
+  { A scope's file is touched only by a session that actually read that scope's
+    config.  Without this, a run in a project with no .mcp.json would write an
+    empty document over the user's cache and cost every user server a connect
+    at the next launch - and the same in reverse for a run with no
+    %USERPROFILE%.  A stale entry is dropped only by a session that had the
+    config in front of it. }
+  Seen := 0;
+  for I := 0 to High(McpServers) do
+    if McpServers[I].Scope = Scope then Inc(Seen);
+  if Seen = 0 then Exit;
   Root := TJson.NewObj;
   try
     for I := 0 to High(McpServers) do
     begin
+      if McpServers[I].Scope <> Scope then Continue;
       if (McpServers[I].Hash = '') or (Length(McpServers[I].Tools) = 0) then
         Continue;
       Arr := TJson.NewArr;
@@ -4814,8 +8092,8 @@ begin
     Root.Free;
   end;
   try
-    ForceDirectories(ExtractFileDir(McpCachePath));
-    F := TFileStream.Create(McpCachePath, fmCreate);
+    ForceDirectories(ExtractFileDir(Path));
+    F := TFileStream.Create(Path, fmCreate);
     try
       if Text <> '' then F.WriteBuffer(Text[1], Length(Text));
     finally
@@ -4824,6 +8102,12 @@ begin
   except
     { A cache that cannot be written costs a connect at the next start. }
   end;
+end;
+
+procedure McpSaveCache;
+begin
+  McpSaveCacheTo(McpCachePath, msProject);
+  McpSaveCacheTo(UserMcpCachePath, msUser);
 end;
 
 { ---- approval, connection, discovery ---- }
@@ -4837,6 +8121,23 @@ begin
   for I := 0 to High(McpServers) do
   begin
     if McpServers[I].Status = mcUnsupported then Continue;
+    { This is where the word "approved" is decided, and the loader is
+      deliberately not a second place that grants it.  A user-scope server
+      names a program the USER chose, so the per-command-line spawn prompt has
+      nothing to ask: read uTools' own note above McpConfigPath, which says the
+      genuinely new risk this feature introduced is a program the PROJECT
+      chose, and that is the whole of the asymmetry.  It is skipped in BOTH
+      loops on purpose - counting it into NeedAsk would make the notice below
+      announce that "this project ships .mcp.json and asks to run N programs"
+      and then list a program the project did not ship, which is a security
+      message wrong in the direction of alarming somebody about their own file.
+      The per-CALL gate in McpRun is untouched: deciding to run a program of
+      your own is not approving every call the model makes to it. }
+    if McpServers[I].Scope = msUser then
+    begin
+      McpServers[I].Approved := True;
+      Continue;
+    end;
     if (McpServers[I].Hash <> '') and
        (TrustedFingerprint('mcp:' + McpServers[I].Name) = McpServers[I].Hash) then
     begin
@@ -4872,6 +8173,14 @@ begin
   for I := 0 to High(McpServers) do
   begin
     if McpServers[I].Status = mcUnsupported then Continue;
+    { Second of the two skips - see the long note in the counting loop.  Both
+      or neither: approving here while still counting above produces a notice
+      that names a program the project never asked for. }
+    if McpServers[I].Scope = msUser then
+    begin
+      McpServers[I].Approved := True;
+      Continue;
+    end;
     if McpServers[I].Approved then Continue;
     { Nobody to ask is no.  This is the whole of why print mode can never be
       the thing that first executes a repository's code: it arrives here with
@@ -4924,9 +8233,26 @@ begin
     Exit;
   end;
 
-  ForceDirectories(McpDir);
-  C := uMcp.McpSpawn(McpServers[I].Name, McpServers[I].Command,
-    McpServers[I].WorkDir, McpServers[I].ErrLog, McpServers[I].EnvPairs, Err);
+  { The directory we create is exactly the one we are about to write, and only
+    that one.  It used to be "create the project's mcp dir, always", which was
+    fine while every spool lived there and is wrong now in both directions: a
+    user server's spool would be created in the wrong place, and a session
+    whose only servers are the user's own would still leave an empty
+    .pasclaude\mcp\ inside somebody else's repository - a program creating a
+    directory it will never write in.  No path, no directory: '' means the
+    stderr is going to NUL and there is nothing to make. }
+  if McpServers[I].ErrLog <> '' then
+    ForceDirectories(ExtractFilePath(McpServers[I].ErrLog));
+  { The one branch the connect path needs.  Everything after it - the
+    handshake, the failure handling, the status - is the same code for both
+    transports, which is the whole point of putting the split inside uMcp's
+    send and poll rather than up here. }
+  if McpServers[I].Http then
+    C := uMcp.McpOpenHttp(McpServers[I].Name, McpServers[I].Url,
+      McpServers[I].Headers, Err)
+  else
+    C := uMcp.McpSpawn(McpServers[I].Name, McpServers[I].Command,
+      McpServers[I].WorkDir, McpServers[I].ErrLog, McpServers[I].EnvPairs, Err);
   if C < 0 then
   begin
     McpServers[I].Status := mcFailed;
@@ -5099,7 +8425,8 @@ begin
 
   if not McpEnsureConnected(Si) then
     Exit(Format('mcp server "%s" is not running: %s (stderr: %s)',
-      [McpServers[Si].Name, McpServers[Si].LastErr, McpServers[Si].ErrLog]));
+      [McpServers[Si].Name, McpServers[Si].LastErr,
+       McpErrLogWord(McpServers[Si].ErrLog)]));
 
   if not uMcp.McpCallTool(McpServers[Si].Conn, McpServers[Si].Tools[Ti].Orig,
        Input, McpServers[Si].TimeoutMs, Text, IsErr, Err) then
@@ -5108,7 +8435,7 @@ begin
     McpServers[Si].LastErr := Err;
     Exit(Format('mcp server "%s" did not answer: %s (exit %d, stderr: %s)',
       [McpServers[Si].Name, Err, uMcp.McpExitCode(McpServers[Si].Conn),
-       McpServers[Si].ErrLog]));
+       McpErrLogWord(McpServers[Si].ErrLog)]));
   end;
 
   { Everything here is bytes a third-party program chose.  uMcp caps them but
@@ -5146,7 +8473,7 @@ begin
     Note := McpServers[I].Note;
     if McpServers[I].LastErr <> '' then NoteReason(Note, McpServers[I].LastErr);
     if (McpServers[I].Status = mcDead) or (McpServers[I].Status = mcFailed) then
-      NoteReason(Note, 'stderr: ' + McpServers[I].ErrLog);
+      NoteReason(Note, 'stderr: ' + McpErrLogWord(McpServers[I].ErrLog));
     if uMcp.McpToolsChanged(McpServers[I].Conn) then
       NoteReason(Note, 'tools changed - /mcp refresh to pick up');
     { A command line is under the user's nose in a prompt, not in a table:
@@ -5154,10 +8481,13 @@ begin
       unreadable, and the full text is in .mcp.json either way. }
     Cmd := McpServers[I].Command;
     if Length(Cmd) > 100 then Cmd := Copy(Cmd, 1, 97) + '...';
+    { Field 6 is the scope, appended rather than inserted: every existing
+      reader indexes by position, and a column added at the end is the one
+      shape of change that cannot silently reinterpret one of them. }
     Result[I] := McpServers[I].Name + #9 + McpStatusWord(McpServers[I].Status) +
       #9 + IntToStr(Length(McpServers[I].Tools)) +
       #9 + IntToStr(McpServers[I].Skipped + McpBudgetDropped) +
-      #9 + Cmd + #9 + Note;
+      #9 + Cmd + #9 + Note + #9 + McpScopeName(McpServers[I].Scope);
   end;
 end;
 
@@ -5224,6 +8554,13 @@ var
   Code: Integer;
   Ok: Boolean;
 begin
+  { Here rather than at the top of RunTool: RunTool's prologue is the ordered
+    R0-R8 decision procedure whose own comment forbids inserting anything
+    above the [DENY] steps, and a spool sweep is not a decision about this
+    call.  RunToolInner sits wholly below that argument and every call that
+    actually executes passes through it. }
+  TickBackgroundJobs;
+
   IsError := False;
 
   if Name = 'read_file' then
@@ -5360,7 +8697,23 @@ begin
   begin
     { No permission call: search reads and reports, so it stays ungated and
       nothing new joins the edits class. }
-    Text := GrepTree(NormalizeRoot, Input.Str('pattern'), Input.Str('glob'),
+    { An explicit path goes through the guard like any other; with none, every
+      root is walked, primary first. }
+    Full := '';
+    if Input.Str('path') <> '' then
+    begin
+      if not SafePath(Input.Str('path'), Full, Err) then
+      begin
+        IsError := True;
+        Exit(Err);
+      end;
+      if not DirectoryExists(Full) then
+      begin
+        IsError := True;
+        Exit('no such directory: ' + Rel(Full));
+      end;
+    end;
+    Text := SearchRoots(Full, Input.Str('pattern'), Input.Str('glob'),
       Input.Bool('regex'), Input.Bool('case_sensitive'),
       WalkDepth(Input, 8), Err);
     if Err <> '' then
@@ -5399,14 +8752,22 @@ begin
         'read its output with bash_output(job_id="%s"), stop it with kill_bash.',
         [Note, Cmd, Note]));
     end;
-    Text := RunShell(Cmd, NormalizeRoot, Code);
+    Text := RunShell(Cmd, NormalizeRoot, True, Code);
     { Console programs emit OEM-codepage bytes, not UTF-8, so anything
       non-ASCII has to be converted or the request body becomes invalid. }
     if not IsValidUtf8(Text) then
       Text := OemToUtf8(Text);
     Result := Clip(Text);
     if Result = '' then Result := '(no output)';
-    Result := Result + Format(#10'[exit code %d]', [Code]);
+    { The level goes on the same line as the exit code, and it goes there
+      whenever a sandboxed command failed rather than only when something in
+      the output looked like the sandbox's doing.  A command that fails only
+      because it was confined must say so, or every user diagnoses a broken
+      tool instead; and the markers that would let us guess more precisely are
+      English, so the tag is what has to carry it. }
+    Result := Result + Format(#10'[exit code %d%s]', [Code, SandboxTag(Code)]);
+    Note := SandboxExplain(Code, Result);
+    if Note <> '' then Result := Result + #10 + Note;
     IsError := Code <> 0;
   end
 
@@ -5700,21 +9061,72 @@ function RunTool(const Name: string; Input: TJson; Ask: TAskProc;
 var
   Call: THookCall;
   HO: THookOutcome;
+  Reason: string;
 begin
+  { R0-R8.  The prologue is one ordered decision procedure and the order is
+    the whole of the argument; nothing may be inserted above the [DENY] steps.
+
+    R0 }
   IsError := False;
 
-  { Cleared before anything can set it.  A hook's allow belongs to the call it
-    was answered for; one surviving into the next call is an approval nobody
-    gave, and task makes nested calls real. }
+  { R1.  Cleared before anything can set it.  A hook's allow belongs to the
+    call it was answered for; one surviving into the next call is an approval
+    nobody gave, and task makes nested calls real. }
   HookAllowPending := False;
 
+  { R2.  A rule cannot be matched against nothing. }
   if Input = nil then
   begin
     IsError := True;
     Exit('missing tool input');
   end;
 
-  { This, not the schema, is where read-only is true.  The schema is advice
+  { R3 [DENY].  Above the hook fire, because a hook is a program a repository
+    ships and handing it the arguments of a call the user forbade is a leak
+    even when the hook cannot allow it.  Above the subagent boundary only
+    because "refused by deny rule" is the more useful of the two messages.
+    Nothing below - not a class allow-all, not a persisted prefix, not a hook
+    allow, not /yolo - is consulted before this line runs.
+
+    R3b takes the bash program name, which is an argument rather than a tool
+    name and so needs its own read; doing it here keeps it above the hook fire
+    with every other deny. }
+  Reason := DenyToolReason(Name);
+  if (Reason = '') and (Name = 'bash') then
+    Reason := DenyBashReason(Input.Str('command'));
+  if Reason <> '' then
+  begin
+    { Byte for byte the shape a permission denial already takes, so uAgent's
+      one-tool_result-per-tool_use invariant holds by construction. }
+    IsError := True;
+    Exit(Reason);
+  end;
+
+  { R4.  Plan mode, and it is a boundary rather than a gate setting - which is
+    why it is here, in a different function from Permit, running before Permit
+    is reached at all.  The subagent block below carries the argument already:
+    the permission gate is no backstop, because Permit short-circuits on
+    BypassMode and AllowAllEdits and PermitBash on a persisted "always".  A
+    check inside Permit would sit below those short-circuits and /yolo would
+    win; here, bypass, a class allow-all, a stored bash prefix, a hook allow
+    and a nil Ask are all structurally unreachable, and none of them had to be
+    taught that plan mode exists.
+
+    Above the hook fire for the reason written at R5: a repository's hook must
+    never be offered the chance to allow what a boundary refused.  Above the
+    subagent boundary only because "plan mode" is the more useful of two
+    refusals to read.
+
+    The refusal is a plain string with IsError, so the transcript still gets
+    exactly one tool_result for the tool_use and the model is told the mode as
+    well as being shown it in the system prompt. }
+  if PlanMode and not IsPlanTool(Name) then
+  begin
+    IsError := True;
+    Exit(PlanRefusal(Name));
+  end;
+
+  { R5.  This, not the schema, is where read-only is true.  The schema is advice
     to the model and nothing stops it naming a tool it was never offered; and
     the permission gate is no backstop here, because Permit short-circuits on
     AllowAllEdits and PermitBash on a persisted "always", so under /yolo a
@@ -5729,6 +9141,7 @@ begin
     Exit('not available to a subagent: ' + Name);
   end;
 
+  { R6 }
   if HooksEnabled then
   begin
     Call := uHooks.HookCall(hePreTool);
@@ -5747,8 +9160,10 @@ begin
     HookAllowPending := HO.Allowed;
   end;
 
+  { R7 }
   Result := RunToolInner(Name, Input, Ask, IsError);
 
+  { R8 }
   if HooksEnabled then
   begin
     { Whether or not a gate consumed it, the allow dies with its tool call. }

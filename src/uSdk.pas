@@ -50,7 +50,29 @@ type
     Format: TSdkFormat;
     StreamInput: Boolean;
     SessionId: string;
-    PermissionMode: string;   { 'deny' or 'ask' }
+    { The mode NAME as reported to the driver in the init event, and nothing
+      else.  It used to be a behaviour switch keyed on a display string, which
+      became a latent bug the moment the vocabulary grew past two words: a
+      mode the driver should see reported ('plan') would have silently
+      disarmed the permission channel.  '' means "ask uTools what it is". }
+    PermissionMode: string;
+    { Whether a permission request should be put to the driver.  Separate from
+      the name above so reporting a mode and answering a prompt are two
+      decisions, taken by whoever knows each. }
+    AskViaDriver: Boolean;
+    { Where this run's transcript is saved and, with Resume, loaded from.
+      Empty means persist nothing, which is what -p has always done and stays
+      the default: a script's throwaway question must not touch the
+      directory's saved conversation. }
+    SessionFile: string;
+    { Load SessionFile before the first turn.  A file that is not there yet is
+      a fresh start; a file that is there and unreadable stops the run. }
+    Resume: Boolean;
+    { What the load actually did, filled in by SdkRun and reported on the init
+      line so a driver can tell a continuation from a fresh start without
+      guessing. }
+    Resumed: Boolean;
+    ResumedMessages: Integer;
   end;
 
 var
@@ -58,11 +80,94 @@ var
   SdkSource: TLineSource = nil;
   SdkSystemExtra: TSystemExtraProc = nil;
 
+  { Whether the tree the session is pointed at may write part of the system
+    prompt.  False by default, and the default is the whole point: a host that
+    forgets to set it loses a project's instructions, which is a visible
+    disappointment, where a host that forgets to clear it would ship the hole
+    this flag exists to close.  Same one-byte shape as uHooks.HooksAllowed and
+    uGitHub.GitHubAllowed, deliberately, because a third spelling of the same
+    idea is a third thing to check when somebody audits the unattended path.
+
+    What it is for: under --ci report the working directory is a checkout of
+    the PULL REQUEST HEAD - actions/checkout runs before the step - so
+    AGENTS.md, CLAUDE.md, .pasclaude.md and everything they @import were being
+    read out of a branch and assembled into a system prompt, which is the most
+    trusted position in a request, bounded only by their author having push
+    access.  The CI deny floor cannot reach it: uTools' rules govern the
+    model's TOOL CALLS, and this loader is not a tool call, so no path: rule
+    was ever consulted for these three files.
+
+    Be exact about the size of that, because the obvious reading is too
+    generous.  Neither --ci verb runs a turn - RunCi ends in Halt on every
+    path - so the prompt those two build is discarded, and what the flag stops
+    there is the READ and the assembly rather than a delivery to a model.
+    Worth stopping anyway, since the cheapest place to lose a hostile file is
+    before it is in a string, but the paragraph below is the one that says
+    what is still open.
+
+    Why the condition is NOT `not PrintMode`, which is what hooks use.  A hook
+    executes a command; an instruction file is prose that still has to talk a
+    gated tool past its own prompt.  And a project's CLAUDE.md binding under
+    -p is a promise README makes to every scripted user, so the host narrows
+    this to the two --ci verbs only.  The honest cost of that USED to be the
+    mention template's answering step, an ordinary -p in the checked-out head
+    where the branch's CLAUDE.md reached the prompt of the run that actually
+    asks a model something.  That step now passes --no-project-context, an
+    explicit flag on the command line, and the flag clears this same one byte
+    through SdkProjectContextDecide below - so it is one gate with two
+    reasons to close rather than a second mechanism to audit.
+
+    -p WITHOUT the flag still loads a project's files, exactly as the REPL
+    does, because that is the promise README's Scripted sessions section
+    makes and a script that quietly stopped following the conventions it was
+    written for would fail invisibly.  What is left reaching a CI request
+    from the branch is the skill catalogue, which rides in the skill tool's
+    own description rather than the system prompt and is deliberately not
+    gated here; ux pins that in both configurations so the claim stays true
+    the day somebody moves the catalogue. }
+  SdkProjectContextAllowed: Boolean = False;
+
+{ The rule that decides the byte above, as a function rather than as an
+  expression in the host.  It lives here because pasclaude.lpr's main block
+  cannot be linked by any suite, so the COMBINING of the two conditions - the
+  half a mis-wiring most often lands in - had no test at all where the two
+  DIRECTIONS of the variable already had several.
+
+  Both INPUTS have since followed it out of the main block, and the paragraph
+  that used to stand here saying they had not is deleted rather than softened,
+  because it was the whole reason to read this comment carefully.  Whether
+  --no-project-context was seen is now decided by uArgs.ArgsParse over an
+  array of string, and smoke drives it both ways; which TDiagMode values count
+  as a --ci verb is now uArgs.ArgsIsCiVerb, one spelling with a truth table of
+  its own, where it used to be `DiagMode in [dmCiPrepare, dmCiReport]` written
+  out at five separate sites, five chances to widen the set by a verb with
+  nothing anywhere that would notice.  smoke chains all three: argv in, this
+  predicate's answer out.
+
+  What is left in the main block is the single assignment of the byte above,
+  which is what "one writer, go and read it" always meant and is not a gap.
+
+  It is an `and` of two negatives on purpose.  Neither term can widen the
+  other - --no-project-context under a --ci verb is redundant rather than an
+  override - and there is deliberately no argument that turns the loader back
+  ON, the same shape as --ci-allow, which narrows only.  A new reason to
+  suppress belongs INSIDE here, where the truth-table test demands a line for
+  it; the host still performs the single assignment, so a reviewer grepping
+  for `SdkProjectContextAllowed :=` in src\ still finds exactly one writer. }
+function SdkProjectContextDecide(NoContextFlag, CiVerb: Boolean): Boolean;
+
 { ---- system prompt assembly, lifted verbatim from pasclaude.lpr ---- }
 function SdkGitContext: string;
 function SdkExpandImports(const Text: string): string;
 function SdkUserContext: string;
 function SdkProjectContext: string;
+{ The instruction files present in the session root right now, in load order,
+  comma separated, '' when there are none.  It exists so a host that has just
+  suppressed them can NAME what it ignored without keeping a second copy of
+  the list beside the loader's: a notice that says CLAUDE.md when the file the
+  loader would have opened is .pasclaude.md is a different claim, and the kind
+  that is only found once somebody trusts it. }
+function SdkProjectContextFiles: string;
 function SdkSystemPrompt: string;
 { The single call site the host uses.  The extra text sits between the
   guidelines and the project's own instructions, because it is session
@@ -70,24 +175,131 @@ function SdkSystemPrompt: string;
   must stay attached to the files it introduces. }
 function SdkFullSystem: string;
 
+{ ---- --append-system-prompt ---- }
+
+const
+  { Four kilobytes of prose, which is about two screens and rather more than
+    the guidelines block this text sits after.  A cap at all because the
+    string goes into the most trusted position in every request of the run and
+    an unbounded one would let a wrapper script push the real instructions out
+    of the model's attention; this cap and not a larger one because a standing
+    rule that does not fit in two screens is a CLAUDE.md, which is read from
+    disk, shown by /memory and reviewable, where a command line is none of
+    those.  Windows caps a command line near 32 KB anyway, so a much larger
+    number here would only be honest about a limit somebody else enforces. }
+  MaxAppendSystemBytes = 4 * 1024;
+
+{ What the user typed on THIS run's command line to be added to the system
+  prompt, already joined and capped, '' when the flag was never given.  Read
+  by SdkFullSystem and reported by the banner, and written by exactly one
+  thing - SdkAppendSystemPush - so the cap cannot be walked around by
+  assigning to it.
+
+  There is deliberately NO settings.json key and no approvals-file key for
+  this, and that absence is the feature.  A project file that could append to
+  the system prompt is a project file that can rewrite the agent's standing
+  instructions from inside a clone, which is the same risk .mcp.json and
+  hooks.json are already refused for; the difference is that those two at
+  least announce themselves and can be trusted per-tree, where a system-prompt
+  line would be invisible in every reply it shaped.  Command line only means
+  the person who typed it was at the keyboard. }
+function SdkAppendSystem: string;
+{ Appends one --append-system-prompt value.  False with Err set when the text
+  is empty after trimming, or when adding it would take the TOTAL past
+  MaxAppendSystemBytes - the caller turns that into a startup error rather
+  than a silent truncation, because a standing instruction the model received
+  half of is worse than one it never received at all.
+
+  Given more than once the values ACCUMULATE, joined by a blank line, in the
+  order they appear on the command line.  That is the literal reading of a
+  flag with "append" in its name; the alternative - last one wins - would
+  silently discard text the user typed and can be had anyway by passing the
+  flag once. }
+function SdkAppendSystemPush(const Text: string; out Err: string): Boolean;
+{ The same rule with no global in it: Current is what has accumulated so far,
+  Text is the next value, Joined is the two of them together once the trim,
+  the blank-line separator and the cap-on-the-TOTAL have all been applied.
+
+  It exists because the argument parser is uArgs.ArgsParse, a pure function
+  that may not write anything, and this flag was the one place in the whole
+  argument loop that reached out and mutated module state as it parsed.  The
+  alternative - collect the raw values and push them in the host afterwards -
+  is a smaller diff and it changes behaviour: today an over-cap append is
+  refused AT THE FLAG, so "--append-system-prompt <5KB> --bogus" reports the
+  cap, and deferring the join would have made it report the unknown option
+  instead.  A different refusal for the same command line is exactly what the
+  extraction was not allowed to do.
+
+  SdkAppendSystemPush is now a wrapper over this, and is still the only thing
+  in the program that STORES: the one-writer property claimed above
+  SdkAppendSystem is unchanged, and a reviewer grepping for AppendSystem_ in
+  src\ still finds one assignment. }
+function SdkAppendJoin(const Current, Text: string;
+  out Joined, Err: string): Boolean;
+procedure SdkAppendSystemClear;            { test seam }
+
 { ---- custom commands ---- }
 function SdkCommandNames: TStringArray;
 function SdkExpandCustomCommand(const Line: string; out Ok: Boolean): string;
 
 { ---- pure encoders: each returns one complete NDJSON line ---- }
-function SdkInitLine(const Opts: TSdkOptions; const AModel: string): string;
+{ AModel is the LITERAL session model, which may now be an alias or a
+  profile name; AResolved is what the next main request would actually carry.
+  Both, because a driver has to be able to report the user's choice and the
+  string on the wire, and after a /mode those two differ. }
+function SdkInitLine(const Opts: TSdkOptions;
+  const AModel, AResolved: string): string;
 function SdkUserLine(const Text: string): string;
 function SdkDeltaLine(const Kind, Text: string): string;
 function SdkToolUseLine(const Id, Name, InputJson: string): string;
 function SdkToolResultLine(const Id, Name, Content: string; IsError: Boolean): string;
 function SdkNoticeLine(const Text: string): string;
+{ One diagnostic report as one protocol line: {"type":"diagnostic","kind":...}
+  with the payload's own keys merged in beside them.  PayloadJson is PARSED
+  and re-emitted rather than spliced, exactly as SdkToolUseLine handles a
+  model's argument text: a payload carrying a newline would otherwise split
+  one event into two lines and desynchronise every driver reading the stream.
+  A payload that will not parse becomes an empty object with the kind intact,
+  which a driver can survive; a broken line is not survivable.
+  Deliberately a string parameter and not a uDiag type, so uSdk gains no
+  dependency on the unit that produces it. }
+function SdkDiagnosticLine(const Kind, PayloadJson: string): string;
+{ One finished hook fire: {"type":"hook","event":...,"tool_name":...,
+  "detail":...,"blocked":true|false}.  Blocked is the whole point of the line -
+  a hook that ran and let a call through and a hook that refused it both land
+  in the same tool_result today, one as content and one as an error, and a
+  driver that wanted to log refusals had to infer which from a string. }
 function SdkHookLine(const Event, ToolName, Detail: string; Blocked: Boolean): string;
 function SdkErrorLine(const Text: string): string;
 function SdkPermissionRequestLine(const Id, ToolName, Title, Detail: string): string;
+{ Models is additive: 'usage' and 'total_usage' keep exactly their present
+  meaning, and the new 'models' array says which model spent what - which the
+  two scalars stopped being able to say once a role could be routed. }
 function SdkResultLine(const Subtype, ErrText, FinalText: string;
-  DurationMs: Int64; Turns: Integer; const Usage, Total: TSdkUsage): string;
+  DurationMs: Int64; Turns: Integer; const Usage, Total: TSdkUsage;
+  const Models: TModelUsageList): string;
 
 { ---- plumbing ---- }
+{ Points uHooks' report seam at this unit's emitter, or clears it.  Called by
+  SdkRun with the run's own format, and public because SdkRun is not the only
+  way in: an embedder that drives TAgent itself, the way examples\embed.lpr
+  does, has the same one decision to make and no reason to reimplement it.
+
+  stream-json and nothing else, and the exclusions are each deliberate.  A
+  text-mode REPL must not gain a line of output for a feature it already
+  renders its own way - the hook's words are in the tool result and a
+  misbehaving hook already gets a yellow notice - and `json` emits exactly one
+  object for the whole run, so an event that happens mid-turn has nowhere in
+  that shape to go.  Clearing on every other format rather than leaving the
+  seam alone is what makes a second SdkRun in one process safe: a reporter
+  left over from a stream-json run would keep writing lines into a format
+  whose frame has no room for them.
+
+  Note what this does NOT do: it does not decide whether hooks run.  That is
+  uHooks.HooksAllowed, which pasclaude sets only on the interactive path, so
+  in the shipped program a stream-json run has this seam armed and no hook to
+  report through it - see FEATURES-NOT-YET.md, which says so out loud. }
+procedure SdkInstallHookReporter(Fmt: TSdkFormat);
 procedure SdkEmit(const Line: string);
 function SdkReadLine(out S: string): Boolean;
 function SdkNewSessionId: string;
@@ -96,9 +308,36 @@ function SdkParseFormat(const S: string; out F: TSdkFormat): Boolean;
   difference of two snapshots.  Computing it here costs uAgent nothing. }
 function SdkSnapshotUsage(A: TAgent): TSdkUsage;
 
-{ Runs the whole SDK session and returns the process exit code (0/1/2). }
+{ A TSdkOptions with every field at its default.  A locally declared record
+  only has its string fields initialised by the compiler - its Booleans and
+  Integers keep whatever was on the stack - so a caller that sets the fields
+  it knows about silently inherits garbage in the ones added after it was
+  written.  A garbage Boolean deciding whether to load a session would be
+  machine-dependent and not a compile error, so every construction goes
+  through here. }
+function SdkDefaultOptions: TSdkOptions;
+
+{ Loads Path into A if there is anything to load.  An empty path and a file
+  that is not there yet are both a fresh start, because the first call in a
+  subprocess-per-turn loop has no file: Msgs comes back 0 and the run goes on.
+  A file that IS there and cannot be read is a refusal, not a fresh start - a
+  script that asked to continue a conversation and quietly got a blank one
+  does work on absent context and then overwrites the evidence.  Err is
+  LoadSession's own reason, unaltered. }
+function SdkResumeInto(A: TAgent; const Path: string;
+  out Msgs: Integer; out Err: string): Boolean;
+
+{ Runs the whole SDK session and returns the process exit code.  0 is a clean
+  run, 1 means some turn failed or a save did not happen, and 2 means the run
+  never started: the named session file exists and could not be resumed. }
 function SdkRun(A: TAgent; const Opts: TSdkOptions;
   const FirstPrompt: string; out Err: string): Integer;
+
+{ Queues any image blocks in a driver's user message onto the agent, and says
+  how many.  Public so a suite can drive it without stdin; called from the
+  type:'user' arm before the turn runs, because UserTextOf keeps only text and
+  a driver's image would otherwise be dropped without a word. }
+function AttachUserImages(A: TAgent; M: TJson): Integer;
 
 type
   { The Pascal embedding facade: the ordering ritual in one object.  One
@@ -121,7 +360,12 @@ type
 
 implementation
 
-uses Classes;
+{ uHooks is below uTools, which is below this unit, so naming it here is a step
+  DOWN the ladder and not a new tie between two peers.  It is in the
+  implementation and not the interface on purpose: nothing in this unit's
+  published shape is a hook type, and a host that includes uSdk should not
+  thereby find itself compiling against the hook table. }
+uses Classes, uHooks;
 
 { ---------------------------------------------------------- system prompt -- }
 
@@ -146,14 +390,24 @@ var
 
 var
   I, Lines: Integer;
+  Git: string;
 begin
   Result := '';
-  Head := uTools.RunShellQuiet('git rev-parse --abbrev-ref HEAD', Code);
+  { Resolved on PATH rather than composed as a bare 'git'.  cmd.exe /C
+    searches the CURRENT DIRECTORY first, so the bare form ran a git.cmd the
+    cloned repository shipped - at startup, before the user typed anything.
+    A git that does not resolve contributes nothing here, exactly as a
+    directory that is not a repository already does. }
+  Git := uTools.ProgramCommand('git', 'rev-parse --abbrev-ref HEAD');
+  if Git = '' then Exit;
+  Head := uTools.RunShellQuiet(Git, Code);
   if Code <> 0 then Exit;
   Head := OneLine(Head);
   if Head = '' then Exit;
 
-  Stat := uTools.RunShellQuiet('git status --porcelain', Code);
+  Git := uTools.ProgramCommand('git', 'status --porcelain');
+  if Git = '' then Exit;
+  Stat := uTools.RunShellQuiet(Git, Code);
   Lines := 0;
   if Code = 0 then
     for I := 1 to Length(Stat) do
@@ -170,13 +424,29 @@ end;
 
 function SdkSystemPrompt: string;
 var
-  GitInfo: string;
+  GitInfo, Extra: string;
+  I: Integer;
 begin
   GitInfo := SdkGitContext;
+  { Emitted only when the user added one, so an ordinary session's prompt -
+    and the cache prefix built on it - is byte-identical to what it was
+    before working directories became a set. }
+  Extra := '';
+  if uTools.RootCount > 1 then
+  begin
+    Extra := 'Additional working directories (same rules as the session ' +
+      'root):' + #10;
+    for I := 1 to uTools.RootCount - 1 do
+      Extra := Extra + '  ' + uTools.RootAt(I) + #10;
+    Extra := Extra + 'Tool paths are relative to the session root. A file ' +
+      'in an additional directory must be given as its full absolute path.' +
+      #10#10;
+  end;
   Result :=
     'You are pasclaude, a terminal coding assistant working inside a user''s ' +
     'project directory on Windows.' + #10#10 +
     'Session root: ' + uTools.RootDir + #10#10 +
+    Extra +
     GitInfo +
     'Guidelines:' + #10 +
     '- Investigate before you act: read the relevant files rather than ' +
@@ -280,36 +550,147 @@ begin
   end;
 end;
 
+const
+  { One list, two readers: the loader below and the name it gives a host that
+    suppressed it.  A local array here and a literal over there would drift,
+    and a notice naming different files from the suppression is not a smaller
+    bug than the suppression being wrong - it is a claim about what was kept
+    out, made by something that was not looking at the same list. }
+  SdkContextNames: array[0..2] of string =
+    ('AGENTS.md', 'CLAUDE.md', '.pasclaude.md');
+
+function SdkProjectContextDecide(NoContextFlag, CiVerb: Boolean): Boolean;
+begin
+  Result := (not NoContextFlag) and (not CiVerb);
+end;
+
 { Project instructions, if the repository ships any.  This is how a project
   tells the agent about its own conventions.  The user-level memory loads
   first so the project's own files can override it - nearer wins. }
 function SdkProjectContext: string;
 var
-  Names: array[0..2] of string = ('AGENTS.md', 'CLAUDE.md', '.pasclaude.md');
   I: Integer;
   Path: string;
   L: TStringList;
 begin
   Result := SdkUserContext;
-  for I := 0 to High(Names) do
-  begin
-    Path := IncludeTrailingPathDelimiter(uTools.RootDir) + Names[I];
-    if not FileExists(Path) then Continue;
-    L := TStringList.Create;
-    try
+  { SdkProjectContextAllowed is re-read HERE, where the files are actually
+    opened, and not at the call site.  Two reasons, and the second is the one
+    that matters.  SdkFullSystem is not the only way in - TSdkSession.Create
+    builds a prompt of its own - so a check at one call site leaves the other
+    ungated.  And uHooks.HooksEnabled re-reads HooksAllowed for exactly this
+    reason: clearing the byte has to turn the feature off everywhere at once,
+    including in whatever calls somebody adds next year.
+    Gating the loop also covers @import for free: a suppressed run never opens
+    the importing file, so SdkExpandImports is never reached and no imported
+    path is resolved against the checkout either. }
+  if SdkProjectContextAllowed then
+    for I := 0 to High(SdkContextNames) do
+    begin
+      Path := IncludeTrailingPathDelimiter(uTools.RootDir) + SdkContextNames[I];
+      if not FileExists(Path) then Continue;
+      L := TStringList.Create;
       try
-        L.LoadFromFile(Path);
-        Result := Result + #10#10 + '--- ' + Names[I] + ' ---' + #10 +
-          SdkExpandImports(L.Text);
-      except
-        { An unreadable context file is not worth failing the session over. }
+        try
+          L.LoadFromFile(Path);
+          Result := Result + #10#10 + '--- ' + SdkContextNames[I] + ' ---' +
+            #10 + SdkExpandImports(L.Text);
+        except
+          { An unreadable context file is not worth failing the session over. }
+        end;
+      finally
+        L.Free;
       end;
-    finally
-      L.Free;
     end;
-  end;
+  { SdkUserContext is above the gate on purpose, so it survives a suppressed
+    run.  The gate asks WHICH TREE wrote the prompt, and
+    %USERPROFILE%\.pasclaude\CLAUDE.md is not in the checkout: the mention
+    template builds the agent from a clone in RUNNER_TEMP and checks the head
+    out afterwards, so nothing a pull request contains can write that path.
+    Suppressing it as well would be a second rule, with a second and much
+    weaker argument - "unattended runs should ignore their user" - which is
+    not the one this flag makes, and it would silently change what -p means
+    the day somebody widened the condition. }
   if Result <> '' then
     Result := #10#10 + 'Project instructions follow. Treat them as binding.' + Result;
+end;
+
+function SdkProjectContextFiles: string;
+var
+  I: Integer;
+begin
+  Result := '';
+  for I := 0 to High(SdkContextNames) do
+    if FileExists(IncludeTrailingPathDelimiter(uTools.RootDir) +
+      SdkContextNames[I]) then
+    begin
+      if Result <> '' then Result := Result + ', ';
+      Result := Result + SdkContextNames[I];
+    end;
+end;
+
+{ ------------------------------------------------ append-system-prompt -- }
+
+var
+  { Written by SdkAppendSystemPush and by nothing else - see the interface for
+    why there is no file that can reach it. }
+  AppendSystem_: string = '';
+
+function SdkAppendSystem: string;
+begin
+  Result := AppendSystem_;
+end;
+
+function SdkAppendJoin(const Current, Text: string;
+  out Joined, Err: string): Boolean;
+var
+  T, Both: string;
+  Total: Integer;
+begin
+  Err := '';
+  { Joined is the caller's new accumulator, so on every refusal it is what
+    they already had.  A caller that ignored the Boolean would then merely
+    fail to append rather than append something the cap refused - the failure
+    mode you want when the value ends up in a system prompt. }
+  Joined := Current;
+  Result := False;
+  T := Trim(Text);
+  if T = '' then
+  begin
+    Err := 'nothing to append';
+    Exit;
+  end;
+  if Current = '' then Both := T else Both := Current + #10#10 + T;
+  { Measured on the JOIN, not on this occurrence, so three flags of fifteen
+    hundred bytes are refused where one of four thousand is allowed - the
+    model is handed the total either way and the cap is a statement about the
+    total.  The blank line between them counts too, which is pedantic and
+    right: it is bytes in the request. }
+  Total := Length(Both);
+  if Total > MaxAppendSystemBytes then
+  begin
+    Err := Format('--append-system-prompt is capped at %d bytes; this would ' +
+      'make %d', [MaxAppendSystemBytes, Total]);
+    Exit;
+  end;
+  Joined := Both;
+  Result := True;
+end;
+
+{ The store, and the only one.  Three lines over SdkAppendJoin, because the
+  cap and the join are a rule about bytes and this is a rule about who is
+  allowed to remember them. }
+function SdkAppendSystemPush(const Text: string; out Err: string): Boolean;
+var
+  Joined: string;
+begin
+  Result := SdkAppendJoin(AppendSystem_, Text, Joined, Err);
+  if Result then AppendSystem_ := Joined;
+end;
+
+procedure SdkAppendSystemClear;
+begin
+  AppendSystem_ := '';
 end;
 
 function SdkFullSystem: string;
@@ -317,6 +698,28 @@ begin
   Result := SdkSystemPrompt;
   if Assigned(SdkSystemExtra) then Result := Result + SdkSystemExtra();
   Result := Result + SdkProjectContext;
+  { LAST, after the project's own instruction files, and that order is the
+    whole argument for the flag.  Everything above was written by whoever last
+    committed to this tree; this line was typed by the person sitting in front
+    of the terminal on this run, and a standing instruction from the keyboard
+    that lost the recency position to a file out of a clone would have the
+    trust relationship backwards.
+
+    It ADDS and can never replace: SdkSystemPrompt and SdkProjectContext are
+    both assembled above, unconditionally, exactly as they were before this
+    existed - the same rule /output-style follows, for the same reason.  A
+    flag that could blank the guidelines would be a flag that turns off the
+    paragraph telling the model its writes need approval, and no command line
+    gets to do that.
+
+    The fence line names where the text came from, because the model is
+    otherwise being handed an anonymous paragraph in the system prompt and
+    "the user typed this at launch" is exactly the provenance it should weigh
+    it by. }
+  if AppendSystem_ <> '' then
+    Result := Result + #10#10 +
+      'Additional instructions, given on this run''s command line:'#10 +
+      AppendSystem_;
 end;
 
 { --------------------------------------------------------- slash commands -- }
@@ -458,7 +861,8 @@ begin
     end;
 end;
 
-function SdkInitLine(const Opts: TSdkOptions; const AModel: string): string;
+function SdkInitLine(const Opts: TSdkOptions;
+  const AModel, AResolved: string): string;
 var
   Root, Arr, Ent: TJson;
   Schema: TJson;
@@ -473,8 +877,22 @@ begin
     Root.AddStr('subtype', 'init');
     Root.AddStr('session_id', Opts.SessionId);
     Root.AddStr('cwd', Safe(uTools.RootDir));
+    { Reported, never accepted: a driver can see which directories are in the
+      set and has no message that adds one. }
+    Arr := TJson.NewArr;
+    for I := 1 to uTools.RootCount - 1 do
+      Arr.Push(TJson.NewStr(Safe(uTools.RootAt(I))));
+    Root.Add('working_dirs', Arr);
     Root.AddStr('model', Safe(AModel));
-    Root.AddStr('permission_mode', Opts.PermissionMode);
+    Root.AddStr('model_resolved', Safe(AResolved));
+    { A caller that says nothing gets the truth rather than a blank: a driver
+      that cannot see the mode cannot explain a refusal to whoever is reading
+      its log. }
+    if Opts.PermissionMode <> '' then
+      Root.AddStr('permission_mode', Opts.PermissionMode)
+    else
+      Root.AddStr('permission_mode',
+        uTools.PermModeName(uTools.CurrentPermMode));
 
     { Walked out of the live schema rather than listed here, so a tool that
       MCP or skills contributed appears without this encoder knowing it
@@ -523,6 +941,15 @@ begin
       Arr.Push(Ent);
     end;
     Root.Add('skills', Arr);
+
+    { All three unconditional, by the same rule as mcp_servers above: a driver
+      that branches on a missing key gets it wrong on the run where nothing
+      was resumed, which is most of them.  resumed is the outcome SdkRun
+      found, not what the caller asked for, so a --resume against a file that
+      was not there yet reports false rather than a hopeful true. }
+    Root.AddBool('resumed', Opts.Resumed);
+    Root.AddNum('resumed_messages', Opts.ResumedMessages);
+    Root.AddStr('session_file', Safe(Opts.SessionFile));
   except
     Root.Free;
     raise;
@@ -602,6 +1029,33 @@ begin
   Result := Finish(Root);
 end;
 
+function SdkDiagnosticLine(const Kind, PayloadJson: string): string;
+var
+  Root, Payload: TJson;
+  I: Integer;
+begin
+  Root := TJson.NewObj;
+  Root.AddStr('type', 'diagnostic');
+  Root.AddStr('kind', Safe(Kind));
+  Payload := nil;
+  if Trim(PayloadJson) <> '' then Payload := JsonParse(PayloadJson);
+  if (Payload <> nil) and (Payload.Kind = jkObj) then
+  try
+    { Merged rather than nested under a 'payload' key, so a driver reads
+      report.model and not report.payload.model.  The payload's own 'type'
+      is skipped: this line's type is 'diagnostic', and letting a nested
+      value overwrite it would produce an event no driver has a case for. }
+    for I := 0 to Payload.Count - 1 do
+      if (Payload.Key(I) <> 'type') and (Payload.Key(I) <> 'kind') then
+        Root.Add(Payload.Key(I), Payload.Take(I));
+  finally
+    Payload.Free;
+  end
+  else
+    Payload.Free;
+  Result := Finish(Root);
+end;
+
 function SdkHookLine(const Event, ToolName, Detail: string; Blocked: Boolean): string;
 var
   Root: TJson;
@@ -642,9 +1096,11 @@ begin
 end;
 
 function SdkResultLine(const Subtype, ErrText, FinalText: string;
-  DurationMs: Int64; Turns: Integer; const Usage, Total: TSdkUsage): string;
+  DurationMs: Int64; Turns: Integer; const Usage, Total: TSdkUsage;
+  const Models: TModelUsageList): string;
 var
-  Root: TJson;
+  Root, Arr, Ent: TJson;
+  I: Integer;
 begin
   Root := TJson.NewObj;
   Root.AddStr('type', 'result');
@@ -656,6 +1112,21 @@ begin
   Root.AddNum('num_turns', Turns);
   Root.Add('usage', UsageJson(Usage));
   Root.Add('total_usage', UsageJson(Total));
+  { Always present, even empty and even with one row: a driver that has to
+    branch on a missing key is a driver that will get it wrong on the run
+    where nothing was routed. }
+  Arr := TJson.NewArr;
+  for I := 0 to High(Models) do
+  begin
+    Ent := TJson.NewObj;
+    Ent.AddStr('model', Safe(Models[I].Model));
+    Ent.AddNum('tokens_in', Models[I].TokensIn);
+    Ent.AddNum('tokens_out', Models[I].TokensOut);
+    Ent.AddNum('cache_read', Models[I].CacheRead);
+    Ent.AddNum('cache_write', Models[I].CacheWrite);
+    Arr.Push(Ent);
+  end;
+  Root.Add('models', Arr);
   { Deliberately no total_cost_usd.  This program has no price table - /cost
     reports tokens for the same reason - and a hardcoded one drifts into a
     lie the first time a model is repriced.  A driver that wants money
@@ -731,6 +1202,41 @@ var
     that uTools' own globals already impose. }
   RunOpts: TSdkOptions;
   PermSeq: Integer = 0;
+  { Set by OneTurn when a save failed, read by SdkRun for the exit code.  It
+    is not the turn's own result: the answer is in the result line either way,
+    and telling a driver its work was lost when the text is right there would
+    be a worse lie than the silence it replaces. }
+  SaveFailed: Boolean = False;
+
+function SdkDefaultOptions: TSdkOptions;
+begin
+  Result.Format := sfText;
+  Result.StreamInput := False;
+  Result.SessionId := '';
+  Result.PermissionMode := '';
+  Result.AskViaDriver := False;
+  Result.SessionFile := '';
+  Result.Resume := False;
+  Result.Resumed := False;
+  Result.ResumedMessages := 0;
+end;
+
+function SdkResumeInto(A: TAgent; const Path: string;
+  out Msgs: Integer; out Err: string): Boolean;
+begin
+  Msgs := 0;
+  Err := '';
+  Result := True;
+  if (A = nil) or (Path = '') then Exit;
+  { Absence is not corruption.  The first iteration of a subprocess-per-turn
+    loop has no file, and requiring the driver to omit --resume on turn one
+    would be a special case in every script that uses this.  Asked with
+    FileExists rather than by sniffing LoadSession's reason string, because a
+    reason is prose and prose gets reworded. }
+  if not FileExists(Path) then Exit;
+  Result := A.LoadSession(Path, Err);
+  if Result then Msgs := A.MessageCount;
+end;
 
 procedure HookText(const S: string);
 begin
@@ -745,6 +1251,39 @@ end;
 procedure HookNotice(const S: string);
 begin
   SdkEmit(SdkNoticeLine(S));
+end;
+
+{ A fired hook's own words, held to the budget one hook's output is already
+  held to.  uHooks caps each CHILD at MaxHookOutBytes, but the outcome text a
+  fire hands back is the concatenation of up to MaxHooksPerEvent of them, so
+  the detail arriving here can be eight times a cap that was chosen to be
+  prompt-sized - and this line is written per tool call, twice.
+
+  Safe first and Utf8Cut second, in that order and not the other: Utf8Cut
+  passes bytes that were never UTF-8 through untouched, by design, so cutting
+  first would hand the encoder a repair job on a string that had already lost
+  the length it was cut to.  Cutting after the repair is safe because a cut of
+  valid UTF-8 on a character boundary is still valid UTF-8.  Control bytes are
+  not touched here at all - JsonQuote escapes everything below #32, which is
+  what keeps one hook's stray newline from becoming two protocol lines, and
+  duplicating that judgement here would be a second place to get it wrong. }
+function HookDetail(const S: string): string;
+begin
+  Result := Safe(S);
+  if Length(Result) > uHooks.MaxHookOutBytes then
+    Result := uJson.Utf8Cut(Result, uHooks.MaxHookOutBytes) +
+      #10'[hook detail truncated]';
+end;
+
+procedure HookFired(const Event, ToolName, Detail: string; Blocked: Boolean);
+begin
+  SdkEmit(SdkHookLine(Event, ToolName, HookDetail(Detail), Blocked));
+end;
+
+procedure SdkInstallHookReporter(Fmt: TSdkFormat);
+begin
+  if Fmt = sfStreamJson then uHooks.OnHookFired := @HookFired
+  else uHooks.OnHookFired := nil;
 end;
 
 procedure HookToolInput(const Id, Name, InputJson: string);
@@ -811,6 +1350,46 @@ begin
   end;
 end;
 
+{ Honours image blocks in a driver's user message, which UserTextOf drops on
+  the floor because it flattens content to a string.  Returns how many were
+  queued.  The same four media types and the same caps as every other entry
+  point - a driver is not more trusted than a keyboard, so the base64 charset
+  and the decoded size are checked before anything reaches the transcript. }
+function AttachUserImages(A: TAgent; M: TJson): Integer;
+var
+  Msg, C, B, Src: TJson;
+  I: Integer;
+  Media, Data, Err: string;
+begin
+  Result := 0;
+  if (A = nil) or (M = nil) then Exit;
+  Msg := M.Find('message');
+  if (Msg <> nil) and (Msg.Kind = jkObj) then
+    C := Msg.Find('content')
+  else
+    C := M.Find('content');
+  if (C = nil) or (C.Kind <> jkArr) then Exit;
+  for I := 0 to C.Count - 1 do
+  begin
+    B := C.Item(I);
+    if (B = nil) or (B.Kind <> jkObj) or (B.Str('type') <> 'image') then
+      Continue;
+    Src := B.Find('source');
+    if (Src = nil) or (Src.Kind <> jkObj) then Continue;
+    { base64 only.  A url source would have the API fetch a host this program
+      cannot vet, and a file_id needs a beta header and an upload round trip. }
+    if Src.Str('type') <> 'base64' then Continue;
+    Media := Src.Str('media_type');
+    Data := Src.Str('data');
+    if Data = '' then Continue;
+    if A.AttachImage(Media, Data, Round(B.Num('width')), Round(B.Num('height')),
+         Err) then
+      Inc(Result)
+    else
+      SdkEmit(SdkErrorLine('image not attached: ' + Err));
+  end;
+end;
+
 { One turn: echo the prompt, run it, and emit exactly one result.  The
   per-turn cost is the difference of two snapshots, so turn fifty reports what
   turn fifty spent rather than the running total. }
@@ -818,7 +1397,7 @@ function OneTurn(A: TAgent; const Prompt: string): Boolean;
 var
   Before, After, Delta: TSdkUsage;
   T0: QWord;
-  Err, Subtype: string;
+  Err, Subtype, SaveErr: string;
 begin
   Before := SdkSnapshotUsage(A);
   T0 := GetTickCount64;
@@ -833,8 +1412,22 @@ begin
   if not Result then Subtype := 'error'
   else if A.TurnWasCancelled then Subtype := 'cancelled'
   else Subtype := 'success';
+
+  { Before the result line, and that ordering is the contract: the result line
+    is the driver's signal that the transcript is on disk, so a
+    subprocess-per-turn agent may spawn the next process the moment it reads
+    one.  Saved whatever the subtype, matching the REPL's unconditional save -
+    Send has already trimmed an unanswered question and dropped unanswered
+    tool calls, so even a failed turn leaves a legal transcript. }
+  if RunOpts.SessionFile <> '' then
+    if not A.SaveSession(RunOpts.SessionFile, SaveErr) then
+    begin
+      SdkEmit(SdkErrorLine('session not saved: ' + SaveErr));
+      SaveFailed := True;
+    end;
+
   SdkEmit(SdkResultLine(Subtype, Err, A.LastAssistantText,
-    Int64(GetTickCount64 - T0), A.TurnCount, Delta, After));
+    Int64(GetTickCount64 - T0), A.TurnCount, Delta, After, A.UsageByModel));
 end;
 
 function SdkRun(A: TAgent; const Opts: TSdkOptions;
@@ -843,11 +1436,14 @@ var
   Line, MsgType, Text: string;
   Doc: TJson;
   AnyFail: Boolean;
+  Imgs, Msgs: Integer;
+  Zero: TSdkUsage;
 begin
   Err := '';
   RunOpts := Opts;
   PermSeq := 0;
   AnyFail := False;
+  SaveFailed := False;
 
   { The console hooks are replaced wholesale, nils included: uTerm is never
     reached in this mode, and a leftover renderer writing prose between two
@@ -869,18 +1465,55 @@ begin
     A.OnToolInput := @HookToolInput;
     A.OnToolDone := @HookToolDone;
   end;
+  { And the same wholesale replacement one step down the ladder, for the same
+    reason.  It is a separate call rather than another line inside the `if`
+    because the seam it sets is uHooks' and not the agent's: RunTool fires the
+    two tool events without the agent being told, so a run that left a stale
+    reporter installed would keep emitting hook lines from inside a format
+    that has no place for them. }
+  SdkInstallHookReporter(Opts.Format);
 
   { Delegation is only offered when there is a driver on stdin to delegate
     to.  Everything else runs the print-mode rule unchanged: nobody to ask
     means every gated tool refuses, in band, with a normal tool_result. }
-  if Opts.StreamInput and (Opts.PermissionMode = 'ask') then
+  if Opts.StreamInput and Opts.AskViaDriver then
     A.Ask := @AskThroughDriver
   else
     A.Ask := nil;
 
+  { The load happens before the init line so that line describes the session
+    that is actually starting rather than the one that was asked for. }
+  RunOpts.Resumed := False;
+  RunOpts.ResumedMessages := 0;
+  if RunOpts.Resume then
+    if not SdkResumeInto(A, RunOpts.SessionFile, Msgs, Err) then
+    begin
+      { Not "start fresh".  A script that asked to continue a conversation and
+        silently got a blank one does work on absent context, and the next
+        save would overwrite the file it could not read.  The frame is kept
+        whole in each format: stream-json opens with system and ends with
+        result, json emits exactly the one line it always emits. }
+      FillChar(Zero, SizeOf(Zero), 0);
+      if Opts.Format = sfStreamJson then
+      begin
+        SdkEmit(SdkInitLine(RunOpts, A.Model, A.EffectiveModel(mrMain)));
+        SdkEmit(SdkErrorLine('cannot resume ' + RunOpts.SessionFile +
+          ': ' + Err));
+      end;
+      SdkEmit(SdkResultLine('error', Err, '', 0, A.TurnCount, Zero,
+        SdkSnapshotUsage(A), A.UsageByModel));
+      Exit(2);
+    end
+    else
+    begin
+      RunOpts.Resumed := Msgs > 0;
+      RunOpts.ResumedMessages := Msgs;
+    end;
+
   { Once, for the whole run.  A driver reads this line to learn what this
     build can do before it sends anything. }
-  if Opts.Format = sfStreamJson then SdkEmit(SdkInitLine(Opts, A.Model));
+  if Opts.Format = sfStreamJson then
+    SdkEmit(SdkInitLine(RunOpts, A.Model, A.EffectiveModel(mrMain)));
 
   if Trim(FirstPrompt) <> '' then
     if not OneTurn(A, FirstPrompt) then AnyFail := True;
@@ -911,7 +1544,11 @@ begin
         else if MsgType = 'user' then
         begin
           Text := UserTextOf(Doc);
-          if Trim(Text) = '' then
+          { Images are queued before the turn so AppendUserText carries them
+            in the same message as the prose.  An image-only message is a
+            legal turn, so the blank test has to account for one. }
+          Imgs := AttachUserImages(A, Doc);
+          if (Trim(Text) = '') and (Imgs = 0) then
             SdkEmit(SdkErrorLine('user message has no content'))
           else if not OneTurn(A, Text) then
             AnyFail := True;
@@ -929,7 +1566,7 @@ begin
       end;
     end;
 
-  if AnyFail then Result := 1 else Result := 0;
+  if AnyFail or SaveFailed then Result := 1 else Result := 0;
 end;
 
 { ------------------------------------------------------------------ facade -- }
@@ -940,7 +1577,16 @@ begin
   { The ordering that pasclaude.lpr performs by hand, in the one order that
     works: the root first, because the ignore rules and every path guard read
     it, and the system prompt after, because it names the root. }
+  { Before the root, so one session in a process cannot inherit another's
+    working directories - they are a grant made to a session, not a property
+    of the machine. }
+  uTools.ClearWorkingDirs;
   uTools.RootDir := Root;
+  { Deny rules, and nothing else out of the approvals store.  They are the one
+    kind of rule it is safe to hand an embedder unasked, because they are the
+    one kind that cannot grant anything: FAgent.Ask stays nil below, so this
+    session inherits the user's refusals and none of their approvals. }
+  uTools.LoadDenyRules(uTools.ApprovalsPath, uTools.GlobalDenyPath);
   uTools.LoadIgnoreRules;
   FAgent := TAgent.Create(ApiKey, AModel, SdkFullSystem);
   FAgent.Ask := nil;

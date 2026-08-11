@@ -5,9 +5,17 @@
   reach the model, so the view summarises every output by mime type and size
   and emits none of its bytes.  Second, a notebook is a file a human diffs and
   a version control system stores, so it is written back in the exact layout
-  Jupyter's own writer produces - one space of indent, sorted keys - and every
-  subtree an edit does not name is carried across by reference, so ids,
-  execution counts and outputs cannot drift.
+  Jupyter's own writer produces - one space of indent, sorted keys, non-ASCII
+  left as raw UTF-8 - and every subtree an edit does not name is carried
+  across by reference, so ids, execution counts and outputs cannot drift.
+
+  Raw UTF-8 is what WE write, when we are the ones spelling a string.  A string
+  that ARRIVED escaped is written back escaped, which sounds like the opposite
+  rule and is not: the promise this unit makes is a git diff with one changed
+  line in it, and normalising an escape somebody else's tool produced is a
+  change to a line nobody asked about even when it is a change towards
+  Jupyter's own form.  uJson's JsonParseVerbatim is what makes that possible,
+  and this unit is its only caller.
 
   Format knowledge lives here and not in uTools because none of it depends on
   paths, permissions or the console; that is what makes the rules testable
@@ -88,20 +96,63 @@ end;
 
 { The array-of-lines form, which is what Jupyter writes and what keeps a
   notebook's diff line-oriented: every line but the last keeps its newline,
-  so adding a line changes one array element instead of one enormous string. }
+  so adding a line changes one array element instead of one enormous string.
+
+  The set of things that end a line is Python's, not the obvious one.  nbformat
+  splits a cell's source with str.splitlines(True) - nbformat/v4/rwbase.py,
+  split_lines, which is what v4/nbjson.py imports as `from .rwbase import
+  split_lines`; there is no top-level nbformat/rwbase.py and the citation used
+  to name one - and that method breaks on eleven things rather than on one:
+  LF, CR, CRLF counted as a single break, VT (#11), FF (#12), FS (#28),
+  GS (#29), RS (#30), NEL (U+0085), LS (U+2028) and PS (U+2029).  Splitting on
+  #10 alone was what stood here, and it differs from Jupyter for a Python
+  source with a form feed page break in it - those are real, FF is legal
+  whitespace in Python and editors still emit it - where Jupyter writes two
+  array elements and we wrote one.  Neither file is invalid and neither loses a
+  byte, which is why leaving it was a genuine option; the reason not to is that
+  the promise at the top of this unit is byte identity with Jupyter's writer,
+  and a promise that only holds for sources somebody has already checked is one
+  nobody can lean on.
+
+  Scanning bytes is safe for the two multi-byte breaks because UTF-8 never
+  puts a lead byte inside another character: $C2 and $E2 can only begin one,
+  and every ASCII break is below $80, where a continuation byte can never
+  land.  So no accented character can be cut in half here by accident - the
+  one way that could happen is input that was not UTF-8 to begin with, which
+  never reaches this unit. }
 function SourceLines(const S: string): TJson;
 var
-  I, Start: Integer;
+  I, Start, Stop, N: Integer;
 begin
   Result := TJson.NewArr;
   Start := 1;
-  for I := 1 to Length(S) do
-    if S[I] = #10 then
-    begin
-      Result.Push(TJson.NewStr(Copy(S, Start, I - Start + 1)));
-      Start := I + 1;
+  I := 1;
+  N := Length(S);
+  while I <= N do
+  begin
+    { Stop is the last byte of the break, so CRLF and the three-byte
+      separators end the line they close rather than starting the next. }
+    Stop := 0;
+    case S[I] of
+      #10, #11, #12, #28, #29, #30: Stop := I;
+      #13:
+        if (I < N) and (S[I + 1] = #10) then Stop := I + 1 else Stop := I;
+      #$C2:
+        if (I < N) and (S[I + 1] = #$85) then Stop := I + 1;
+      #$E2:
+        if (I + 2 <= N) and (S[I + 1] = #$80) and
+           ((S[I + 2] = #$A8) or (S[I + 2] = #$A9)) then Stop := I + 2;
     end;
-  if Start <= Length(S) then
+    if Stop = 0 then
+      Inc(I)
+    else
+    begin
+      Result.Push(TJson.NewStr(Copy(S, Start, Stop - Start + 1)));
+      I := Stop + 1;
+      Start := I;
+    end;
+  end;
+  if Start <= N then
     Result.Push(TJson.NewStr(Copy(S, Start, MaxInt)));
 end;
 
@@ -216,7 +267,15 @@ var
 begin
   Doc := nil;
   Cells := nil;
-  Doc := JsonParse(Text, Err);
+  { Verbatim, and this is the entire opt-in for the whole program.  Every
+    string reaching this parse is going back into a file somebody else wrote,
+    so the literal it arrived as is the literal to write; the tool only ever
+    replaces a cell's source slot, and a replaced source is a fresh node built
+    by SourceLines with no memory of anything, so the cell we edit goes out the
+    way we would write any cell and the cells we did not touch are not rewritten
+    at all.  NotebookView, NotebookCanonical and NotebookApply all come through
+    here, so all three are faithful together or none of them is. }
+  Doc := JsonParseVerbatim(Text, Err);
   if Doc = nil then
   begin
     if Err = '' then Err := 'not JSON';
@@ -231,13 +290,36 @@ begin
       Exit;
     end;
     Ver := Doc.Num('nbformat', 0);
-    { v3 kept cells inside worksheets and named half the fields differently.
-      Rewriting one as v4 would silently discard structure, so it is refused
-      by name rather than half-understood. }
+    { v3 kept cells inside worksheets and named half the fields differently,
+      and it stays refused after reading what an upgrade would have to do
+      rather than on the assumption that it is hard.  nbformat/v4/convert.py's
+      upgrade() flattens the worksheets, renames input to source and
+      prompt_number to execution_count, rewrites every output - pyout becomes
+      execute_result, pyerr becomes error, the alias keys png and text become
+      image/png and text/plain, and an application/json payload goes from a
+      string to a parsed object - turns a heading cell into markdown, and
+      stamps a fresh id on every cell.  Two of those cost something the user
+      cannot get back.  The heading join is lossy: a level-2 heading cell whose
+      source is the two lines "Part" and "two" comes out as the single line
+      "## Part two", and running nbformat 5.11 on exactly that is where the
+      example is from.  And the ids come from a random word corpus, so the same
+      v3 file converted twice gives two different v4 files - the same run also
+      confirmed that, byte for byte.  A conversion that is not reproducible
+      cannot be a no-op edit, which was the bar set for doing it at all.
+
+      The rest is worse than lossy, it is off-contract: an upgrade rewrites
+      every line of the document, and the one guarantee this unit makes is that
+      an edit touches the cell it names and nothing else.  Somebody asking to
+      change cell 3 would get their whole notebook converted in place, with the
+      metadata name field dropped on the way past.  So the version is refused
+      by name, and the error says which tool owns the conversion rather than
+      pretending this one does. }
     if Ver <> 4 then
     begin
       Err := Format('unsupported nbformat %d: only version 4 notebooks can be ' +
-        'read or edited here', [Round(Ver)]);
+        'read or edited here - convert it with Jupyter first ' +
+        '(nbformat.read(path, as_version=4) then nbformat.write), which ' +
+        'rewrites every cell', [Round(Ver)]);
       Exit;
     end;
     Cells := Doc.Find('cells');
@@ -370,8 +452,42 @@ end;
 { ---------------------------------------------------------------- write -- }
 
 { The one place a document becomes text, so the layout cannot diverge between
-  the canonical check and a real edit.  A trailing newline because that is
-  what nbformat writes and what every text tool expects. }
+  the canonical check and a real edit.  A trailing newline because that is what
+  nbformat writes - its write() appends one when json.dumps did not end in one
+  - and what every text tool expects.
+
+  Non-ASCII goes out as raw UTF-8, and that is a match with Jupyter rather than
+  a deviation from it.  This was worth checking because the obvious guess runs
+  the other way: Python's json.dumps defaults to ensure_ascii=True and would
+  write an e-acute as a \u escape, so the writer that emits the two bytes
+  C3 A9 looks like the one out of step, and this program's own documentation
+  claimed for a while that it was.  It is not.  nbformat overrides that default
+  - nbformat/v4/nbjson.py, JSONWriter.writes, which sets indent=1,
+  sort_keys=True, separators=(',', ': ') and then, on the next line,
+  kwargs.setdefault('ensure_ascii', False) - and writing a notebook with
+  nbformat 5.11 confirms it on the bytes rather than on the reading: cafe with
+  an acute lands as 63 61 66 C3 A9, a CJK character as its three bytes, and
+  U+1F600 as the four bytes F0 9F 98 80 and not as the two \u escapes for the
+  surrogates D83D and DE00.  Escaping to "match Jupyter" would have introduced
+  the whole-file diff it was meant to remove, on every notebook with an accent
+  in it, which is why the alternative was measured before it was rejected.
+
+  What json.dumps still escapes with ensure_ascii off is the mandatory set and
+  nothing more: quote, backslash, and everything below U+0020 as lower-case
+  \u00XX except the five with short forms.  That is JsonQuote's set exactly,
+  down to leaving DEL and U+2028 raw - legal JSON, if awkward JavaScript - so
+  the two writers agree on every byte and not merely on the common ones.
+
+  All of that is about what we WRITE, and none of it moved.  What changed later
+  is what we REPRODUCE, which is a different question and it is worth saying so
+  here rather than leaving a later reader to think the two decisions are in
+  tension.  Writing: a string this program composed has no history, so it goes
+  out raw, matching nbformat.  Reproducing: a string that arrived in somebody
+  else's file has a history, and OpenDoc parses verbatim so it goes back out as
+  the bytes it came in as.  A tool that wrote the file with ensure_ascii left at
+  Python's default escaped every non-ASCII character in it; converting all of
+  those to Jupyter's spelling on the way past would be exactly the whole-file
+  diff the paragraph above rejected, only pointed the other way. }
 function Emit(Doc: TJson): string;
 begin
   Result := Doc.ToJsonPretty(True) + #10;

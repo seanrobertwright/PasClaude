@@ -144,6 +144,71 @@ var
   become the transport for a later one. }
 function McpWireInstalled: Boolean;
 
+{ ---- Streamable HTTP, the second transport -------------------------------
+
+  Everything above this line stays exactly as it was.  That is the design and
+  not a happy accident: the JSON-RPC framing, the id matching, pagination, the
+  deadlines, the line cap and every hostile-input path in this unit operate on
+  "bytes in, bytes out" through ConnSendRaw and ConnPoll, so a second transport
+  is a third branch in each of those two functions and nothing else.  A version
+  of this that gave HTTP its own handshake and its own list loop would have
+  been two clients to keep in step, and the second one would have been the one
+  without the hostile-input tests.
+
+  WHAT IS IMPLEMENTED: stateless Streamable HTTP.  One POST per JSON-RPC
+  message; the response is either one application/json document or a
+  text/event-stream whose data: payloads are the messages.  Both are turned
+  into the same newline-framed bytes the pipe path produces, by McpHttpFrame
+  below, and handed to the reader that already exists.
+
+  WHAT IS REFUSED, BY NAME: a server that requires a session.  The spec lets a
+  server hand back an Mcp-Session-Id on initialize and demand it on every later
+  request, and this client does not carry one - so such a server answers the
+  first real request with 400 or 404, and that is reported as what it most
+  likely is rather than as a bare status code.  Refused rather than
+  half-supported for the reason nbformat v3 is: a session id we accepted but
+  did not resend would produce a client that works for one call and then fails
+  in a way nobody can read.
+
+  ALSO NOT IMPLEMENTED, deliberately: the GET listening stream (a server
+  pushing notifications to us needs a reader that is not on the caller's
+  thread, which is the thread argument this whole unit rests on), resumption
+  via Last-Event-Id, and the deprecated HTTP+SSE two-endpoint transport. }
+
+{ Turns one HTTP response body into the newline-framed message bytes the rest
+  of this unit reads.  Pure, and exported for that reason: it is where a
+  hostile server's body meets our framing, so it is driven directly.
+
+  application/json - the body is one message.  It is re-emitted COMPACT rather
+  than passed through, because a server is entitled to pretty-print and a
+  newline inside a pretty-printed object would frame one message as several -
+  which is the same class of bug as ToJsonPretty on the send side, and is
+  guarded here for the same reason.
+
+  text/event-stream - each event's data: payload is one message.  Multiple
+  data: lines in one event are joined with a newline before parsing, per the
+  SSE grammar, and then compacted like any other message.  event:, id: and
+  retry: fields are read and discarded; a comment line is ignored.
+
+  Anything else, including a missing Content-Type, is treated as JSON: a
+  server that sends the right bytes with the wrong label is more likely than
+  one that means something else entirely, and a body that then fails to parse
+  is reported by the framing layer with the text in it. }
+function McpHttpFrame(const Body, ContentType: string): string;
+
+{ Opens an HTTP connection to Url and returns its index, or -1 with Err set.
+  Nothing is sent here: the first bytes on the wire are the handshake's, so a
+  URL that is unreachable fails at McpHandshake with the transport's own error
+  rather than at open time with a different one.
+
+  ExtraHeaders is a CRLF-separated block added to the two this unit sets
+  (Content-Type and Accept), '' for none.  It is passed through verbatim: the
+  caller composed it from a file only the user can write, and a transport that
+  edited headers would be forming an opinion about a document it did not
+  read. }
+function McpOpenHttp(const Name, Url, ExtraHeaders: string;
+  out Err: string): Integer;
+
 { Starts a server and returns its connection index, or -1 with Err set.  Cmd
   is a complete command line and is passed to CreateProcess as written: no
   shell is interposed, because a shell would change the quoting the caller
@@ -198,54 +263,15 @@ function McpConnectionCount: Integer;
 
 implementation
 
-uses SysUtils;
+uses SysUtils, uSandbox, uHttp;
 
-{ FPC 3.2.2's Windows unit declares CreatePipe, PeekNamedPipe and
-  SetHandleInformation but not the job-object API.  uTools declares its own
-  copy for background bash; this is a second one on purpose.  Sharing them
-  would mean editing a currently-green path for another feature's
-  convenience, and thirty lines of header fixed by the operating system are
-  not the kind of duplication that drifts. }
+{ The job-object record and its four kernel32 imports used to be declared here
+  verbatim, a third copy of the same thirty lines, because the ladder forbids
+  this unit from importing uTools.  uSandbox is a leaf below all three, so
+  there is now one declaration - the only direction that duplication could
+  ever have been collapsed in. }
 const
-  JobObjectExtendedLimitInformation = 9;
-  JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = $2000;
   McpKillWaitMs = 2000;
-
-type
-  TJobBasicLimits = record
-    PerProcessUserTimeLimit: Int64;
-    PerJobUserTimeLimit: Int64;
-    LimitFlags: DWORD;
-    MinimumWorkingSetSize: SIZE_T;
-    MaximumWorkingSetSize: SIZE_T;
-    ActiveProcessLimit: DWORD;
-    Affinity: ULONG_PTR;
-    PriorityClass: DWORD;
-    SchedulingClass: DWORD;
-  end;
-
-  TJobIoCounters = record
-    ReadOperationCount, WriteOperationCount, OtherOperationCount: QWord;
-    ReadTransferCount, WriteTransferCount, OtherTransferCount: QWord;
-  end;
-
-  TJobExtendedLimits = record
-    BasicLimitInformation: TJobBasicLimits;
-    IoInfo: TJobIoCounters;
-    ProcessMemoryLimit: SIZE_T;
-    JobMemoryLimit: SIZE_T;
-    PeakProcessMemoryUsed: SIZE_T;
-    PeakJobMemoryUsed: SIZE_T;
-  end;
-
-function CreateJobObjectA(Attr: Pointer; Name: PAnsiChar): THandle; stdcall;
-  external 'kernel32' name 'CreateJobObjectA';
-function SetInformationJobObject(J: THandle; Cls: Integer; Info: Pointer;
-  Len: DWORD): BOOL; stdcall; external 'kernel32' name 'SetInformationJobObject';
-function AssignProcessToJobObject(J, P: THandle): BOOL; stdcall;
-  external 'kernel32' name 'AssignProcessToJobObject';
-function TerminateJobObject(J: THandle; Code: UINT): BOOL; stdcall;
-  external 'kernel32' name 'TerminateJobObject';
 
 type
   TMcpConn = record
@@ -253,6 +279,24 @@ type
     hIn, hOut, Proc, Job: THandle;
     OnWire: Boolean;      { the stand-in wire owns this connection }
     Wire: Integer;
+    { The HTTP transport.  Http excludes OnWire and the pipe handles: the three
+      are alternatives, and every branch that asks tests OnWire first, then
+      Http, then falls through to the pipes that have always been here - so a
+      connection that is neither of the first two behaves exactly as it did
+      before this existed. }
+    Http: Boolean;
+    Url: string;
+    Hdrs: string;         { extra request headers, CRLF-separated }
+    { What the last POST answered, waiting for ConnPoll to hand it over.  HTTP
+      is request/response and the reader above is a stream, so the response is
+      buffered here for exactly as long as it takes the reader to ask - which
+      is immediately, because McpAwait polls in a loop. }
+    Pending: string;
+    { Set when a request came back 400 or 404 after the handshake had already
+      succeeded, which is what a session-requiring server looks like from here.
+      Kept as a field rather than reported once because every later call on
+      this connection has the same problem and should say so. }
+    NeedsSession: Boolean;
     Buf: string;
     NextId: Integer;
     State: TMcpState;
@@ -334,6 +378,95 @@ begin
   Result := (H <> 0) and (WaitForSingleObject(H, 0) = WAIT_TIMEOUT);
 end;
 
+{ One message, compacted, with its framing newline; '' for anything that is
+  not a JSON object or array.  A body that will not parse is passed through
+  verbatim so the line reader above reports it with the server's own bytes in
+  the message - dropping it here would turn "the server sent nonsense" into
+  "the server sent nothing", which is the harder failure to diagnose. }
+function FrameOne(const Text: string): string;
+var
+  J: TJson;
+  S: string;
+begin
+  S := Trim(Text);
+  if S = '' then Exit('');
+  J := JsonParse(S);
+  if J = nil then Exit(S + #10);
+  try
+    Result := J.ToJson + #10;
+  finally
+    J.Free;
+  end;
+end;
+
+function McpHttpFrame(const Body, ContentType: string): string;
+var
+  I, N: Integer;
+  Line, Data: string;
+  Lines: TStringArray;
+
+  procedure Flush;
+  begin
+    if Data <> '' then Result := Result + FrameOne(Data);
+    Data := '';
+  end;
+
+begin
+  Result := '';
+  if Trim(Body) = '' then Exit;
+  if ContentType <> 'text/event-stream' then Exit(FrameOne(Body));
+
+  { SSE.  Split on LF and strip a trailing CR, which covers both line endings
+    without a second pass; the grammar is field ':' optional-space value, an
+    empty line ends the event, and a line opening with ':' is a comment. }
+  Lines := nil;
+  SetLength(Lines, 0);
+  N := 0;
+  Line := '';
+  for I := 1 to Length(Body) do
+    if Body[I] = #10 then
+    begin
+      SetLength(Lines, N + 1);
+      Lines[N] := Line;
+      Inc(N);
+      Line := '';
+    end
+    else if Body[I] <> #13 then
+      Line := Line + Body[I];
+  if Line <> '' then
+  begin
+    SetLength(Lines, N + 1);
+    Lines[N] := Line;
+  end;
+
+  Data := '';
+  for I := 0 to High(Lines) do
+  begin
+    Line := Lines[I];
+    if Line = '' then
+    begin
+      Flush;
+      Continue;
+    end;
+    if Line[1] = ':' then Continue;                 { comment }
+    if Copy(Line, 1, 5) = 'data:' then
+    begin
+      Line := Copy(Line, 6, MaxInt);
+      if (Line <> '') and (Line[1] = ' ') then Delete(Line, 1, 1);
+      { Joined with a newline per the grammar, then compacted by FrameOne, so
+        a payload a server chose to split across data: lines arrives as the one
+        message it is rather than as several broken ones. }
+      if Data = '' then Data := Line else Data := Data + #10 + Line;
+    end;
+    { event:, id: and retry: are read and dropped: this client has no use for
+      an event name, does not resume, and has its own deadlines. }
+  end;
+  { A stream that ended without its terminating blank line still delivered a
+    message, and a server closing the connection cleanly is the ordinary way
+    a single-response stream ends. }
+  Flush;
+end;
+
 function ConnPoll(C: Integer; out Data: string; out Alive: Boolean): Boolean;
 begin
   Data := '';
@@ -341,11 +474,89 @@ begin
   if not Valid(C) then Exit(False);
   if Conns[C].OnWire then
     Result := McpWire.Poll(Conns[C].Wire, Data, Alive)
+  else if Conns[C].Http then
+  begin
+    { Whatever the last POST answered, once.  Alive is the connection's own
+      state and not a process handle: there is no child here, so "alive" means
+      the transport has not been declared finished - which POST failure and the
+      session refusal are the only two ways to do. }
+    Data := Conns[C].Pending;
+    Conns[C].Pending := '';
+    Alive := Conns[C].State <> msDead;
+    Result := Alive or (Data <> '');
+  end
   else
   begin
     Result := PipePoll(Conns[C], Data);
     Alive := ProcAlive(Conns[C].Proc);
   end;
+end;
+
+{ One POST carrying one JSON-RPC message, with the answer parked in Pending
+  for the poll that is about to ask for it.
+
+  DEADLINES ARE THE TRANSPORT'S HERE, not this loop's, and that is the one
+  place the HTTP path genuinely differs from the pipe path rather than merely
+  looking different.  WinHTTP owns the resolve, connect, send and receive
+  timeouts, so there is no equivalent of ConnSendRaw's write loop and nothing
+  to poll a cancel flag against mid-request: a POST is atomic from here.  What
+  that costs is stated rather than hidden - Ctrl+C cannot cut a request that is
+  already on the wire, where the pipe path checks McpShouldCancel every five
+  milliseconds - and what stops it being a hang is that HttpTimeoutMs is set
+  for the duration of the call and restored in a finally, exactly as the
+  telemetry flush does it.
+
+  A notification has no id and its answer is 202 with an empty body; that
+  produces no frame, which is correct, because nothing upstream is waiting for
+  one.
+
+  400 and 404 AFTER a completed handshake are the session refusal.  Before the
+  handshake they are an ordinary transport failure and read as one: a server
+  that 404s the initialize was never an MCP endpoint, and telling somebody
+  their URL needs a session when the URL is simply wrong would be the more
+  confusing of the two lies. }
+function HttpSendRaw(C: Integer; const Data: string): Boolean;
+var
+  R: uHttp.THttpResult;
+  Saved: Integer;
+  Hdrs: string;
+begin
+  if Trim(Data) = '' then Exit(True);
+  { Accept names both, because a server chooses which to answer with and this
+    client reads either.  The caller's own headers go last so a user who wants
+    an Authorization line gets one, and so that nothing they wrote can be
+    silently overridden by a default appended after it. }
+  Hdrs := 'Content-Type: application/json'#13#10 +
+          'Accept: application/json, text/event-stream';
+  if Conns[C].Hdrs <> '' then Hdrs := Hdrs + #13#10 + Conns[C].Hdrs;
+
+  Saved := uHttp.HttpTimeoutMs;
+  uHttp.HttpTimeoutMs := McpCallMs;
+  try
+    R := uHttp.HttpPost(Conns[C].Url, Hdrs, Trim(Data), nil, nil);
+  finally
+    uHttp.HttpTimeoutMs := Saved;
+  end;
+
+  if not R.Ok then
+  begin
+    Conns[C].State := msDead;
+    Exit(False);
+  end;
+  if (R.Status = 400) or (R.Status = 404) then
+    if Conns[C].State = msRunning then
+    begin
+      Conns[C].NeedsSession := True;
+      Conns[C].State := msDead;
+      Exit(False);
+    end;
+  if (R.Status < 200) or (R.Status > 299) then
+  begin
+    Conns[C].State := msDead;
+    Exit(False);
+  end;
+  Conns[C].Pending := Conns[C].Pending + McpHttpFrame(R.Body, R.ContentType);
+  Result := True;
 end;
 
 { The write half of the same guarantee McpAwait gives the read half, and it
@@ -369,6 +580,7 @@ var
 begin
   if not Valid(C) then Exit(False);
   if Conns[C].OnWire then Exit(McpWire.Send(Conns[C].Wire, Data));
+  if Conns[C].Http then Exit(HttpSendRaw(C, Data));
   if Data = '' then Exit(True);
   Sent := 0;
   Deadline := GetTickCount64 + QWord(DeadlineMs);
@@ -409,8 +621,25 @@ begin
   Result := ConnSendRaw(C, S + #10, DeadlineMs);
   { One message for both endings on purpose: from here a server that closed
     its stdin and one that stopped reading it are the same fact - the request
-    did not land - and the connection is finished either way. }
-  if not Result then Err := 'the server stopped reading its input';
+    did not land - and the connection is finished either way.
+
+    The HTTP transport has a third ending that is worth naming, because it is
+    the one a user can act on: a server that answered the handshake and then
+    refused the next request is almost always one demanding the session id this
+    client does not carry.  "Almost always" is doing real work in that sentence
+    and the message says so rather than asserting it - the same status can mean
+    the endpoint moved - but a refusal that names the likely cause is worth
+    more than a bare 400 to somebody deciding whether their URL is wrong or
+    their server is simply out of scope for this build. }
+  if not Result then
+    if Valid(C) and Conns[C].NeedsSession then
+      Err := 'the server refused the request after the handshake, which is ' +
+        'what a server requiring an Mcp-Session-Id looks like; this build ' +
+        'speaks stateless streamable http only'
+    else if Valid(C) and Conns[C].Http then
+      Err := 'the request did not reach the server'
+    else
+      Err := 'the server stopped reading its input';
 end;
 
 function NewRequest(C: Integer; const Method: string; Params: TJson;
@@ -455,6 +684,58 @@ begin
   Result := Result + #0;
 end;
 
+function McpOpenHttp(const Name, Url, ExtraHeaders: string;
+  out Err: string): Integer;
+var
+  Cn: TMcpConn;
+  Host, Path: string;
+  Port: Word;
+  Secure: Boolean;
+begin
+  Err := '';
+  Result := -1;
+  if Trim(Url) = '' then
+  begin
+    Err := 'no url';
+    Exit;
+  end;
+  { SplitUrlEx and not a scheme test of our own, so this transport inherits
+    exactly the rule the rest of the program already enforces: https anywhere,
+    http only when the host is EXACTLY 127.0.0.1 or localhost.  Checked here
+    rather than left to the first POST, because a refusal at open time names
+    the URL in a message somebody can act on, where a failure at handshake time
+    reads as a server that would not talk to us. }
+  if not uHttp.SplitUrlEx(Url, Host, Path, Port, Secure) then
+  begin
+    Err := 'not a usable URL (https, or http only on localhost): ' + Url;
+    Exit;
+  end;
+  if not uHttp.HttpAvailable then
+  begin
+    Err := 'winhttp.dll is not available, so no http server can be reached';
+    Exit;
+  end;
+  FillChar(Cn, SizeOf(Cn), 0);
+  Cn.Name := Name;
+  { Cmd carries the URL because every display path above - /mcp, /doctor, the
+    cache key, the notices - reads Cmd to say what a server IS.  Giving the URL
+    a second field there as well would mean each of those growing a branch, and
+    the one thing they all want is a string that identifies the server. }
+  Cn.Cmd := Url;
+  Cn.Url := Url;
+  Cn.Hdrs := ExtraHeaders;
+  Cn.Http := True;
+  Cn.ExitCode := -1;
+  { msIdle and not msRunning: nothing has been sent, so nothing has agreed to
+    talk to us yet, and the handshake is what promotes it.  HttpSendRaw reads
+    that difference to tell an ordinary 404 from a session refusal. }
+  Cn.State := msIdle;
+  Cn.Live := True;
+  SetLength(Conns, Length(Conns) + 1);
+  Conns[High(Conns)] := Cn;
+  Result := High(Conns);
+end;
+
 function McpSpawn(const Name, Cmd, WorkDir, ErrLogPath: string;
   const EnvPairs: array of string; out Err: string): Integer;
 var
@@ -462,11 +743,10 @@ var
   SA: SECURITY_ATTRIBUTES;
   SI: STARTUPINFOA;
   PI: PROCESS_INFORMATION;
-  Info: TJobExtendedLimits;
   hInR, hInW, hOutR, hOutW, hErr, hJob: THandle;
   Mode: DWORD;
   CmdLine, EnvBlock, Dir: string;
-  EnvPtr, DirPtr: PChar;
+  InJob: Boolean;
 begin
   Err := '';
   Result := -1;
@@ -535,27 +815,18 @@ begin
       FILE_SHARE_READ or FILE_SHARE_WRITE, @SA, OPEN_EXISTING,
       FILE_ATTRIBUTE_NORMAL, 0);
 
-  hJob := CreateJobObjectA(nil, nil);
-  if hJob <> 0 then
-  begin
-    FillChar(Info, SizeOf(Info), 0);
-    Info.BasicLimitInformation.LimitFlags := JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-    if not SetInformationJobObject(hJob, JobObjectExtendedLimitInformation,
-             @Info, SizeOf(Info)) then
-    begin
-      CloseHandle(hJob);
-      hJob := 0;
-    end;
-  end;
+  hJob := SandboxNewJob;
 
+  { Unmodified, with no cmd.exe wrapper, unlike bash and hooks: what .mcp.json
+    holds is a complete command line passed to CreateProcess as written.
+    SandboxSpawn takes a finished line and never composes one, which is the
+    property that lets this and the wrapped callers share it. }
   CmdLine := Cmd;
-  { CreateProcessA may write into lpCommandLine, so it must not be sharing a
-    string with anybody. }
-  UniqueString(CmdLine);
-  EnvBlock := BuildEnvBlock(EnvPairs);
-  if EnvBlock = '' then EnvPtr := nil else EnvPtr := PChar(EnvBlock);
+  { The server's own env pairs first, then the sandbox's temp redirection over
+    the top - the scratch is the only directory a low child can write, so it
+    has to win over anything the config set. }
+  EnvBlock := SandboxApplyEnv(BuildEnvBlock(EnvPairs));
   Dir := WorkDir;
-  if Dir = '' then DirPtr := nil else DirPtr := PChar(Dir);
 
   FillChar(SI, SizeOf(SI), 0);
   SI.cb := SizeOf(SI);
@@ -565,10 +836,14 @@ begin
   SI.hStdError := hErr;
   FillChar(PI, SizeOf(PI), 0);
 
-  if not CreateProcess(nil, PChar(CmdLine), nil, nil, True, CREATE_NO_WINDOW,
-           EnvPtr, DirPtr, SI, PI) then
+  if not SandboxSpawn(CmdLine, Dir, EnvBlock, 0, SI, PI, hJob, InJob) then
   begin
     Err := 'could not start: ' + SysErrorMessage(GetLastError);
+    { Said here rather than left to the caller: at low integrity a server that
+      wants to unpack itself into %APPDATA% fails before it has spoken a word
+      of protocol, and without this the level looks like a broken config. }
+    if uSandbox.SandboxLevel = slLow then
+      Err := Err + ' [sandbox: low]';
     CloseHandle(hInR); CloseHandle(hInW);
     CloseHandle(hOutR); CloseHandle(hOutW);
     if hErr <> INVALID_HANDLE_VALUE then CloseHandle(hErr);
@@ -588,11 +863,9 @@ begin
   Cn.hOut := hOutR;
   Cn.Proc := PI.hProcess;
   Cn.Job := hJob;
-  { After the spawn, so a grandchild started in the microseconds before it
-    escapes the job.  The same documented race the background-bash path has,
-    and for the same reason: there is no way to create a process already in a
-    job without also inheriting it into every child of this one. }
-  Cn.Tree := (hJob <> 0) and AssignProcessToJobObject(hJob, PI.hProcess);
+  { Created suspended, assigned, then resumed, so the grandchild race this
+    used to document is closed. }
+  Cn.Tree := InJob;
 
   SetLength(Conns, Length(Conns) + 1);
   Conns[High(Conns)] := Cn;
@@ -629,7 +902,7 @@ begin
   if Conns[C].Proc <> 0 then
   begin
     if WaitForSingleObject(Conns[C].Proc, McpKillWaitMs) <> WAIT_OBJECT_0 then
-      if Conns[C].Job <> 0 then TerminateJobObject(Conns[C].Job, 1)
+      if Conns[C].Job <> 0 then SandboxTerminateJob(Conns[C].Job, 1)
       else TerminateProcess(Conns[C].Proc, 1);
     Code := DWORD(-1);
     if GetExitCodeProcess(Conns[C].Proc, Code) and (Code <> STILL_ACTIVE) then

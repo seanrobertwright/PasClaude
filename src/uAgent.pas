@@ -17,14 +17,31 @@ unit uAgent;
 
 interface
 
-uses uJson, uTools;
+uses uJson, uTools, uImage;
 
 type
+  { An image waiting to go out with the next user message.  It is queued
+    rather than pushed straight into the transcript because the user's prose
+    and the image belong in one message - the API is explicit that an image
+    works best placed before the text it is asked about, and a message per
+    attachment would put them in the wrong order and the wrong turns. }
+  TImageAttach = record
+    Media: string;    { one of the four types the API accepts }
+    Data: string;     { base64, no line breaks }
+    W, H: Integer;    { 0 when the format was recognised but not measurable }
+  end;
+  TImageAttachArray = array of TImageAttach;
+
   { Rendering hooks, so this unit stays free of console code. }
   TTextProc = procedure(const S: string);
   TToolProc = procedure(const Name, Detail: string);
   { Polled while a response streams; True abandons the request. }
   TCancelProc = function: Boolean;
+  { Asked for a credential after one was refused.  Returns '' when there is
+    no better one - this unit never treats that as an error, only as "do not
+    retry".  A plain function variable, not a method pointer, so the host can
+    wire a top-level function the way it wires HttpTransport. }
+  TAuthRefreshFn = function: string;
   { Fires in RunTools with the tool's id and its effective input JSON - what
     RunTool will actually be given, after this unit's own repair of an
     unparseable argument stream.  The console never needed the id, because a
@@ -36,11 +53,59 @@ type
     consumer could not tell a refusal from an answer. }
   TToolDoneProc = procedure(const Id, Name, Output: string; IsError: Boolean);
 
+  { Fires once at the end of every API request, on the success path and on
+    both failure paths.  StatusCode is 0 when the transport never produced
+    one.  It carries NO body, NO error text and NO headers - deliberately, so
+    that nothing which could contain prompt or completion content is reachable
+    from it.  The host wires telemetry to this; nothing in uAgent depends on
+    it being assigned. }
+  TRequestDoneProc = procedure(StatusCode, ElapsedMs: Integer;
+    const Model: string);
+
   TModelInfo = record
     Id: string;           { what the API wants in "model" }
     DisplayName: string;  { what a human calls it }
   end;
   TModelList = array of TModelInfo;
+
+  { What a request is for, which is the only thing that decides which model
+    carries it.  mrMain is the user's own turn and is never routed anywhere:
+    the model they picked is the model that answers them. }
+  TModelRole = (mrMain, mrSubagent, mrCompact);
+  { makProfile is an alias that is not an id at all - it names one model for
+    one situation and another for the rest, and is resolved at request time
+    rather than when it is set. }
+  TModelAliasKind = (makNone, makModel, makProfile);
+  TModelUsage = record
+    Model: string;
+    TokensIn, TokensOut, CacheRead, CacheWrite: Int64;
+  end;
+  TModelUsageList = array of TModelUsage;
+
+  { One row of "what is the transcript made of", for /context.
+
+    BYTES AND NOT TOKENS, and that is the whole honesty of this record.  The
+    API reports prompt tokens for a request as a WHOLE and never per block, so
+    a tokens column here would be an invention - the same class of invention as
+    the price table this program refuses to ship, and wrong in the same way,
+    because prose, base64 and JSON keys do not tokenize at one ratio.  What can
+    be measured exactly is the bytes each kind of block contributes to the
+    document that gets posted, and a share of those bytes is what actually
+    answers the question somebody types /context to ask, which is "what do I
+    evict".  The measured token total is printed beside the table as one
+    number, where it is true.
+
+    Bytes of the block's own JSON, not of its text: a tool_result's key names
+    and quoting are re-sent every turn exactly as its content is, and a
+    breakdown that counted only payloads would under-report the cheapest thing
+    to fix.  Blocks is the count contributing, so "2 images, 8 KB" and "40
+    images, 8 KB" read differently, as they should. }
+  TContextPart = record
+    Name: string;
+    Bytes: Int64;
+    Blocks: Integer;
+  end;
+  TContextParts = array of TContextPart;
 
   { bkServerToolUse is a tool the API runs for us: same shape as bkToolUse,
     but no RunTool ever sees it.  bkResult is a verbatim passthrough of a
@@ -48,7 +113,17 @@ type
     the next request - its Text holds the block's own JSON, captured whole
     from content_block_start.  Making bkResult the fallback for any
     unrecognised type is what keeps a future server-side block from being
-    silently flattened into empty prose. }
+    silently flattened into empty prose.
+
+    Exactly one type is now interpreted far enough to be shortened, and the
+    exception is worth stating precisely because the sentence above is the
+    rule the rest of this unit rests on.  web_search_tool_result - whose
+    content array this decoder already had to reach into to count results for
+    the host - is clipped at capture by ClipSearchResult when it is larger
+    than MaxSearchResultBytes.  The interpretation is deliberately shallow:
+    whole elements are dropped off the end and one title string is annotated
+    to say so.  No element is ever rebuilt, nothing inside a surviving
+    element is touched, and no other block type is looked at at all. }
   TBlockKind = (bkText, bkThinking, bkToolUse, bkServerToolUse, bkResult);
 
   TPartialBlock = record
@@ -66,9 +141,28 @@ type
     FModel: string;
     FSystem: string;
     FMessages: TJson;              { the "messages" array, owned here }
+    { Images the user attached that no message has carried yet.  Drained by
+      AppendUserText, never by AppendUserTextOnly. }
+    FPendingImages: TImageAttachArray;
     FMaxTokens: Integer;
     FTotalIn, FTotalOut: Int64;
     FCacheWrite, FCacheRead: Int64;
+    { Per-model rows behind the scalar totals above.  The scalars stay the
+      truth about this session's tokens; these say which model spent them,
+      which the scalars stopped being able to say the moment a role could be
+      routed somewhere else. }
+    FModelUsage: TModelUsageList;
+    { What this agent's next request is for.  A field rather than a parameter
+      threaded through BuildBody, because BuildBody is reached from the retry
+      loop, the compaction path and the test seam, and a parameter would have
+      to be correct at all three. }
+    FRole: TModelRole;
+    { What the last request actually carried, and the name it was resolved
+      from.  The pair exists for the 404: a bare not_found_error cannot say
+      that an alias produced the id, and the first turn is the worst possible
+      moment to be told nothing. }
+    FLastRequestModel: string;
+    FLastRequestSource: string;
     FTurns: Integer;
     { From the last failed response's Retry-After header, for the retry loop.
       Zero when the server named no wait. }
@@ -89,6 +183,11 @@ type
       every Send, so it always describes the most recent turn and never a
       stale one. }
     FTurnCancelled: Boolean;
+    { Whether this request has already spent its one auth retry.  Reset per
+      SendWithRetry call rather than per turn, which is the strictly tighter
+      bound: two dead sources alternating cannot loop, because the second
+      attempt is the last one this request gets. }
+    FAuthRefreshed: Boolean;
 
     { The cancel test every poll site uses.  ShouldCancel is consume-on-read
       in the host (CtrlCPressed clears the flag as it answers), so a subagent
@@ -99,6 +198,27 @@ type
       reports what the turn actually cost rather than what the parent alone
       spent. }
     procedure AbsorbUsage(Sub: TAgent);
+    { Adds one response's usage to the row for Model, creating it if this is
+      the first request that model carried. }
+    procedure BumpModelUsage(const AModel: string;
+      InTok, OutTok, CW, CR: Int64);
+    { The model a usage row should be filed under.  FLastRequestModel is empty
+      only on the recorded-stream seam, which never went near a transport. }
+    function UsageModelKey: string;
+    { What the role's model was resolved FROM - the alias name when there is
+      one, so a failure can name it. }
+    function RoleSource(Role: TModelRole): string;
+
+    { True when the credential in hand is a subscription OAuth token rather
+      than an API key.  Extracted because the same Copy() test used to be
+      written out at three call sites - the messages request, the models
+      request and the system-block builder - and a fourth request path would
+      have had to remember all three.  One function means it cannot drift. }
+    function IsOauth: Boolean;
+    { Consults OnAuthRefresh after a 401, at most once per request, and
+      installs a genuinely different key.  True when it did, meaning the
+      caller should try the same request again. }
+    function TryAuthRefresh(const Err: string): Boolean;
 
     function BuildBody: string;
     { Turns web search off after the server refused the declaration, so the
@@ -124,6 +244,18 @@ type
     { Puts the transcript back into a state the next question can legally
       follow after a cancellation. }
     procedure UnwindCancelledTail;
+    { AppendUserText's original semantics: one text block, and the pending
+      image queue is left strictly alone.  Every append this unit makes on its
+      own behalf goes through here, because an internal bookkeeping message -
+      a summarise instruction, say - must not spend the image the user just
+      pasted and meant for their next question. }
+    procedure AppendUserTextOnly(const S: string);
+    { Puts the image blocks of a user message that is about to be dropped back
+      on the pending queue.  AppendUserText drains the queue into the message
+      before the request goes out, so a message removed because the turn never
+      reached the server takes the attachment with it - and the clipboard the
+      user copied it from may be long gone. }
+    procedure RequeueImagesFrom(M: TJson);
   public
     OnText: TTextProc;             { streamed assistant prose }
     OnThinking: TTextProc;         { streamed reasoning, when the model emits it }
@@ -142,9 +274,25 @@ type
       it did. }
     OnToolInput: TToolInputProc;
     OnToolDone: TToolDoneProc;
+    { Nil by default and never assigned by this unit, the HttpTransport
+      pattern again.  Fired inside a try/except so a telemetry fault cannot
+      fail a turn: a give-up rule is worthless if the recording path can
+      raise. }
+    OnRequestDone: TRequestDoneProc;
     Ask: TAskProc;
     { Polled between chunks so the user can abandon a long reply. }
     ShouldCancel: TCancelProc;
+    { Consulted ONLY on an HTTP 401, and at most once per request.  Nil by
+      default and never assigned by this unit - the uHttp.HttpTransport
+      pattern.  The host wires it to a credential re-resolve, so a token the
+      owning program refreshed on disk mid-session is picked up without a
+      restart; re-reading another program's file is not writing it.
+
+      401 is deliberately NOT added to Transient(): a rejected credential is
+      not a busy server, and retrying the same key would fail identically.
+      The retry happens only when the callback hands back a non-empty key
+      that DIFFERS from the one that was just refused. }
+    OnAuthRefresh: TAuthRefreshFn;
 
     constructor Create(const ApiKey, AModel, SystemPrompt: string);
     destructor Destroy; override;
@@ -162,9 +310,41 @@ type
       any failure, so a refusal or a dropped connection costs nothing.  The
       summary streams through OnText like any reply. }
     function CompactWithSummary(out Err: string): Boolean;
+    { Queues an image for the next user message.  B64 is already base64; this
+      unit never sees pixels.  False with Err set when the queue is full or
+      the media type is not one the API takes - a refusal the user reads beats
+      a request the API rejects whole. }
+    function AttachImage(const Media, B64: string; W, H: Integer;
+      out Err: string): Boolean;
+    { How many images are waiting for the next message. }
+    function PendingImages: Integer;
+    { Throws the queue away, for a user who changed their mind. }
+    procedure ClearPendingImages;
+    { Replaces every image block except the newest KeepNewest with a short
+      text placeholder, oldest first, and returns how many it replaced.  Base64
+      is re-sent in full on every turn until it goes, so on a long session the
+      stale images are the most expensive and least re-read thing in the
+      transcript.  Substitution rather than deletion is deliberate: removing a
+      block could empty a content array, which ValidTranscript rejects, so a
+      measure meant to save context would produce a session that will not
+      load. }
+    function EvictImages(KeepNewest: Integer): Integer;
+
     { Bytes the transcript currently occupies as JSON. }
     function TranscriptBytes: Integer;
     function MessageCount: Integer;
+    { The same bytes, split by what kind of block they are in.  Always the same
+      six rows in the same order, zeros included, because a table whose rows
+      appear and disappear is a table a reader has to re-read every time and a
+      renderer has to decide about; deciding not to print a zero is the
+      caller's job and one it can do by looking.
+
+      The sum of Bytes is deliberately NOT TranscriptBytes: this counts the
+      blocks and that counts the whole document, so the array separators and
+      the role keys wrapping each message are outside every row.  The renderer
+      says so rather than quietly making the columns add up, because the gap is
+      real overhead that no eviction can reach. }
+    function ContextComposition: TContextParts;
     { Prompt tokens of the most recent request - the context's true size.
       Zero until a request has been made. }
     function ContextTokens: Int64;
@@ -191,7 +371,31 @@ type
     function CacheWriteTokens: Int64;
     function CacheReadTokens: Int64;
     function TurnCount: Integer;
+    { The one place a model string is produced.  Every request path goes
+      through it, so there is exactly one answer to "what will this carry",
+      and a profile is expanded here - at request time - rather than when it
+      was set, which is what lets /mode change the model with no new state to
+      keep consistent. }
+    function EffectiveModel(Role: TModelRole): string;
+    { What the last request actually carried; '' before the first one. }
+    function LastRequestModel: string;
+    { Per-model token rows, with any subagent's already folded in.  A copy:
+      the caller must not be able to edit the counters. }
+    function UsageByModel: TModelUsageList;
+    { May now hold an alias or a profile name rather than an id.  Deliberately
+      unexpanded: /resume round-trips the profile, not a snapshot of whichever
+      half happened to be active when the session was saved. }
     property Model: string read FModel write FModel;
+    { Write-only, and uAuth is its only legitimate source.  It exists so
+      /login takes effect without a restart - before it, FApiKey was set once
+      in Create and a user who logged in mid-session would have gone on
+      401ing until they restarted.  Write-only because nothing outside the
+      credential layer has any business READING the key back out of the
+      agent, and a getter is exactly the accessor a future feature would
+      reach for on its way to putting the secret somewhere it does not
+      belong.  Anything that plumbs a project-derived string in here has
+      defeated the whole of uAuth. }
+    property ApiKey: string write FApiKey;
     { Asks the API which models this key can use.  Empty with Err set when
       the endpoint could not be reached or the answer was not understood. }
     function ListModels(out Err: string): TModelList;
@@ -245,25 +449,135 @@ const
   OauthBeta      = 'oauth-2025-04-20';
   OauthIdentity  = 'You are Claude Code, Anthropic''s official CLI for Claude.';
   MaxToolRounds = 24;
+  { The budget one web_search_tool_result block may occupy in the transcript.
+    A single result is a title, a url, a page age - a few hundred bytes of
+    that - and then an opaque blob of page content the server encoded for
+    itself, which is several kilobytes on its own and is essentially the
+    whole cost.  Five of those is commonly fifty to a hundred and fifty
+    kilobytes, and unlike a tool result it is not paid once: the block is
+    echoed back on every later request for the rest of the session, so a
+    single verbose search quietly taxes every turn that follows it.
+    Thirty-two kilobytes is the same order as uTools.MaxOutBytes (30 KB), the
+    ceiling every local tool's output already lives under - a search must not
+    be allowed to cost more in the transcript than reading a file does - and
+    it still holds two to four real results, which is what a follow-up
+    question actually reaches for.  Declared here rather than in the
+    implementation so the suite can assert against the same number the code
+    uses instead of writing its own copy of it. }
+  MaxSearchResultBytes = 32 * 1024;
   { Transient failures are retried this many times before giving up. }
   MaxRetries    = 3;
   { Bumped when the saved-session shape changes incompatibly. }
   SessionVersion = 1;
   { A mentioned file larger than this is refused rather than attached; the
-    model can read it in slices through the tool instead. }
+    model can read it in slices through the tool instead.  This is a budget
+    for TEXT: an image is not prose, is not read in slices, and is bounded by
+    MaxImageFileBytes instead. }
   MaxMentionBytes = 100 * 1024;
+  { Images in one message.  The API allows far more, but above twenty blocks
+    it imposes a stricter per-image dimension limit, and eight keeps a turn
+    structurally clear of that rule while bounding it at roughly twenty
+    thousand visual tokens. }
+  MaxImagesPerMessage = 8;
+  { A mentioned image file larger than this is refused rather than attached.
+    Its bytes are never transcoded - a JPEG cannot be resized without a
+    decoder - so an oversize file is a refusal, not a resize. }
+  MaxImageFileBytes = 5 * 1024 * 1024;
   { Where a session lives, relative to the session root. }
   SessionDir  = '.pasclaude';
   SessionFile = 'session.json';
 
+{ ------------------------------------------------------------- aliases -- }
+
+{ Short names for models, and the two routes.  This is a table of strings
+  asserting things about a namespace this program does not own, which is
+  exactly the mistake that produced the retired-default 404 recorded in the
+  README - so three properties keep it from being that mistake twice:
+
+    * every built-in target is a DATELESS family alias, the same class of
+      string DefaultModel already is, and the server resolves it to whatever
+      snapshot is current;
+    * GET /v1/models stays the only authority - a bare /model annotates this
+      table against the live list rather than the other way round;
+    * any entry is overridable from %USERPROFILE%\.pasclaude\settings.json,
+      so a stale table is an annoyance rather than a rebuild.
+
+  An alias name may not contain '-' and may not begin with 'claude'.  Every
+  model id Anthropic has shipped has hyphens and begins with 'claude', so no
+  legal id can be captured by an alias and the resolution order stays
+  readable.  It is a rule about someone else's naming convention, which is
+  why it is stated here rather than assumed. }
+
+{ True when Name is in the table.  Kind says whether Target is an id
+  (makModel) or the two halves of a profile joined ' / ' (makProfile). }
+function ResolveModelAlias(const Name: string; out Target: string;
+  out Kind: TModelAliasKind): Boolean;
+function ModelAliasCount: Integer;
+function ModelAliasName(I: Integer): string;
+{ For a profile: 'opus / sonnet'. }
+function ModelAliasTarget(I: Integer): string;
+{ Adds or replaces an entry.  False with Err set when the name breaks the
+  no-hyphen/no-'claude' rule or the target is not something that could be a
+  model id - a target with a control byte or invalid UTF-8 would go straight
+  into the "model" field of a request. }
+function SetModelAlias(const Name, Target: string; out Err: string): Boolean;
+procedure SetModelRoute(Role: TModelRole; const NameOrId: string);
+function ModelRoute(Role: TModelRole): string;
+{ Resolves aliases and profiles to a concrete id, with a hop limit so a
+  table a user pointed at itself terminates instead of looping. }
+function ExpandModelName(const Name: string): string;
+{ ' - the model came from alias "opus" (-> claude-opus-4-5); /model lists
+  what this key can actually use', or '' when Name was typed literally. }
+function ModelSourceNote(const Name: string): string;
+{ True when Target names, or is named by, one of the ids the live list
+  returned - a dateless alias against a dated snapshot, in either direction.
+  The boundary must be a '-' or 'claude-opus-4' would match
+  'claude-opus-40'. }
+function ModelListMatches(const Target: string; const List: TModelList): Boolean;
+
 { The default save location under Root. }
 function SessionPath(const Root: string): string;
+
+{ What counts as a saved conversation, and the only statement of it: the live
+  file, the safety copy that a fresh run leaves behind, and any /save <name>,
+  which writes <name>.session.json.  It lives here beside SessionPath rather
+  than in the host because there are now two askers - the /sessions picker and
+  --continue - and two spellings of "is this a session" is how a file the
+  picker lists becomes one --continue cannot see, or, far worse, how the
+  approvals file that shares that directory gets loaded as a transcript. }
+function IsSessionFile(const FileName: string): Boolean;
+
+{ The most recently written saved conversation under Root, full path, '' when
+  there is none.  This is --continue's whole definition of "most recent", and
+  it deliberately walks the same set of files and reads the same date that the
+  /sessions listing prints beside each name: a flag that reached a file the
+  picker does not show, or that disagreed with the newest date on that
+  listing, would be a second notion of recency for the user to carry.
+
+  Ties go to whichever FindFirst returns first, which is arbitrary and
+  admitted - the stamp has two-second granularity, so two saves inside one
+  tick are a coin toss however it is broken, and /sessions is there for
+  anybody who needs to be certain. }
+function NewestSession(const Root: string): string;
 
 { Expands @path mentions in a prompt.  Each mention of a readable text file
   under the session root becomes an attachment appended after the prose, so
   the model gets the file without spending a tool round reading it.  Returns
-  the expanded text; Notes lists what was attached or why something was not. }
-function ExpandMentions(const Text: string; out Notes: string): string;
+  the expanded text; Notes lists what was attached or why something was not.
+
+  A mentioned image goes to A's pending queue instead of into the prose, and A
+  is an explicit parameter rather than a module hook: a var hook exists so a
+  unit need not learn about something below it, and uAgent already depends on
+  uTools and uImage, so a hook here would buy nothing and hide the dependency.
+  A nil agent refuses images with the same note a non-image binary gets. }
+function ExpandMentions(const Text: string; A: TAgent;
+  out Notes: string): string;
+
+{ '[image 1920x1080 image/png]' for a block that cannot be shown - the
+  placeholder style uMcp and uNotebook already use for content a terminal
+  cannot render.  Base64 must never reach the console: it is megabytes of
+  noise that says nothing a reader can act on. }
+function DescribeImageBlock(B: TJson): string;
 
 { Copies an existing session aside so a run that is not resuming it cannot
   destroy it on the first save.  True when there was nothing to do, or the
@@ -301,6 +615,245 @@ begin
     PathDelim + SessionFile;
 end;
 
+function IsSessionFile(const FileName: string): Boolean;
+begin
+  Result := (FileName = SessionFile) or (FileName = 'session.prev.json') or
+            (Pos('.' + SessionFile, FileName) > 0);
+end;
+
+function NewestSession(const Root: string): string;
+var
+  R: TSearchRec;
+  Dir: string;
+  Best, Stamp: TDateTime;
+begin
+  Result := '';
+  Best := 0;
+  Dir := IncludeTrailingPathDelimiter(Root) + SessionDir + PathDelim;
+  { '*.json' and then the name test, which is the same two-step the picker
+    does: the glob is a cheap first cut and IsSessionFile is the rule. }
+  if FindFirst(Dir + '*.json', faAnyFile, R) = 0 then
+  begin
+    repeat
+      if IsSessionFile(R.Name) then
+      begin
+        Stamp := FileDateToDateTime(R.Time);
+        if (Result = '') or (Stamp > Best) then
+        begin
+          Result := Dir + R.Name;
+          Best := Stamp;
+        end;
+      end;
+    until FindNext(R) <> 0;
+    SysUtils.FindClose(R);
+  end;
+end;
+
+{ ------------------------------------------------------------- aliases -- }
+
+type
+  TModelAlias = record
+    Name: string;
+    Kind: TModelAliasKind;
+    Target: string;              { makModel }
+    PlanHalf, ExecHalf: string;  { makProfile }
+  end;
+
+var
+  { Built in the initialization section from the compiled-in defaults, then
+    mutable, because SetModelAlias is how the user's settings file overrides
+    a target that retired without waiting for a new build. }
+  Aliases: array of TModelAlias;
+  { Empty means "this role is not routed anywhere": it falls back to the main
+    model, which is the only fallback that cannot spend the user's quality
+    budget without being asked.  Falling back to DefaultModel instead would
+    route a user who opted into nothing onto sonnet. }
+  Routes: array[TModelRole] of string;
+
+{ The hop ceiling for alias resolution.  A user can define a -> b and b -> a
+  in settings.json; the loop has to end at a value that can be sent rather
+  than at a stack overflow. }
+const
+  MaxAliasHops = 8;
+
+function AliasIndex(const Name: string): Integer;
+var
+  I: Integer;
+begin
+  Result := -1;
+  if Name = '' then Exit;
+  for I := 0 to High(Aliases) do
+    if Aliases[I].Name = Name then Exit(I);
+end;
+
+function ModelAliasCount: Integer;
+begin
+  Result := Length(Aliases);
+end;
+
+function ModelAliasName(I: Integer): string;
+begin
+  Result := '';
+  if (I >= 0) and (I <= High(Aliases)) then Result := Aliases[I].Name;
+end;
+
+function ModelAliasTarget(I: Integer): string;
+begin
+  Result := '';
+  if (I < 0) or (I > High(Aliases)) then Exit;
+  if Aliases[I].Kind = makProfile then
+    Result := Aliases[I].PlanHalf + ' / ' + Aliases[I].ExecHalf
+  else
+    Result := Aliases[I].Target;
+end;
+
+function ResolveModelAlias(const Name: string; out Target: string;
+  out Kind: TModelAliasKind): Boolean;
+var
+  I: Integer;
+begin
+  Target := '';
+  Kind := makNone;
+  I := AliasIndex(Name);
+  Result := I >= 0;
+  if not Result then Exit;
+  Kind := Aliases[I].Kind;
+  Target := ModelAliasTarget(I);
+end;
+
+{ Model ids are printable ASCII with no spaces.  The check is on the bytes
+  rather than on intent because whatever passes here is copied verbatim into
+  the "model" field of a request: a NUL truncates the JSON, a control byte
+  makes it unparseable, and an invalid UTF-8 sequence breaks the rule that
+  everything sent to the model is valid UTF-8.  Restricting to ASCII settles
+  all three at once and costs nothing - no id has ever needed more. }
+function ModelTargetOk(const S: string): Boolean;
+var
+  I: Integer;
+begin
+  Result := False;
+  if (S = '') or (Length(S) > 128) then Exit;
+  for I := 1 to Length(S) do
+    if (S[I] < #33) or (S[I] > #126) then Exit;
+  Result := True;
+end;
+
+function SetModelAlias(const Name, Target: string; out Err: string): Boolean;
+var
+  I: Integer;
+begin
+  Err := '';
+  Result := False;
+  if Name = '' then
+  begin
+    Err := 'an alias needs a name';
+    Exit;
+  end;
+  if Pos('-', Name) > 0 then
+  begin
+    Err := 'an alias name may not contain a dash: every model id has one, ' +
+      'and an alias that looked like an id would shadow it';
+    Exit;
+  end;
+  if CompareText(Copy(Name, 1, 6), 'claude') = 0 then
+  begin
+    Err := 'an alias name may not begin with "claude": that is the shape of ' +
+      'a real model id';
+    Exit;
+  end;
+  if not ModelTargetOk(Target) then
+  begin
+    Err := 'the target must be printable ASCII with no spaces, at most 128 ' +
+      'characters - it goes straight into the request as the model';
+    Exit;
+  end;
+  I := AliasIndex(Name);
+  if I < 0 then
+  begin
+    I := Length(Aliases);
+    SetLength(Aliases, I + 1);
+  end;
+  { An override always lands as a plain model entry.  A profile is a shape
+    this program defines, not a string a settings file can name, so
+    overriding 'opusplan' with an id turns it into an ordinary alias rather
+    than half-rewriting a profile. }
+  Aliases[I].Name := Name;
+  Aliases[I].Kind := makModel;
+  Aliases[I].Target := Target;
+  Aliases[I].PlanHalf := '';
+  Aliases[I].ExecHalf := '';
+  Result := True;
+end;
+
+procedure SetModelRoute(Role: TModelRole; const NameOrId: string);
+begin
+  { mrMain is not a route.  The user's own turn carries the model the user
+    chose, and a "route" for it would be a second, invisible way to set the
+    session model. }
+  if Role = mrMain then Exit;
+  Routes[Role] := Trim(NameOrId);
+end;
+
+function ModelRoute(Role: TModelRole): string;
+begin
+  Result := Routes[Role];
+end;
+
+function ExpandModelName(const Name: string): string;
+var
+  Hops, I: Integer;
+begin
+  Result := Name;
+  for Hops := 1 to MaxAliasHops do
+  begin
+    I := AliasIndex(Result);
+    if I < 0 then Exit;
+    if Aliases[I].Kind = makProfile then
+    begin
+      { Read per request, not remembered.  uTools.PlanMode is derived state
+        the permission round already maintains, so a profile costs one
+        boolean test and no callback: /mode plan changes the model on the
+        next request with nothing to keep in step. }
+      if uTools.PlanMode then Result := Aliases[I].PlanHalf
+      else Result := Aliases[I].ExecHalf;
+    end
+    else
+      Result := Aliases[I].Target;
+  end;
+  { Out of hops: the table points at itself.  Whatever we hold is a string
+    the API can reject cleanly, which is a better end than a hang. }
+end;
+
+function ModelSourceNote(const Name: string): string;
+var
+  Target: string;
+  Kind: TModelAliasKind;
+begin
+  Result := '';
+  if not ResolveModelAlias(Name, Target, Kind) then Exit;
+  Result := ' - the model came from alias "' + Name + '" (-> ' +
+    ExpandModelName(Name) + '); /model lists what this key can actually use';
+end;
+
+function ModelListMatches(const Target: string; const List: TModelList): Boolean;
+var
+  I: Integer;
+  Id: string;
+begin
+  Result := False;
+  if Target = '' then Exit;
+  for I := 0 to High(List) do
+  begin
+    Id := List[I].Id;
+    if Id = Target then Exit(True);
+    { The '-' is the whole of the check.  Without it 'claude-opus-4' matches
+      'claude-opus-40', and the warning this feeds would never fire for the
+      case it exists for. }
+    if Copy(Id, 1, Length(Target) + 1) = Target + '-' then Exit(True);
+    if Copy(Target, 1, Length(Id) + 1) = Id + '-' then Exit(True);
+  end;
+end;
+
 { ---------------------------------------------------------------- mentions -- }
 
 { True for the characters that can appear in a mentioned path.  The set stops
@@ -311,12 +864,47 @@ begin
   Result := C in ['A'..'Z', 'a'..'z', '0'..'9', '\', '/', '.', '_', '-', ':'];
 end;
 
-function ExpandMentions(const Text: string; out Notes: string): string;
+{ '1920x1080 image/png', or as much of it as the block records.  Shared so the
+  placeholder EvictImages leaves behind and the transcript description say the
+  same thing about the same image. }
+function ImageFacts(B: TJson): string;
+var
+  Src: TJson;
+  Media: string;
+  W, H: Integer;
+begin
+  Result := '';
+  if (B = nil) or (B.Kind <> jkObj) then Exit;
+  Src := B.Find('source');
+  Media := '';
+  if Src <> nil then Media := Src.Str('media_type');
+  W := Round(B.Num('width'));
+  H := Round(B.Num('height'));
+  if (W > 0) and (H > 0) then Result := Format('%dx%d', [W, H]);
+  if Media <> '' then
+  begin
+    if Result <> '' then Result := Result + ' ';
+    Result := Result + Media;
+  end;
+end;
+
+function DescribeImageBlock(B: TJson): string;
+var
+  Facts: string;
+begin
+  Facts := ImageFacts(B);
+  if Facts = '' then Result := '[image]' else Result := '[image ' + Facts + ']';
+end;
+
+function ExpandMentions(const Text: string; A: TAgent;
+  out Notes: string): string;
 var
   I, Start: Integer;
   Path, Full, FileText, Attach: string;
   F: TFileStream;
   N: Int64;
+  Media, AttachErr: string;
+  IW, IH: Integer;
 begin
   Result := Text;
   Notes := '';
@@ -351,16 +939,39 @@ begin
         Notes := Notes + Format('@%s: no such file'#10, [Path]);
         Continue;
       end;
+      Media := '';
       try
         F := TFileStream.Create(Full, fmOpenRead or fmShareDenyNone);
         try
           N := F.Size;
-          if N > MaxMentionBytes then
+          { The header alone decides which budget applies, so a four-megabyte
+            text file is refused without being read and a four-megabyte PNG is
+            not refused for being over a limit that was only ever about
+            prose. }
+          SetLength(FileText, N);
+          if N > 64 then SetLength(FileText, 64);
+          if Length(FileText) > 0 then
+            F.ReadBuffer(FileText[1], Length(FileText));
+          if not uImage.SniffImage(FileText, Media, IW, IH) then Media := '';
+
+          if Media <> '' then
+          begin
+            if N > MaxImageFileBytes then
+            begin
+              Notes := Notes + Format(
+                '@%s: %d bytes, too large to attach (limit %d)'#10,
+                [Path, N, MaxImageFileBytes]);
+              Continue;
+            end;
+          end
+          else if N > MaxMentionBytes then
           begin
             Notes := Notes + Format('@%s: %d bytes, too large to attach'#10,
               [Path, N]);
             Continue;
           end;
+
+          F.Position := 0;
           SetLength(FileText, N);
           if N > 0 then F.ReadBuffer(FileText[1], N);
         finally
@@ -373,6 +984,47 @@ begin
           Continue;
         end;
       end;
+
+      { The old refusal of a binary file is where images branch off: the bytes
+        are one of the four types the API takes, so they go up verbatim as an
+        image block instead of being turned away.  A user's own file is never
+        transcoded - it is already properly compressed, and re-encoding it
+        would cost quality for nothing. }
+      if Media <> '' then
+      begin
+        if A = nil then
+        begin
+          Notes := Notes + Format('@%s: images cannot be attached here'#10,
+            [Path]);
+          Continue;
+        end;
+        if (IW > uImage.MaxImageDim) or (IH > uImage.MaxImageDim) then
+        begin
+          Notes := Notes + Format('@%s: %dx%d is over the %d px limit'#10,
+            [Path, IW, IH, uImage.MaxImageDim]);
+          Continue;
+        end;
+        if not A.AttachImage(Media, uImage.Base64Encode(FileText), IW, IH,
+             AttachErr) then
+        begin
+          Notes := Notes + Format('@%s: %s'#10, [Path, AttachErr]);
+          Continue;
+        end;
+        { The token figure is the documented patch formula, not a guess: an
+          image is expensive and cannot be skimmed later in the transcript, so
+          the moment of attaching is the only honest place to say what it
+          costs. }
+        if (IW > 0) and (IH > 0) then
+          Notes := Notes + Format(
+            '@%s: image attached (%dx%d %s, %d bytes, ~%d tokens)'#10,
+            [Path, IW, IH, Media, N, uImage.VisualTokens(IW, IH)])
+        else
+          Notes := Notes + Format(
+            '@%s: image attached (%s, %d bytes, size unknown)'#10,
+            [Path, Media, N]);
+        Continue;
+      end;
+
       { A binary file would poison the request body; the model can still ask
         for a hex dump through the tool if it really wants one. }
       if not uTools.IsValidUtf8(FileText) then
@@ -456,11 +1108,91 @@ begin
   end;
 end;
 
+{ Clips a web_search_tool_result block in place and returns the one-line
+  summary the host prints for it.  The two jobs are one function because only
+  this walk knows both the count that arrived and the count that survived;
+  splitting it would mean walking the array twice and computing the same
+  running total in two places, and the second copy is the one that would
+  drift.
+
+  The cut is at result boundaries and nowhere else.  Truncating the block's
+  JSON at a byte offset the way Clip does everywhere else would land inside an
+  object and produce not a fused pair of results but text that no longer
+  parses, and the block would then fail to reparse on the next request and
+  lose its pairing to the server_tool_use that produced it.  Utf8Cut protects
+  a byte from being cut through a character; nothing protects an object from
+  being cut through a brace.  So whole elements are kept from the front while
+  a running byte total stays under the budget, and whole elements are dropped
+  after that.  Every element that survives is byte-identical to what the
+  server sent.
+
+  The first result is kept however large it is.  An empty content array reads
+  as "the search found nothing", which is a different claim from "the search
+  found things and this client did not carry them all", and it is a claim the
+  model would act on.  One oversize result is the honest failure here.
+
+  The marker goes into the last kept result's title because that is where the
+  cut happened, and because title is the one field in this shape that is
+  display text rather than something the server has to read back.  An extra
+  array element would be a search result this client forged, and an extra key
+  on the block itself is exactly the unknown field a strict request validator
+  rejects. }
+function ClipSearchResult(CB: TJson): string;
+var
+  Content, Item: TJson;
+  I, Kept, Ti, Arrived: Integer;
+  Total, Dropped: Int64;
+  Title: string;
+begin
+  Content := CB.Find('content');
+  if Content = nil then Exit('no results');
+  { The error shape is an object, not an array, and there is nothing in it to
+    clip - it is a code and no page content at all. }
+  if Content.Kind <> jkArr then
+    Exit('error: ' + Content.Str('error_code'));
+
+  Arrived := Content.Count;
+  Total := 0;
+  Kept := 0;
+  for I := 0 to Arrived - 1 do
+  begin
+    Total := Total + Length(Content.Item(I).ToJson);
+    if (I > 0) and (Total > MaxSearchResultBytes) then Break;
+    Kept := I + 1;
+  end;
+  if Kept >= Arrived then Exit(Format('%d results', [Arrived]));
+
+  { Dropped bytes are counted before the drop, because after it the only
+    thing that could say how much was saved is a number nobody kept. }
+  Dropped := 0;
+  for I := Kept to Arrived - 1 do
+    Dropped := Dropped + Length(Content.Item(I).ToJson);
+  while Content.Count > Kept do
+    Content.Drop(Content.Count - 1);
+
+  Item := Content.Item(Kept - 1);
+  if Item <> nil then
+  begin
+    Title := Item.Str('title');
+    Title := Title + Format(' [+%d more results from this search were ' +
+      'dropped from this transcript by pasclaude; search again to see them]',
+      [Arrived - Kept]);
+    Ti := Item.IndexOf('title');
+    if Ti >= 0 then
+      Item.SetAt(Ti, TJson.NewStr(Title))
+    else
+      Item.AddStr('title', Title);
+  end;
+
+  Result := Format('%d results, %d kept (%d dropped, %d KB)',
+    [Arrived, Kept, Arrived - Kept, (Dropped + 1023) div 1024]);
+end;
+
 procedure ApplyEvent(St: PStream; Ev: TJson);
 var
   T, K: string;
   Idx: Integer;
-  CB, Delta, Msg, Usage, ErrObj, Content: TJson;
+  CB, Delta, Msg, Usage, ErrObj: TJson;
   Frag: string;
 begin
   T := Ev.Str('type');
@@ -529,23 +1261,26 @@ begin
         to text, as this branch used to, dropped it from the transcript
         entirely and broke the echo the API requires. }
       St^.Blocks[Idx].Kind := bkResult;
-      St^.Blocks[Idx].Text := CB.ToJson;
       if K = 'web_search_tool_result' then
       begin
         { A network fetch that leaves no trace in the transcript would be the
           one tool where silence is least acceptable, so the result is
-          summarised for the host the same way a local tool's would be. }
-        Frag := '';
-        Content := CB.Find('content');
-        if (Content <> nil) and (Content.Kind = jkArr) then
-          Frag := Format('%d results', [Content.Count])
-        else if Content <> nil then
-          Frag := 'error: ' + Content.Str('error_code')
-        else
-          Frag := 'no results';
+          summarised for the host the same way a local tool's would be.  The
+          summary now also names the clip when one happened, because a set of
+          results that shrank on its way into the transcript is exactly the
+          thing the user should learn about while it is on screen rather than
+          three turns later from a title. }
+        Frag := ClipSearchResult(CB);
         if Assigned(St^.Agent.OnToolResult) then
           St^.Agent.OnToolResult('web_search', Frag);
       end;
+      { Captured after the clip, not before: this string is what every later
+        request echoes and what the session file writes to disk, so clipping
+        it afterwards would save nothing and a resumed session would carry the
+        whole unclipped set straight back into the context the clip exists to
+        protect.  CB is a child of Ev and is freed with it in ConsumeLines, so
+        editing it here costs no allocation and outlives nothing. }
+      St^.Blocks[Idx].Text := CB.ToJson;
     end;
   end
 
@@ -648,6 +1383,13 @@ begin
     still reacts within a few hundred bytes of the user pressing Esc. }
   if St^.Agent.WantsCancel then
     St^.Cancel := True;
+  { And swept per chunk for the same reason, one level down: a turn where the
+    model thinks for two minutes and calls no tool at all is exactly the gap
+    the background spool cap used to fall through, and chunks arrive all the
+    way through it.  The call is throttled inside uTools and returns on an
+    integer compare when no job is running, which is nearly always, so a fast
+    stream pays nothing for it. }
+  uTools.TickBackgroundJobs;
   Result := not St^.Cancel;
 end;
 
@@ -664,8 +1406,16 @@ begin
   FMaxTokens := 8192;
   FMaxRounds := MaxToolRounds;
   { Stated rather than left to the zero value, because "off" is a decision
-    here and not an accident of initialisation. }
+    here and not an accident of initialisation.  The same applies to the
+    role: every agent answers a user until something says otherwise, and a
+    subagent's role stays mrMain because it was handed a resolved id. }
   FWebSearch := False;
+  FRole := mrMain;
+end;
+
+function TAgent.IsOauth: Boolean;
+begin
+  Result := Copy(FApiKey, 1, Length(OauthKeyPrefix)) = OauthKeyPrefix;
 end;
 
 function TAgent.WantsCancel: Boolean;
@@ -673,13 +1423,81 @@ begin
   Result := ForceCancel or (Assigned(ShouldCancel) and ShouldCancel());
 end;
 
+procedure TAgent.BumpModelUsage(const AModel: string;
+  InTok, OutTok, CW, CR: Int64);
+var
+  I, N: Integer;
+begin
+  if AModel = '' then Exit;
+  for I := 0 to High(FModelUsage) do
+    if FModelUsage[I].Model = AModel then
+    begin
+      Inc(FModelUsage[I].TokensIn, InTok);
+      Inc(FModelUsage[I].TokensOut, OutTok);
+      Inc(FModelUsage[I].CacheWrite, CW);
+      Inc(FModelUsage[I].CacheRead, CR);
+      Exit;
+    end;
+  N := Length(FModelUsage);
+  SetLength(FModelUsage, N + 1);
+  FModelUsage[N].Model := AModel;
+  FModelUsage[N].TokensIn := InTok;
+  FModelUsage[N].TokensOut := OutTok;
+  FModelUsage[N].CacheWrite := CW;
+  FModelUsage[N].CacheRead := CR;
+end;
+
+function TAgent.UsageModelKey: string;
+begin
+  Result := FLastRequestModel;
+  if Result = '' then Result := EffectiveModel(FRole);
+end;
+
+function TAgent.UsageByModel: TModelUsageList;
+var
+  I: Integer;
+begin
+  Result := nil;
+  SetLength(Result, Length(FModelUsage));
+  for I := 0 to High(FModelUsage) do Result[I] := FModelUsage[I];
+end;
+
+function TAgent.LastRequestModel: string;
+begin
+  Result := FLastRequestModel;
+end;
+
+function TAgent.RoleSource(Role: TModelRole): string;
+begin
+  Result := FModel;
+  if (Role <> mrMain) and (Routes[Role] <> '') then Result := Routes[Role];
+end;
+
+function TAgent.EffectiveModel(Role: TModelRole): string;
+begin
+  Result := ExpandModelName(RoleSource(Role));
+  { Cannot happen with a model set at Create, but a caller that cleared the
+    property must still produce something sendable rather than an empty
+    "model" the API rejects with a message about the wrong thing. }
+  if Result = '' then Result := DefaultModel;
+end;
+
 procedure TAgent.AbsorbUsage(Sub: TAgent);
+var
+  I: Integer;
 begin
   if Sub = nil then Exit;
   Inc(FTotalIn, Sub.FTotalIn);
   Inc(FTotalOut, Sub.FTotalOut);
   Inc(FCacheWrite, Sub.FCacheWrite);
   Inc(FCacheRead, Sub.FCacheRead);
+  { The rows have to come across too, or a routed subagent's tokens appear in
+    the scalar totals and in no row at all, and the per-model block silently
+    under-reports the thing it exists to report. }
+  for I := 0 to High(Sub.FModelUsage) do
+    BumpModelUsage(Sub.FModelUsage[I].Model,
+      Sub.FModelUsage[I].TokensIn, Sub.FModelUsage[I].TokensOut,
+      Sub.FModelUsage[I].CacheWrite, Sub.FModelUsage[I].CacheRead);
 end;
 
 function TAgent.LastAssistantText: string;
@@ -737,6 +1555,86 @@ begin
   Result := FMessages.Count;
 end;
 
+function TAgent.ContextComposition: TContextParts;
+const
+  { The row order, and it is the reading order rather than the size order: a
+    table that re-sorted itself as a session grew would make two runs of the
+    same command impossible to compare by eye, which is most of what somebody
+    does with this. }
+  PartUserText    = 0;
+  PartReplyText   = 1;
+  PartThinking    = 2;
+  PartToolCalls   = 3;
+  PartToolResults = 4;
+  PartImages      = 5;
+var
+  I, J, Slot: Integer;
+  Msg, Content, Blk: TJson;
+  Role, Kind: string;
+
+  procedure Add(Index: Integer; B: TJson);
+  begin
+    if B = nil then Exit;
+    Inc(Result[Index].Blocks);
+    Result[Index].Bytes := Result[Index].Bytes + Length(B.ToJson);
+  end;
+
+begin
+  SetLength(Result, 6);
+  Result[PartUserText].Name    := 'your messages';
+  Result[PartReplyText].Name   := 'replies';
+  Result[PartThinking].Name    := 'thinking';
+  Result[PartToolCalls].Name   := 'tool calls';
+  Result[PartToolResults].Name := 'tool results';
+  Result[PartImages].Name      := 'images';
+  for I := 0 to High(Result) do
+  begin
+    Result[I].Bytes := 0;
+    Result[I].Blocks := 0;
+  end;
+
+  for I := 0 to FMessages.Count - 1 do
+  begin
+    Msg := FMessages.Item(I);
+    if Msg = nil then Continue;
+    Role := Msg.Str('role');
+    Content := Msg.Find('content');
+    { A content that is not an array is a shape this program never composes and
+      ValidTranscript never admits, so it cannot arrive from a loaded session
+      either.  Counted as text by role rather than skipped, because a row of
+      zeros next to a transcript that is plainly not empty is the one output
+      here that would read as a bug in the table instead of a surprise in the
+      data. }
+    if (Content = nil) or (Content.Kind <> jkArr) then
+    begin
+      if Role = 'assistant' then Add(PartReplyText, Msg)
+      else Add(PartUserText, Msg);
+      Continue;
+    end;
+    for J := 0 to Content.Count - 1 do
+    begin
+      Blk := Content.Item(J);
+      if Blk = nil then Continue;
+      Kind := Blk.Str('type');
+      { tool_result rides in a USER message and text rides in both, so the
+        block type decides first and the role only breaks the text tie.  Doing
+        it the other way round - role first - is what would file every tool
+        result under "your messages", which is the row somebody would then try
+        and fail to make smaller by typing less. }
+      if Kind = 'tool_result' then Slot := PartToolResults
+      else if Kind = 'tool_use' then Slot := PartToolCalls
+      else if Kind = 'server_tool_use' then Slot := PartToolCalls
+      else if Kind = 'web_search_tool_result' then Slot := PartToolResults
+      else if Kind = 'thinking' then Slot := PartThinking
+      else if Kind = 'redacted_thinking' then Slot := PartThinking
+      else if Kind = 'image' then Slot := PartImages
+      else if Role = 'assistant' then Slot := PartReplyText
+      else Slot := PartUserText;
+      Add(Slot, Blk);
+    end;
+  end;
+end;
+
 procedure TAgent.TruncateMessages(Count: Integer);
 begin
   if Count < 0 then Count := 0;
@@ -762,7 +1660,7 @@ begin
   Result := nil;
   Err := '';
 
-  if Copy(FApiKey, 1, Length(OauthKeyPrefix)) = OauthKeyPrefix then
+  if IsOauth then
     Headers :=
       'authorization: Bearer ' + FApiKey + #13#10 +
       'anthropic-beta: ' + OauthBeta + #13#10 +
@@ -829,6 +1727,10 @@ begin
   { A trailing tool_result message is a different animal: it answers the
     assistant turn before it, and dropping it would orphan that tool call. }
   if IsToolResultMessage(Last) then Exit;
+  { The question is being thrown away unanswered; anything the user attached
+    to it was never sent either, so it goes back on the queue rather than
+    vanishing with the message. }
+  RequeueImagesFrom(Last);
   FMessages.Drop(FMessages.Count - 1);
   Result := True;
 end;
@@ -922,7 +1824,8 @@ function TAgent.CompactWithSummary(out Err: string): Boolean;
 var
   Backup, StopReason, Summary: string;
   Blocks: TPartialBlocks;
-  Cancelled: Boolean;
+  Cancelled, Sent: Boolean;
+  SavedRole: TModelRole;
   Restored, Msg, Arr, B: TJson;
   I: Integer;
 
@@ -944,14 +1847,29 @@ begin
   end;
 
   Backup := FMessages.ToJson;
-  AppendUserText(
+  { Only-text on purpose: this is pasclaude asking a question of its own, and
+    draining the user's pending attachment into it would spend the image on a
+    summary the user never sees. }
+  AppendUserTextOnly(
     'Summarize this conversation so far for your own future reference. ' +
     'Write plain prose, no tool calls. Preserve: what the user asked for, ' +
     'what was done and how, exact file paths and names involved, decisions ' +
     'made and their reasons, and anything still unfinished. Omit pleasantries ' +
     'and dead ends.');
 
-  if not SendWithRetry(Blocks, StopReason, Err, Cancelled) then
+  { Summarising text the model already produced is mechanical work, so it is
+    one of the two things routed off the main model.  The role is set around
+    the request alone and restored in a finally: a compaction that failed or
+    was cancelled must not strand the rest of the session on the compaction
+    model, and every exit below this point is an early one. }
+  SavedRole := FRole;
+  FRole := mrCompact;
+  try
+    Sent := SendWithRetry(Blocks, StopReason, Err, Cancelled);
+  finally
+    FRole := SavedRole;
+  end;
+  if not Sent then
   begin
     Restore;
     Exit;
@@ -979,8 +1897,8 @@ begin
     so the next question follows an assistant turn as the API requires. }
   FMessages.Free;
   FMessages := TJson.NewArr;
-  AppendUserText('Summary of the conversation so far, carried over after ' +
-    'compaction:'#10#10 + Summary);
+  AppendUserTextOnly('Summary of the conversation so far, carried over ' +
+    'after compaction:'#10#10 + Summary);
   Arr := TJson.NewArr;
   B := TJson.NewObj;
   B.AddStr('type', 'text');
@@ -1008,15 +1926,49 @@ begin
   Result := FTurns;
 end;
 
+{ width and height are ours, not the API's.  They live in FMessages so a
+  resumed session can say '[image 1920x1080 image/png]' without decoding a
+  megabyte of base64, and LoadSession reads them back - but the Messages API
+  validates content blocks strictly and rejects a block carrying a key it does
+  not know, so every one of them has to be gone from the copy that goes on the
+  wire.  Stripped here, beside the cache_control fixup, for the same reason:
+  the transcript stays free of transport concerns and the transport stays free
+  of ours.  Local-only keys added later belong in this one list. }
+procedure StripLocalImageFields(Msg: TJson);
+var
+  Content, B: TJson;
+  I, K: Integer;
+begin
+  if Msg = nil then Exit;
+  Content := Msg.Find('content');
+  if (Content = nil) or (Content.Kind <> jkArr) then Exit;
+  for I := 0 to Content.Count - 1 do
+  begin
+    B := Content.Item(I);
+    if (B = nil) or (B.Kind <> jkObj) then Continue;
+    if B.Str('type') <> 'image' then Continue;
+    K := B.IndexOf('width');
+    if K >= 0 then B.Drop(K);
+    K := B.IndexOf('height');
+    if K >= 0 then B.Drop(K);
+  end;
+end;
+
 function TAgent.BuildBody: string;
 var
   Root, Msgs, M, C: TJson;
   I: Integer;
   SysBlock, SysArr, Content, LastBlock, CC, Tools: TJson;
+  Note: string;
 begin
   Root := TJson.NewObj;
   try
-    Root.AddStr('model', FModel);
+    { The single production point for a model string.  Recorded as it is
+      produced, together with the name it came from, because by the time a
+      404 comes back the only thing that can explain it is what was sent. }
+    FLastRequestModel := EffectiveModel(FRole);
+    FLastRequestSource := RoleSource(FRole);
+    Root.AddStr('model', FLastRequestModel);
     { Thinking spends from the same max_tokens pot as the reply, so the
       ceiling rises with the budget or a long think would starve the
       answer that follows it. }
@@ -1043,7 +1995,7 @@ begin
       { Under an OAuth token the API insists the system prompt open with
         Claude Code's own identity line, exactly.  It goes in as its own
         block ahead of ours, which continues unchanged. }
-      if Copy(FApiKey, 1, Length(OauthKeyPrefix)) = OauthKeyPrefix then
+      if IsOauth then
       begin
         SysBlock := TJson.NewObj;
         SysBlock.AddStr('type', 'text');
@@ -1057,6 +2009,24 @@ begin
       CC.AddStr('type', 'ephemeral');
       SysBlock.Add('cache_control', CC);
       SysArr.Push(SysBlock);
+      { Whatever is true of this session rather than of the program: plan
+        mode, deny rules, and later the extra roots.  Read from uTools here
+        rather than set by the host, because a host that forgot to wire it
+        would produce exactly the failure plan mode exists to prevent - a
+        model told nothing, discovering the boundary by walking into it after
+        doing half the work.  It goes
+        AFTER the marked block and carries no marker of its own, so a session
+        that turns one of these on does not invalidate the cached prefix -
+        and with everything at its default uTools.SessionNote is '', no second
+        block is emitted, and the body is byte-identical to before. }
+      Note := uTools.SessionNote;
+      if Note <> '' then
+      begin
+        SysBlock := TJson.NewObj;
+        SysBlock.AddStr('type', 'text');
+        SysBlock.AddStr('text', Note);
+        SysArr.Push(SysBlock);
+      end;
       Root.Add('system', SysArr);
     end;
     { Web search is declared only when the user asked for it.  Absent, the
@@ -1074,7 +2044,11 @@ begin
     begin
       M := FMessages.Item(I);
       C := JsonParse(M.ToJson);
-      if C <> nil then Msgs.Push(C);
+      if C <> nil then
+      begin
+        StripLocalImageFields(C);
+        Msgs.Push(C);
+      end;
     end;
     { A second marker on the final content block caches the conversation so
       far.  Each turn then only pays full price for what was added since the
@@ -1133,6 +2107,22 @@ var
   Headers, Body: string;
   Res: THttpResult;
   ErrJson, ErrObj: TJson;
+  StartedMs: QWord;
+
+  { Every exit from this function below the POST goes through here.  Wrapped,
+    because a fault in a metrics callback must not become a failed turn. }
+  procedure FireDone(Status: Integer);
+  begin
+    if not Assigned(OnRequestDone) then Exit;
+    try
+      OnRequestDone(Status, Integer(GetTickCount64 - StartedMs),
+        FLastRequestModel);
+    except
+      { Swallowed on purpose and reported nowhere: uAgent has no console, and
+        the alternative is losing the user's answer to a counter. }
+    end;
+  end;
+
 begin
   Blocks := nil;
   StopReason := '';
@@ -1152,7 +2142,7 @@ begin
 
   { A subscription OAuth token authenticates as a Bearer with its beta flag;
     an API key rides the x-api-key header.  Same endpoint either way. }
-  if Copy(FApiKey, 1, Length(OauthKeyPrefix)) = OauthKeyPrefix then
+  if IsOauth then
     Headers :=
       'authorization: Bearer ' + FApiKey + #13#10 +
       'anthropic-beta: ' + OauthBeta + #13#10 +
@@ -1167,6 +2157,7 @@ begin
       'accept: text/event-stream';
 
   Body := BuildBody;
+  StartedMs := GetTickCount64;
   Res := HttpPost(ApiUrl, Headers, Body, @StreamChunk, @St);
   { Clamped on this side too: a substituted transport may leave the field
     uninitialized, and a nonsense wait must not become a nonsense sleep. }
@@ -1183,9 +2174,12 @@ begin
     Inc(FCacheWrite, St.CacheWrite);
     Inc(FCacheRead, St.CacheRead);
     Inc(FTotalOut, St.OutTok);
+    BumpModelUsage(UsageModelKey, St.InTok, St.OutTok,
+      St.CacheWrite, St.CacheRead);
     FLastPromptTokens := St.InTok + St.CacheWrite + St.CacheRead;
     Blocks := St.Blocks;
     StopReason := 'cancelled';
+    FireDone(Res.Status);
     Exit(True);
   end;
 
@@ -1210,12 +2204,21 @@ begin
       else
         Err := Err + ' - ' + Copy(Res.Body, 1, 500);
     end;
+    { A model the account cannot use is a 404 on the first turn, which is the
+      worst possible moment to be told nothing.  When the id came from an
+      alias, say so and name it: the alternative is an opaque
+      not_found_error about a string the user never typed.  Nothing is
+      printed here - uAgent has no console - the text is returned. }
+    if (Res.Status = 404) or (Copy(Err, 1, 8) = 'HTTP 404') then
+      Err := Err + ModelSourceNote(FLastRequestSource);
+    FireDone(Res.Status);
     Exit(False);
   end;
 
   if St.ErrText <> '' then
   begin
     Err := St.ErrText;
+    FireDone(Res.Status);
     Exit(False);
   end;
 
@@ -1223,9 +2226,12 @@ begin
   Inc(FCacheWrite, St.CacheWrite);
   Inc(FCacheRead, St.CacheRead);
   Inc(FTotalOut, St.OutTok);
+  BumpModelUsage(UsageModelKey, St.InTok, St.OutTok,
+    St.CacheWrite, St.CacheRead);
   FLastPromptTokens := St.InTok + St.CacheWrite + St.CacheRead;
   Blocks := St.Blocks;
   StopReason := St.StopReason;
+  FireDone(Res.Status);
   Result := True;
 end;
 
@@ -1288,8 +2294,13 @@ begin
         end;
       bkResult:
         begin
-          { Echoed byte-for-byte: this client never understood the block, so
-            reconstructing it is the one thing guaranteed to be wrong. }
+          { The capture is echoed byte-for-byte: this client never understood
+            the block, so reconstructing it is the one thing guaranteed to be
+            wrong.  The only editing a capture ever gets happened at capture
+            time, in ClipSearchResult, while the whole block was still in
+            hand and the decoder could still tell one result from the next.
+            This arm stays a pure replay of whatever was stored, and stays the
+            place that must never learn to rebuild anything. }
           B := JsonParse(Blocks[I].Text);
           if B = nil then Continue;
         end;
@@ -1405,6 +2416,8 @@ begin
   Inc(FTotalOut, St.OutTok);
   Inc(FCacheWrite, St.CacheWrite);
   Inc(FCacheRead, St.CacheRead);
+  BumpModelUsage(UsageModelKey, St.InTok, St.OutTok,
+    St.CacheWrite, St.CacheRead);
   StopReason := St.StopReason;
   Err := St.ErrText;
   Result := St.Blocks;
@@ -1431,7 +2444,12 @@ end;
 { A saved session is the transcript plus enough context to tell whether
   resuming it makes sense.  The API key is deliberately not stored: it belongs
   in the environment, and writing it into a file inside the user's project is
-  how secrets end up committed. }
+  how secrets end up committed.  Still true now that a credential can also
+  come from uAuth's own store - MORE true, since the whole point of that
+  store is that the secret lives out of tree under DPAPI, and a copy of it in
+  <root>\.pasclaude\session.json would be one SafePath does not protect and
+  git might.  There is a test pinning this; the field this comment describes
+  is the one that must never be added. }
 function TAgent.SaveSession(const Path: string; out Err: string): Boolean;
 var
   Root, Msgs, M: TJson;
@@ -1659,8 +2677,12 @@ begin
     FTurns := Round(Root.Num('turns', 0));
     FTotalIn := Round(Root.Num('tokens_in', 0));
     FTotalOut := Round(Root.Num('tokens_out', 0));
-    { The model is restored only when the caller did not pick one, so an
-      explicit ANTHROPIC_MODEL still wins over whatever was saved. }
+    { The saved model wins whenever it is not blank, including over an
+      explicit ANTHROPIC_MODEL.  The comment here used to claim the opposite;
+      the code has always done this, and telling the truth is the cheaper fix -
+      distinguishing "the caller picked one" from "the caller took the
+      default" needs a flag threaded through TAgent.Create, and changing the
+      behaviour would change interactive /resume with it. }
     if Root.Str('model') <> '' then FModel := Root.Str('model');
     Result := True;
   finally
@@ -1679,16 +2701,60 @@ begin
             (Pos('HTTP 503', Err) > 0) or (Pos('HTTP 504', Err) > 0);
 end;
 
+{ True for an authentication failure and nothing else.  A 403 is a
+  permission error and a 400 is a bad request; replaying either against a new
+  credential would just fail again, and widening this test is the specific
+  mistake that turns one clear refusal into a retry storm. }
+function IsUnauthorized(const Err: string): Boolean;
+begin
+  { The status alone, deliberately.  Matching the API's error TYPE as well
+    would look more generous and be wrong: the body is attacker-adjacent
+    text that arrives with any status, so an error_type test would let a 403
+    or a 400 carrying the word authentication_error trigger a replay. }
+  Result := Pos('HTTP 401', Err) > 0;
+end;
+
+function TAgent.TryAuthRefresh(const Err: string): Boolean;
+var
+  NewKey: string;
+begin
+  Result := False;
+  if FAuthRefreshed then Exit;
+  if not IsUnauthorized(Err) then Exit;
+  if not Assigned(OnAuthRefresh) then Exit;
+  { Marked spent BEFORE the callback runs, so a callback that throws or that
+    keeps handing back fresh-but-dead keys still cannot produce a third
+    request. }
+  FAuthRefreshed := True;
+  NewKey := OnAuthRefresh();
+  { A key identical to the one just refused would fail identically; an empty
+    one means the host found nothing better. }
+  if (NewKey = '') or (NewKey = FApiKey) then Exit;
+  FApiKey := NewKey;
+  if Assigned(OnNotice) then
+    OnNotice('the credential was refused; retrying with a newly resolved one');
+  Result := True;
+end;
+
 { Sends one request, retrying transient failures with a widening delay. }
 function TAgent.SendWithRetry(out Blocks: TPartialBlocks;
   out StopReason, Err: string; out Cancelled: Boolean): Boolean;
 var
   Attempt, Wait: Integer;
 begin
+  FAuthRefreshed := False;
   for Attempt := 0 to MaxRetries do
   begin
     Result := SendOnce(Blocks, StopReason, Err, Cancelled);
     if Result or Cancelled then Exit;
+    { Before the Transient test, because 401 is not transient and must not
+      become so.  This is an immediate re-send with a different credential,
+      not a backoff: there is nothing to wait for. }
+    if TryAuthRefresh(Err) then
+    begin
+      Result := SendOnce(Blocks, StopReason, Err, Cancelled);
+      if Result or Cancelled then Exit;
+    end;
     if not Transient(Err) then Exit;
     if Attempt = MaxRetries then Exit;
 
@@ -1727,7 +2793,7 @@ begin
   Result := True;
 end;
 
-procedure TAgent.AppendUserText(const S: string);
+procedure TAgent.AppendUserTextOnly(const S: string);
 var
   Msg, Arr, B: TJson;
 begin
@@ -1741,6 +2807,151 @@ begin
   Msg.AddStr('role', 'user');
   Msg.Add('content', Arr);
   FMessages.Push(Msg);
+end;
+
+function TAgent.AttachImage(const Media, B64: string; W, H: Integer;
+  out Err: string): Boolean;
+var
+  N: Integer;
+begin
+  Err := '';
+  Result := False;
+  if (Media <> 'image/png') and (Media <> 'image/jpeg') and
+     (Media <> 'image/gif') and (Media <> 'image/webp') then
+  begin
+    Err := Media + ' is not an image type the API accepts';
+    Exit;
+  end;
+  if B64 = '' then
+  begin
+    Err := 'the image is empty';
+    Exit;
+  end;
+  N := Length(FPendingImages);
+  if N >= MaxImagesPerMessage then
+  begin
+    Err := Format('at most %d images per message; send these first',
+      [MaxImagesPerMessage]);
+    Exit;
+  end;
+  SetLength(FPendingImages, N + 1);
+  FPendingImages[N].Media := Media;
+  FPendingImages[N].Data := B64;
+  FPendingImages[N].W := W;
+  FPendingImages[N].H := H;
+  Result := True;
+end;
+
+function TAgent.PendingImages: Integer;
+begin
+  Result := Length(FPendingImages);
+end;
+
+procedure TAgent.ClearPendingImages;
+begin
+  SetLength(FPendingImages, 0);
+end;
+
+{ The one builder of user messages, for prose and images alike.  A second one
+  would eventually drift from this ordering, and the ordering is not
+  arbitrary: the API documents that an image works best before the text that
+  asks about it. }
+procedure TAgent.AppendUserText(const S: string);
+var
+  Msg, Arr, B, Src: TJson;
+  I: Integer;
+begin
+  { An image-only paste is a real message.  Testing the text alone here would
+    make it vanish silently, which is the worst outcome available: the user
+    paid for the image and it never left the machine. }
+  if (Trim(S) = '') and (Length(FPendingImages) = 0) then Exit;
+
+  Arr := TJson.NewArr;
+  for I := 0 to High(FPendingImages) do
+  begin
+    Src := TJson.NewObj;
+    Src.AddStr('type', 'base64');
+    Src.AddStr('media_type', FPendingImages[I].Media);
+    Src.AddStr('data', FPendingImages[I].Data);
+    B := TJson.NewObj;
+    B.AddStr('type', 'image');
+    B.Add('source', Src);
+    { Dimensions the API ignores and this program reads back: they are what
+      lets a resumed transcript say '[image 1920x1080 image/png]' rather than
+      '[image]', without decoding a megabyte of base64 to find out. }
+    if (FPendingImages[I].W > 0) and (FPendingImages[I].H > 0) then
+    begin
+      B.AddNum('width', FPendingImages[I].W);
+      B.AddNum('height', FPendingImages[I].H);
+    end;
+    Arr.Push(B);
+  end;
+  SetLength(FPendingImages, 0);
+
+  if Trim(S) <> '' then
+  begin
+    B := TJson.NewObj;
+    B.AddStr('type', 'text');
+    B.AddStr('text', S);
+    Arr.Push(B);
+  end;
+
+  Msg := TJson.NewObj;
+  Msg.AddStr('role', 'user');
+  Msg.Add('content', Arr);
+  FMessages.Push(Msg);
+end;
+
+function TAgent.EvictImages(KeepNewest: Integer): Integer;
+var
+  I, J, Total, Seen: Integer;
+  Content, B, Repl: TJson;
+  Desc: string;
+
+  function CountImages: Integer;
+  var
+    A, C: Integer;
+    Ct: TJson;
+  begin
+    Result := 0;
+    for A := 0 to FMessages.Count - 1 do
+    begin
+      Ct := FMessages.Item(A).Find('content');
+      if (Ct = nil) or (Ct.Kind <> jkArr) then Continue;
+      for C := 0 to Ct.Count - 1 do
+        if Ct.Item(C).Str('type') = 'image' then Inc(Result);
+    end;
+  end;
+
+begin
+  Result := 0;
+  if KeepNewest < 0 then KeepNewest := 0;
+  Total := CountImages;
+  if Total <= KeepNewest then Exit;
+
+  { Oldest first: the image the user just pasted is the one still being
+    discussed, and the stale ones at the front are what nobody will look at
+    again. }
+  Seen := 0;
+  for I := 0 to FMessages.Count - 1 do
+  begin
+    Content := FMessages.Item(I).Find('content');
+    if (Content = nil) or (Content.Kind <> jkArr) then Continue;
+    for J := 0 to Content.Count - 1 do
+    begin
+      B := Content.Item(J);
+      if (B = nil) or (B.Str('type') <> 'image') then Continue;
+      Inc(Seen);
+      if Seen > Total - KeepNewest then Exit;
+      Desc := ImageFacts(B);
+      if Desc = '' then Desc := 'unknown';
+      Repl := TJson.NewObj;
+      Repl.AddStr('type', 'text');
+      Repl.AddStr('text', '[image removed to save context: ' + Desc + ']');
+      Content.SetAt(J, Repl);
+      Inc(Result);
+    end;
+  end;
 end;
 
 function TAgent.Send(const UserText: string; out Err: string): Boolean;
@@ -1860,11 +3071,51 @@ begin
     TrimUnansweredQuestion;
 end;
 
+{ The queue is bounded, so an image that cannot fit is dropped rather than
+  allowed to push the count past what AttachImage would ever have permitted -
+  a silently over-long queue would fail the next request instead of this one.
+  Order within the message is preserved, which is the order the user pasted
+  them in. }
+procedure TAgent.RequeueImagesFrom(M: TJson);
+var
+  Content, B, Src: TJson;
+  I, N, Back: Integer;
+begin
+  if M = nil then Exit;
+  if M.Str('role') <> 'user' then Exit;
+  Content := M.Find('content');
+  if (Content = nil) or (Content.Kind <> jkArr) then Exit;
+  Back := 0;
+  for I := 0 to Content.Count - 1 do
+  begin
+    B := Content.Item(I);
+    if (B = nil) or (B.Kind <> jkObj) then Continue;
+    if B.Str('type') <> 'image' then Continue;
+    Src := B.Find('source');
+    if (Src = nil) or (Src.Str('data') = '') then Continue;
+    N := Length(FPendingImages);
+    if N >= MaxImagesPerMessage then Break;
+    SetLength(FPendingImages, N + 1);
+    FPendingImages[N].Media := Src.Str('media_type');
+    FPendingImages[N].Data := Src.Str('data');
+    FPendingImages[N].W := Round(B.Num('width'));
+    FPendingImages[N].H := Round(B.Num('height'));
+    Inc(Back);
+  end;
+  { Silence here would be the real damage: the user was told the image goes
+    with their next message, and without this they would send that message
+    without it and never know. }
+  if (Back > 0) and Assigned(OnNotice) then
+    OnNotice(Format('%d attached image(s) were not sent; they go with your ' +
+      'next message', [Back]));
+end;
+
 procedure TAgent.UnwindUnsentTail;
 begin
   while (FMessages.Count > 1) and
         (FMessages.Item(FMessages.Count - 1).Str('role') = 'user') do
   begin
+    RequeueImagesFrom(FMessages.Item(FMessages.Count - 1));
     FMessages.Drop(FMessages.Count - 1);
     DropUnansweredToolCalls;
   end;
@@ -1963,6 +3214,23 @@ begin
     SubHost.OnNotice('subagent: ' + S);
 end;
 
+{ The same block the main system prompt carries, under the same condition:
+  a subagent reads in every root the parent can, and a path it cannot name is
+  a path it will waste a round guessing at.  '' when there is one root, so an
+  ordinary subagent's prompt is unchanged. }
+function SubRootsNote: string;
+var
+  I: Integer;
+begin
+  Result := '';
+  if uTools.RootCount <= 1 then Exit;
+  Result := 'Additional working directories you may also read:' + #10;
+  for I := 1 to uTools.RootCount - 1 do
+    Result := Result + '  ' + uTools.RootAt(I) + #10;
+  Result := Result + 'Paths are relative to the session root; a file in an ' +
+    'additional directory must be given as its full absolute path.' + #10;
+end;
+
 function RunSubagent(const Prompt, SystemExtra: string;
   out Reply, Err: string): Boolean;
 var
@@ -1986,6 +3254,7 @@ begin
   SysText :=
     'You are a read-only subagent working inside a coding session rooted at ' +
     uTools.RootDir + '.' + #10 +
+    SubRootsNote +
     'You have exactly three tools: read_file, list_dir and search. You ' +
     'cannot change files, run commands, fetch URLs, or start a subagent of ' +
     'your own.' + #10 +
@@ -1997,7 +3266,14 @@ begin
   if Trim(SystemExtra) <> '' then
     SysText := SysText + #10#10 + SystemExtra;
 
-  Sub := TAgent.Create(Parent.FApiKey, Parent.FModel, SysText);
+  { Routed rather than inherited.  A read-only investigator with three tools
+    and nobody watching it spend is the clearest case in the program for a
+    cheaper model - RunSubagent already declines to give it a thinking budget
+    for the same reason.  The child is handed a concrete id and its own role
+    stays mrMain, so its resolution is a plain passthrough and it cannot
+    route again. }
+  Sub := TAgent.Create(Parent.FApiKey, Parent.EffectiveModel(mrSubagent),
+    SysText);
   try
     Sub.MaxRounds := uTools.SubagentMaxRounds;
     { Nil by construction rather than by omission: nothing a subagent can call
@@ -2046,7 +3322,51 @@ begin
   Result := ForceCancel or (Assigned(ActiveAgent) and ActiveAgent.WantsCancel);
 end;
 
+procedure AddBuiltinAlias(const Name, Target: string);
+var
+  I: Integer;
+begin
+  I := Length(Aliases);
+  SetLength(Aliases, I + 1);
+  Aliases[I].Name := Name;
+  Aliases[I].Kind := makModel;
+  Aliases[I].Target := Target;
+end;
+
+procedure AddBuiltinProfile(const Name, PlanHalf, ExecHalf: string);
+var
+  I: Integer;
+begin
+  I := Length(Aliases);
+  SetLength(Aliases, I + 1);
+  Aliases[I].Name := Name;
+  Aliases[I].Kind := makProfile;
+  Aliases[I].PlanHalf := PlanHalf;
+  Aliases[I].ExecHalf := ExecHalf;
+end;
+
 initialization
+  { Dateless on purpose, every one of them.  A dated snapshot id is a promise
+    about a date this program does not control, and one of those has already
+    expired under this codebase - a live 404 on a hardcoded default, which is
+    why DefaultModel is 'claude-sonnet-4-5' and not a snapshot.  The server
+    resolves a family alias to whatever is current; a table of snapshots
+    would have to be re-shipped to stay true. }
+  AddBuiltinAlias('opus',   'claude-opus-4-5');
+  AddBuiltinAlias('sonnet', 'claude-sonnet-4-5');
+  AddBuiltinAlias('haiku',  'claude-haiku-4-5');
+  { Not an id: a profile.  Plan mode refuses every changing tool, so under
+    opusplan the expensive model only ever reads and the cheap one does the
+    work - which is the whole argument for the alias existing. }
+  AddBuiltinProfile('opusplan', 'opus', 'sonnet');
+  { The shipped routes.  On the shipped default model these are a no-op -
+    'sonnet' expands to exactly DefaultModel - so out of the box every
+    request carries the same string it carried before routing existed.  The
+    feature only bites once the user has deliberately chosen a stronger main
+    model, which is the moment they asked for it. }
+  Routes[mrSubagent] := 'sonnet';
+  Routes[mrCompact]  := 'sonnet';
+
   { The ladder crossing: uTools declares the hole because it is the unit that
     needs a way to run one, and the unit that knows what an agent is fills it.
     The same shape uHttp uses for the network transport. }

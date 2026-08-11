@@ -1,0 +1,119 @@
+# pasclaude answers an @claude mention. Copy this into .github/workflows/ in
+# YOUR repository; it is deliberately not live in pasclaude's own.
+#
+# Read it before you copy it. It is short so that you can.
+#
+# Two steps hold GH_TOKEN - "read the pull request" and "post the comment" -
+# and both run fixed command lines. The step that runs the model holds
+# ANTHROPIC_API_KEY and NO GitHub token at all, so an instruction injected
+# into a comment has no GitHub credential to use even if it reached a shell.
+# It cannot reach one: the deny floor written below removes bash, fetch,
+# web_search, every write tool and task, and nothing overrides a deny rule.
+name: pasclaude
+
+# issue_comment only, and created only. Its workflow file is always taken from
+# the default branch, so a pull request cannot edit the workflow that reviews
+# it. The classic hole - the "_target" variant of the pull request trigger,
+# which runs a fork's code in the base repository's context holding these
+# secrets - is used NOWHERE, and the ux suite fails if its name ever appears
+# in this file at all, which is why it is spelled around here rather than out.
+on:
+  issue_comment:
+    types: [created]
+
+# Naming any key sets every unnamed one to none. With exactly these three, an
+# injected instruction could read this repository, read pull request metadata,
+# and post issue comments here. It could NOT push to a branch, create a branch
+# or a tag, approve or submit a review, merge, edit a workflow, publish a
+# release, or reach any other repository.
+permissions:
+  contents: read
+  issues: write
+  pull-requests: read
+
+jobs:
+  answer:
+    # The cheap gate, so a stranger's comment never starts a runner at all.
+    # The real one runs again in Pascal, inside --ci prepare, against the same
+    # author_association - a value GitHub computes from the commenter's
+    # relationship to this repository, not one the commenter types.
+    if: >-
+      github.event.sender.type != 'Bot' &&
+      contains(github.event.comment.body, '@claude') &&
+      (github.event.comment.author_association == 'OWNER' ||
+       github.event.comment.author_association == 'MEMBER' ||
+       github.event.comment.author_association == 'COLLABORATOR')
+    runs-on: windows-latest
+    steps:
+      # There is no release pipeline, so the agent is built from source into
+      # RUNNER_TEMP - outside the tree that gets reviewed. Pin the branch or
+      # tag you have read.
+      - name: Build pasclaude
+        shell: pwsh
+        run: |
+          git clone --depth 1 --branch master https://github.com/YOUR-FORK/pasclaude.git "$env:RUNNER_TEMP\agent"
+          choco install freepascal -y --no-progress
+          & "$env:RUNNER_TEMP\agent\build.cmd"
+
+      # Out of tree, so nothing in the checkout can supply or edit it. Drop
+      # this step and --ci prepare exits 2 naming every missing rule.
+      - name: Write the CI deny floor
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force "$env:LOCALAPPDATA\pasclaude" | Out-Null
+          @'
+          {"deny":["tool:bash","tool:bash_output","tool:kill_bash","tool:fetch",
+          "tool:web_search","tool:write_file","tool:edit_file",
+          "tool:notebook_edit","tool:task","path:**/.git/**","path:**/.env*",
+          "path:**/*.pem"]}
+          '@ | Set-Content -Encoding utf8 "$env:LOCALAPPDATA\pasclaude\deny.json"
+
+      # One of the two token-bearing steps. The number is GitHub's own field.
+      - name: Read the pull request
+        if: github.event.issue.pull_request != null
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh pr view ${{ github.event.issue.number }} --repo ${{ github.repository }} --json isCrossRepository,headRefOid,state > "$env:RUNNER_TEMP\pr.json"
+
+      # The comment text reaches pasclaude as a FILE it opens itself. It is
+      # never interpolated into a run line, which is the injection this whole
+      # design is arranged to avoid.
+      - name: Decide
+        id: prepare
+        shell: pwsh
+        run: |
+          $pr = if (Test-Path "$env:RUNNER_TEMP\pr.json") { @("--ci-pr","$env:RUNNER_TEMP\pr.json") } else { @() }
+          & "$env:RUNNER_TEMP\agent\bin\pasclaude.exe" --ci prepare --ci-in "$env:GITHUB_EVENT_PATH" --ci-out "$env:RUNNER_TEMP\prompt.txt" @pr
+
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        if: steps.prepare.outputs.proceed == 'true'
+        with:
+          ref: ${{ steps.prepare.outputs.head_sha }}
+          persist-credentials: false
+
+      # The only step that sees the model credential, and the only one with no
+      # GitHub token. Plan mode, the deny floor, and --no-project-context: this IS
+      # the author's checkout, so its CLAUDE.md is not fit for a system prompt.
+      - name: Answer
+        if: steps.prepare.outputs.proceed == 'true'
+        shell: pwsh
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: Get-Content "$env:RUNNER_TEMP\prompt.txt" -Raw | & "$env:RUNNER_TEMP\agent\bin\pasclaude.exe" -p --output-format json --permission-mode plan --no-project-context > "$env:RUNNER_TEMP\result.json"
+
+      - name: Render the comment
+        if: steps.prepare.outputs.proceed == 'true'
+        shell: pwsh
+        run: '& "$env:RUNNER_TEMP\agent\bin\pasclaude.exe" --ci report --ci-in "$env:RUNNER_TEMP\result.json" --ci-out "$env:RUNNER_TEMP\comment.md"'
+
+      # The second token-bearing step, and the last one.
+      - name: Post
+        if: always() && (steps.prepare.outputs.proceed == 'true' || steps.prepare.outputs.refusal_file == 'yes')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $body = "$env:RUNNER_TEMP\comment.md"
+          if (-not (Test-Path $body)) { $body = "$env:RUNNER_TEMP\prompt.txt.md" }
+          gh api "repos/${{ github.repository }}/issues/${{ github.event.issue.number }}/comments" -F "body=@$body"
